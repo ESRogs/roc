@@ -2912,9 +2912,9 @@ const Lowerer = struct {
             .field_access => |field| blk: {
                 const receiver_ty = try self.lowerExprTy(field.receiver);
                 const field_index = self.recordFieldIndex(receiver_ty, field.field);
-                break :blk self.aggregateFieldLayout(try self.layoutOfType(receiver_ty), field_index);
+                break :blk self.maybeAggregateFieldLayout(try self.layoutOfType(receiver_ty), field_index) orelse return default_layout;
             },
-            .tuple_access => |access| self.aggregateFieldLayout(try self.layoutOfType(try self.lowerExprTy(access.tuple)), @intCast(access.elem_index)),
+            .tuple_access => |access| self.maybeAggregateFieldLayout(try self.layoutOfType(try self.lowerExprTy(access.tuple)), @intCast(access.elem_index)) orelse return default_layout,
             else => return default_layout,
         };
 
@@ -5411,6 +5411,11 @@ const Lowerer = struct {
     }
 
     fn aggregateFieldLayout(self: *Lowerer, aggregate_layout_idx: layout.Idx, field_index: u16) layout.Idx {
+        return self.maybeAggregateFieldLayout(aggregate_layout_idx, field_index) orelse
+            Common.invariant("field read expected a struct layout");
+    }
+
+    fn maybeAggregateFieldLayout(self: *Lowerer, aggregate_layout_idx: layout.Idx, field_index: u16) ?layout.Idx {
         const source_layout_idx = aggregate_layout_idx;
         const source_layout = self.result.layouts.getLayout(source_layout_idx);
         const struct_layout_idx = switch (source_layout.tag) {
@@ -5418,10 +5423,9 @@ const Lowerer = struct {
             else => source_layout_idx,
         };
         const struct_layout = self.result.layouts.getLayout(struct_layout_idx);
-        if (struct_layout.tag != .struct_) {
-            Common.invariant("field read expected a struct layout");
-        }
-        return self.result.layouts.getStructFieldLayoutByOriginalIndex(struct_layout.getStruct().idx, field_index);
+        if (struct_layout.tag != .struct_) return null;
+        return self.structFieldLayoutByOriginalIndex(struct_layout.getStruct().idx, field_index) orelse
+            Common.invariant("field read referenced missing struct field");
     }
 
     fn localListElemLayout(self: *Lowerer, source: LIR.LocalId) layout.Idx {
