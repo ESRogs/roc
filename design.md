@@ -1438,6 +1438,21 @@ the optimizer's allocation cost or call optimized-only helpers. The explicit
 build-mode decision is consumed at this boundary; after that, optimized helpers
 are reachable only through the optimized context's API.
 
+The mode classifier is deliberately smaller than the full build configuration.
+It answers one question for post-check lowering:
+
+```text
+ordinary public-value lowering
+optimized callable-state lowering
+```
+
+Only `--opt=size` and `--opt=speed` map to optimized callable-state lowering.
+Every other build mode maps to ordinary public-value lowering. The classifier
+must be computed once by the post-check driver and passed as explicit data into
+lowering construction. Lowering code must not re-read target options,
+optimization names, target triples, backend choices, or wasm-specific settings
+to decide whether it owns optimized-demand state.
+
 This gate is part of the optimizer's data-ownership model. Optimized demand
 state is not a dormant field on ordinary lowering, and ordinary lowering must
 not be able to manufacture an optimized context. `--opt=size` and `--opt=speed`
@@ -1457,6 +1472,14 @@ loop fixed-point work, and demand-keyed workers. Any helper that needs one of
 those structures must require that optimized context directly, so calling it
 from ordinary lowering is an API error rather than a mode check buried inside
 the helper.
+
+Focused tests should prove this boundary directly. A negative test should be
+able to lower the same small program through dev/check/interpreter-style paths
+without constructing the optimized context. Positive tests for `--opt=size` and
+`--opt=speed` should observe the same optimized entrypoint and the same
+optimizer-owned facts before backend-specific size or speed preferences run.
+The proof must come from compiler-owned lowering/test data, not from final wasm
+size, generated symbol names, disassembly, or backend output.
 
 The optimized path is a different post-check lowering entrypoint, not a cleanup
 pass after ordinary lowering. It may create extra private workers, private
