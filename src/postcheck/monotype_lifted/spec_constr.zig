@@ -4759,9 +4759,8 @@ const Cloner = struct {
                 try self.stabilizeLoopDemandsFromStateBodies(loop, params, known_values, demands, result_demand);
                 _ = self.loop_stack.pop();
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
-                for (known_values, demands, demanded_known_values) |known_value, demand, *out| {
-                    out.* = (try demandedKnownValueFromDemand(self, self.pass.program, self.pass.arena.allocator(), known_value, demand)) orelse
-                        DemandedKnownValue{ .any = known_valueType(known_value) };
+                for (known_values, values, demands, demanded_known_values) |known_value, value, demand, *out| {
+                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand);
                 }
                 self.restore(change_start);
                 return try self.cloneStateLoopFromDemandedKnownValues(ty, loop, params, values, demanded_known_values, demands, result_demand);
@@ -4771,9 +4770,8 @@ const Cloner = struct {
 
             if (valueDemandsRequirePrivateState(demands)) {
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
-                for (known_values, demands, demanded_known_values) |known_value, demand, *out| {
-                    out.* = (try demandedKnownValueFromDemand(self, self.pass.program, self.pass.arena.allocator(), known_value, demand)) orelse
-                        DemandedKnownValue{ .any = known_valueType(known_value) };
+                for (known_values, values, demands, demanded_known_values) |known_value, value, demand, *out| {
+                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand);
                 }
                 self.restore(change_start);
                 return try self.cloneStateLoopFromDemandedKnownValues(ty, loop, params, values, demanded_known_values, demands, result_demand);
@@ -4791,9 +4789,8 @@ const Cloner = struct {
             if (knownValuesContainFiniteState(known_values) or valueDemandsRequirePrivateState(demands)) {
                 try self.stabilizeLoopDemandsFromStateBodies(loop, params, known_values, demands, result_demand);
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
-                for (known_values, demands, demanded_known_values) |known_value, demand, *out| {
-                    out.* = (try demandedKnownValueFromDemand(self, self.pass.program, self.pass.arena.allocator(), known_value, demand)) orelse
-                        DemandedKnownValue{ .any = known_valueType(known_value) };
+                for (known_values, values, demands, demanded_known_values) |known_value, value, demand, *out| {
+                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand);
                 }
                 if (demandedKnownValuesContainFiniteState(demanded_known_values) or valueDemandsRequirePrivateState(demands)) {
                     self.restore(change_start);
@@ -4828,6 +4825,22 @@ const Cloner = struct {
             } } });
             return .{ .expr = try self.wrapPendingLetsAroundExpr(ty, loop_expr, pending_lets.items) };
         }
+    }
+
+    fn demandedKnownValueFromLoopEntryDemand(
+        self: *Cloner,
+        value: Value,
+        known_value: KnownValue,
+        demand: ValueDemand,
+    ) Common.LowerError!DemandedKnownValue {
+        if (valueDemandRequiresPrivateState(demand)) {
+            if (try self.demandedKnownValueFromValueDemand(value, demand)) |demanded| {
+                return demanded;
+            }
+        }
+
+        return (try demandedKnownValueFromDemand(self, self.pass.program, self.pass.arena.allocator(), known_value, demand)) orelse
+            DemandedKnownValue{ .any = known_valueType(known_value) };
     }
 
     fn stabilizeLoopDemandsFromStateBodies(
