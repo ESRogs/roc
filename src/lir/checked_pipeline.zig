@@ -68,13 +68,20 @@ pub const CheckedModuleState = enum {
     checking_finalization,
 };
 
+/// Field metadata for runtime record value inspection.
 pub const RuntimeRecordFieldSchema = postcheck.SolvedLirLower.RuntimeRecordFieldSchema;
+/// Record metadata for runtime value inspection.
 pub const RuntimeRecordSchema = postcheck.SolvedLirLower.RuntimeRecordSchema;
+/// Tag metadata for runtime tag-union value inspection.
 pub const RuntimeTagSchema = postcheck.SolvedLirLower.RuntimeTagSchema;
+/// Tag-union metadata for runtime value inspection.
 pub const RuntimeTagUnionSchema = postcheck.SolvedLirLower.RuntimeTagUnionSchema;
+/// Inlining behavior selected for post-check lowering.
 pub const InlineMode = postcheck.SolvedInline.Mode;
+/// Debug effect handling selected for post-check lowering.
 pub const DebugEffectMode = postcheck.SolvedLirLower.DebugEffectMode;
 
+/// Whether post-check lowering should run optimized callable-state specialization.
 pub const PostCheckSpecializationMode = enum {
     off,
     optimized,
