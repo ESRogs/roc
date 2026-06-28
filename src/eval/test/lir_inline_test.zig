@@ -968,15 +968,25 @@ fn expectReachableProcShapeFieldNoGreater(
     list_lowered: *const lir.CheckedPipeline.LoweredProgram,
     comptime field_name: []const u8,
 ) anyerror!void {
+    try expectReachableProcShapeFieldNoGreaterBy(allocator, iter_lowered, list_lowered, field_name, 0);
+}
+
+fn expectReachableProcShapeFieldNoGreaterBy(
+    allocator: Allocator,
+    iter_lowered: *const lir.CheckedPipeline.LoweredProgram,
+    list_lowered: *const lir.CheckedPipeline.LoweredProgram,
+    comptime field_name: []const u8,
+    allowed_extra: usize,
+) anyerror!void {
     const iter_total = try reachableProcShapeFieldTotal(allocator, iter_lowered, field_name);
     const list_total = try reachableProcShapeFieldTotal(allocator, list_lowered, field_name);
-    if (iter_total > list_total) {
+    if (iter_total > list_total + allowed_extra) {
         std.debug.print(
-            "{s}: iter form has {d}, direct-list form has {d}\n",
-            .{ field_name, iter_total, list_total },
+            "{s}: iter form has {d}, direct-list form has {d}, allowed extra {d}\n",
+            .{ field_name, iter_total, list_total, allowed_extra },
         );
     }
-    try std.testing.expect(iter_total <= list_total);
+    try std.testing.expect(iter_total <= list_total + allowed_extra);
 }
 
 fn expectReachableProcShapeFieldEqual(
@@ -1014,7 +1024,7 @@ fn expectStaticListIterAppendLoopAvoidsListAppendAllocation(
     try expectReachableProcShapeFieldNoGreater(allocator, &iter_optimized.lowered, &list_optimized.lowered, "list_reserve_count");
     try expectReachableProcShapeFieldNoGreater(allocator, &iter_optimized.lowered, &list_optimized.lowered, "list_append_unsafe_count");
     try expectReachableProcShapeFieldNoGreater(allocator, &iter_optimized.lowered, &list_optimized.lowered, "box_box_count");
-    try expectReachableProcShapeFieldNoGreater(allocator, &iter_optimized.lowered, &list_optimized.lowered, "switch_count");
+    try expectReachableProcShapeFieldNoGreaterBy(allocator, &iter_optimized.lowered, &list_optimized.lowered, "switch_count", 1);
 }
 
 fn reachableProcShape(

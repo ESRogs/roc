@@ -2007,14 +2007,17 @@ const Lowerer = struct {
 
         const target_is_zst = self.isZstLocal(target);
         for (items, 0..) |expr_id, i| {
-            expr_locals[i] = try self.addTemp(try self.lowerExprTy(expr_id));
             if (target_is_zst) {
+                expr_locals[i] = try self.addTemp(try self.lowerExprTy(expr_id));
                 field_locals[i] = expr_locals[i];
                 continue;
             }
             const field_layout = self.localFieldLayout(target, @intCast(i));
-            const expr_layout = self.result.store.getLocal(expr_locals[i]).layout_idx;
-            field_locals[i] = if (expr_layout == field_layout)
+            const expr_ty = try self.lowerExprTy(expr_id);
+            const preferred_layout = try self.preferredExprLayoutForStorage(expr_ty, field_layout);
+            expr_locals[i] = try self.addLocalForLayout(preferred_layout);
+            const actual_expr_layout = self.result.store.getLocal(expr_locals[i]).layout_idx;
+            field_locals[i] = if (actual_expr_layout == field_layout)
                 expr_locals[i]
             else
                 try self.addLocalForLayout(field_layout);
@@ -2042,6 +2045,22 @@ const Lowerer = struct {
             current = try self.lowerExprInto(expr_locals[i], items[i], current);
         }
         return current;
+    }
+
+    fn preferredExprLayoutForStorage(self: *Lowerer, expr_ty: Type.TypeId, storage_layout: layout.Idx) Common.LowerError!layout.Idx {
+        const default_layout = try self.layoutOfType(expr_ty);
+        const storage_content = self.result.layouts.getLayout(storage_layout);
+        return switch (self.types.get(expr_ty)) {
+            .callable => |variants| blk: {
+                if (self.callableLayoutCanRepresentVariantCount(storage_layout, variants.len)) break :blk storage_layout;
+                if (storage_content.tag == .box) {
+                    const child_layout = storage_content.getIdx();
+                    if (self.callableLayoutCanRepresentVariantCount(child_layout, variants.len)) break :blk child_layout;
+                }
+                break :blk default_layout;
+            },
+            else => default_layout,
+        };
     }
 
     fn lowerCaptureRecordFromCapturesInto(
@@ -2223,14 +2242,27 @@ const Lowerer = struct {
         if (target_content.tag == .box and self.result.layouts.getLayout(target_content.getIdx()).eql(source_content)) {
             return try self.assignUnaryLowLevel(target, .box_box, source, next);
         }
+        if (target_content.tag == .box and self.layoutsAssignable(target_content.getIdx(), source_layout)) {
+            const payload = try self.addLocalForLayout(target_content.getIdx());
+            const box = try self.assignUnaryLowLevel(target, .box_box, payload, next);
+            return try self.assignBoxBoundary(payload, source, source_layout, box);
+        }
         if (target_content.tag == .box_of_zst and self.result.layouts.isZeroSized(source_content)) {
             return try self.assignUnaryLowLevel(target, .box_box, source, next);
         }
         if (source_content.tag == .box and self.result.layouts.getLayout(source_content.getIdx()).eql(target_content)) {
             return try self.assignUnaryLowLevel(target, .box_unbox, source, next);
         }
+        if (source_content.tag == .box and self.layoutsAssignable(target_layout, source_content.getIdx())) {
+            const payload = try self.addLocalForLayout(source_content.getIdx());
+            const assign = try self.assignBoxBoundary(target, payload, source_content.getIdx(), next);
+            return try self.assignUnaryLowLevel(payload, .box_unbox, source, assign);
+        }
         if (source_content.tag == .box_of_zst and self.result.layouts.isZeroSized(target_content)) {
             return try self.assignUnaryLowLevel(target, .box_unbox, source, next);
+        }
+        if (try self.assignTagUnionBoundary(target, target_content, source, source_content, next)) |stmt| {
+            return stmt;
         }
         if (try self.assignStructBoundary(target, target_content, source, source_content, next)) |stmt| {
             return stmt;
@@ -2270,6 +2302,79 @@ const Lowerer = struct {
             );
         }
         unreachable;
+    }
+
+    fn assignTagUnionBoundary(
+        self: *Lowerer,
+        target: LIR.LocalId,
+        target_content: layout.Layout,
+        source: LIR.LocalId,
+        source_content: layout.Layout,
+        next: LIR.CFStmtId,
+    ) Common.LowerError!?LIR.CFStmtId {
+        if (target_content.tag != .tag_union or source_content.tag != .tag_union) return null;
+        if (!self.tagUnionLayoutsAssignable(target_content, source_content)) return null;
+
+        const target_data = self.result.layouts.getTagUnionData(target_content.getTagUnion().idx);
+        const source_data = self.result.layouts.getTagUnionData(source_content.getTagUnion().idx);
+        const target_variants = self.result.layouts.getTagUnionVariants(target_data);
+        const source_variants = self.result.layouts.getTagUnionVariants(source_data);
+
+        const branches = try self.allocator.alloc(LIR.CFSwitchBranch, target_variants.len);
+        defer self.allocator.free(branches);
+
+        for (0..target_variants.len) |variant_index_usize| {
+            const variant_index: u16 = @intCast(variant_index_usize);
+            const discriminant = variant_index;
+            const target_payload_layout = target_variants.get(@intCast(variant_index_usize)).payload_layout;
+            const source_payload_layout = source_variants.get(@intCast(variant_index_usize)).payload_layout;
+
+            const payload = if (self.result.layouts.isZeroSized(self.result.layouts.getLayout(target_payload_layout)))
+                null
+            else
+                try self.addLocalForLayout(target_payload_layout);
+
+            const assign_tag = try self.result.store.addCFStmt(.{ .assign_tag = .{
+                .target = target,
+                .variant_index = variant_index,
+                .discriminant = discriminant,
+                .payload = payload,
+                .next = next,
+            } });
+
+            const body = if (payload) |payload_local|
+                try self.assignRefRead(
+                    payload_local,
+                    source_payload_layout,
+                    .{ .tag_payload_struct = .{
+                        .source = source,
+                        .variant_index = variant_index,
+                        .tag_discriminant = discriminant,
+                    } },
+                    assign_tag,
+                )
+            else
+                assign_tag;
+
+            branches[variant_index_usize] = .{
+                .value = discriminant,
+                .body = body,
+            };
+        }
+
+        const default = try self.result.store.addCFStmt(.{ .runtime_error = {} });
+        const disc_local = try self.addLocalForLayout(.u16);
+        const switch_stmt = try self.result.store.addCFStmt(.{ .switch_stmt = .{
+            .cond = disc_local,
+            .branches = try self.result.store.addCFSwitchBranches(branches),
+            .default_branch = default,
+            .continuation = null,
+        } });
+        return try self.result.store.addCFStmt(.{ .assign_ref = .{
+            .target = disc_local,
+            .op = .{ .discriminant = .{ .source = source } },
+            .next = switch_stmt,
+        } });
     }
 
     fn assignStructBoundary(
@@ -2337,6 +2442,22 @@ const Lowerer = struct {
         return true;
     }
 
+    fn tagUnionLayoutsAssignable(self: *Lowerer, target_content: layout.Layout, source_content: layout.Layout) bool {
+        if (target_content.tag != .tag_union or source_content.tag != .tag_union) return false;
+        const target_data = self.result.layouts.getTagUnionData(target_content.getTagUnion().idx);
+        const source_data = self.result.layouts.getTagUnionData(source_content.getTagUnion().idx);
+        const target_variants = self.result.layouts.getTagUnionVariants(target_data);
+        const source_variants = self.result.layouts.getTagUnionVariants(source_data);
+        if (target_variants.len != source_variants.len) return false;
+
+        for (0..target_variants.len) |variant_index| {
+            const target_payload_layout = target_variants.get(@intCast(variant_index)).payload_layout;
+            const source_payload_layout = source_variants.get(@intCast(variant_index)).payload_layout;
+            if (!self.layoutsAssignable(target_payload_layout, source_payload_layout)) return false;
+        }
+        return true;
+    }
+
     fn nonPaddingStructFieldCount(self: *Lowerer, struct_idx: layout.StructIdx) usize {
         const struct_data = self.result.layouts.getStructData(struct_idx);
         const fields = self.result.layouts.struct_fields.sliceRange(struct_data.getFields());
@@ -2367,10 +2488,13 @@ const Lowerer = struct {
         const source_content = self.result.layouts.getLayout(source_layout);
         if (target_content.eql(source_content)) return true;
         if (target_content.tag == .box and self.result.layouts.getLayout(target_content.getIdx()).eql(source_content)) return true;
+        if (target_content.tag == .box and self.layoutsAssignable(target_content.getIdx(), source_layout)) return true;
         if (target_content.tag == .box_of_zst and self.result.layouts.isZeroSized(source_content)) return true;
         if (source_content.tag == .box and self.result.layouts.getLayout(source_content.getIdx()).eql(target_content)) return true;
+        if (source_content.tag == .box and self.layoutsAssignable(target_layout, source_content.getIdx())) return true;
         if (source_content.tag == .box_of_zst and self.result.layouts.isZeroSized(target_content)) return true;
         if (target_content.tag == .struct_ and source_content.tag == .struct_) return self.structLayoutsAssignable(target_content, source_content);
+        if (target_content.tag == .tag_union and source_content.tag == .tag_union) return self.tagUnionLayoutsAssignable(target_content, source_content);
         return false;
     }
 
@@ -2753,7 +2877,9 @@ const Lowerer = struct {
         arg_exprs: []const Lifted.ExprId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
-        const callee = try self.addTemp(try self.lowerExprTy(callee_expr));
+        const callee_ty = try self.lowerExprTy(callee_expr);
+        const callee_layout = try self.callableCalleeStorageLayout(callee_expr, callee_ty, variants_span.len);
+        const callee = try self.addLocalForLayout(callee_layout);
         const done = self.freshJoinPointId();
         var current = try self.result.store.addCFStmt(.{ .runtime_error = {} });
         var i: usize = variants_span.len;
@@ -2772,6 +2898,43 @@ const Lowerer = struct {
             .body = next,
             .remainder = remainder,
         } });
+    }
+
+    fn callableCalleeStorageLayout(
+        self: *Lowerer,
+        callee_expr: Lifted.ExprId,
+        callee_ty: Type.TypeId,
+        variant_count: usize,
+    ) Common.LowerError!layout.Idx {
+        const default_layout = try self.layoutOfType(callee_ty);
+        const expr = self.solved.lifted.exprs.items[@intFromEnum(callee_expr)];
+        const storage_layout = switch (expr.data) {
+            .field_access => |field| blk: {
+                const receiver_ty = try self.lowerExprTy(field.receiver);
+                const field_index = self.recordFieldIndex(receiver_ty, field.field);
+                break :blk self.aggregateFieldLayout(try self.layoutOfType(receiver_ty), field_index);
+            },
+            .tuple_access => |access| self.aggregateFieldLayout(try self.layoutOfType(try self.lowerExprTy(access.tuple)), @intCast(access.elem_index)),
+            else => return default_layout,
+        };
+
+        const storage_content = self.result.layouts.getLayout(storage_layout);
+        const candidate_layout = if (storage_content.tag == .box)
+            storage_content.getIdx()
+        else
+            storage_layout;
+
+        if (self.callableLayoutCanRepresentVariantCount(candidate_layout, variant_count)) return candidate_layout;
+        return default_layout;
+    }
+
+    fn callableLayoutCanRepresentVariantCount(self: *Lowerer, layout_idx: layout.Idx, variant_count: usize) bool {
+        const content = self.result.layouts.getLayout(layout_idx);
+        if (self.result.layouts.isZeroSized(content)) return true;
+        if (content.tag != .tag_union) return variant_count == 1;
+        const data = self.result.layouts.getTagUnionData(content.getTagUnion().idx);
+        const variants = self.result.layouts.getTagUnionVariants(data);
+        return variants.len == variant_count;
     }
 
     fn lowerCallableVariantCallInto(
@@ -3596,7 +3759,6 @@ const Lowerer = struct {
         if (self.result.store.getLocalSpan(entry_state.params).len != entry_values.len) {
             Common.invariant("state_loop entry value count differed from entry state parameter count");
         }
-
         try self.state_loop_stack.append(self.allocator, .{
             .state_start = state_loop.states.start,
             .states = lowered_states,
@@ -4726,10 +4888,14 @@ const Lowerer = struct {
         const ids = try self.allocator.alloc(?LIR.LocalId, exprs.len);
         errdefer self.allocator.free(ids);
         for (exprs, 0..) |expr_id, i| {
-            ids[i] = if (try self.joinArgNeedsWrite(param_locals[i], expr_id))
-                try self.addTemp(try self.lowerExprTy(expr_id))
-            else
-                null;
+            if (!(try self.joinArgNeedsWrite(param_locals[i], expr_id))) {
+                ids[i] = null;
+                continue;
+            }
+
+            const param_layout = self.result.store.getLocal(param_locals[i]).layout_idx;
+            const expr_ty = try self.lowerExprTy(expr_id);
+            ids[i] = try self.addLocalForLayout(try self.preferredExprLayoutForStorage(expr_ty, param_layout));
         }
         return .{ .exprs = exprs, .ids = ids };
     }
@@ -5241,6 +5407,11 @@ const Lowerer = struct {
 
     fn localFieldLayout(self: *Lowerer, source: LIR.LocalId, field_index: u16) layout.Idx {
         const source_layout_idx = self.result.store.getLocal(source).layout_idx;
+        return self.aggregateFieldLayout(source_layout_idx, field_index);
+    }
+
+    fn aggregateFieldLayout(self: *Lowerer, aggregate_layout_idx: layout.Idx, field_index: u16) layout.Idx {
+        const source_layout_idx = aggregate_layout_idx;
         const source_layout = self.result.layouts.getLayout(source_layout_idx);
         const struct_layout_idx = switch (source_layout.tag) {
             .box => source_layout.getIdx(),
