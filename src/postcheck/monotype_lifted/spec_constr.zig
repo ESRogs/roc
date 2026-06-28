@@ -4630,8 +4630,7 @@ const Cloner = struct {
 
             const demands = try self.pass.arena.allocator().alloc(ValueDemand, values.len);
             const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, values.len);
-            for (values, demands, demanded_known_values, 0..) |value, *demand_out, *known_out, index| {
-                _ = index;
+            for (values, demands, demanded_known_values) |value, *demand_out, *known_out| {
                 const inferred_demand = try self.valueDemandFromValueShape(value);
                 demand_out.* = inferred_demand;
                 known_out.* = (try self.demandedKnownValueFromValueDemand(value, inferred_demand)) orelse
@@ -4687,7 +4686,7 @@ const Cloner = struct {
                 if (!demand_changed) break;
             }
             if (valueDemandsRequirePrivateState(demands)) {
-                try self.stabilizeLoopDemandsFromStateBodies(loop, params, values, known_values, demands, result_demand);
+                try self.stabilizeLoopDemandsFromStateBodies(loop, params, known_values, demands, result_demand);
                 _ = self.loop_stack.pop();
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
                 for (known_values, demands, demanded_known_values) |known_value, demand, *out| {
@@ -4718,7 +4717,7 @@ const Cloner = struct {
             if (refined) continue;
 
             if (knownValuesContainFiniteState(known_values) or valueDemandsRequirePrivateState(demands)) {
-                try self.stabilizeLoopDemandsFromStateBodies(loop, params, values, known_values, demands, result_demand);
+                try self.stabilizeLoopDemandsFromStateBodies(loop, params, known_values, demands, result_demand);
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
                 for (known_values, demands, demanded_known_values) |known_value, demand, *out| {
                     out.* = (try demandedKnownValueFromDemand(self, self.pass.program, self.pass.arena.allocator(), known_value, demand)) orelse
@@ -4762,12 +4761,10 @@ const Cloner = struct {
         self: *Cloner,
         loop: anytype,
         params: []const Ast.TypedLocal,
-        values: []const Value,
         known_values: []const KnownValue,
         demands: []ValueDemand,
         result_demand: ValueDemand,
     ) Common.LowerError!void {
-        _ = values;
         while (true) {
             var changed = false;
 
@@ -5380,9 +5377,8 @@ const Cloner = struct {
         var states = std.ArrayList(SparseStateLoopState).empty;
         defer states.deinit(self.pass.allocator);
 
-        for (state_keys, 0..) |state_values, index| {
+        for (state_keys) |state_values| {
             if (state_values.len != params.len) Common.invariant("state_loop key arity differed from loop params");
-            _ = index;
             _ = try self.appendSparseState(&states, state_values);
         }
 
@@ -6427,7 +6423,6 @@ const Cloner = struct {
     }
 
     fn selectCorrelatedIfBranch(
-        self: *Cloner,
         original_values: []const Value,
         selected_values: []Value,
         selected_index: usize,
@@ -6435,7 +6430,6 @@ const Cloner = struct {
         branch_index: usize,
         final_else: bool,
     ) void {
-        _ = self;
         for (original_values, selected_values, 0..) |original, *selected, index| {
             if (index == selected_index) continue;
             const other = switch (original) {
@@ -6451,14 +6445,12 @@ const Cloner = struct {
     }
 
     fn selectCorrelatedMatchBranch(
-        self: *Cloner,
         original_values: []const Value,
         selected_values: []Value,
         selected_index: usize,
         control: MatchValue,
         branch_index: usize,
     ) void {
-        _ = self;
         for (original_values, selected_values, 0..) |original, *selected, index| {
             if (index == selected_index) continue;
             const other = switch (original) {
@@ -6765,7 +6757,7 @@ const Cloner = struct {
 
             for (if_value.branches, 0..) |branch, branch_index| {
                 branch_values[value_index] = branch.body;
-                self.selectCorrelatedIfBranch(values, branch_values, value_index, if_value, branch_index, false);
+                selectCorrelatedIfBranch(values, branch_values, value_index, if_value, branch_index, false);
                 branches[branch_index] = .{
                     .cond = branch.cond,
                     .body = try self.addExpr(.{
@@ -6776,7 +6768,7 @@ const Cloner = struct {
             }
 
             branch_values[value_index] = if_value.final_else.*;
-            self.selectCorrelatedIfBranch(values, branch_values, value_index, if_value, 0, true);
+            selectCorrelatedIfBranch(values, branch_values, value_index, if_value, 0, true);
             const final_else = try self.addExpr(.{
                 .ty = ty,
                 .data = try self.cloneContinueDataFromValues(ty, loop, branch_values),
@@ -6801,7 +6793,7 @@ const Cloner = struct {
 
             for (match_value.branches, 0..) |branch, branch_index| {
                 branch_values[value_index] = branch.body;
-                self.selectCorrelatedMatchBranch(values, branch_values, value_index, match_value, branch_index);
+                selectCorrelatedMatchBranch(values, branch_values, value_index, match_value, branch_index);
                 branches[branch_index] = .{
                     .pat = branch.pat,
                     .guard = branch.guard,

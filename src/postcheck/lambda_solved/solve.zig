@@ -599,7 +599,7 @@ const Solver = struct {
                     state_param_tys[state_index] = try self.program.types.addSpan(param_tys);
                 }
 
-                const entry_params = self.stateLoopParamsFromSlice(state_loop.states, state_param_tys, state_loop.entry_state);
+                const entry_params = stateLoopParamsFromSlice(state_loop.states, state_param_tys, state_loop.entry_state);
                 const entry_values = self.program.lifted.exprSpan(state_loop.entry_values);
                 if (entry_params.count() != entry_values.len) Common.invariant("state_loop entry value count differs from entry state parameter count");
                 for (entry_values, 0..) |value, i| {
@@ -834,14 +834,12 @@ const Solver = struct {
     }
 
     fn stateLoopParamsFromSlice(
-        self: *Solver,
         states: Lifted.Span(Lifted.StateLoopState),
         state_param_tys: []const Type.Span,
         state_id: Lifted.StateLoopStateId,
     ) Type.Span {
         const param_index = stateParamIndex(states.start, states.len, state_id) orelse
             Common.invariant("state_loop entry state was not in its state span");
-        _ = self;
         return state_param_tys[param_index];
     }
 
