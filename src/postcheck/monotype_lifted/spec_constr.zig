@@ -3382,14 +3382,6 @@ const Cloner = struct {
         };
     }
 
-    fn privateStateValueFromValueDemandOrLeaf(
-        self: *Cloner,
-        value: Value,
-        demand: ValueDemand,
-    ) Common.LowerError!?PrivateStateValue {
-        return try self.privateStateValueFromValueDemandOrLeafCollectingLets(value, demand, null);
-    }
-
     fn privateStateValueFromValueDemandOrLeafCollectingLets(
         self: *Cloner,
         value: Value,
@@ -5618,16 +5610,6 @@ const Cloner = struct {
         return try self.pass.arena.allocator().dupe(KnownValue, alternatives.items);
     }
 
-    fn stateForValues(self: *Cloner, states: []const SparseStateLoopState, values: []const Value) ?SparseStateLoopState {
-        var found: ?SparseStateLoopState = null;
-        for (states) |state| {
-            if (!demandedKnownValuesMatchValues(self.pass.program, state.values, values)) continue;
-            if (found != null) Common.invariant("state_loop edge matched multiple states");
-            found = state;
-        }
-        return found;
-    }
-
     fn stateForDemandedKnownValues(self: *Cloner, states: []const SparseStateLoopState, values: []const DemandedKnownValue) ?SparseStateLoopState {
         var found: ?SparseStateLoopState = null;
         for (states) |state| {
@@ -5866,25 +5848,6 @@ const Cloner = struct {
             const demanded_child = (try self.demandedKnownValueFromPrivateStateDemand(child, demand.demand.*)) orelse return null;
             try values.append(self.pass.allocator, .{
                 .index = demand.index,
-                .known_value = demanded_child,
-            });
-        }
-        return try self.pass.arena.allocator().dupe(DemandedKnownIndexedValue, values.items);
-    }
-
-    fn demandedKnownIndexedValuesFromPrivateStateCaptureDemands(
-        self: *Cloner,
-        indexed: []const PrivateStateIndexedValue,
-        demands: []const ValueDemand,
-    ) Common.LowerError!?[]const DemandedKnownIndexedValue {
-        var values = std.ArrayList(DemandedKnownIndexedValue).empty;
-        defer values.deinit(self.pass.allocator);
-        for (demands, 0..) |demand, index| {
-            if (demand == .none) continue;
-            const child = privateStateIndexedValueByIndex(indexed, @intCast(index)) orelse return null;
-            const demanded_child = (try self.demandedKnownValueFromPrivateStateDemand(child, demand)) orelse return null;
-            try values.append(self.pass.allocator, .{
-                .index = @intCast(index),
                 .known_value = demanded_child,
             });
         }
@@ -8817,20 +8780,6 @@ const Cloner = struct {
         };
     }
 
-    fn joinKnownValuesFromValues(self: *Cloner, values: []const Value) Allocator.Error!?KnownValue {
-        if (values.len == 0) return null;
-        var joined = (try self.pass.knownValueFromValue(values[0])) orelse return null;
-        for (values[1..]) |value| {
-            const next = (try self.pass.knownValueFromValue(value)) orelse return null;
-            joined = (try self.joinKnownValuePair(joined, next)) orelse return null;
-        }
-        return joined;
-    }
-
-    fn joinKnownValuePair(self: *Cloner, lhs: KnownValue, rhs: KnownValue) Allocator.Error!?KnownValue {
-        return try joinKnownValuesInArena(self.pass.program, self.pass.arena.allocator(), lhs, rhs);
-    }
-
     fn cloneMatch(self: *Cloner, ty: Type.TypeId, match: @import("../monotype/ast.zig").MatchExpr) Common.LowerError!Ast.ExprId {
         const scrutinee = try self.cloneMatchScrutineeValue(match, .materialize);
         if (try self.simplifyKnownMatch(ty, scrutinee, match.branches)) |body| return body;
@@ -9727,25 +9676,6 @@ const Cloner = struct {
             .comptime_exhaustiveness_failed,
             .uninitialized,
             .uninitialized_payload,
-            => {},
-        }
-    }
-
-    fn mergeLocalDemandInStmt(
-        self: *Cloner,
-        local: Ast.LocalId,
-        stmt_id: Ast.StmtId,
-        out: *ValueDemand,
-    ) Allocator.Error!void {
-        switch (self.pass.program.stmts.items[@intFromEnum(stmt_id)]) {
-            .let_ => |let_| try self.mergeLocalDemandInExpr(local, let_.value, .materialize, out),
-            .expr,
-            .expect,
-            .dbg,
-            .return_,
-            => |expr| try self.mergeLocalDemandInExpr(local, expr, .materialize, out),
-            .uninitialized,
-            .crash,
             => {},
         }
     }
@@ -11333,26 +11263,6 @@ const Cloner = struct {
         return try self.addExpr(.{ .ty = selector_ty, .data = .{ .if_ = .{
             .branches = try self.pass.program.addIfBranchSpan(branches),
             .final_else = try self.selectorLiteral(@intCast(if_value.branches.len)),
-        } } });
-    }
-
-    fn selectorForMatchValue(self: *Cloner, match_value: MatchValue) Common.LowerError!Ast.ExprId {
-        if (match_value.branches.len == 0) Common.invariant("match value had no branches");
-
-        const selector_ty = try self.pass.primitiveType(.u64);
-        const branches = try self.pass.allocator.alloc(Ast.Branch, match_value.branches.len);
-        defer self.pass.allocator.free(branches);
-        for (match_value.branches, branches, 0..) |branch, *out, index| {
-            out.* = .{
-                .pat = branch.pat,
-                .guard = branch.guard,
-                .body = try self.selectorLiteral(@intCast(index)),
-            };
-        }
-        return try self.addExpr(.{ .ty = selector_ty, .data = .{ .match_ = .{
-            .scrutinee = match_value.scrutinee,
-            .branches = try self.pass.program.addBranchSpan(branches),
-            .comptime_site = match_value.comptime_site,
         } } });
     }
 
@@ -16591,14 +16501,6 @@ fn known_valueEql(program: *const Ast.Program, lhs: KnownValue, rhs: KnownValue)
         .finite_tags => |lhs_finite| knownTagsEql(program, lhs_finite, rhs.finite_tags),
         .finite_callables => |lhs_finite| knownCallablesEql(program, lhs_finite, rhs.finite_callables),
     };
-}
-
-fn knownValuesMatchValues(program: *const Ast.Program, known_values: []const KnownValue, values: []const Value) bool {
-    if (known_values.len != values.len) return false;
-    for (known_values, values) |known_value, value| {
-        if (!knownValueMatchesValue(program, known_value, value)) return false;
-    }
-    return true;
 }
 
 fn demandedKnownValuesMatchValues(program: *const Ast.Program, known_values: []const DemandedKnownValue, values: []const Value) bool {

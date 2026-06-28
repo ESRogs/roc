@@ -289,17 +289,6 @@ fn appendRewriteBoundary(
     return nested;
 }
 
-fn appendJoinKeep(
-    allocator: std.mem.Allocator,
-    join_keeps: []const JoinKeep,
-    join_keep: JoinKeep,
-) ResourceError![]JoinKeep {
-    const nested = try allocator.alloc(JoinKeep, join_keeps.len + 1);
-    @memcpy(nested[0..join_keeps.len], join_keeps);
-    nested[join_keeps.len] = join_keep;
-    return nested;
-}
-
 fn keepForJoin(join_keeps: []const JoinKeep, target: LIR.JoinPointId) ?*const OwnedSet {
     var i = join_keeps.len;
     while (i > 0) {
