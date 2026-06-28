@@ -1480,6 +1480,24 @@ depend on this optimizer. If an optimized-mode regression reveals missing
 checked facts, the producer of those facts must be fixed; non-optimized modes
 must not grow dormant optimizer state just to share the fix.
 
+This means the optimizer may use more expensive exact machinery than a dev
+lowering path would tolerate. It may create demand graphs, revisit provisional
+loop-edge clones when a fixed point grows, and create demand-keyed direct-call
+workers. That cost is acceptable only because the entrypoint is restricted to
+`--opt=size` and `--opt=speed`. The same design would be wrong if it ran during
+`roc check`, dev builds, interpreter preparation, or compile-time
+finalization. Those paths need low latency and public-value lowering, not
+Rust-like private cursor specialization.
+
+The compile-time performance contract is structural, not a benchmark-only
+promise. Non-optimized paths must be unable to allocate optimized-demand
+arenas, private-state tables, loop fixed-point graphs, or worker queues.
+Optimized helpers must require the optimized context in their API, so ordinary
+lowering cannot accidentally pay for specialization through a cold branch,
+nullable field, or lazy constructor. Performance tests may measure the
+boundary, but the primary proof is ownership: the data needed by this optimizer
+does not exist outside the optimized lowering context.
+
 Within optimized modes, compile-time cost is bounded by explicit optimizer work
 items: distinct result demands, sparse private-state nodes, finite callable
 alternatives, loop-demand graph nodes, and demand-keyed direct-call workers.
