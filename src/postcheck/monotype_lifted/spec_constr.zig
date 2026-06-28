@@ -18093,7 +18093,7 @@ test "demanded known value matching ignores omitted callable captures" {
         } } },
     };
     const value_captures = [_]Value{
-        .{ .expr = @enumFromInt(0) },
+        .{ .expr = undefined }, // capture 0 is omitted by demand; reading it is a test failure.
         .{ .tag = .{
             .ty = tag_ty,
             .name = tag_name,
@@ -18138,6 +18138,7 @@ test "demanded known value distinguishes omitted capture from unknown carried ca
     const first_ty: Type.TypeId = @enumFromInt(31);
     const second_ty: Type.TypeId = @enumFromInt(32);
     const third_ty: Type.TypeId = @enumFromInt(33);
+    const fn_id: Ast.FnId = @enumFromInt(34);
     const captures = [_]KnownValue{
         .{ .leaf = first_ty },
         .{ .any = second_ty },
@@ -18145,7 +18146,7 @@ test "demanded known value distinguishes omitted capture from unknown carried ca
     };
     const known = KnownValue{ .callable = .{
         .ty = callable_ty,
-        .fn_id = @enumFromInt(0),
+        .fn_id = fn_id,
         .captures = &captures,
     } };
     const capture_demands = [_]ValueDemand{
@@ -18159,6 +18160,7 @@ test "demanded known value distinguishes omitted capture from unknown carried ca
     })) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqual(callable_ty, demanded.callable.ty);
+    try std.testing.expectEqual(fn_id, demanded.callable.fn_id);
     try std.testing.expectEqual(@as(usize, 1), demanded.callable.captures.len);
     try std.testing.expectEqual(@as(u32, 1), demanded.callable.captures[0].index);
     try std.testing.expectEqual(second_ty, demanded.callable.captures[0].known_value.any);
