@@ -1579,6 +1579,14 @@ lowering construction. Lowering code must not re-read target options,
 optimization names, target triples, backend choices, or wasm-specific settings
 to decide whether it owns optimized-demand state.
 
+The classifier is consumed at construction time; it is not a global setting that
+optimized helpers can query later. After construction, ordinary lowering and
+optimized lowering should be represented by different context/API shapes. An
+optimized helper should require optimized-owned data in its arguments, and that
+data should not exist in ordinary lowering. This makes accidental use of the
+optimizer from dev/check/interpreter paths structurally impossible instead of
+depending on a runtime mode check.
+
 This gate is part of the optimizer's data-ownership model. Optimized demand
 state is not a dormant field on ordinary lowering, and ordinary lowering must
 not be able to manufacture an optimized context. `--opt=size` and `--opt=speed`
