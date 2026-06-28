@@ -1430,6 +1430,17 @@ post-check lowering contract that happens to make `Iter` and `Stream` optimize
 to the Rust-like cursor shape when the checked program exposes finite callable
 facts under demand.
 
+The concrete algorithm is selective demand-specialized lowering. It is not a
+source-loop rewrite, a source-conditional rewrite, a builtin iterator rewrite,
+or a late cleanup pass. A consumer creates exact result demand, optimized
+lowering clones the producer while that demand is active, and the same cloning
+context creates any private state machine, finite callable dispatch, or
+demand-keyed worker required by the facts exposed during cloning. The optimizer
+may emit direct recursive workers or LIR joins for compiler-created private
+state, but those workers are internal code-generation artifacts; they do not
+change source loop semantics, source mutable-variable semantics, or public Roc
+value identity.
+
 The optimized callable-state path is an optimized-code-generation facility, not
 a correctness mechanism. It is allowed to spend extra time specializing calls,
 control-flow boundaries, and loop-carried private state only when the user has
@@ -1468,6 +1479,15 @@ compile-time evaluation, static storage, and interpreter behavior must not
 depend on this optimizer. If an optimized-mode regression reveals missing
 checked facts, the producer of those facts must be fixed; non-optimized modes
 must not grow dormant optimizer state just to share the fix.
+
+Within optimized modes, compile-time cost is bounded by explicit optimizer work
+items: distinct result demands, sparse private-state nodes, finite callable
+alternatives, loop-demand graph nodes, and demand-keyed direct-call workers.
+Those keys are exact compiler data, not source-form heuristics. There is no
+state-count cutoff or "try optimized and fall back" escape hatch; if the graph
+is larger than expected, the correct fix is more precise demand production,
+better sharing of equivalent exact keys, or removal of unnecessary demanded
+public observations.
 
 This is not a heuristic and not a fallback boundary. The build mode selects the
 lowering architecture before optimized state exists. `--opt=size` and
