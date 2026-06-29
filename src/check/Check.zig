@@ -12021,6 +12021,9 @@ fn checkExprIter(self: *Self, root_idx: CIR.Expr.Idx, root_env: *Env, root_expec
                     .e_unary_not,
                     .e_expect,
                     .e_method_eq,
+                    // Helper-delegating: `checkMatchExpr` runs as a unit in
+                    // `.exit`, re-entering `checkExpr` for the cond/guards/bodies.
+                    .e_match,
                     // Call-family kinds: run the recursive body verbatim in
                     // `.exit` (re-entering `checkExpr` per child), because each
                     // arg sets `checking_call_arg` immediately before its check.
@@ -13150,6 +13153,23 @@ fn checkExprIter(self: *Self, root_idx: CIR.Expr.Idx, root_env: *Env, root_expec
                         const fx = try self.checkRunLowLevelExpr(env, child_expected, run_ll);
                         self.check_frame_stack.items[top].does_fx = fx;
                     },
+                    // Helper-delegating: `checkMatchExpr` is the single source of
+                    // truth (also called by the recursive arm). It re-enters
+                    // `checkExpr` for the cond/guards/bodies — that re-entry may
+                    // realloc `check_frame_stack`, so read all values off `f`
+                    // first and write `does_fx` back via `items[top]` (never reuse
+                    // `f` afterward). It takes the ORIGINAL `expected` (for
+                    // `expected.branch_result`/`forStatement()`), not
+                    // `child_expected`. No children are scheduled, so `f.does_fx`
+                    // is still its initial `false`; assigning the helper's result
+                    // matches the recursive arm's `fx or does_fx` (does_fx=false).
+                    .e_match => |match| {
+                        const expr_idx_l = f.expr_idx;
+                        const env = f.env;
+                        const expected = f.expected;
+                        const fx = try self.checkMatchExpr(expr_idx_l, env, match, expected);
+                        self.check_frame_stack.items[top].does_fx = fx;
+                    },
                     // INTERLEAVING POST-CHILD body for `e_call`. The function child
                     // and every arg child were checked via scheduled frames; their
                     // `does_fx` was OR'd into `f.does_fx` on pop. The (instantiated)
@@ -13286,6 +13306,12 @@ fn isMigratedKind(expr: CIR.Expr) bool {
         .e_run_low_level,
         .e_type_dispatch_call,
         .e_type_method_call,
+        // Helper-delegating interleaving kind: `checkMatchExpr` is run as a
+        // single unit in `.exit` (like `checkBlockStatements` for `e_block`).
+        // Its child `checkExpr` calls (cond/guards/bodies) re-enter the driver,
+        // each its own `frame_base`, so no native recursion is added through the
+        // statement-nesting spine.
+        .e_match,
         // Interleaving call kind: `.enter` schedules the func child, the
         // `call_after_func` resume step instantiates a generalized func var and
         // schedules the arg children, and `.exit` runs the post-args body.
