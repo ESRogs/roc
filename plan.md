@@ -832,9 +832,9 @@ so the comparison isolates the source-form difference.
       and `--opt=speed`.
 - [x] Dev/check/interpreter/compile-time-finalization paths do not build
       optimized demand/private-state/worker data.
-- [ ] Ordinary lowering has no dormant optimized fields.
-- [ ] Optimized-only helpers require an optimized context.
-- [ ] No deeper helper independently checks target/backend/source facts to
+- [x] Ordinary lowering has no dormant optimized fields.
+- [x] Optimized-only helpers require an optimized context.
+- [x] No deeper helper independently checks target/backend/source facts to
       enable callable-state specialization.
 - [x] Mode-boundary instrumentation proves non-optimized modes construct zero
       optimized contexts.

@@ -224,16 +224,16 @@ const Allocator = std.mem.Allocator;
 
 /// Specialize recursive direct calls whose arguments are known constructor known_values.
 pub fn run(allocator: Allocator, program: *Ast.Program) Common.LowerError!void {
-    var pass = try Pass.init(allocator, program, null);
-    defer pass.deinit();
-    try pass.run();
+    var optimized = try OptimizedContext.init(allocator, program, null);
+    defer optimized.deinit();
+    try optimized.run();
 }
 
 /// Specialize with Lambda Solved type data available for checked-call known_values.
 pub fn runWithSolved(allocator: Allocator, solved: *Solved.Program) Common.LowerError!void {
-    var pass = try Pass.init(allocator, &solved.lifted, solved);
-    defer pass.deinit();
-    try pass.run();
+    var optimized = try OptimizedContext.init(allocator, &solved.lifted, solved);
+    defer optimized.deinit();
+    try optimized.run();
 }
 
 const KnownValue = union(enum) {
@@ -803,7 +803,7 @@ const AvailableBindingScope = struct {
     parent: ?*const AvailableBindingScope,
 };
 
-const Pass = struct {
+const OptimizedContext = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     program: *Ast.Program,
@@ -814,7 +814,7 @@ const Pass = struct {
     callable_specializations: std.ArrayList(CallableSpecialization),
     symbols: Common.SymbolGen,
 
-    fn init(allocator: Allocator, program: *Ast.Program, solved: ?*const Solved.Program) Allocator.Error!Pass {
+    fn init(allocator: Allocator, program: *Ast.Program, solved: ?*const Solved.Program) Allocator.Error!OptimizedContext {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
@@ -861,7 +861,7 @@ const Pass = struct {
         };
     }
 
-    fn deinit(self: *Pass) void {
+    fn deinit(self: *OptimizedContext) void {
         self.callable_specializations.deinit(self.allocator);
         self.worker_worklist.deinit(self.allocator);
         for (self.plans) |*plan| plan.deinit(self.allocator);
@@ -869,14 +869,14 @@ const Pass = struct {
         self.arena.deinit();
     }
 
-    fn solvedSingleCallableMember(self: *const Pass, expr_id: Ast.ExprId) ?SolvedType.FnMember {
+    fn solvedSingleCallableMember(self: *const OptimizedContext, expr_id: Ast.ExprId) ?SolvedType.FnMember {
         const solved = self.solved orelse return null;
         const raw = @intFromEnum(expr_id);
         if (raw >= solved.expr_tys.items.len) return null;
         return self.solvedSingleCallableMemberFromType(solved.expr_tys.items[raw]);
     }
 
-    fn solvedSingleCallableMemberFromType(self: *const Pass, ty: SolvedType.TypeVarId) ?SolvedType.FnMember {
+    fn solvedSingleCallableMemberFromType(self: *const OptimizedContext, ty: SolvedType.TypeVarId) ?SolvedType.FnMember {
         const solved = self.solved orelse return null;
         const callable_ty = switch (solved.types.rootContent(ty)) {
             .func => |func| func.callable,
@@ -893,7 +893,7 @@ const Pass = struct {
         return member_items[0];
     }
 
-    fn solvedCallableMembersAreEquivalent(self: *const Pass, members: []const SolvedType.FnMember) bool {
+    fn solvedCallableMembersAreEquivalent(self: *const OptimizedContext, members: []const SolvedType.FnMember) bool {
         if (members.len <= 1) return true;
 
         const first_fn_id = self.fnWithSymbol(members[0].lambda) orelse return false;
@@ -914,18 +914,18 @@ const Pass = struct {
         return true;
     }
 
-    fn fnWithSymbol(self: *const Pass, symbol: Common.Symbol) ?Ast.FnId {
+    fn fnWithSymbol(self: *const OptimizedContext, symbol: Common.Symbol) ?Ast.FnId {
         for (self.program.fns.items, 0..) |fn_, index| {
             if (fn_.symbol == symbol) return @enumFromInt(@as(u32, @intCast(index)));
         }
         return null;
     }
 
-    fn primitiveType(self: *Pass, primitive: Type.Primitive) Allocator.Error!Type.TypeId {
+    fn primitiveType(self: *OptimizedContext, primitive: Type.Primitive) Allocator.Error!Type.TypeId {
         return try self.program.types.add(.{ .primitive = primitive });
     }
 
-    fn run(self: *Pass) Common.LowerError!void {
+    fn run(self: *OptimizedContext) Common.LowerError!void {
         const original_fn_count = self.plans.len;
         const original_bodies = try self.captureOriginalBodies(original_fn_count);
         defer self.allocator.free(original_bodies);
@@ -939,19 +939,19 @@ const Pass = struct {
         self.program.next_symbol = self.symbols.next;
     }
 
-    fn originalBody(self: *const Pass, fn_id: Ast.FnId) ?Ast.ExprId {
+    fn originalBody(self: *const OptimizedContext, fn_id: Ast.FnId) ?Ast.ExprId {
         const index = @intFromEnum(fn_id);
         if (index >= self.original_bodies.len) return null;
         return self.original_bodies[index];
     }
 
-    fn copyProcDebugName(self: *Pass, source_symbol: Common.Symbol, target_symbol: Common.Symbol) Allocator.Error!void {
+    fn copyProcDebugName(self: *OptimizedContext, source_symbol: Common.Symbol, target_symbol: Common.Symbol) Allocator.Error!void {
         if (self.program.procDebugName(source_symbol)) |name| {
             try self.program.setProcDebugName(target_symbol, name);
         }
     }
 
-    fn captureOriginalBodies(self: *Pass, original_fn_count: usize) Allocator.Error![]?Ast.ExprId {
+    fn captureOriginalBodies(self: *OptimizedContext, original_fn_count: usize) Allocator.Error![]?Ast.ExprId {
         const original_bodies = try self.allocator.alloc(?Ast.ExprId, original_fn_count);
         for (self.program.fns.items[0..original_fn_count], original_bodies) |fn_, *body_slot| {
             body_slot.* = switch (fn_.body) {
@@ -962,7 +962,7 @@ const Pass = struct {
         return original_bodies;
     }
 
-    fn collectArgUses(self: *Pass, original_fn_count: usize) Allocator.Error!void {
+    fn collectArgUses(self: *OptimizedContext, original_fn_count: usize) Allocator.Error!void {
         var changed = true;
         while (changed) {
             changed = false;
@@ -977,7 +977,7 @@ const Pass = struct {
         }
     }
 
-    fn rewriteBaseBodies(self: *Pass, original_bodies: []const ?Ast.ExprId) Common.LowerError!void {
+    fn rewriteBaseBodies(self: *OptimizedContext, original_bodies: []const ?Ast.ExprId) Common.LowerError!void {
         for (original_bodies, 0..) |maybe_body, index| {
             const body_expr = maybe_body orelse continue;
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
@@ -996,7 +996,7 @@ const Pass = struct {
         }
     }
 
-    fn createSpecializations(self: *Pass, original_bodies: []const ?Ast.ExprId) Common.LowerError!void {
+    fn createSpecializations(self: *OptimizedContext, original_bodies: []const ?Ast.ExprId) Common.LowerError!void {
         while (self.worker_worklist.pop()) |job| {
             const source_index = @intFromEnum(job.source_fn);
             const source_body = original_bodies[source_index] orelse
@@ -1008,7 +1008,7 @@ const Pass = struct {
         }
     }
 
-    fn markArgUsesInExpr(self: *Pass, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) Allocator.Error!void {
+    fn markArgUsesInExpr(self: *OptimizedContext, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) Allocator.Error!void {
         const expr = self.program.exprs.items[@intFromEnum(expr_id)];
         switch (expr.data) {
             .local => try self.markArgUseIfLocal(fn_id, expr_id, changed),
@@ -1160,7 +1160,7 @@ const Pass = struct {
         }
     }
 
-    fn markArgUsesInStmt(self: *Pass, fn_id: Ast.FnId, stmt_id: Ast.StmtId, changed: *bool) Allocator.Error!void {
+    fn markArgUsesInStmt(self: *OptimizedContext, fn_id: Ast.FnId, stmt_id: Ast.StmtId, changed: *bool) Allocator.Error!void {
         switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
             .let_ => |let_| try self.markArgUsesInExpr(fn_id, let_.value, changed),
             .expr,
@@ -1172,12 +1172,12 @@ const Pass = struct {
         }
     }
 
-    fn markArgUseIfLocal(self: *Pass, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) Allocator.Error!void {
+    fn markArgUseIfLocal(self: *OptimizedContext, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) Allocator.Error!void {
         try self.markArgDemandIfLocal(fn_id, expr_id, .materialize, changed);
     }
 
     fn markArgDemandInExpr(
-        self: *Pass,
+        self: *OptimizedContext,
         fn_id: Ast.FnId,
         expr_id: Ast.ExprId,
         demand: ValueDemand,
@@ -1205,7 +1205,7 @@ const Pass = struct {
     }
 
     fn markArgDemandIfLocal(
-        self: *Pass,
+        self: *OptimizedContext,
         fn_id: Ast.FnId,
         expr_id: Ast.ExprId,
         demand: ValueDemand,
@@ -1217,7 +1217,7 @@ const Pass = struct {
     }
 
     fn markArgDemandForLocal(
-        self: *Pass,
+        self: *OptimizedContext,
         fn_id: Ast.FnId,
         local: Ast.LocalId,
         demand: ValueDemand,
@@ -1259,13 +1259,13 @@ const Pass = struct {
         }
     }
 
-    fn storedDemand(self: *Pass, demand: ValueDemand) Allocator.Error!*const ValueDemand {
+    fn storedDemand(self: *OptimizedContext, demand: ValueDemand) Allocator.Error!*const ValueDemand {
         const stored = try self.arena.allocator().create(ValueDemand);
         stored.* = demand;
         return stored;
     }
 
-    fn demandRecordField(self: *Pass, field: names.RecordFieldNameId, demand: ValueDemand) Allocator.Error!ValueDemand {
+    fn demandRecordField(self: *OptimizedContext, field: names.RecordFieldNameId, demand: ValueDemand) Allocator.Error!ValueDemand {
         const fields = try self.arena.allocator().alloc(FieldDemand, 1);
         fields[0] = .{
             .name = field,
@@ -1274,7 +1274,7 @@ const Pass = struct {
         return .{ .record = fields };
     }
 
-    fn demandTupleItem(self: *Pass, index: u32, demand: ValueDemand) Allocator.Error!ValueDemand {
+    fn demandTupleItem(self: *OptimizedContext, index: u32, demand: ValueDemand) Allocator.Error!ValueDemand {
         const items = try self.arena.allocator().alloc(ItemDemand, 1);
         items[0] = .{
             .index = index,
@@ -1283,7 +1283,7 @@ const Pass = struct {
         return .{ .tuple = items };
     }
 
-    fn mergeValueDemand(self: *Pass, existing: ValueDemand, incoming: ValueDemand) Allocator.Error!ValueDemand {
+    fn mergeValueDemand(self: *OptimizedContext, existing: ValueDemand, incoming: ValueDemand) Allocator.Error!ValueDemand {
         if (existing == .materialize or incoming == .materialize) return .materialize;
         if (existing == .none) return incoming;
         if (incoming == .none) return existing;
@@ -1325,7 +1325,7 @@ const Pass = struct {
     }
 
     fn mergeRecordDemand(
-        self: *Pass,
+        self: *OptimizedContext,
         existing: []const FieldDemand,
         incoming: []const FieldDemand,
     ) Allocator.Error!ValueDemand {
@@ -1348,7 +1348,7 @@ const Pass = struct {
     }
 
     fn mergeTupleDemand(
-        self: *Pass,
+        self: *OptimizedContext,
         existing: []const ItemDemand,
         incoming: []const ItemDemand,
     ) Allocator.Error!ValueDemand {
@@ -1370,7 +1370,7 @@ const Pass = struct {
         return .{ .tuple = try self.arena.allocator().dupe(ItemDemand, items.items) };
     }
 
-    fn valueDemandFromDemandedKnownValue(self: *Pass, known_value: DemandedKnownValue) Allocator.Error!ValueDemand {
+    fn valueDemandFromDemandedKnownValue(self: *OptimizedContext, known_value: DemandedKnownValue) Allocator.Error!ValueDemand {
         return switch (known_value) {
             .any,
             .leaf,
@@ -1416,7 +1416,7 @@ const Pass = struct {
     }
 
     fn valueDemandItemsFromDemandedKnownIndexedValues(
-        self: *Pass,
+        self: *OptimizedContext,
         indexed: []const DemandedKnownIndexedValue,
     ) Allocator.Error![]const ItemDemand {
         const items = try self.arena.allocator().alloc(ItemDemand, indexed.len);
@@ -1429,7 +1429,7 @@ const Pass = struct {
         return items;
     }
 
-    fn valueDemandFromDemandedKnownCallable(self: *Pass, callable: DemandedKnownCallable) Allocator.Error!ValueDemand {
+    fn valueDemandFromDemandedKnownCallable(self: *OptimizedContext, callable: DemandedKnownCallable) Allocator.Error!ValueDemand {
         var captures_len: usize = 0;
         for (callable.captures) |capture| {
             captures_len = @max(captures_len, @as(usize, capture.index) + 1);
@@ -1443,7 +1443,7 @@ const Pass = struct {
         return .{ .callable = .{ .captures = captures } };
     }
 
-    fn ensureCallPatternForValues(self: *Pass, fn_id: Ast.FnId, values: []const Value) Common.LowerError!void {
+    fn ensureCallPatternForValues(self: *OptimizedContext, fn_id: Ast.FnId, values: []const Value) Common.LowerError!void {
         const raw = @intFromEnum(fn_id);
         if (raw >= self.plans.len) return;
 
@@ -1485,7 +1485,7 @@ const Pass = struct {
         try self.reserveWorker(@enumFromInt(@as(u32, @intCast(raw))), spec_index);
     }
 
-    fn reserveWorker(self: *Pass, source_fn_id: Ast.FnId, spec_index: usize) Allocator.Error!void {
+    fn reserveWorker(self: *OptimizedContext, source_fn_id: Ast.FnId, spec_index: usize) Allocator.Error!void {
         const source_index = @intFromEnum(source_fn_id);
         const spec = &self.plans[source_index].specs.items[spec_index];
         if (spec.fn_id != null) Common.invariant("call-pattern specialization id was assigned twice");
@@ -1513,7 +1513,7 @@ const Pass = struct {
         try self.copyProcDebugName(source_fn.symbol, symbol);
     }
 
-    fn callPatternArgSpan(self: *Pass, pattern: CallPattern) Allocator.Error!Ast.Span(Ast.TypedLocal) {
+    fn callPatternArgSpan(self: *OptimizedContext, pattern: CallPattern) Allocator.Error!Ast.Span(Ast.TypedLocal) {
         var args = std.ArrayList(Ast.TypedLocal).empty;
         defer args.deinit(self.allocator);
 
@@ -1523,7 +1523,7 @@ const Pass = struct {
     }
 
     fn appendDemandedKnownValueArgs(
-        self: *Pass,
+        self: *OptimizedContext,
         known_value: DemandedKnownValue,
         args: *std.ArrayList(Ast.TypedLocal),
     ) Allocator.Error!void {
@@ -1548,14 +1548,14 @@ const Pass = struct {
     }
 
     fn appendDemandedKnownIndexedValueArgs(
-        self: *Pass,
+        self: *OptimizedContext,
         known_values: []const DemandedKnownIndexedValue,
         args: *std.ArrayList(Ast.TypedLocal),
     ) Allocator.Error!void {
         for (known_values) |known_value| try self.appendDemandedKnownValueArgs(known_value.known_value, args);
     }
 
-    fn writeSpecialization(self: *Pass, source_fn_id: Ast.FnId, spec_index: usize, source_body: Ast.ExprId) Common.LowerError!void {
+    fn writeSpecialization(self: *OptimizedContext, source_fn_id: Ast.FnId, spec_index: usize, source_body: Ast.ExprId) Common.LowerError!void {
         const source_fn = self.program.fns.items[@intFromEnum(source_fn_id)];
         const spec = &self.plans[@intFromEnum(source_fn_id)].specs.items[spec_index];
 
@@ -1605,7 +1605,7 @@ const Pass = struct {
         try self.copyProcDebugName(source_fn.symbol, symbol);
     }
 
-    fn constructorKnownValue(self: *Pass, expr_id: Ast.ExprId) Allocator.Error!?KnownValue {
+    fn constructorKnownValue(self: *OptimizedContext, expr_id: Ast.ExprId) Allocator.Error!?KnownValue {
         const expr = self.program.exprs.items[@intFromEnum(expr_id)];
         return switch (expr.data) {
             .unit,
@@ -1683,7 +1683,7 @@ const Pass = struct {
         };
     }
 
-    fn knownValueFromValue(self: *Pass, value: Value) Allocator.Error!?KnownValue {
+    fn knownValueFromValue(self: *OptimizedContext, value: Value) Allocator.Error!?KnownValue {
         return switch (value) {
             .expr => |expr| try self.constructorKnownValue(expr),
             .expr_with_known_value => |known_value_expr| known_value_expr.known_value,
@@ -1818,7 +1818,7 @@ const Pass = struct {
 };
 
 const Cloner = struct {
-    pass: *Pass,
+    pass: *OptimizedContext,
     source_fn: Ast.FnId,
     pattern: CallPattern,
     subst: std.AutoHashMap(Ast.LocalId, Value),
@@ -1849,7 +1849,7 @@ const Cloner = struct {
     next_subst_scope_id: usize,
     next_demand_frame_id: usize,
 
-    fn init(pass: *Pass, source_fn: Ast.FnId, pattern: CallPattern) Cloner {
+    fn init(pass: *OptimizedContext, source_fn: Ast.FnId, pattern: CallPattern) Cloner {
         return .{
             .pass = pass,
             .source_fn = source_fn,
@@ -1884,7 +1884,7 @@ const Cloner = struct {
         };
     }
 
-    fn initForBaseClone(pass: *Pass) Cloner {
+    fn initForBaseClone(pass: *OptimizedContext) Cloner {
         return .{
             .pass = pass,
             .source_fn = undefined, // Base-body cloning never calls buildArgs, which is the only reader.
@@ -1919,7 +1919,7 @@ const Cloner = struct {
         };
     }
 
-    fn initForBaseBody(pass: *Pass, source_fn: Ast.FnId) Cloner {
+    fn initForBaseBody(pass: *OptimizedContext, source_fn: Ast.FnId) Cloner {
         var cloner = Cloner.initForBaseClone(pass);
         cloner.source_fn = source_fn;
         cloner.inline_direct_requires_known_arg = true;
