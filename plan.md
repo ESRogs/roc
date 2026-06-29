@@ -830,13 +830,13 @@ so the comparison isolates the source-form difference.
 - [x] Temporary diagnostics and relaxed optimizer assertions are removed.
 - [x] Optimized callable-state specialization is entered only for `--opt=size`
       and `--opt=speed`.
-- [ ] Dev/check/interpreter/compile-time-finalization paths do not build
+- [x] Dev/check/interpreter/compile-time-finalization paths do not build
       optimized demand/private-state/worker data.
 - [ ] Ordinary lowering has no dormant optimized fields.
 - [ ] Optimized-only helpers require an optimized context.
 - [ ] No deeper helper independently checks target/backend/source facts to
       enable callable-state specialization.
-- [ ] Mode-boundary instrumentation proves non-optimized modes construct zero
+- [x] Mode-boundary instrumentation proves non-optimized modes construct zero
       optimized contexts.
 - [ ] Result demand is explicit compiler data.
 - [ ] Every optimized-shape regression runs in both optimized modes.

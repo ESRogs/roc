@@ -61,6 +61,7 @@ fn lowerModule(
 }
 
 const LowerModuleOptions = struct {
+    checked_module_state: lir.CheckedPipeline.CheckedModuleState = .complete,
     debug_effects: lir.CheckedPipeline.DebugEffectMode = .run,
     proc_debug_names: bool = false,
     tag_reachability: bool = false,
@@ -99,6 +100,7 @@ fn lowerModuleWithOptions(
         .{ .requests = resources.checked_artifact.root_requests.requests },
         .{
             .target_usize = base.target.TargetUsize.native,
+            .checked_module_state = options.checked_module_state,
             .post_check_lowering = post_check_lowering,
             .debug_effects = options.debug_effects,
             .proc_debug_names = options.proc_debug_names,
@@ -1916,6 +1918,23 @@ test "post-check lowering mode constructs optimized context only in optimized mo
 
     try std.testing.expectEqual(@as(u32, 1), optimized.lowered.post_check_stats.optimized_contexts);
     try std.testing.expectEqual(@as(u32, 0), ordinary.lowered.post_check_stats.optimized_contexts);
+}
+
+test "checking finalization lowering constructs no optimized context" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\main : U64
+        \\main = 0
+    ;
+
+    var lowered = try lowerModuleWithOptions(allocator, source, .ordinary, .{
+        .checked_module_state = .checking_finalization,
+    });
+    defer lowered.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.lowered.post_check_stats.optimized_contexts);
 }
 
 test "post-check lowering mode gates public iter adapter elimination" {
