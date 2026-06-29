@@ -373,7 +373,7 @@ pub const Expr = struct {
 /// LIR const plan and target layout are known.
 pub const StaticDataCandidate = struct {
     static_data: Common.StaticDataId,
-    fallback: ExprId,
+    restored_expr: ExprId,
 };
 
 /// Monotype expression forms.

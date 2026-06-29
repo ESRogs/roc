@@ -1961,13 +1961,13 @@ const Builder = struct {
         self: *Builder,
         ty: Type.TypeId,
         static_data: Common.StaticDataId,
-        fallback: Ast.ExprId,
+        restored_expr: Ast.ExprId,
     ) Allocator.Error!Ast.ExprId {
         return try self.program.addExpr(.{
             .ty = ty,
             .data = .{ .static_data_candidate = .{
                 .static_data = static_data,
-                .fallback = fallback,
+                .restored_expr = restored_expr,
             } },
         });
     }

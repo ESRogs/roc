@@ -46,8 +46,7 @@ pub const RootRequestSet = struct {
 pub const TargetConfig = struct {
     target_usize: base.target.TargetUsize = base.target.TargetUsize.native,
     checked_module_state: CheckedModuleState = .complete,
-    inline_mode: InlineMode = .none,
-    post_check_specialization: PostCheckSpecializationMode = .off,
+    post_check_lowering: PostCheckLoweringMode = .ordinary,
     debug_effects: DebugEffectMode = .run,
     /// Allow `List.map` to reuse a unique input list's allocation when the
     /// input and output element layouts are interchangeable. Optimized builds
@@ -76,19 +75,29 @@ pub const RuntimeRecordSchema = postcheck.SolvedLirLower.RuntimeRecordSchema;
 pub const RuntimeTagSchema = postcheck.SolvedLirLower.RuntimeTagSchema;
 /// Tag-union metadata for runtime value inspection.
 pub const RuntimeTagUnionSchema = postcheck.SolvedLirLower.RuntimeTagUnionSchema;
-/// Inlining behavior selected for post-check lowering.
-pub const InlineMode = postcheck.SolvedInline.Mode;
 /// Debug effect handling selected for post-check lowering.
 pub const DebugEffectMode = postcheck.SolvedLirLower.DebugEffectMode;
 
-/// Whether post-check lowering should run optimized callable-state specialization.
-pub const PostCheckSpecializationMode = enum {
-    off,
+/// Checked-to-LIR lowering family selected at the driver boundary.
+pub const PostCheckLoweringMode = enum {
+    ordinary,
     optimized,
 
-    pub fn enabled(self: PostCheckSpecializationMode) bool {
+    pub fn isOptimized(self: PostCheckLoweringMode) bool {
         return self == .optimized;
     }
+
+    fn inlineMode(self: PostCheckLoweringMode) postcheck.SolvedInline.Mode {
+        return switch (self) {
+            .ordinary => .none,
+            .optimized => .wrappers,
+        };
+    }
+};
+
+/// Construction counts for post-check lowering families.
+pub const PostCheckLoweringStats = struct {
+    optimized_contexts: u32 = 0,
 };
 
 /// Runtime record and tag-union schemas needed by dev tooling.
@@ -148,6 +157,7 @@ pub const LoweredProgram = struct {
     main_proc: ?LIR.LirProcSpecId,
     target_usize: base.target.TargetUsize,
     runtime_value_schemas: RuntimeValueSchemaStore,
+    post_check_stats: PostCheckLoweringStats,
 
     pub fn deinit(self: *LoweredProgram) void {
         self.runtime_value_schemas.deinit();
@@ -243,7 +253,11 @@ pub fn lowerCheckedModulesToLir(
     var lifted_owned = true;
     errdefer if (lifted_owned) lifted.deinit();
 
-    if (target.post_check_specialization.enabled()) {
+    var post_check_stats = PostCheckLoweringStats{};
+
+    if (target.post_check_lowering.isOptimized()) {
+        post_check_stats.optimized_contexts += 1;
+
         var pre_solved = try postcheck.LambdaSolved.Solve.run(allocator, lifted);
         lifted_owned = false;
         var pre_solved_owned = true;
@@ -263,7 +277,7 @@ pub fn lowerCheckedModulesToLir(
     var solved_owned = true;
     errdefer if (solved_owned) solved.deinit();
 
-    var inline_plan = try postcheck.SolvedInline.analyze(allocator, target.inline_mode, &solved);
+    var inline_plan = try postcheck.SolvedInline.analyze(allocator, target.post_check_lowering.inlineMode(), &solved);
     defer inline_plan.deinit();
 
     var lowered = try postcheck.SolvedLirLower.run(allocator, target.target_usize, solved, .{
@@ -291,7 +305,7 @@ pub fn lowerCheckedModulesToLir(
 
     try Arc.insert(&lowered.lir_result.store, &lowered.lir_result.layouts, .{
         .roots = lowered.lir_result.root_procs.items,
-        .specialize = target.post_check_specialization.enabled(),
+        .specialize = target.post_check_lowering.isOptimized(),
     });
 
     if (roots.requests.len != 0 and lowered.lir_result.root_procs.items.len == 0) {
@@ -314,6 +328,7 @@ pub fn lowerCheckedModulesToLir(
         .main_proc = main_proc,
         .target_usize = target.target_usize,
         .runtime_value_schemas = runtime_value_schemas,
+        .post_check_stats = post_check_stats,
     };
 }
 
@@ -323,12 +338,9 @@ fn verifyCheckedBoundary(modules: CheckedModuleSet, target: TargetConfig) Alloca
         .complete => try modules.root.module.verifyComplete(),
         .checking_finalization => modules.root.module.verifyReadyForCompileTimeLowering(),
     }
-    if (target.post_check_specialization.enabled()) {
-        if (target.inline_mode == .none) {
-            checkedPipelineInvariant("post-check specialization requires wrapper inline mode");
-        }
+    if (target.post_check_lowering.isOptimized()) {
         if (target.checked_module_state != .complete) {
-            checkedPipelineInvariant("post-check specialization cannot run during checking finalization");
+            checkedPipelineInvariant("optimized post-check lowering cannot run during checking finalization");
         }
     }
 }

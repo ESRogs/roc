@@ -405,7 +405,7 @@ const Solver = struct {
             .comptime_exhaustiveness_failed,
             => {},
             .static_data_candidate => |candidate| {
-                _ = try self.expectExpr(candidate.fallback, expected);
+                _ = try self.expectExpr(candidate.restored_expr, expected);
             },
             .list => |items| {
                 const elem_ty = try self.listElem(expected);

@@ -501,7 +501,7 @@ const Lowerer = struct {
             .static_data => |value| .{ .static_data = value },
             .static_data_candidate => |candidate| .{ .static_data_candidate = .{
                 .static_data = candidate.static_data,
-                .fallback = try self.lowerExpr(candidate.fallback),
+                .restored_expr = try self.lowerExpr(candidate.restored_expr),
             } },
             .uninitialized => .uninitialized,
             .uninitialized_payload => |payload| .{ .uninitialized_payload = .{

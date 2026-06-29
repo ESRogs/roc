@@ -55,13 +55,12 @@ fn sharedPrePublishedBuiltin() anyerror!helpers.PrePublishedBuiltin {
 fn lowerModule(
     allocator: Allocator,
     source: []const u8,
-    inline_mode: lir.CheckedPipeline.InlineMode,
+    post_check_lowering: lir.CheckedPipeline.PostCheckLoweringMode,
 ) anyerror!LoweredSource {
-    return lowerModuleWithOptions(allocator, source, inline_mode, .{});
+    return lowerModuleWithOptions(allocator, source, post_check_lowering, .{});
 }
 
 const LowerModuleOptions = struct {
-    post_check_specialization: ?lir.CheckedPipeline.PostCheckSpecializationMode = null,
     debug_effects: lir.CheckedPipeline.DebugEffectMode = .run,
     proc_debug_names: bool = false,
     tag_reachability: bool = false,
@@ -71,7 +70,7 @@ const LowerModuleOptions = struct {
 fn lowerModuleWithOptions(
     allocator: Allocator,
     source: []const u8,
-    inline_mode: lir.CheckedPipeline.InlineMode,
+    post_check_lowering: lir.CheckedPipeline.PostCheckLoweringMode,
     options: LowerModuleOptions,
 ) anyerror!LoweredSource {
     var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, source, options.imports, try sharedPrePublishedBuiltin());
@@ -100,8 +99,7 @@ fn lowerModuleWithOptions(
         .{ .requests = resources.checked_artifact.root_requests.requests },
         .{
             .target_usize = base.target.TargetUsize.native,
-            .inline_mode = inline_mode,
-            .post_check_specialization = options.post_check_specialization orelse postCheckSpecializationForInlineMode(inline_mode),
+            .post_check_lowering = post_check_lowering,
             .debug_effects = options.debug_effects,
             .proc_debug_names = options.proc_debug_names,
             .tag_reachability = options.tag_reachability,
@@ -115,29 +113,22 @@ fn lowerModuleWithOptions(
     };
 }
 
-fn postCheckSpecializationForInlineMode(inline_mode: lir.CheckedPipeline.InlineMode) lir.CheckedPipeline.PostCheckSpecializationMode {
-    return switch (inline_mode) {
-        .wrappers => .optimized,
-        .none => .off,
-    };
-}
-
 fn lowerModuleWithDebugEffects(
     allocator: Allocator,
     source: []const u8,
-    inline_mode: lir.CheckedPipeline.InlineMode,
+    post_check_lowering: lir.CheckedPipeline.PostCheckLoweringMode,
     debug_effects: lir.CheckedPipeline.DebugEffectMode,
 ) anyerror!LoweredSource {
-    return lowerModuleWithOptions(allocator, source, inline_mode, .{ .debug_effects = debug_effects });
+    return lowerModuleWithOptions(allocator, source, post_check_lowering, .{ .debug_effects = debug_effects });
 }
 
 fn lowerModuleWithProcDebugNames(
     allocator: Allocator,
     source: []const u8,
-    inline_mode: lir.CheckedPipeline.InlineMode,
+    post_check_lowering: lir.CheckedPipeline.PostCheckLoweringMode,
     proc_debug_names: bool,
 ) anyerror!LoweredSource {
-    return lowerModuleWithOptions(allocator, source, inline_mode, .{ .proc_debug_names = proc_debug_names });
+    return lowerModuleWithOptions(allocator, source, post_check_lowering, .{ .proc_debug_names = proc_debug_names });
 }
 
 fn mainProcArgLayouts(
@@ -191,7 +182,7 @@ fn runLoweredWithHostEvents(
 fn expectOptimizedDbgEvents(source: []const u8, expected: []const []const u8) anyerror!void {
     const allocator = std.testing.allocator;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
     var run = try runLoweredWithHostEvents(allocator, &optimized.lowered);
@@ -220,7 +211,7 @@ fn expectOptimizedHostEvents(
 ) anyerror!void {
     const allocator = std.testing.allocator;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
     var run = try runLoweredWithHostEvents(allocator, &optimized.lowered);
@@ -277,14 +268,14 @@ test "optimized debug effect lowering erases inline dbg and expect" {
         \\}
     ;
 
-    var run_effects = try lowerModuleWithDebugEffects(allocator, source, .wrappers, .run);
+    var run_effects = try lowerModuleWithDebugEffects(allocator, source, .optimized, .run);
     defer run_effects.deinit(allocator);
 
     const run_counts = countDebugEffectStmts(&run_effects.lowered);
     try std.testing.expect(run_counts.debug > 0);
     try std.testing.expect(run_counts.expect > 0);
 
-    var erased_effects = try lowerModuleWithDebugEffects(allocator, source, .wrappers, .erase);
+    var erased_effects = try lowerModuleWithDebugEffects(allocator, source, .optimized, .erase);
     defer erased_effects.deinit(allocator);
 
     const erased_counts = countDebugEffectStmts(&erased_effects.lowered);
@@ -306,7 +297,7 @@ test "nominal record lays out fields in declared order" {
         \\main = |account| account
     ;
 
-    var lowered_source = try lowerModule(allocator, source, .wrappers);
+    var lowered_source = try lowerModule(allocator, source, .optimized);
     defer lowered_source.deinit(allocator);
     const lowered = &lowered_source.lowered;
 
@@ -342,7 +333,7 @@ test "imported nominal record lays out fields in declared order" {
         \\main = |account| account
     ;
 
-    var lowered_source = try lowerModuleWithOptions(allocator, source, .wrappers, .{
+    var lowered_source = try lowerModuleWithOptions(allocator, source, .optimized, .{
         .imports = &.{.{ .name = "Acct", .source = acct_module }},
     });
     defer lowered_source.deinit(allocator);
@@ -371,7 +362,7 @@ test "nominal record reserves unnamed padding fields without inflating alignment
         \\main = |padded| padded
     ;
 
-    var lowered_source = try lowerModule(allocator, source, .wrappers);
+    var lowered_source = try lowerModule(allocator, source, .optimized);
     defer lowered_source.deinit(allocator);
     const lowered = &lowered_source.lowered;
 
@@ -405,7 +396,7 @@ test "generic nominal record instantiates unnamed padding to the argument's size
         \\main = |foo| foo
     ;
 
-    var lowered_source = try lowerModule(allocator, source, .wrappers);
+    var lowered_source = try lowerModule(allocator, source, .optimized);
     defer lowered_source.deinit(allocator);
     const lowered = &lowered_source.lowered;
 
@@ -435,7 +426,7 @@ test "nominal record with a parenthesized backing still honors declared order an
         \\main = |padded| padded
     ;
 
-    var lowered_source = try lowerModule(allocator, source, .wrappers);
+    var lowered_source = try lowerModule(allocator, source, .optimized);
     defer lowered_source.deinit(allocator);
     const lowered = &lowered_source.lowered;
 
@@ -980,12 +971,6 @@ fn expectReachableProcShapeFieldNoGreaterBy(
 ) anyerror!void {
     const iter_total = try reachableProcShapeFieldTotal(allocator, iter_lowered, field_name);
     const list_total = try reachableProcShapeFieldTotal(allocator, list_lowered, field_name);
-    if (iter_total > list_total + allowed_extra) {
-        std.debug.print(
-            "{s}: iter form has {d}, direct-list form has {d}, allowed extra {d}\n",
-            .{ field_name, iter_total, list_total, allowed_extra },
-        );
-    }
     try std.testing.expect(iter_total <= list_total + allowed_extra);
 }
 
@@ -996,12 +981,6 @@ fn expectReachableProcShapeFieldEqual(
     expected: usize,
 ) anyerror!void {
     const actual = try reachableProcShapeFieldTotal(allocator, lowered, field_name);
-    if (actual != expected) {
-        std.debug.print(
-            "{s}: expected {d}, found {d}\n",
-            .{ field_name, expected, actual },
-        );
-    }
     try std.testing.expectEqual(expected, actual);
 }
 
@@ -1010,9 +989,9 @@ fn expectStaticListIterAppendLoopAvoidsListAppendAllocation(
     list_source: []const u8,
 ) anyerror!void {
     const allocator = std.testing.allocator;
-    var iter_optimized = try lowerModuleWithOptions(allocator, iter_source, .wrappers, .{ .tag_reachability = true });
+    var iter_optimized = try lowerModuleWithOptions(allocator, iter_source, .optimized, .{ .tag_reachability = true });
     defer iter_optimized.deinit(allocator);
-    var list_optimized = try lowerModuleWithOptions(allocator, list_source, .wrappers, .{ .tag_reachability = true });
+    var list_optimized = try lowerModuleWithOptions(allocator, list_source, .optimized, .{ .tag_reachability = true });
     defer list_optimized.deinit(allocator);
 
     try expectReachableProcShapeFieldEqual(allocator, &iter_optimized.lowered, "erased_call_count", 0);
@@ -1238,7 +1217,7 @@ fn hasGroupedStrMatchSet(shape: ProcShape) bool {
 fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_unsafe_count: usize) anyerror!void {
     const allocator = std.testing.allocator;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
     try std.testing.expect(!try reachableIterCollectShape(allocator, &optimized.lowered, .specialized));
@@ -1264,11 +1243,11 @@ fn rootDirectCallTarget(
 
 fn expectRootDirectCallCount(
     source: []const u8,
-    inline_mode: lir.CheckedPipeline.InlineMode,
+    post_check_lowering: lir.CheckedPipeline.PostCheckLoweringMode,
     expected: usize,
 ) anyerror!void {
     const allocator = std.testing.allocator;
-    var lowered_source = try lowerModule(allocator, source, inline_mode);
+    var lowered_source = try lowerModule(allocator, source, post_check_lowering);
     defer lowered_source.deinit(allocator);
 
     const root_calls = try collectAssignCallProcs(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
@@ -1279,10 +1258,10 @@ fn expectRootDirectCallCount(
 
 fn expectRootTargetHasCalls(
     source: []const u8,
-    inline_mode: lir.CheckedPipeline.InlineMode,
+    post_check_lowering: lir.CheckedPipeline.PostCheckLoweringMode,
 ) anyerror!void {
     const allocator = std.testing.allocator;
-    var lowered_source = try lowerModule(allocator, source, inline_mode);
+    var lowered_source = try lowerModule(allocator, source, post_check_lowering);
     defer lowered_source.deinit(allocator);
 
     const target = try rootDirectCallTarget(allocator, &lowered_source.lowered);
@@ -1292,7 +1271,7 @@ fn expectRootTargetHasCalls(
     try std.testing.expect(target_calls.len > 0);
 }
 
-test "direct call wrapper is inlined when inline mode is enabled" {
+test "direct call wrapper is inlined under optimized post-check lowering" {
     try expectRootDirectCallCount(
         \\module [main]
         \\
@@ -1304,10 +1283,10 @@ test "direct call wrapper is inlined when inline mode is enabled" {
         \\
         \\main : U64
         \\main = wrapper(41)
-    , .wrappers, 0);
+    , .optimized, 0);
 }
 
-test "direct call wrapper is not inlined when inline mode is none" {
+test "direct call wrapper is not inlined under ordinary post-check lowering" {
     try expectRootTargetHasCalls(
         \\module [main]
         \\
@@ -1319,7 +1298,7 @@ test "direct call wrapper is not inlined when inline mode is none" {
         \\
         \\main : U64
         \\main = wrapper(41)
-    , .none);
+    , .ordinary);
 }
 
 test "zero statement block wrapper is inlined" {
@@ -1336,7 +1315,7 @@ test "zero statement block wrapper is inlined" {
         \\
         \\main : U64
         \\main = wrapper(41)
-    , .wrappers, 0);
+    , .optimized, 0);
 }
 
 test "low level wrapper is inlined when inline mode is enabled" {
@@ -1346,7 +1325,7 @@ test "low level wrapper is inlined when inline mode is enabled" {
         \\
         \\main : Str -> U64
         \\main = |str| Str.count_utf8_bytes(str)
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     const shape = try collectProcShape(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
@@ -1372,7 +1351,7 @@ test "user single wrapper can inline to builtin single iterator" {
         \\    }
         \\    $sum
         \\}
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     const shape = try collectProcShape(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
@@ -1399,7 +1378,7 @@ test "user iter method is not recognized as builtin list cursor" {
         \\    }
         \\    $sum
         \\}
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     const shape = try collectProcShape(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
@@ -1444,7 +1423,7 @@ test "destination baseline: boxed record update reboxes a list and string payloa
         \\
         \\main : Box(State) -> Box(State)
         \\main = |boxed| step(boxed)
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     const step_proc = try rootDirectCallTarget(allocator, &lowered_source.lowered);
@@ -1477,7 +1456,7 @@ test "destination phase 3: direct boxed update wrapper calls a return-slot varia
         \\
         \\main : Box(Model) -> Box(Model)
         \\main = |boxed| step(boxed)
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     const root_shape = try collectProcShape(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
@@ -1505,7 +1484,7 @@ test "destination baseline: boxed lambda is packed then boxed" {
         \\
         \\main : Str -> Box(Formatter)
         \\main = |prefix| make(prefix)
-    , .none);
+    , .ordinary);
     defer lowered_source.deinit(allocator);
 
     const make_proc = try rootDirectCallTarget(allocator, &lowered_source.lowered);
@@ -1545,7 +1524,7 @@ test "destination baseline: large record return feeds a record update" {
         \\
         \\main : Str, U64 -> Big
         \\main = |label, n| change_big(label, n)
-    , .none);
+    , .ordinary);
     defer lowered_source.deinit(allocator);
 
     const change_proc = try rootDirectCallTarget(allocator, &lowered_source.lowered);
@@ -1578,7 +1557,7 @@ test "destination phase 6: string concat caller uses append variant" {
         \\    held = input
         \\    build(held)
         \\}
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     const build_proc = try rootDirectCallTarget(allocator, &lowered_source.lowered);
@@ -1632,7 +1611,7 @@ test "self-recursive direct wrapper is not inlined" {
         \\
         \\main : U64 -> U64
         \\main = |x| wrapper(x)
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     // The root still calls the wrapper as a separate proc (not inlined). The
@@ -1660,7 +1639,7 @@ test "mutually recursive direct wrappers are not inlined" {
         \\
         \\main : U64 -> U64
         \\main = |x| a(x)
-    , .wrappers);
+    , .optimized);
 }
 
 test "capturing direct wrapper is inlined when captures are inline inputs" {
@@ -1676,7 +1655,7 @@ test "capturing direct wrapper is inlined when captures are inline inputs" {
         \\    wrapper = |x| callee(x + offset)
         \\    wrapper(41)
         \\}
-    , .wrappers);
+    , .optimized);
     defer lowered_source.deinit(allocator);
 
     const root_calls = try collectAssignCallProcs(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
@@ -1693,7 +1672,7 @@ fn expectRootTargetTailTransform(
     expected: LIR.TailTransform,
 ) anyerror!void {
     const allocator = std.testing.allocator;
-    var lowered_source = try lowerModule(allocator, source, .none);
+    var lowered_source = try lowerModule(allocator, source, .ordinary);
     defer lowered_source.deinit(allocator);
 
     const target = try rootDirectCallTarget(allocator, &lowered_source.lowered);
@@ -1786,7 +1765,7 @@ test "known-length List.iter collect specializes without unbound locals" {
         \\    Iter.collect(
         \\        Iter.map(List.iter([1.I64, 2, 3]), |i| i * 12),
         \\    )
-    , .wrappers);
+    , .optimized);
     defer optimized.deinit(allocator);
 }
 
@@ -1833,7 +1812,7 @@ test "imported iterator producer keeps finite step callables" {
         \\}
     ;
 
-    var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{
+    var optimized = try lowerModuleWithOptions(allocator, source, .optimized, .{
         .imports = &.{.{ .name = "Points", .source = producer_module }},
     });
     defer optimized.deinit(allocator);
@@ -1910,9 +1889,9 @@ test "static list iter append loop eliminates public iter adapters" {
         \\main = sum_points(2)
     ;
 
-    var iter_optimized = try lowerModuleWithProcDebugNames(allocator, iter_source, .wrappers, true);
+    var iter_optimized = try lowerModuleWithProcDebugNames(allocator, iter_source, .optimized, true);
     defer iter_optimized.deinit(allocator);
-    var list_optimized = try lowerModuleWithProcDebugNames(allocator, list_source, .wrappers, true);
+    var list_optimized = try lowerModuleWithProcDebugNames(allocator, list_source, .optimized, true);
     defer list_optimized.deinit(allocator);
 
     try std.testing.expect(!try reachableProcDebugName(allocator, &iter_optimized.lowered, "Builtin.List.iter"));
@@ -1921,7 +1900,25 @@ test "static list iter append loop eliminates public iter adapters" {
     try std.testing.expect(!try reachableProcDebugName(allocator, &list_optimized.lowered, "Builtin.Iter.append"));
 }
 
-test "post-check specialization mode gates public iter adapter elimination" {
+test "post-check lowering mode constructs optimized context only in optimized mode" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\main : U64
+        \\main = 0
+    ;
+
+    var optimized = try lowerModule(allocator, source, .optimized);
+    defer optimized.deinit(allocator);
+    var ordinary = try lowerModule(allocator, source, .ordinary);
+    defer ordinary.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), optimized.lowered.post_check_stats.optimized_contexts);
+    try std.testing.expectEqual(@as(u32, 0), ordinary.lowered.post_check_stats.optimized_contexts);
+}
+
+test "post-check lowering mode gates public iter adapter elimination" {
     const allocator = std.testing.allocator;
     const source =
         \\module [main]
@@ -1948,19 +1945,13 @@ test "post-check specialization mode gates public iter adapter elimination" {
         \\main = sum_points(4)
     ;
 
-    var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{
-        .post_check_specialization = .optimized,
-        .proc_debug_names = true,
-    });
+    var optimized = try lowerModuleWithOptions(allocator, source, .optimized, .{ .proc_debug_names = true });
     defer optimized.deinit(allocator);
-    var unspecialized = try lowerModuleWithOptions(allocator, source, .wrappers, .{
-        .post_check_specialization = .off,
-        .proc_debug_names = true,
-    });
-    defer unspecialized.deinit(allocator);
+    var ordinary = try lowerModuleWithOptions(allocator, source, .ordinary, .{ .proc_debug_names = true });
+    defer ordinary.deinit(allocator);
 
     try std.testing.expect(!try reachableProcDebugName(allocator, &optimized.lowered, "Builtin.Iter.append"));
-    try std.testing.expect(try reachableProcDebugName(allocator, &unspecialized.lowered, "Builtin.Iter.append"));
+    try std.testing.expect(try reachableProcDebugName(allocator, &ordinary.lowered, "Builtin.Iter.append"));
 }
 
 test "state loop lowers to ordinary lir joins" {
@@ -2081,7 +2072,7 @@ test "dynamic static list iter append loop splits nested callable captures" {
         \\}
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 }
 
@@ -2205,7 +2196,7 @@ test "stream from iterator collect keeps finite step callables" {
         \\}
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
     try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
@@ -2226,7 +2217,7 @@ test "spec constr list filter-map loop does not produce unbound ARC locals" {
         \\}
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 }
 
@@ -2250,7 +2241,7 @@ test "spec constr does not duplicate opaque let-bound direct calls" {
         \\main = read_twice({ n: 1 })
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, opaqueLetCallWorkerDoesNotDuplicateCall));
@@ -2278,7 +2269,7 @@ test "spec constr does not duplicate opaque known-match payloads" {
         \\main = read_twice({ n: 1 })
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, opaqueLetCallWorkerDoesNotDuplicateCall));
@@ -2577,10 +2568,10 @@ test "spec constr specializes recursive record state" {
         \\main = sum_record({ n: 4, acc: 0 })
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     // Adapted from the GHC code base's SpecConstr examples for inspected loop state.
@@ -2614,10 +2605,10 @@ test "spec constr specializes record state carried by while loop" {
         \\main = sum_from({ n: 4 })
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, whileRecordStateWorkerIsSpecialized));
@@ -2649,10 +2640,10 @@ test "spec constr specializes primitive-start record state carried by while loop
         \\main = sum_from(4)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, whileRecordStateWorkerIsSpecialized));
@@ -2704,9 +2695,9 @@ test "spec constr does not require single-field record wrapper for local loop sp
         \\main = sum_from(4)
     ;
 
-    var wrapped_optimized = try lowerModule(allocator, wrapped_source, .wrappers);
+    var wrapped_optimized = try lowerModule(allocator, wrapped_source, .optimized);
     defer wrapped_optimized.deinit(allocator);
-    var primitive_optimized = try lowerModule(allocator, primitive_source, .wrappers);
+    var primitive_optimized = try lowerModule(allocator, primitive_source, .optimized);
     defer primitive_optimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &wrapped_optimized.lowered, localLoopStateIsSplitToTwoLeaves));
@@ -2739,10 +2730,10 @@ test "spec constr splits loop record state with opaque callable field" {
         \\main = sum_from(4)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, whileRecordStateWithZeroCaptureCallableIsSpecialized));
@@ -2775,10 +2766,10 @@ test "spec constr splits loop record state with direct callable captures" {
         \\main = sum_from(4, 10, 3)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, whileRecordStateWithCallableCapturesIsSpecialized));
@@ -2813,10 +2804,10 @@ test "spec constr splits loop record state with returned callable captures" {
         \\main = sum_from(4, 10, 3)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, whileRecordStateWithCallableCapturesIsSpecialized));
@@ -2852,10 +2843,10 @@ test "spec constr splits loop record state with annotated returned callable capt
         \\main = sum_from(4, 10, 3)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, whileRecordStateWithCallableCapturesIsSpecialized));
@@ -2883,10 +2874,10 @@ test "spec constr exposes direct call record result for field access" {
         \\main = read_acc({ n: 4 })
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "direct_call_count"));
@@ -2910,10 +2901,10 @@ test "spec constr exposes block-wrapped direct call record result for field acce
         \\main = { make_state(4) }.acc
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "direct_call_count"));
@@ -2940,10 +2931,10 @@ test "spec constr exposes demanded direct call argument facts" {
         \\main = copy_state(make_state(4)).acc
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "direct_call_count"));
@@ -2981,10 +2972,10 @@ test "spec constr specializes if-joined record state carried by while loop" {
         \\main = sum_from({ n: 4 }, True)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, branchJoinedRecordStateWorkerIsSpecialized));
@@ -3023,10 +3014,10 @@ test "spec constr specializes match-joined record state carried by while loop" {
         \\main = sum_from({ n: 4 }, True)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, branchJoinedRecordStateWorkerIsSpecialized));
@@ -3056,10 +3047,10 @@ test "spec constr specializes recursive tuple state" {
         \\main = sum_tuple((4, 0))
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     // Adapted from the GHC code base's SpecConstr strict-tuple examples.
@@ -3087,10 +3078,10 @@ test "spec constr leaves uninspected constructor arguments generic" {
         \\main = unused_state({ n: 0 }, 3)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     // Adapted from the GHC code base's Note [Good arguments].
@@ -3124,10 +3115,10 @@ test "spec constr specializes tagged recursive state" {
         \\main = count_down(More(4), 0)
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     // Adapted from the GHC code base's SpecConstr constructor-call examples.
@@ -3157,10 +3148,10 @@ test "spec constr uses fully known entry shape for multiple tuple states" {
         \\main = roman(4, (1, 2), (3, 4))
     ;
 
-    var optimized = try lowerModule(allocator, source, .wrappers);
+    var optimized = try lowerModule(allocator, source, .optimized);
     defer optimized.deinit(allocator);
 
-    var unoptimized = try lowerModule(allocator, source, .none);
+    var unoptimized = try lowerModule(allocator, source, .ordinary);
     defer unoptimized.deinit(allocator);
 
     // Adapted from the GHC code base's testsuite/tests/eyeball/spec-constr1.hs.
@@ -3190,7 +3181,7 @@ test "LIR statements and procs carry resolved source locations" {
         \\}
     ;
 
-    var lowered_source = try lowerModuleWithProcDebugNames(allocator, source, .none, true);
+    var lowered_source = try lowerModuleWithProcDebugNames(allocator, source, .ordinary, true);
     defer lowered_source.deinit(allocator);
 
     const store = &lowered_source.lowered.lir_result.store;
@@ -3293,7 +3284,7 @@ test "referenced but uncalled function does not materialize a proc" {
         \\}
     ;
 
-    var lowered_source = try lowerModuleWithProcDebugNames(allocator, source, .none, true);
+    var lowered_source = try lowerModuleWithProcDebugNames(allocator, source, .ordinary, true);
     defer lowered_source.deinit(allocator);
 
     const store = &lowered_source.lowered.lir_result.store;
@@ -3321,7 +3312,7 @@ test "LIR statements carry source locations under optimizing inline mode" {
         \\}
     ;
 
-    var lowered_source = try lowerModule(allocator, source, .wrappers);
+    var lowered_source = try lowerModule(allocator, source, .optimized);
     defer lowered_source.deinit(allocator);
 
     const store = &lowered_source.lowered.lir_result.store;
@@ -3351,7 +3342,7 @@ test "adjacent string interpolation patterns lower to grouped LIR match set" {
         \\main = classify("bOKz")
     ;
 
-    var lowered_source = try lowerModule(allocator, source, .none);
+    var lowered_source = try lowerModule(allocator, source, .ordinary);
     defer lowered_source.deinit(allocator);
 
     try std.testing.expect(try reachableProcShape(allocator, &lowered_source.lowered, hasGroupedStrMatchSet));
@@ -3374,7 +3365,7 @@ test "LIR locals carry source-level names" {
         \\main = compute(20)
     ;
 
-    var lowered_source = try lowerModule(allocator, source, .none);
+    var lowered_source = try lowerModule(allocator, source, .ordinary);
     defer lowered_source.deinit(allocator);
 
     const store = &lowered_source.lowered.lir_result.store;

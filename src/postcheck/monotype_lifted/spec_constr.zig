@@ -1043,7 +1043,7 @@ const Pass = struct {
                     try self.markArgDemandForLocal(fn_id, capture.local, capture_demand, changed);
                 }
             },
-            .static_data_candidate => |candidate| try self.markArgUsesInExpr(fn_id, candidate.fallback, changed),
+            .static_data_candidate => |candidate| try self.markArgUsesInExpr(fn_id, candidate.restored_expr, changed),
             .list,
             .tuple,
             => |items| for (self.program.exprSpan(items)) |child| try self.markArgUsesInExpr(fn_id, child, changed),
@@ -2785,10 +2785,10 @@ const Cloner = struct {
         return try self.ensureDemandedKnownValue(value);
     }
 
-    fn activeBreakResultDemand(self: *Cloner, fallback: ValueDemand) ValueDemand {
+    fn activeBreakResultDemand(self: *Cloner, default_demand: ValueDemand) ValueDemand {
         if (self.loop_stack.getLastOrNull()) |loop| return loop.result_demand;
         if (self.state_loop_stack.getLastOrNull()) |state_loop| return state_loop.result_demand;
-        return fallback;
+        return default_demand;
     }
 
     fn activeCompactBreakResult(self: *Cloner) ?CompactResult {
@@ -2810,7 +2810,7 @@ const Cloner = struct {
         self: *Cloner,
         break_ty: Type.TypeId,
         maybe_value: ?Ast.ExprId,
-        fallback_demand: ValueDemand,
+        default_demand: ValueDemand,
     ) Common.LowerError!Ast.ExprId {
         const active_compact = self.activeCompactBreakForType(break_ty);
         const output_ty = if (active_compact) |active| switch (active) {
@@ -2819,7 +2819,7 @@ const Cloner = struct {
         } else break_ty;
 
         return try self.addExpr(.{ .ty = output_ty, .data = .{
-            .break_ = if (maybe_value) |value| try self.cloneBreakPayloadExpr(active_compact, value, fallback_demand) else null,
+            .break_ = if (maybe_value) |value| try self.cloneBreakPayloadExpr(active_compact, value, default_demand) else null,
         } });
     }
 
@@ -2827,19 +2827,19 @@ const Cloner = struct {
         self: *Cloner,
         active_compact: ?ActiveCompactBreak,
         value: Ast.ExprId,
-        fallback_demand: ValueDemand,
+        default_demand: ValueDemand,
     ) Common.LowerError!Ast.ExprId {
         if (active_compact) |active| {
             return switch (active) {
                 .source => |result| blk: {
-                    const payload = try self.cloneExprValueWithDemand(value, self.activeBreakResultDemand(fallback_demand));
+                    const payload = try self.cloneExprValueWithDemand(value, self.activeBreakResultDemand(default_demand));
                     break :blk try self.compactResultExpr(result, payload);
                 },
                 .compact => try self.materialize(try self.cloneExprValueWithDemand(value, .materialize)),
             };
         }
 
-        return try self.materialize(try self.cloneExprValueWithDemand(value, self.activeBreakResultDemand(fallback_demand)));
+        return try self.materialize(try self.cloneExprValueWithDemand(value, self.activeBreakResultDemand(default_demand)));
     }
 
     fn cloneExprValueWithDemand(self: *Cloner, expr_id: Ast.ExprId, demand: ValueDemand) Common.LowerError!Value {
@@ -5058,7 +5058,7 @@ const Cloner = struct {
             .comptime_exhaustiveness_failed,
             .crash,
             => true,
-            .static_data_candidate => |candidate| self.exprReferencesAvailableBindingsInScope(candidate.fallback, scope),
+            .static_data_candidate => |candidate| self.exprReferencesAvailableBindingsInScope(candidate.restored_expr, scope),
             .field_access => |field| self.exprReferencesAvailableBindingsInScope(field.receiver, scope),
             .tuple_access => |access| self.exprReferencesAvailableBindingsInScope(access.tuple, scope),
             .list,
@@ -5426,7 +5426,7 @@ const Cloner = struct {
             .static_data => |value| .{ .static_data = value },
             .static_data_candidate => |candidate| .{ .static_data_candidate = .{
                 .static_data = candidate.static_data,
-                .fallback = try self.cloneExpr(candidate.fallback),
+                .restored_expr = try self.cloneExpr(candidate.restored_expr),
             } },
             .list => |items| .{ .list = try self.cloneExprSpan(items) },
             .tuple => |items| .{ .tuple = try self.cloneExprSpan(items) },
@@ -8880,10 +8880,10 @@ const Cloner = struct {
             }
         }
 
-        const fallback_args = try self.valuesToExprSpan(values);
+        const materialized_args = try self.valuesToExprSpan(values);
         return try self.addExpr(.{ .ty = ty, .data = .{ .call_proc = .{
             .callee = .{ .lifted = callee },
-            .args = fallback_args,
+            .args = materialized_args,
             .is_cold = is_cold,
         } } });
     }
@@ -9023,17 +9023,17 @@ const Cloner = struct {
                     } };
                 }
             }
-            const fallback_args = try self.valuesToExprSpan(values);
+            const materialized_args = try self.valuesToExprSpan(values);
             return .{ .call_proc = .{
                 .callee = call.callee,
-                .args = fallback_args,
+                .args = materialized_args,
                 .is_cold = call.is_cold,
             } };
         }
-        const fallback_args = try self.cloneExprSpan(call.args);
+        const materialized_args = try self.cloneExprSpan(call.args);
         return .{ .call_proc = .{
             .callee = call.callee,
-            .args = fallback_args,
+            .args = materialized_args,
             .is_cold = call.is_cold,
         } };
     }
@@ -11934,7 +11934,7 @@ const Cloner = struct {
                 }
                 break :blk try self.exprMayDemandLocalInCurrentContextSeen(lambda.body, source_local, visited);
             },
-            .static_data_candidate => |candidate| try self.exprMayDemandLocalInCurrentContextSeen(candidate.fallback, source_local, visited),
+            .static_data_candidate => |candidate| try self.exprMayDemandLocalInCurrentContextSeen(candidate.restored_expr, source_local, visited),
             .list,
             .tuple,
             => |items| try self.exprSpanMayDemandLocalInCurrentContext(items, source_local, visited),
@@ -12848,7 +12848,7 @@ const Cloner = struct {
                 try self.mergeLocalDemandInExpr(local, sequence.try_expr, .materialize, out);
                 try self.mergeLocalDemandInExpr(local, sequence.ok_body, context, out);
             },
-            .static_data_candidate => |candidate| try self.mergeLocalDemandInExpr(local, candidate.fallback, context, out),
+            .static_data_candidate => |candidate| try self.mergeLocalDemandInExpr(local, candidate.restored_expr, context, out),
             .expect_err => |expect_err| try self.mergeLocalDemandInExpr(local, expect_err.msg, .materialize, out),
             .fn_ref => |fn_id| {
                 const source_fn = self.pass.program.fns.items[@intFromEnum(fn_id)];
@@ -13796,7 +13796,7 @@ const Cloner = struct {
                 } };
             },
             // List patterns are not statically destructured during
-            // specialization; fall back to the runtime match.
+            // specialization; keep the runtime match.
             .list,
             .int_lit,
             .dec_lit,
@@ -18234,7 +18234,7 @@ fn exprAlwaysEscapesControlTransferDepth(
         .structural_eq,
         .structural_hash,
         => false,
-        .static_data_candidate => |candidate| exprAlwaysEscapesControlTransferDepth(program, candidate.fallback, loop_depth, state_loop_depth),
+        .static_data_candidate => |candidate| exprAlwaysEscapesControlTransferDepth(program, candidate.restored_expr, loop_depth, state_loop_depth),
     };
 }
 
@@ -18297,7 +18297,7 @@ fn exprContainsEscapingControlTransferDepth(
         .crash,
         .comptime_exhaustiveness_failed,
         => false,
-        .static_data_candidate => |candidate| exprContainsEscapingControlTransferDepth(program, candidate.fallback, loop_depth, state_loop_depth),
+        .static_data_candidate => |candidate| exprContainsEscapingControlTransferDepth(program, candidate.restored_expr, loop_depth, state_loop_depth),
         .list,
         .tuple,
         => |items| exprSpanContainsEscapingControlTransferDepth(program, items, loop_depth, state_loop_depth),
@@ -18433,7 +18433,7 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
         .crash,
         .comptime_exhaustiveness_failed,
         => false,
-        .static_data_candidate => |candidate| exprContainsReturn(program, candidate.fallback),
+        .static_data_candidate => |candidate| exprContainsReturn(program, candidate.restored_expr),
         .list,
         .tuple,
         => |items| exprSpanContainsReturn(program, items),
@@ -18546,7 +18546,7 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
         .uninitialized,
         .uninitialized_payload,
         => 0,
-        .static_data_candidate => |candidate| localUseCountInExpr(program, local, candidate.fallback),
+        .static_data_candidate => |candidate| localUseCountInExpr(program, local, candidate.restored_expr),
         .list,
         .tuple,
         => |items| localUseCountInExprSpan(program, local, items),
@@ -18699,7 +18699,7 @@ fn localMaxUseCountPerPathInExpr(program: *const Ast.Program, local: Ast.LocalId
         .def_ref,
         .fn_def,
         => 0,
-        .static_data_candidate => |candidate| localMaxUseCountPerPathInExpr(program, local, candidate.fallback),
+        .static_data_candidate => |candidate| localMaxUseCountPerPathInExpr(program, local, candidate.restored_expr),
         .list,
         .tuple,
         => |items| localMaxUseCountPerPathInExprSpan(program, local, items),
@@ -18813,7 +18813,7 @@ fn discardedExprIsEffectFreeInner(program: *const Ast.Program, expr_id: Ast.Expr
         .uninitialized,
         .uninitialized_payload,
         => true,
-        .static_data_candidate => |candidate| discardedExprIsEffectFreeInner(program, candidate.fallback, active_fns),
+        .static_data_candidate => |candidate| discardedExprIsEffectFreeInner(program, candidate.restored_expr, active_fns),
         .list,
         .tuple,
         => |items| try discardedExprSpanIsEffectFree(program, items, active_fns),
@@ -19013,7 +19013,7 @@ fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: 
         .uninitialized,
         .uninitialized_payload,
         => {},
-        .static_data_candidate => |candidate| scanLocalUseInExpr(program, local, candidate.fallback, scan),
+        .static_data_candidate => |candidate| scanLocalUseInExpr(program, local, candidate.restored_expr, scan),
         .crash, .comptime_exhaustiveness_failed => scan.seen_effect = true,
         .list,
         .tuple,
@@ -19222,7 +19222,7 @@ fn exprMayDemandLocal(program: *const Ast.Program, expr_id: Ast.ExprId, local: A
 fn exprContainsFnRef(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
     return switch (program.exprs.items[@intFromEnum(expr_id)].data) {
         .fn_ref => true,
-        .static_data_candidate => |candidate| exprContainsFnRef(program, candidate.fallback),
+        .static_data_candidate => |candidate| exprContainsFnRef(program, candidate.restored_expr),
         .list,
         .tuple,
         => |items| exprSpanContainsFnRef(program, items),
@@ -19672,17 +19672,6 @@ fn privateStateContainsLocalName(program: *const Ast.Program, value: PrivateStat
             break :blk false;
         },
     };
-}
-
-fn debugExprContainsLocalName(program: *const Ast.Program, expr_id: Ast.ExprId, name: []const u8) bool {
-    return exprContainsLocalName(program, expr_id, name);
-}
-
-fn debugExprSpanContainsLocalName(program: *const Ast.Program, exprs: Ast.Span(Ast.ExprId), name: []const u8) bool {
-    for (program.exprSpan(exprs)) |expr| {
-        if (debugExprContainsLocalName(program, expr, name)) return true;
-    }
-    return false;
 }
 
 fn valueFromProjectedExpr(expr: Ast.ExprId, known_value: KnownValue) Value {

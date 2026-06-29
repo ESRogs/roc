@@ -444,7 +444,7 @@ const Lowerer = struct {
                 } });
             }
         }
-        return try self.lowerExprInto(target, candidate.fallback, next);
+        return try self.lowerExprInto(target, candidate.restored_expr, next);
     }
 
     fn constPlanNeedsStaticData(self: *Lowerer, plan_id: LirProgram.ConstPlanId, layout_idx: layout.Idx) bool {

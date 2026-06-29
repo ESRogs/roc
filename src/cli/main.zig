@@ -6250,8 +6250,6 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) anyerror!void {
     const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
     defer ctx.gpa.free(build_roots);
 
-    const preserve_default_backtrace_frames = args.synthetic_default_platform and args.debug;
-
     reporter.begin("Specializing");
     var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
         ctx.gpa,
@@ -6262,8 +6260,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) anyerror!void {
         .{ .requests = build_roots, .include_static_data_exports = true },
         .{
             .target_usize = target_usize,
-            .inline_mode = postCheckInlineModeForOpt(args.opt, preserve_default_backtrace_frames),
-            .post_check_specialization = postCheckSpecializationForOpt(args.opt, preserve_default_backtrace_frames),
+            .post_check_lowering = postCheckLoweringModeForOpt(args.opt),
             .debug_effects = debugEffectsForOpt(args.opt),
             .list_in_place_map = listInPlaceMapForOpt(args.opt),
             .tag_reachability = tagReachabilityForOpt(args.opt),
@@ -6589,8 +6586,6 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) anyerror!void {
     const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
     defer ctx.gpa.free(build_roots);
 
-    const preserve_default_backtrace_frames = args.synthetic_default_platform and args.debug;
-
     reporter.begin("Specializing");
     var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
         ctx.gpa,
@@ -6601,8 +6596,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) anyerror!void {
         .{ .requests = build_roots, .include_static_data_exports = true },
         .{
             .target_usize = target_usize,
-            .inline_mode = postCheckInlineModeForOpt(args.opt, preserve_default_backtrace_frames),
-            .post_check_specialization = postCheckSpecializationForOpt(args.opt, preserve_default_backtrace_frames),
+            .post_check_lowering = postCheckLoweringModeForOpt(args.opt),
             .debug_effects = debugEffectsForOpt(args.opt),
             .list_in_place_map = listInPlaceMapForOpt(args.opt),
             .tag_reachability = tagReachabilityForOpt(args.opt),
@@ -7472,21 +7466,10 @@ fn cliTestExecutionMode(opt: cli_args.OptLevel) CliTestExecutionMode {
     };
 }
 
-fn postCheckInlineModeForOpt(opt: cli_args.OptLevel, preserve_proc_frames: bool) lir.CheckedPipeline.InlineMode {
-    if (preserve_proc_frames) return .none;
-
-    return switch (opt) {
-        .size, .speed => .wrappers,
-        .dev, .interpreter => .none,
-    };
-}
-
-fn postCheckSpecializationForOpt(opt: cli_args.OptLevel, preserve_proc_frames: bool) lir.CheckedPipeline.PostCheckSpecializationMode {
-    if (preserve_proc_frames) return .off;
-
+fn postCheckLoweringModeForOpt(opt: cli_args.OptLevel) lir.CheckedPipeline.PostCheckLoweringMode {
     return switch (opt) {
         .size, .speed => .optimized,
-        .dev, .interpreter => .off,
+        .dev, .interpreter => .ordinary,
     };
 }
 
@@ -7509,6 +7492,13 @@ fn debugEffectsForOpt(opt: cli_args.OptLevel) lir.CheckedPipeline.DebugEffectMod
         .size, .speed => .erase,
         .dev, .interpreter => .run,
     };
+}
+
+test "post-check lowering mode follows optimization level" {
+    try std.testing.expectEqual(lir.CheckedPipeline.PostCheckLoweringMode.ordinary, postCheckLoweringModeForOpt(.dev));
+    try std.testing.expectEqual(lir.CheckedPipeline.PostCheckLoweringMode.ordinary, postCheckLoweringModeForOpt(.interpreter));
+    try std.testing.expectEqual(lir.CheckedPipeline.PostCheckLoweringMode.optimized, postCheckLoweringModeForOpt(.size));
+    try std.testing.expectEqual(lir.CheckedPipeline.PostCheckLoweringMode.optimized, postCheckLoweringModeForOpt(.speed));
 }
 
 const CliTestRootRun = struct {
@@ -7845,8 +7835,7 @@ fn runCheckedArtifactTests(
         .{ .requests = test_roots },
         .{
             .target_usize = base.target.TargetUsize.native,
-            .inline_mode = postCheckInlineModeForOpt(opt, false),
-            .post_check_specialization = postCheckSpecializationForOpt(opt, false),
+            .post_check_lowering = postCheckLoweringModeForOpt(opt),
             .list_in_place_map = listInPlaceMapForOpt(opt),
             .tag_reachability = tagReachabilityForOpt(opt),
         },
