@@ -13710,21 +13710,20 @@ const BodyContext = struct {
             .block => |block| {
                 const statements = try self.lowerBlockStatements(block.statements);
                 defer self.allocator.free(statements.items);
-                const value = if (statements.diverges)
-                    try self.unreachableAfterDivergentStatementExpr(result_ty)
-                else if (self.checkedExprDiverges(block.final_expr))
-                    try self.lowerDivergentExprAtType(block.final_expr, result_ty)
-                else
-                    try self.lowerExprAtType(block.final_expr, result_ty);
                 return try self.builder.program.addExpr(.{ .ty = state_ty, .data = .{ .block = .{
                     .statements = try self.builder.program.addStmtSpan(statements.items[0..statements.len]),
-                    .final_expr = try self.stateResultAfterValue(state_ty, merge_binders, result_ty, value),
+                    .final_expr = if (statements.diverges)
+                        try self.stateResultAfterValue(
+                            state_ty,
+                            merge_binders,
+                            result_ty,
+                            try self.unreachableAfterDivergentStatementExpr(result_ty),
+                        )
+                    else
+                        try self.lowerExprThenStateResult(block.final_expr, result_ty, state_ty, merge_binders),
                 } } });
             },
-            else => {
-                const value = try self.lowerExprAtType(body, result_ty);
-                return try self.stateResultAfterValue(state_ty, merge_binders, result_ty, value);
-            },
+            else => return try self.lowerExprThenStateResult(body, result_ty, state_ty, merge_binders),
         }
     }
 
@@ -13742,10 +13741,7 @@ const BodyContext = struct {
                 var statements = try self.lowerBlockStatements(block.statements);
                 defer self.allocator.free(statements.items);
                 if (!statements.diverges) {
-                    const final_stmt = try self.builder.program.addStmt(.{ .expr = if (self.checkedExprDiverges(block.final_expr))
-                        try self.lowerDivergentExprAtType(block.final_expr, try self.lowerType(checked_body.ty))
-                    else
-                        try self.lowerExpr(block.final_expr) });
+                    const final_stmt = try self.lowerTailExprStatement(block.final_expr, try self.lowerType(checked_body.ty));
                     try statements.append(self.allocator, final_stmt);
                 }
                 return try self.builder.program.addExpr(.{ .ty = state_ty, .data = .{ .block = .{
@@ -13760,6 +13756,49 @@ const BodyContext = struct {
                     .statements = try self.builder.program.addStmtSpan(&[_]Ast.StmtId{stmt}),
                     .final_expr = try self.stateOnlyTupleExpr(state_ty, merge_binders),
                 } } });
+            },
+        }
+    }
+
+    fn lowerTailExprStatement(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        divergent_ty: Type.TypeId,
+    ) Allocator.Error!Ast.StmtId {
+        const stmt: Ast.Stmt = if (self.checkedExprDiverges(expr_id))
+            .{ .expr = try self.lowerDivergentExprAtType(expr_id, divergent_ty) }
+        else
+            try self.lowerExprStatement(expr_id);
+        return try self.builder.program.addStmt(stmt);
+    }
+
+    fn lowerExprThenStateResult(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        result_ty: Type.TypeId,
+        state_ty: Type.TypeId,
+        merge_binders: []const MergeBinder,
+    ) Allocator.Error!Ast.ExprId {
+        if (self.checkedExprDiverges(expr_id)) return try self.lowerDivergentExprAtType(expr_id, state_ty);
+
+        const expr = self.view.bodies.expr(expr_id);
+        switch (expr.data) {
+            .block => return try self.lowerBodyThenStateResult(expr_id, result_ty, state_ty, merge_binders),
+            .if_ => |if_| {
+                const comptime_site = try self.ifComptimeSite(expr_id, if_);
+                return try self.builder.program.addExpr(.{
+                    .ty = state_ty,
+                    .data = try self.lowerIf(if_, result_ty, state_ty, merge_binders, comptime_site),
+                });
+            },
+            .match_ => |match| return try self.lowerMatchExprWithOutput(match, .{ .state_result = .{
+                .result_ty = result_ty,
+                .state_ty = state_ty,
+                .merge_binders = merge_binders,
+            } }, try self.matchComptimeSite(expr_id, match)),
+            else => {
+                const value = try self.lowerExprAtType(expr_id, result_ty);
+                return try self.stateResultAfterValue(state_ty, merge_binders, result_ty, value);
             },
         }
     }
@@ -14438,10 +14477,7 @@ const BodyContext = struct {
                     lowered_statements[i] = try self.lowerStatement(statement);
                 }
                 if (!statement_diverges) {
-                    lowered_statements[block.statements.len] = try self.builder.program.addStmt(.{ .expr = if (self.checkedExprDiverges(block.final_expr))
-                        try self.lowerDivergentExprAtType(block.final_expr, result_ty)
-                    else
-                        try self.lowerExpr(block.final_expr) });
+                    lowered_statements[block.statements.len] = try self.lowerTailExprStatement(block.final_expr, result_ty);
                 }
                 return try self.builder.program.addExpr(.{ .ty = result_ty, .data = .{ .block = .{
                     .statements = try self.builder.program.addStmtSpan(lowered_statements),
@@ -14479,10 +14515,7 @@ const BodyContext = struct {
                     lowered_statements[i] = try self.lowerStatement(statement);
                 }
                 if (!statement_diverges) {
-                    lowered_statements[block.statements.len] = try self.builder.program.addStmt(.{ .expr = if (self.checkedExprDiverges(block.final_expr))
-                        try self.lowerDivergentExprAtType(block.final_expr, result_ty)
-                    else
-                        try self.lowerExpr(block.final_expr) });
+                    lowered_statements[block.statements.len] = try self.lowerTailExprStatement(block.final_expr, result_ty);
                 }
                 return try self.builder.program.addExpr(.{ .ty = result_ty, .data = .{ .block = .{
                     .statements = try self.builder.program.addStmtSpan(lowered_statements),

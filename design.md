@@ -1358,7 +1358,7 @@ asks for optimized generated code. It is not a target policy, a wasm policy, an
 iterator policy, or a compile-time recovery mechanism. Checking,
 compile-time evaluation, const storage, diagnostics, interpreter preparation,
 and ordinary public-value lowering all remain correct without constructing
-optimized callable-state data. Optimized lowering may consume checked facts and
+optimized callable-state data. Optimized lowering may consume checked output and
 stored constants produced by those stages, but those stages must not create
 private cursor state, demand graphs, or demand-keyed workers just in case a
 later optimized build could use them.
@@ -1836,10 +1836,10 @@ this design. The transition is complete only when the same demand machinery
 explains optimized direct calls, branch results, match results, loop-carried
 state, finite callable alternatives, and public materialization boundaries.
 
-The implementation must prove that transition through compiler-owned facts.
+The implementation must prove that transition through compiler-owned data.
 The first proof is the mode boundary: non-optimized lowering constructs no
 optimized context, and both optimized modes construct the same optimized
-context. Later proofs are shape facts produced by optimized lowering itself:
+context. Later proofs are shape data produced by optimized lowering itself:
 result demand, sparse private state, finite callable alternatives, loop-demand
 fixed points, demand-keyed workers, and explicit materialization boundaries.
 Final wasm size and disassembly may confirm the result, but they are not the

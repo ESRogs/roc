@@ -418,9 +418,11 @@ fn writeFailureContext(
                 @intFromEnum(j.id), @intFromEnum(j.body), @intFromEnum(j.remainder),
             }),
             .jump => |j| context.append(" target={d}", .{@intFromEnum(j.target)}),
-            .assign_ref => |a| context.append(" target={d} op={s} next={d}", .{
-                @intFromEnum(a.target), @tagName(a.op), @intFromEnum(a.next),
-            }),
+            .assign_ref => |a| {
+                context.append(" target={d} op=", .{@intFromEnum(a.target)});
+                appendRefOp(context, a.op);
+                context.append(" next={d}", .{@intFromEnum(a.next)});
+            },
             .set_local => |a| context.append(" target={d} value={d} mode={s} next={d}", .{
                 @intFromEnum(a.target), @intFromEnum(a.value), @tagName(a.mode), @intFromEnum(a.next),
             }),
@@ -553,6 +555,25 @@ fn spanHasLocal(store: *const LirStore, span: LIR.LocalSpan, needle: LIR.LocalId
         if (local == needle) return true;
     }
     return false;
+}
+
+fn appendRefOp(context: *FailureContext, op: LIR.RefOp) void {
+    switch (op) {
+        .local => |src| context.append("local {d}", .{@intFromEnum(src)}),
+        .discriminant => |d| context.append("discriminant {d}", .{@intFromEnum(d.source)}),
+        .field => |f| context.append("field {d}[{d}]", .{ @intFromEnum(f.source), f.field_idx }),
+        .tag_payload => |t| context.append("tag_payload {d} variant={d} payload={d}", .{
+            @intFromEnum(t.source),
+            t.variant_index,
+            t.payload_idx,
+        }),
+        .tag_payload_struct => |t| context.append("tag_payload_struct {d} variant={d}", .{
+            @intFromEnum(t.source),
+            t.variant_index,
+        }),
+        .list_reinterpret => |l| context.append("list_reinterpret {d}", .{@intFromEnum(l.backing_ref)}),
+        .nominal => |n| context.append("nominal {d}", .{@intFromEnum(n.backing_ref)}),
+    }
 }
 
 const ValueId = u32;
@@ -883,23 +904,29 @@ const Certifier = struct {
     /// lenders is live through either path: the holder keeps the moved unit's
     /// allocation alive, and live lenders keep the borrowed-from allocation
     /// alive.
-    fn valueIsLive(self: *const Certifier, state: *const State, value: ValueId) bool {
-        return self.valueIsLiveDepth(state, value, 0);
+    fn valueIsLive(self: *Certifier, state: *const State, value: ValueId) Allocator.Error!bool {
+        var seen = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.values.items.len);
+        defer seen.deinit(self.allocator);
+        return self.valueIsLiveSeen(state, value, &seen);
     }
 
-    fn valueIsLiveDepth(self: *const Certifier, state: *const State, value: ValueId, depth: usize) bool {
-        if (depth > 64) return false;
+    fn valueIsLiveSeen(self: *Certifier, state: *const State, value: ValueId, seen: *std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!bool {
         if (value >= self.values.items.len) return false;
+        const value_index: usize = @intCast(value);
+        if (seen.isSet(value_index)) return false;
+        seen.set(value_index);
+        defer seen.unset(value_index);
+
         const info = self.values.items[value];
         if (info.always_live) return true;
         if (state.balanceOf(value) > 0) return true;
         const holder = state.holderOf(value);
-        if (holder != no_value and self.valueIsLiveDepth(state, holder, depth + 1)) {
+        if (holder != no_value and try self.valueIsLiveSeen(state, holder, seen)) {
             return true;
         }
         if (info.lenders.len == 0) return false;
         for (info.lenders) |lender| {
-            if (!self.valueIsLiveDepth(state, lender, depth + 1)) return false;
+            if (!try self.valueIsLiveSeen(state, lender, seen)) return false;
         }
         return true;
     }
@@ -942,7 +969,7 @@ const Certifier = struct {
             self.diag.context_proc = self.current_proc;
             return self.fail("use of unbound refcounted local {d}", .{@intFromEnum(local)});
         }
-        if (!self.valueIsLive(state, value)) {
+        if (!try self.valueIsLive(state, value)) {
             self.diag.context_local = local;
             self.diag.context_proc = self.current_proc;
             self.describeValueChain(state, value);
@@ -1039,12 +1066,12 @@ const Certifier = struct {
                         } else {
                             summary = .{ .class = .owned, .repr = repr, .balance = @intCast(units), .lender_repr = 0, .condition = no_dense, .condition_mask = 0 };
                         }
-                    } else if (self.valueIsLive(state, value)) {
+                    } else if (try self.valueIsLive(state, value)) {
                         summary = .{
                             .class = .borrowed,
                             .repr = repr,
                             .balance = 0,
-                            .lender_repr = self.liveAnchorRepr(state, value),
+                            .lender_repr = try self.borrowSummaryAnchorRepr(state, value),
                             .condition = no_dense,
                             .condition_mask = 0,
                         };
@@ -1058,13 +1085,49 @@ const Certifier = struct {
     }
 
     /// Returns the dense position anchoring the first unit-carrying (or
-    /// ABI-borrowed) value reached through lender/holder links, for stable
-    /// cross-path naming of where a borrow takes its liveness from.
-    fn liveAnchorRepr(self: *const Certifier, state: *const State, value: ValueId) u32 {
-        const anchor = self.liveAnchorValue(state, value);
+    /// ABI-borrowed) value reached through a borrowed value's lender chain,
+    /// falling back to holder links only when no complete lender chain is
+    /// live. Join summaries use this anchor for borrowed locals, so
+    /// preferring the original lender preserves source-borrow liveness across
+    /// join bodies that release a temporary retained holder before the next
+    /// borrow use.
+    fn borrowSummaryAnchorRepr(self: *Certifier, state: *const State, value: ValueId) Allocator.Error!u32 {
+        const anchor = try self.borrowSummaryAnchorValue(state, value);
         if (anchor == no_value) return 0;
         if (self.repr_scratch.get(anchor)) |repr| return repr;
         return self.denseOf(self.values.items[anchor].origin);
+    }
+
+    fn borrowSummaryAnchorValue(self: *Certifier, state: *const State, value: ValueId) Allocator.Error!ValueId {
+        var seen = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.values.items.len);
+        defer seen.deinit(self.allocator);
+        return self.borrowSummaryAnchorValueSeen(state, value, &seen);
+    }
+
+    fn borrowSummaryAnchorValueSeen(self: *Certifier, state: *const State, value: ValueId, seen: *std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!ValueId {
+        if (value >= self.values.items.len) return no_value;
+        const value_index: usize = @intCast(value);
+        if (seen.isSet(value_index)) return no_value;
+        seen.set(value_index);
+        defer seen.unset(value_index);
+
+        const info = self.values.items[value];
+        if (info.always_live or state.balanceOf(value) > 0) return value;
+        if (info.lenders.len != 0) {
+            var first_anchor: ValueId = no_value;
+            for (info.lenders) |lender| {
+                const anchor = try self.borrowSummaryAnchorValueSeen(state, lender, seen);
+                if (anchor == no_value) {
+                    first_anchor = no_value;
+                    break;
+                }
+                if (first_anchor == no_value) first_anchor = anchor;
+            }
+            if (first_anchor != no_value) return first_anchor;
+        }
+        const holder = state.holderOf(value);
+        if (holder != no_value) return try self.borrowSummaryAnchorValueSeen(state, holder, seen);
+        return no_value;
     }
 
     fn summaryDigest(cursor: LIR.CFStmtId, summary: []const LocalSummary) u64 {
@@ -1710,27 +1773,6 @@ const Certifier = struct {
         return relevant;
     }
 
-    /// Returns a unit-carrying or ABI-borrowed value that keeps this value
-    /// live, reached through holder or lender links, or `no_value` when no
-    /// chain is live.
-    fn liveAnchorValue(self: *const Certifier, state: *const State, value: ValueId) ValueId {
-        return self.liveAnchorValueDepth(state, value, 0);
-    }
-
-    fn liveAnchorValueDepth(self: *const Certifier, state: *const State, value: ValueId, depth: usize) ValueId {
-        if (depth > 64) return no_value;
-        if (value >= self.values.items.len) return no_value;
-        const info = self.values.items[value];
-        if (info.always_live or state.balanceOf(value) > 0) return value;
-        const holder = state.holderOf(value);
-        if (holder != no_value) {
-            const through_holder = self.liveAnchorValueDepth(state, holder, depth + 1);
-            if (through_holder != no_value) return through_holder;
-        }
-        if (info.lenders.len == 0) return no_value;
-        return self.liveAnchorValueDepth(state, info.lenders[0], depth + 1);
-    }
-
     fn maybeUninitializedCondition(record: *const JoinRecord, store: *const LirStore, local: LIR.LocalId) ?PresenceCondition {
         const params = store.getLocalSpan(record.maybe_uninitialized_params);
         const conditions = store.getLocalSpan(record.maybe_uninitialized_conditions);
@@ -1763,8 +1805,7 @@ const Certifier = struct {
         // Extend through borrow anchors: a relevant borrowed local keeps its
         // lender's carrier local live, so the carrier joins the agreement.
         var changed = true;
-        var rounds: usize = 0;
-        while (changed and rounds < 64) : (rounds += 1) {
+        while (changed) {
             changed = false;
             for (self.proc_locals.items) |local| {
                 const local_index = @intFromEnum(local);
@@ -1773,7 +1814,7 @@ const Certifier = struct {
                 const value = state.valueOf(local);
                 if (value == no_value) continue;
                 if (state.balanceOf(value) > 0) continue;
-                const anchor = self.liveAnchorValue(state, value);
+                const anchor = try self.borrowSummaryAnchorValue(state, value);
                 if (anchor == no_value) continue;
                 // Find a carrier local for the anchor value.
                 var carrier: u32 = no_dense;
@@ -1835,12 +1876,12 @@ const Certifier = struct {
                             } else {
                                 summary = .{ .class = .owned, .repr = repr, .balance = @intCast(units), .lender_repr = 0, .condition = no_dense, .condition_mask = 0 };
                             }
-                        } else if (self.valueIsLive(state, value)) {
+                        } else if (try self.valueIsLive(state, value)) {
                             summary = .{
                                 .class = .borrowed,
                                 .repr = repr,
                                 .balance = 0,
-                                .lender_repr = self.liveAnchorRepr(state, value),
+                                .lender_repr = try self.borrowSummaryAnchorRepr(state, value),
                                 .condition = no_dense,
                                 .condition_mask = 0,
                             };
@@ -3170,4 +3211,46 @@ test "certify accepts agreeing jumps through a join" {
     const body = try f.assignStr(value, cond_assign);
     _ = try f.addProc(&.{}, body, .i64);
     try f.certify();
+}
+
+test "certify preserves payload lender when retained holder crosses join" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    const owner = try f.local(f.pair_str);
+    const field = try f.local(.str);
+    const retained_holder = try f.local(f.pair_str);
+    const holder_other = try f.local(.str);
+    const result = try f.local(.i64);
+
+    const join_id = f.freshJoinPointId();
+    const ret = try f.ret(result);
+    const result_assign = try f.assignI64(result, ret);
+    const use_field = try f.store.addCFStmt(.{ .expect = .{
+        .condition = field,
+        .next = result_assign,
+    } });
+    const release_holder = try f.decrefStmt(retained_holder, f.pair_str, use_field);
+    const jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const join_stmt = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = release_holder,
+        .remainder = jump,
+    } });
+    const holder_assign = try f.store.addCFStmt(.{ .assign_struct = .{
+        .target = retained_holder,
+        .fields = try f.store.addLocalSpan(&.{ field, holder_other }),
+        .next = join_stmt,
+    } });
+    const assign_holder_other = try f.assignStr(holder_other, holder_assign);
+    const retain_field = try f.increfStmt(field, .str, assign_holder_other);
+    const field_read = try f.store.addCFStmt(.{ .assign_ref = .{
+        .target = field,
+        .op = .{ .field = .{ .source = owner, .field_idx = 0 } },
+        .next = retain_field,
+    } });
+    _ = try f.addProc(&.{owner}, field_read, .i64);
+
+    const sigs = [_]arc_sig.RcSig{arc_sig.RcSig.all_owned.withBorrowedParam(0)};
+    try f.certifyWith(.{ .sigs = &sigs });
 }

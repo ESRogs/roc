@@ -1892,7 +1892,10 @@ const Lowerer = struct {
                 .next = next,
             } }),
             .static_data_candidate => |candidate| try self.lowerStaticDataCandidateInto(target, candidate, expr_ty, next),
-            .uninitialized, .uninitialized_payload => next,
+            .uninitialized, .uninitialized_payload => try self.result.store.addCFStmt(.{ .init_uninitialized = .{
+                .target = target,
+                .next = next,
+            } }),
             .list => |items| try self.lowerListInto(target, items, next),
             .tuple => |items| try self.lowerTupleInto(target, items, next),
             .record => |fields| try self.lowerRecordInto(target, expr_ty, fields, next),
@@ -4873,7 +4876,10 @@ const Lowerer = struct {
     fn lowerExprsToTemps(self: *Lowerer, exprs: []const Lifted.ExprId) Common.LowerError!LoweredExprLocals {
         const ids = try self.allocator.alloc(LIR.LocalId, exprs.len);
         errdefer self.allocator.free(ids);
-        for (exprs, 0..) |expr_id, i| ids[i] = try self.addTemp(try self.lowerExprTy(expr_id));
+        for (exprs, 0..) |expr_id, i| {
+            const expr_ty = try self.lowerExprTy(expr_id);
+            ids[i] = try self.addTemp(expr_ty);
+        }
         return .{ .exprs = exprs, .ids = ids };
     }
 
@@ -4956,7 +4962,8 @@ const Lowerer = struct {
     }
 
     fn addTemp(self: *Lowerer, ty: Type.TypeId) Common.LowerError!LIR.LocalId {
-        return try self.addLocalForLayout(try self.layoutOfType(ty));
+        const local = try self.addLocalForLayout(try self.layoutOfType(ty));
+        return local;
     }
 
     fn addTempWithSolvedType(

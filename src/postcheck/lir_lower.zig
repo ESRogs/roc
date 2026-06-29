@@ -943,7 +943,10 @@ const Lowerer = struct {
                 .next = next,
             } }),
             .static_data_candidate => |candidate| try self.lowerStaticDataCandidateInto(target, candidate, expr_data.ty, next),
-            .uninitialized, .uninitialized_payload => next,
+            .uninitialized, .uninitialized_payload => try self.result.store.addCFStmt(.{ .init_uninitialized = .{
+                .target = target,
+                .next = next,
+            } }),
             .list => |items| try self.lowerListInto(target, items, next),
             .tuple => |items| try self.lowerTupleInto(target, items, next),
             .record => |fields| try self.lowerRecordInto(target, expr_data.ty, fields, next),
