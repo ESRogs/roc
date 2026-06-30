@@ -114,6 +114,56 @@ sub iter_zig_files {
 
 my @violations;
 
+sub read_file {
+    my ($rel) = @_;
+    my $path = File::Spec->catfile($ROOT, $rel);
+    open my $fh, '<', $path or die "failed to read $rel: $!\n";
+    local $/;
+    my $source = <$fh>;
+    close $fh or die "failed to close $rel: $!\n";
+    return $source;
+}
+
+sub source_slice {
+    my ($source, $start, $end, $label) = @_;
+    my $start_index = index($source, $start);
+    if ($start_index < 0) {
+        push @violations, "$label: missing start marker: $start";
+        return '';
+    }
+    my $after_start = substr($source, $start_index);
+    my $end_index = index($after_start, $end);
+    if ($end_index < 0) {
+        push @violations, "$label: missing end marker: $end";
+        return '';
+    }
+    return substr($after_start, 0, $end_index);
+}
+
+sub check_builtin_iterator_step_shape {
+    my $rel = 'src/build/roc/Builtin.roc';
+    my $source = read_file($rel);
+    my $iter_step = source_slice($source, 'Iter(item) :: {', '# The general unfold.', "$rel:Iter");
+    my $stream_step = source_slice($source, 'Stream(item) :: {', 'from_iter : Iter(item) -> Stream(item)', "$rel:Stream");
+
+    my $iter_expected = 'step : () -> [One({ item : item, rest : Iter(item) }), Skip({ rest : Iter(item) }), Done]';
+    my $stream_expected = 'step! : () => [One({ item : item, rest : Stream(item) }), Skip({ rest : Stream(item) }), Done]';
+
+    if (index($iter_step, $iter_expected) < 0) {
+        push @violations, "$rel:Iter: public Iter step result shape changed or no longer has exactly One/Skip/Done";
+    }
+    if ($iter_step =~ /\bAppend\b/) {
+        push @violations, "$rel:Iter: public Iter step result must not contain Append";
+    }
+
+    if (index($stream_step, $stream_expected) < 0) {
+        push @violations, "$rel:Stream: public Stream step result shape changed or no longer has exactly One/Skip/Done";
+    }
+    if ($stream_step =~ /\bAppend\b/) {
+        push @violations, "$rel:Stream: public Stream step result must not contain Append";
+    }
+}
+
 for my $rel (iter_zig_files()) {
     my $path = File::Spec->catfile($ROOT, $rel);
     open my $fh, '<', $path or die "failed to read $rel: $!\n";
@@ -133,6 +183,8 @@ for my $rel (iter_zig_files()) {
 
     close $fh or die "failed to close $rel: $!\n";
 }
+
+check_builtin_iterator_step_shape();
 
 if (@violations) {
     print "Post-check architecture violations found:\n";

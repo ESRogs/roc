@@ -348,9 +348,9 @@ zig build minici
 
 ## Completion Checklist
 
-- [ ] Architecture checks reject `Append` iterator steps and explicit iterator
+- [x] Architecture checks reject `Append` iterator steps and explicit iterator
       plans.
-- [ ] Architecture checks reject committed trace/debug scaffolding and
+- [x] Architecture checks reject committed trace/debug scaffolding and
       hardcoded local/proc/symbol recognition in optimized lowering.
 - [ ] Optimized callable-state lowering is constructed only for `--opt=size`
       and `--opt=speed`.
@@ -389,7 +389,7 @@ zig build minici
 - [ ] Rocci Bird final `--opt=size` wasm size is recorded.
 - [ ] Rust comparison wasm size is recorded.
 - [ ] Remaining Roc-vs-Rust size gap is explained with disassembly evidence.
-- [ ] `zig build run-test-zig-module-postcheck --summary all --color off`
+- [x] `zig build run-test-zig-module-postcheck --summary all --color off`
       passes.
 - [ ] `zig build run-test-zig-lir-inline --summary all --color off` passes.
 - [ ] `zig build run-test-cli --summary all --color off` passes.

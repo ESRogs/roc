@@ -43,6 +43,10 @@ fn expectContains(haystack: []const u8, needle: []const u8) anyerror!void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
 }
 
+fn expectNotContains(haystack: []const u8, needle: []const u8) anyerror!void {
+    try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
+}
+
 test "Monotype has direct calls and no checked-only expression forms" {
     try std.testing.expect(@hasField(Mono.ExprData, "call_proc"));
     try std.testing.expect(@hasField(Mono.ExprData, "call_value"));
@@ -63,6 +67,23 @@ test "Monotype has no explicit builtin iterator plan storage" {
     try std.testing.expect(!@hasField(Mono.Program, "iter_plans"));
     try std.testing.expect(!@hasDecl(Mono.Program, "addIterPlan"));
     try std.testing.expect(!@hasDecl(Mono.Program, "iterPlan"));
+    try std.testing.expect(!@hasField(Mono.ExprData, "iter_plan"));
+    try std.testing.expect(!@hasField(Mono.ExprData, "stream_plan"));
+    try std.testing.expect(!@hasField(Mono.ExprData, "adapter_chain"));
+
+    try std.testing.expect(!@hasField(Lifted.Program, "iter_plans"));
+    try std.testing.expect(!@hasDecl(Lifted.Program, "addIterPlan"));
+    try std.testing.expect(!@hasDecl(Lifted.Program, "iterPlan"));
+    try std.testing.expect(!@hasField(Lifted.ExprData, "iter_plan"));
+    try std.testing.expect(!@hasField(Lifted.ExprData, "stream_plan"));
+    try std.testing.expect(!@hasField(Lifted.ExprData, "adapter_chain"));
+
+    try std.testing.expect(!@hasField(LambdaMono.Program, "iter_plans"));
+    try std.testing.expect(!@hasDecl(LambdaMono.Program, "addIterPlan"));
+    try std.testing.expect(!@hasDecl(LambdaMono.Program, "iterPlan"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "iter_plan"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "stream_plan"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "adapter_chain"));
 }
 
 test "Monotype types are closed checked types without row tails" {
@@ -198,12 +219,36 @@ test "post-check expression forms do not reintroduce checked-only syntax" {
     }
 }
 
-test "stage expression forms only shrink checked syntax or add runtime encoding forms" {
-    try std.testing.expect(unionFieldCount(Lifted.ExprData) <= unionFieldCount(Mono.ExprData));
-    try std.testing.expect(unionFieldCount(LambdaMono.ExprData) >= unionFieldCount(Lifted.ExprData));
-
+test "Lambda Mono replaces callable source forms with runtime callable encoding forms" {
+    try std.testing.expect(Lifted.ExprData == Mono.ExprData);
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "lambda"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "def_ref"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "fn_def"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "fn_ref"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "fn_ref_captures"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "call_value"));
+    try std.testing.expect(!@hasField(LambdaMono.ExprData, "call_proc"));
     try std.testing.expect(@hasField(LambdaMono.ExprData, "direct_call"));
     try std.testing.expect(@hasField(LambdaMono.ExprData, "callable"));
+    try std.testing.expect(@hasField(LambdaMono.ExprData, "capture_record"));
+    try std.testing.expect(@hasField(LambdaMono.ExprData, "capture_access"));
+    try std.testing.expect(@hasField(LambdaMono.ExprData, "indirect_erased_call"));
+    try std.testing.expect(@hasField(LambdaMono.ExprData, "packed_erased_fn"));
+}
+
+test "optimized callable-state lowering has no debug or hardcoded recognition scaffolding" {
+    const spec_constr_source = @embedFile("monotype_lifted/spec_constr.zig");
+    const optimized_lowering = sourceSliceBetween(spec_constr_source, "const OptimizedContext = struct", "fn unsignedIntLiteral");
+
+    try expectNotContains(optimized_lowering, "traceSpecConstr");
+    try expectNotContains(optimized_lowering, "debugTraceTest");
+    try expectNotContains(optimized_lowering, "created call_proc with local");
+    try expectNotContains(optimized_lowering, "local 22");
+    try expectNotContains(optimized_lowering, "Builtin.Iter.append");
+    try expectNotContains(optimized_lowering, "Builtin.List.iter");
+    try expectNotContains(optimized_lowering, "iter_from_step");
+    try expectNotContains(optimized_lowering, "Rocci");
+    try expectNotContains(optimized_lowering, "wasm4");
 }
 
 test "post-check stage products do not store expression cache state" {
