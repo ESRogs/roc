@@ -41,6 +41,72 @@ Added minimal contract tests:
 - loop-demand references can nest through callable step-result demand without
   requiring materialization or infinite structural expansion
 
+## Reset Guardrails
+
+The previous attempt went off track because implementation pressure started
+producing diagnostics, temporary refinement paths, source-shape repairs, and
+special-case fallbacks before the core contract was fully represented. The rest
+of this plan must be implemented with these guardrails.
+
+Every change starts from the contract, not from Rocci Bird or final wasm size.
+Rocci Bird is the motivating integration case, but it is not the design source
+of truth. If a Rocci Bird failure cannot be explained through `Demand`,
+`KnownValue`, `PrivateState`, `FiniteCallableState`, `LoopDemandNode`,
+`DemandFrame`, or `WorkerKey`, stop and add the missing compiler fact or revise
+the contract before changing lowering.
+
+Every behavior change gets a minimal compiler regression first. The regression
+should use the smallest source or Zig unit shape that proves the invariant:
+capture indexes, loop-demand references, public materialization, scope closure,
+effect order, or ordinary-LIR output. Rocci Bird and disassembly checks come
+after those focused tests, not instead of them.
+
+No implementation step may add a second path to keep progress moving. In
+particular, do not add:
+
+- trace or print debugging committed to the branch
+- hardcoded ids, local numbers, symbol names, proc names, builtin names, wasm
+  details, or Rocci Bird-specific recognition
+- a fallback from optimized lowering to ordinary public-value lowering
+- a cleanup pass that removes wrappers after public-value lowering created them
+- source-form branches for `for`, `if`, `match`, `.iter()`, `.append()`, or
+  `.next`
+- recursive direct-call expansion as a replacement for loop-demand graph nodes
+- nullable optimized fields on ordinary lowering state
+- dense private-state placeholders for omitted children
+- temporary result-refinement or call-rewrite paths whose inputs are not exact
+  compiler data from the target contract
+
+When a test fails, classify the failure before changing code:
+
+- Missing explicit data: add the data to the producing stage and consume it
+  directly.
+- Wrong invariant: fix the invariant and add a regression that would have caught
+  the wrong one.
+- Scope leak: keep the binding inside the owning control region or pass it as an
+  explicit runtime leaf.
+- Demand recursion: represent it through `LoopDemandNode`, not structural
+  expansion or recursive direct-call fallback.
+- Public observation: add materialization demand at the observation boundary.
+- Backend/ARC issue: first prove optimized lowering emitted ordinary
+  scope-closed LIR; only then change ARC or backend code.
+
+If the local fix would need a phrase like "for now", "fallback", "special case",
+"detect", "recognize", "cleanup", or "just inline", stop. Either the target
+contract is missing an explicit fact, or the implementation is in the wrong
+stage.
+
+Each commit should leave the branch in one of two states:
+
+- a pure contract/test/doc checkpoint with no behavior change, or
+- an implementation checkpoint whose new tests pass and whose diff removes any
+  obsolete path it replaces
+
+Do not keep obsolete code beside replacement code unless both are permanent
+public paths described by this plan. Ordinary public-value lowering and
+optimized callable-state lowering are the two permanent paths; everything else
+is suspect until justified by the target contract.
+
 ## Target Contract
 
 The optimized entrypoint owns builder-local optimizer data. That data is not a
@@ -105,6 +171,9 @@ Forbidden shapes:
   lambdas.
 - Add architecture checks that reject any reintroduction of `Append` as an
   iterator step or any explicit iterator-plan IR.
+- Before changing optimizer code, add source scans or structural tests for the
+  forbidden public/private iterator shapes so obsolete representations cannot
+  reappear silently.
 
 ### 2. Mode Gate And Context Ownership
 
@@ -115,6 +184,8 @@ Forbidden shapes:
 - Make optimized helpers require optimized-owned data in their API.
 - Add tests proving dev/check/interpreter/finalization paths construct no
   optimized context and optimized modes enter the same optimized entrypoint.
+- Delete nullable optimized fields from any ordinary lowering state before
+  adding replacement optimized-owned fields elsewhere.
 
 ### 3. Demand Model
 
@@ -127,6 +198,8 @@ Forbidden shapes:
   LIR boundaries.
 - Add tests for nested loop references, field/tuple/tag demand, callable
   result demand, and active-reference closure.
+- Any new demand merge rule must state which exact demand forms it consumes and
+  must not inspect source syntax, proc debug names, or backend output.
 
 ### 4. Known Values And Sparse Private State
 
@@ -142,6 +215,8 @@ Forbidden shapes:
 - Add tests for primitive leaves, single-field records, sparse records, sparse
   tuples, sparse tags, sparse callables, sparse nominals, and public
   materialization.
+- Do not introduce dense placeholder children to satisfy an existing helper.
+  Change the helper to consume sparse identity-keyed state.
 
 ### 5. Finite Callable-State Defunctionalization
 
@@ -155,6 +230,8 @@ Forbidden shapes:
 - Add tests for one target, multiple targets, differing capture counts,
   differing capture indexes, omitted captures, callable reuse after optimized
   call, and public callable crossing.
+- Do not normalize differing capture shapes by building public erased callables
+  unless materialization demand explicitly requires a public callable value.
 
 ### 6. Loop Demand Fixed Points
 
@@ -169,6 +246,9 @@ Forbidden shapes:
 - Add tests for list iterators, iterator append/concat phase changes, runtime
   cursor leaves, mutually recursive loop parameters, source mutable variables,
   `break`, `return`, stream effects, and infinite iterators.
+- If loop demand appears to need unbounded structural expansion, add or use a
+  loop-demand graph reference. Do not cap the expansion or switch to public
+  materialization to terminate it.
 
 ### 7. Control Boundaries
 
@@ -184,6 +264,9 @@ Forbidden shapes:
   LIR reaches ARC.
 - Add tests for if-joined state, match-joined state, branch-local payloads,
   pending lets, and scope-closed private-state bodies.
+- Do not repair branch or match failures by adding special splitting code under
+  leaf demand. The same demand-frame mechanism must handle every control
+  boundary.
 
 ### 8. Demand-Keyed Direct-Call Workers
 
@@ -196,6 +279,9 @@ Forbidden shapes:
 - Add tests proving worker creation in both optimized modes, no worker creation
   in non-optimized modes, deterministic worker reuse, and public call
   correctness without workers.
+- A worker key is not complete until it includes every fact that can affect
+  generated behavior. If two calls need different code, add the missing fact to
+  `WorkerKey` instead of adding a side condition at the call site.
 
 ### 9. Public Boundaries And Effects
 
@@ -219,6 +305,8 @@ effect ordering, and custom unbounded iterators.
 - Keep ARC and backends limited to ordinary LIR and explicit RC statements.
 - Add source scans or architecture checks proving backend and ARC code do not
   contain iterator, stream, private-cursor, demand, or worker-key concepts.
+- Do not use ARC, backend output, wasm disassembly, or Binaryen output to
+  recover missing optimized-lowering data.
 
 ### 11. Rocci Bird And Rust Validation
 
@@ -262,12 +350,16 @@ zig build minici
 
 - [ ] Architecture checks reject `Append` iterator steps and explicit iterator
       plans.
+- [ ] Architecture checks reject committed trace/debug scaffolding and
+      hardcoded local/proc/symbol recognition in optimized lowering.
 - [ ] Optimized callable-state lowering is constructed only for `--opt=size`
       and `--opt=speed`.
 - [ ] Non-optimized paths construct zero optimized demand/private-state/worker
       data.
 - [ ] Result demand is explicit compiler data everywhere optimized lowering
       needs it.
+- [ ] Every optimizer behavior change has a focused compiler regression before
+      Rocci Bird validation.
 - [ ] Loop-carried demand is represented by graph nodes and reaches a fixed
       point over body observations and reachable `continue` edges.
 - [ ] Loop-demand references are closed or resolved before worker,
@@ -282,6 +374,8 @@ zig build minici
 - [ ] Private-state bodies are scope-closed before LIR.
 - [ ] Demand is threaded through fields, tuples, tags, callables, direct calls,
       branches, matches, and loops.
+- [ ] No implementation step relies on source-form rules, target rules,
+      generated names, disassembly, or post-lowering cleanup.
 - [ ] Public iterator reuse and public materialization boundaries are correct.
 - [ ] Stream effect ordering is correct.
 - [ ] Infinite iterator examples work.
