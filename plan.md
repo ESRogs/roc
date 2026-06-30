@@ -229,6 +229,12 @@ When a test fails, classify the failure before changing code:
 - Fixed-point non-convergence: reduce to a demand-graph regression, then fix
   demand normalization, reference closure, ordering, or equality. Do not add
   caps, cutoffs, source-specific exits, or public materialization.
+- Stale demanded product: reduce to a value whose normalized demand grows after
+  a sparse private product has already been derived. The fix is to connect the
+  demand owner to the original producer and rebuild the demanded product from
+  that producer. Do not refresh missing fields or captures from the sparse
+  product, insert placeholders, or move the repair to the call/materialization
+  site.
 - Generated-scope leak: reduce to the smallest private-state body that
   references a generated local outside its owning control region. The fix is to
   make the owner frame expose that local explicitly while cloning the region, or
@@ -530,6 +536,44 @@ ordinary public value for a direct-call, hosted-call, or backend-visible
 boundary. The fix must not be in `materialize`, must not force a late direct
 call inline, and must not treat structural `record` demand as equivalent to a
 public runtime value.
+
+After adding the producer fact that call-value wrappers are optimized-inline
+eligible but not materialize-inline eligible, the same focused regression moves
+past the public `Iter.next` boundary and reaches:
+
+```text
+postcheck invariant violated: sparse private callable was missing a demanded capture
+```
+
+Expected failure class: callable capture demand propagation. The direct wrapper
+fact exposes the real `(iterator.step)()` callable call under exact result
+demand, but the private callable value being called does not carry every
+capture that the callee body demands under that result demand. The next producer
+fact must connect callable result demand to demanded capture indexes before the
+callable is split into sparse private state. The fix must not manufacture a
+capture during the call, widen all callables to dense public capture lists, or
+materialize the public callable to recover omitted captures.
+
+The follow-up lesson is that sparse private state is a derived product, not a
+source of truth. If a later exact demand grows after a loop entry, callable, or
+record has already been split, the compiler must invalidate the derived sparse
+product and rebuild it from the original producer value under the normalized
+new demand. It must not try to "refresh" missing fields or captures from the
+sparse value itself; omitted state is intentionally absent and cannot be
+recovered locally. A fix that makes progress only by re-reading an already
+sparse `KnownValue`, adding an uninitialized placeholder, or letting the call
+site request a missing capture is still consuming stale producer data.
+
+This means every demand-fixed-point change must identify both sides of the
+contract before implementation:
+
+- the demand owner that is allowed to grow the normalized demand graph
+- the original value producer that can rebuild the demanded private/public
+  product after that growth
+
+If either side is missing, stop and add that explicit data first. Do not make
+the consumer infer ownership from stack position, state-array index, source
+shape, or the current sparse product.
 
 ## Target Contract
 
