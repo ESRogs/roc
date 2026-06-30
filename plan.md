@@ -64,6 +64,16 @@ propagation begins, and those decisions are ordinary checked compiler data.
 If a wrapper only becomes visible after public-value LIR has already been
 created, the producer stage is incomplete.
 
+A follow-up failure made the same lesson sharper: solved-inline wrapper facts
+are not a global permission to inline a call anywhere. They are producer facts
+for optimized lowering under an exact demand. Consuming the same fact again
+later in `SolvedLirLower`, or consuming it in a plain materialization context,
+can erase useful destination-passing and `Box` update boundaries after the
+stage that could have represented them explicitly. The fix must make wrapper
+facts single-stage and demand-contextual: structured-demand lowering may use a
+transparent wrapper to see the real producer, but late public-value lowering
+must not rediscover and inline that wrapper as a cleanup step.
+
 The same failure also exposed demand fixed-point fragility. A fixed point has
 not grown merely because the next iteration allocated a fresh demand node,
 reordered equivalent entries, or preserved different temporary provenance.
@@ -122,6 +132,11 @@ When a test fails, classify the failure before changing code:
   scope-closed LIR; only then change ARC or backend code.
 - Late wrapper exposure: move explicit solved-inline wrapper data to optimized
   lowering before demand propagation; do not rely on late LIR inline cleanup.
+- Wrapper-context leak: if a solved-inline wrapper fact inlines a public
+  materialization boundary or destroys a destination/`Box` update opportunity,
+  the fact is being consumed in the wrong context or stage. Move the decision
+  to structured-demand lowering or add the missing destination fact there; do
+  not repair the resulting LIR afterward.
 - Fixed-point non-convergence: reduce to a demand-graph regression, then fix
   demand normalization, reference closure, ordering, or equality. Do not add
   caps, cutoffs, source-specific exits, or public materialization.
@@ -168,6 +183,11 @@ following for the section just changed:
 - any new fixed-point loop is proved by a regression that converges because the
   demand graph is semantically stable, not because an iteration limit or
   fallback path stops it
+- solved-inline wrapper facts have exactly one optimized consumer for the
+  behavior being changed; if both `spec_constr` and `SolvedLirLower` can inline
+  the same source wrapper, there must be a focused regression proving that the
+  later consumer cannot erase a destination-passing, `Box`, ARC, or private
+  state boundary
 
 Do not check off a Rocci Bird item until the focused compiler tests for the
 underlying invariant have passed. Do not check off a compiler invariant because
