@@ -2,153 +2,202 @@
 
 ## Goal
 
-Implement optimized callable-state lowering as the single long-term design for
-turning Roc `Iter`, `Stream`, and other callable-state values into tight
-generated code in optimized builds.
+Implement optimized callable-state lowering as the compiler's single design for
+turning Roc `Iter`, `Stream`, and other callable-state values into tight code in
+optimized builds.
 
-The generated-code target is Rust-like iterator lowering: private cursor state,
-direct stepping, no heap allocation for adapter wrappers in consuming hot paths,
-and no public wrapper churn when the source program does not observe the public
-value. Roc keeps its public API. `Iter(item)` and `Stream(item)` remain ordinary
-concrete Roc records whose step fields are ordinary Roc lambdas. The optimizer
-uses checked identities, lambda-set facts, captures, known values, layouts, and
-explicit result demand to specialize code during optimized lowering.
+The target generated shape is Rust-like iterator lowering: private cursor
+state, direct stepping, no heap allocation for adapter wrappers in consuming
+hot paths, no unobserved public length-hint work, and ordinary LIR before ARC.
+Roc does not adopt Rust's public typing model. `Iter(item)` and `Stream(item)`
+remain concrete public Roc records whose step fields are ordinary Roc lambdas.
+The optimizer uses existing lambda-set data, captures, known values, exact
+result demand, and loop-demand graph nodes to reach the private cursor shape.
 
-This optimizer runs only for Roc `--opt=size` and `--opt=speed`. Every other
-mode uses ordinary public-value lowering and constructs no optimized demand
-graphs, sparse private-state tables, loop fixed-point nodes, or demand-keyed
-workers.
+This optimizer runs only for `--opt=size` and `--opt=speed`. Every other mode
+uses ordinary public-value lowering and constructs no optimized demand graphs,
+sparse private-state tables, loop fixed-point nodes, or demand-keyed workers.
 
-## Required Architecture
+## Current Checkpoint
 
-The post-check driver chooses one lowering family before constructing lowering
-state:
+The debug and experimental WIP paths have been removed. The remaining direction
+is the target design, not a fallback plan.
 
-```text
-ordinary public-value lowering
-optimized callable-state lowering
-```
+Deleted or verified absent:
 
-Ordinary lowering owns materialization of public Roc values. Optimized lowering
-owns result demand, sparse private state, finite callable alternatives,
-loop-demand fixed points, and demand-keyed workers. LIR, ARC, interpreters,
-LLVM, wasm, Binaryen, and linkers see only ordinary LIR after lowering.
+- trace/debug instrumentation for specialization debugging
+- hardcoded local-id tripwires
+- compact-result demand-refinement experiments
+- leaf conditional splitting fallback logic
+- public or private `Append` step variants
+- explicit iterator-plan or stream-plan IR
+- source-form optimization rules for `for`, `if`, `match`, `Iter.append`, or
+  `Stream.next!`
+- recursive direct-call fallback as a substitute for loop-demand graph nodes
 
-The optimizer is producer-under-demand lowering:
+Added minimal contract tests:
 
-1. A consumer creates exact result demand.
-2. The producer is cloned under that demand.
-3. Known records, tuples, tags, nominals, primitive leaves, direct calls, and
-   callable values expose only the demanded data.
-4. Finite callable targets are defunctionalized into private alternatives.
-5. Loops solve recursive carried demand as graph fixed points.
-6. Public values are materialized only when source code observes the public
-   representation.
+- finite callable private state preserves differing demanded capture indexes
+- loop-demand references can nest through callable step-result demand without
+  requiring materialization or infinite structural expansion
 
-There is no iterator-specific IR, no public or private `Append` step variant,
-no source-form optimization rule, no late cleanup pass, and no target-specific
-rule for wasm or Rocci Bird.
+## Target Contract
 
-## Invariants
+The optimized entrypoint owns builder-local optimizer data. That data is not a
+stored public IR stage and must not escape into LIR, ARC, interpreters, LLVM,
+wasm, Binaryen, or linkers.
 
-- `Iter` and `Stream` have the public three-step shape: `One`, `Skip`, `Done`.
-- Ordinary Roc lambdas and existing lambda-set data are the only private
-  adapter-shape source.
-- Result demand is explicit data owned by optimized lowering.
-- Private state is sparse and keyed by checked child identity.
-- Missing sparse children mean "not carried"; unknown-but-carried children are
-  explicit runtime leaves.
-- Primitive demanded values optimize without requiring aggregate wrappers.
-- Loop-carried demand is represented by loop graph nodes, not recursive finite
-  trees.
-- Runtime leaves are loop parameters, not finite-state dimensions.
-- Public materialization is explicit and preserves public Roc immutability.
-- `dbg`, `expect`, `crash`, branch conditions, scrutinees, guards, appended
-  item expressions, stream effects, `break`, and `return` keep checked source
-  order.
-- Optimized workers are keyed by exact compiler data and are created only in
-  optimized modes.
-- Private-state bodies are scope-closed before ARC.
-- ARC follows explicit LIR reference-count statements and does not know
-  iterator, stream, callable-state, or private-cursor rules.
+Required internal data:
 
-## Implementation Steps
+- `Demand`: exact continuation use of a value, including materialization,
+  runtime leaves, fields, tuple items, nominal backing data, tag alternatives
+  and payloads, callable captures and results, direct-call results, and
+  loop-carried values.
+- `KnownValue`: checked producer structure, including primitive leaves,
+  records, tuples, tags, nominals, finite callable targets, and finite tag
+  choices.
+- `PrivateState`: optimized-only state with sparse demanded children. Missing
+  children mean not carried. Present unknown children mean carried runtime
+  leaves.
+- `FiniteCallableState`: ordinary lambda-set target data plus demanded captures
+  by original capture index. Alternatives may have different capture shapes.
+- `LoopDemandNode`: graph identity for recursive loop-carried demand. A nested
+  demand may refer back to a loop parameter while the owning fixed point is
+  active; references must be resolved or closed before crossing worker,
+  public-materialization, or LIR boundaries.
+- `DemandFrame`: the transient producer-consumer boundary while cloning under
+  demand, including the checked control scope that owns any locals introduced
+  while satisfying that demand.
+- `WorkerKey`: exact compiler data for optimized direct-call workers: callee
+  identity, split argument facts, split capture facts, result demand, and
+  relevant type/layout decisions.
 
-### 1. Mode Gate And Context Ownership
+Output:
 
-- Compute the lowering family once at the post-check driver boundary from
-  explicit Roc optimization mode.
-- Construct either ordinary lowering state or optimized lowering state, never a
-  shared context with nullable optimized fields.
-- Make optimized-only helpers require optimized-owned data in their API.
-- Prove dev/check/interpreter/compile-time-finalization paths construct zero
-  optimized contexts and zero optimized-owned nodes.
-- Prove `--opt=size` and `--opt=speed` enter the same optimized entrypoint and
-  produce the same optimizer-owned facts before backend preferences.
+- ordinary scope-closed LIR only
+- explicit LIR ARC statements only
+- no iterator, stream, private-cursor, demand, worker-key, or loop-demand-node
+  concepts in LIR, ARC, or backend code
 
-### 2. Result Demand And Sparse Private State
+Forbidden shapes:
 
-- Represent demand for materialization, runtime leaves, record fields, tuple
-  items, nominal backing data, tag choices and payloads, callable calls and
-  captures, direct-call results, and loop-carried values.
+- public or compiler-private `Append` step variants
+- explicit iterator plans, stream plans, or adapter-chain IR
+- source-form rewrites for `for`, `if`, `match`, `Iter.append`, or
+  `Stream.next!`
+- target, wasm, Rocci Bird, generated-symbol, object-byte, or disassembly
+  recognition rules
+- late cleanup passes after public-value lowering
+- state-count, size-count, or "try optimized then fall back" cutoffs
+- dense private state that cannot distinguish omitted children from carried
+  unknown children
+- hidden mutation of public iterator, stream, callable, or source mutable values
+
+## Implementation Plan
+
+### 1. Preserve The Public Model
+
+- Keep public `Iter` and `Stream` as the three-step shape: `One`, `Skip`,
+  `Done`.
+- Keep `len_if_known` as a public field that is demanded only when source code
+  observes it.
+- Keep adapter construction in Roc source as ordinary records and ordinary
+  lambdas.
+- Add architecture checks that reject any reintroduction of `Append` as an
+  iterator step or any explicit iterator-plan IR.
+
+### 2. Mode Gate And Context Ownership
+
+- Compute the post-check lowering family once from explicit build mode.
+- Construct ordinary public-value lowering for all non-optimized modes.
+- Construct optimized callable-state lowering only for `--opt=size` and
+  `--opt=speed`.
+- Make optimized helpers require optimized-owned data in their API.
+- Add tests proving dev/check/interpreter/finalization paths construct no
+  optimized context and optimized modes enter the same optimized entrypoint.
+
+### 3. Demand Model
+
+- Make result demand explicit at every optimized producer-consumer boundary.
+- Represent materialization, runtime leaves, records, tuples, nominals, tags,
+  callables, direct-call results, and loop-carried values.
 - Merge demand deterministically and exactly.
-- Store demanded children sparsely by checked identity.
-- Treat public layouts as materialization data only.
-- Add focused tests for primitive state, single-field-record state, sparse
-  records, sparse tuples, sparse tags, sparse callables, sparse nominals, and
-  explicit materialization.
+- Keep recursive loop demand as graph references, not copied trees.
+- Close or resolve loop-demand references before worker, materialization, or
+  LIR boundaries.
+- Add tests for nested loop references, field/tuple/tag demand, callable
+  result demand, and active-reference closure.
 
-### 3. Producer-Under-Demand Cloning
+### 4. Known Values And Sparse Private State
 
-- Thread demand through field access, tuple access, tag matches, callable calls,
-  direct calls, branches, matches, pending lets, and loops.
-- Preserve source evaluation order by keeping condition, guard, payload, and
-  pending-let scopes inside the cloned region that owns their locals.
-- Materialize only when the active demand says the public Roc value is observed.
-- Reject any optimized private-state body that references an out-of-scope
-  local before LIR reaches ARC.
-- Add tests for branch/match demand merging, public materialization after a
-  private value, and equivalent source forms optimizing from facts rather than
-  syntax.
+- Treat primitive known leaves as first-class. A primitive loop cursor must
+  optimize equivalently to a single-field record wrapping that primitive.
+- Store demanded children sparsely by checked identity: record field name,
+  tuple item index, tag payload index, nominal backing value, and callable
+  capture index.
+- Preserve the difference between omitted children and carried unknown
+  children.
+- Convert sparse private state to public values only at explicit
+  materialization boundaries.
+- Add tests for primitive leaves, single-field records, sparse records, sparse
+  tuples, sparse tags, sparse callables, sparse nominals, and public
+  materialization.
 
-### 4. Finite Callable-State Defunctionalization
+### 5. Finite Callable-State Defunctionalization
 
-- Preserve finite lambda-set alternatives under callable demand.
-- Inline one known target directly.
-- Dispatch over multiple known targets without widening to public callables
-  merely because capture shapes differ.
-- Carry only demanded captures as private state.
-- Materialize public callables only at explicit public boundaries.
-- Add tests for one target, multiple targets, differing capture counts, omitted
-  captures, callable reuse after optimized call, and public callable crossing.
+- Use existing lambda-set data as the only source of finite callable targets.
+- Carry demanded captures by original capture index.
+- Inline a single known target directly when demand and scope allow it.
+- Dispatch over multiple known targets without widening to a public erased
+  callable merely because capture shapes differ.
+- Keep callable alternatives private until source code observes a public
+  callable boundary.
+- Add tests for one target, multiple targets, differing capture counts,
+  differing capture indexes, omitted captures, callable reuse after optimized
+  call, and public callable crossing.
 
-### 5. Loop Demand Fixed Points
+### 6. Loop Demand Fixed Points
 
 - Represent loop-parameter demand with explicit graph nodes owned by the loop
   fixed point.
 - Merge body observations and reachable `continue` edges monotonically.
-- Clone loop initial values and `continue` values under final fixed-point
-  demand.
-- Recompute provisional edge clones when demand grows.
-- Carry runtime leaves as state parameters.
-- Keep unobserved fields such as `len_if_known` out of private stepping loops.
+- Reclone provisional edge values when demand grows.
+- Carry runtime leaves as loop parameters, not finite-state dimensions.
+- Keep known tag/callable choices as finite private states only when demanded.
+- Keep branch, match, guard, stream effect, `dbg`, `expect`, `crash`,
+  `break`, and `return` order exactly as checked source requires.
 - Add tests for list iterators, iterator append/concat phase changes, runtime
-  cursor leaves, mutually recursive loop parameters, `break`, `return`, source
-  mutable variables, stream effects, and infinite iterator examples.
+  cursor leaves, mutually recursive loop parameters, source mutable variables,
+  `break`, `return`, stream effects, and infinite iterators.
 
-### 6. Demand-Keyed Direct-Call Workers
+### 7. Control Boundaries
+
+- Treat branches, matches, loops, and direct calls as the same
+  producer-under-demand mechanism.
+- Do not add source-specific rules for `if`, `match`, `for`, or iterator
+  builtins.
+- Keep branch-local and match-payload locals inside the cloned region that owns
+  them.
+- If a demanded private value crosses a control boundary, pass the needed value
+  as an explicit runtime leaf or keep the binding inside the state body.
+- Reject any private-state body that references an out-of-scope local before
+  LIR reaches ARC.
+- Add tests for if-joined state, match-joined state, branch-local payloads,
+  pending lets, and scope-closed private-state bodies.
+
+### 8. Demand-Keyed Direct-Call Workers
 
 - Create optimized workers only while cloning a call under explicit optimized
   demand.
-- Key workers by callee identity, split argument facts, result demand, and
-  relevant type/layout decisions.
+- Key workers by callee identity, split argument facts, split capture facts,
+  result demand, and relevant type/layout decisions.
 - Keep the original public-ABI body available.
 - Share workers only when all correctness-relevant facts match.
 - Add tests proving worker creation in both optimized modes, no worker creation
-  in dev mode, public call correctness without workers, and deterministic worker
-  reuse.
+  in non-optimized modes, deterministic worker reuse, and public call
+  correctness without workers.
 
-### 7. Public Boundaries And Effects
+### 9. Public Boundaries And Effects
 
 Materialize public values when source code observes them, including:
 
@@ -156,22 +205,22 @@ Materialize public values when source code observes them, including:
 - reading `len_if_known`
 - directly matching on public `Iter.next` or `Stream.next!`
 - returning, storing, or passing a callable through a public/erased boundary
+- storing private candidates in records or lists that source later observes
 
-Add public-boundary tests for iterator reuse, storing in records/lists, passing
+Add tests for iterator reuse, storing iterators in records/lists, passing
 through unspecialized code, direct public `next` matches, length hints, stream
 effect ordering, and custom unbounded iterators.
 
-### 8. Generic LIR, ARC, And Backends
+### 10. Lower To Ordinary LIR
 
-- Lower private state machines to ordinary LIR joins, blocks, switches, calls,
-  and jumps.
-- Validate scope closure before ARC insertion.
-- Keep LIR, ARC, LirImage, interpreters, LLVM, object, wasm, Binaryen, and
-  linkers free of iterator/stream/private-cursor rules.
-- Add source scans or focused tests proving backend and ARC code do not know
-  this optimizer's private concepts.
+- Lower private state machines to ordinary joins, blocks, switches, calls, and
+  jumps.
+- Ensure every state body is scope-closed before ARC insertion.
+- Keep ARC and backends limited to ordinary LIR and explicit RC statements.
+- Add source scans or architecture checks proving backend and ARC code do not
+  contain iterator, stream, private-cursor, demand, or worker-key concepts.
 
-### 9. Rocci Bird And Rust Validation
+### 11. Rocci Bird And Rust Validation
 
 Build and record:
 
@@ -209,49 +258,34 @@ the targeted section passes.
 zig build minici
 ```
 
-Rocci Bird validation uses identical wasm and Binaryen tooling for `.iter()`
-and direct-list Roc builds so the comparison isolates compiler behavior.
-
 ## Completion Checklist
 
-- [x] Public `Iter`/`Stream` use the three-step shape.
-- [x] Public `Append` step variant is absent.
-- [x] Iterator-plan IR is absent.
-- [x] Pipeline has an explicit optimized post-check mode.
-- [x] Primitive known-value leaves exist.
-- [x] Private state-loop IR exists before LIR.
-- [x] State loops lower to ordinary LIR joins/blocks.
-- [x] Generic ARC forward-sibling-join behavior has focused coverage.
-- [x] Optimized callable-state specialization is entered only for `--opt=size`
+- [ ] Architecture checks reject `Append` iterator steps and explicit iterator
+      plans.
+- [ ] Optimized callable-state lowering is constructed only for `--opt=size`
       and `--opt=speed`.
-- [x] Non-optimized paths construct zero optimized demand/private-state/worker
+- [ ] Non-optimized paths construct zero optimized demand/private-state/worker
       data.
-- [x] Ordinary lowering has no dormant optimized fields.
-- [x] Optimized-only helpers require an optimized context.
-- [x] No deeper helper independently checks target/backend/source facts to
-      enable callable-state specialization.
 - [ ] Result demand is explicit compiler data everywhere optimized lowering
       needs it.
-- [ ] Every optimized-shape regression runs in both optimized modes.
+- [ ] Loop-carried demand is represented by graph nodes and reaches a fixed
+      point over body observations and reachable `continue` edges.
+- [ ] Loop-demand references are closed or resolved before worker,
+      materialization, and LIR boundaries.
 - [ ] Primitive demanded values optimize without aggregate wrapping.
 - [ ] Primitive and single-field-record loop state optimize equivalently.
 - [ ] Sparse private state distinguishes omitted children from
       unknown-but-carried children.
-- [ ] Sparse private state is used for loop construction.
-- [ ] Public materialization is explicit.
-- [ ] Private state bodies are scope-closed before LIR.
-- [ ] Demand is threaded through fields, tuples, tags, callables, direct calls,
-      branches, matches, and loops.
 - [ ] Finite callable alternatives remain finite across differing capture
       shapes.
-- [ ] Loop demand is a graph fixed point over observations and reachable
-      `continue` edges.
-- [ ] Runtime leaves are state parameters, not state dimensions.
-- [ ] Demand-keyed direct-call workers are created only in optimized modes.
+- [ ] Public materialization is explicit.
+- [ ] Private-state bodies are scope-closed before LIR.
+- [ ] Demand is threaded through fields, tuples, tags, callables, direct calls,
+      branches, matches, and loops.
 - [ ] Public iterator reuse and public materialization boundaries are correct.
 - [ ] Stream effect ordering is correct.
 - [ ] Infinite iterator examples work.
-- [ ] LIR, ARC, and backends contain no iterator/stream-specific logic.
+- [ ] LIR, ARC, and backends contain no iterator/stream/private-cursor logic.
 - [ ] Focused iterator allocation/control-flow regressions pass.
 - [ ] Rocci Bird `.iter()` and direct-list collision loops have equivalent
       optimized hot-path disassembly.
@@ -261,29 +295,8 @@ and direct-list Roc builds so the comparison isolates compiler behavior.
 - [ ] Rocci Bird final `--opt=size` wasm size is recorded.
 - [ ] Rust comparison wasm size is recorded.
 - [ ] Remaining Roc-vs-Rust size gap is explained with disassembly evidence.
-- [ ] Rocci Bird optimized-mode compiler cost and optimizer-node counts are
-      recorded.
 - [ ] `zig build run-test-zig-module-postcheck --summary all --color off`
       passes.
 - [ ] `zig build run-test-zig-lir-inline --summary all --color off` passes.
 - [ ] `zig build run-test-cli --summary all --color off` passes.
 - [ ] `zig build minici` passes.
-- [ ] Stable compiler changes are committed and pushed in small checkpoints.
-
-## Forbidden Shapes
-
-- No explicit iterator plans.
-- No public or compiler-private `Append` step variant.
-- No source-form rule for `for`, `if`, or `match`.
-- No Rocci Bird, wasm, generated-symbol, object-byte, disassembly, or backend
-  output rule.
-- No trait/interface encoding for `Iter`.
-- No adapter-chain encoding in public Roc types.
-- No hidden mutation of public iterator or stream values.
-- No reference-count uniqueness test for iterator optimization.
-- No late cleanup pass after public-value lowering.
-- No optimized callable-state specialization in dev, interpreter, `roc check`,
-  compile-time finalization, or non-optimized build modes.
-- No state-count cutoff, size cutoff, or other optimization heuristic.
-- No private state body may reference a local that is not bound in that body or
-  passed as an explicit state parameter.

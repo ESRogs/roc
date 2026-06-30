@@ -26919,6 +26919,85 @@ test "demanded known value products preserve sparse callable capture indexes" {
     try std.testing.expectEqual(@as(u32, 2), products[1][0].callable.captures[0].index);
 }
 
+test "finite callable private state preserves differing demanded capture indexes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const callable_ty: Type.TypeId = @enumFromInt(132);
+    const first_ty: Type.TypeId = @enumFromInt(133);
+    const second_ty: Type.TypeId = @enumFromInt(134);
+    const fourth_ty: Type.TypeId = @enumFromInt(135);
+    const first_fn: Ast.FnId = @enumFromInt(10);
+    const second_fn: Ast.FnId = @enumFromInt(11);
+    const first_captures = [_]DemandedKnownIndexedValue{
+        .{ .index = 0, .known_value = .{ .leaf = first_ty } },
+        .{ .index = 3, .known_value = .{ .any = fourth_ty } },
+    };
+    const second_captures = [_]DemandedKnownIndexedValue{
+        .{ .index = 1, .known_value = .{ .leaf = second_ty } },
+    };
+    const alternatives = [_]DemandedKnownCallable{
+        .{
+            .ty = callable_ty,
+            .fn_id = first_fn,
+            .captures = &first_captures,
+        },
+        .{
+            .ty = callable_ty,
+            .fn_id = second_fn,
+            .captures = &second_captures,
+        },
+    };
+    const finite = DemandedKnownValue{ .finite_callables = .{
+        .ty = callable_ty,
+        .alternatives = &alternatives,
+    } };
+    const roots = [_]DemandedKnownValue{finite};
+
+    try std.testing.expectEqual(@as(usize, 2), demandedKnownValuePrivateStateParamCount(finite));
+    try std.testing.expectEqual(@as(usize, 4), demandedKnownValueArgCount(finite));
+
+    const products = try demandedKnownValueProducts(std.testing.allocator, arena.allocator(), &roots);
+
+    try std.testing.expectEqual(@as(usize, 2), products.len);
+    try std.testing.expectEqual(first_fn, products[0][0].callable.fn_id);
+    try std.testing.expectEqual(@as(usize, 2), products[0][0].callable.captures.len);
+    try std.testing.expectEqual(@as(u32, 0), products[0][0].callable.captures[0].index);
+    try std.testing.expectEqual(@as(u32, 3), products[0][0].callable.captures[1].index);
+    try std.testing.expectEqual(second_fn, products[1][0].callable.fn_id);
+    try std.testing.expectEqual(@as(usize, 1), products[1][0].callable.captures.len);
+    try std.testing.expectEqual(@as(u32, 1), products[1][0].callable.captures[0].index);
+}
+
+test "loop demand references nest through callable step demand" {
+    const step_field: names.RecordFieldNameId = @enumFromInt(50);
+    const one_tag: names.TagNameId = @enumFromInt(51);
+    const done_tag: names.TagNameId = @enumFromInt(52);
+    const item_demand: ValueDemand = .materialize;
+    const rest_demand: ValueDemand = .{ .loop_param = 0 };
+    const one_payloads = [_]ItemDemand{
+        .{ .index = 0, .demand = &item_demand },
+        .{ .index = 1, .demand = &rest_demand },
+    };
+    const step_alternatives = [_]TagAlternativeDemand{
+        .{ .name = one_tag, .payloads = &one_payloads },
+        .{ .name = done_tag, .payloads = &.{} },
+    };
+    const step_result_demand = ValueDemand{ .tag = .{ .alternatives = &step_alternatives } };
+    const step_callable_demand = ValueDemand{ .callable = .{
+        .captures = &.{},
+        .result = &step_result_demand,
+    } };
+    const iter_fields = [_]FieldDemand{
+        .{ .name = step_field, .demand = &step_callable_demand },
+    };
+    const iter_demand = ValueDemand{ .record = &iter_fields };
+
+    try std.testing.expect(valueDemandContainsActiveRef(iter_demand));
+    try std.testing.expect(valueDemandEql(null, .{ .loop_param = 0 }, .{ .loop_param = 0 }));
+    try std.testing.expect(!valueDemandEql(null, .{ .loop_param = 0 }, .{ .loop_param = 1 }));
+}
+
 test "demanded known value private state param count ignores identity-only state" {
     const tag_ty: Type.TypeId = @enumFromInt(140);
     const callable_ty: Type.TypeId = @enumFromInt(141);

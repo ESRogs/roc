@@ -1445,6 +1445,53 @@ The selected design has these hard implementation commitments:
   lists, and nominals only at explicit public observation boundaries
 - emit ordinary scope-closed LIR before ARC and backend code generation
 
+The optimized entrypoint has a precise internal IR contract. This contract is
+builder-owned data inside optimized lowering, not a stored public IR stage:
+
+- `Demand` describes exactly what the current continuation observes:
+  materialization, runtime leaves, record fields, tuple items, nominal backing
+  data, tag alternatives and payloads, callable captures and results, direct
+  call results, and loop-carried values.
+- `KnownValue` and demanded-known values describe checked producer structure:
+  primitive leaves, records, tuples, nominals, tags, finite callable targets,
+  finite tag choices, and sparse demanded children by checked identity.
+- `PrivateState` describes optimized-only state that is not the public Roc
+  value. It stores only demanded children. A missing child means not carried; a
+  present unknown child means carried as a runtime leaf.
+- `FiniteCallableState` is ordinary lambda-set data plus demanded captures by
+  original capture index. Different alternatives may have different capture
+  indexes and counts without widening to a public erased callable.
+- `LoopDemandNode` represents recursive loop-carried demand by graph identity.
+  A demand may refer back to a loop parameter instead of expanding an infinite
+  structural tree. These references are legal only while the owning loop fixed
+  point is active and must be closed or resolved before crossing a worker,
+  public materialization, or LIR boundary.
+- `DemandFrame` is the transient producer-consumer boundary while cloning a
+  value under demand. It owns the checked control scope for locals introduced
+  while satisfying that demand.
+- `WorkerKey` is exact compiler data: callee identity, split argument facts,
+  split capture facts, result demand, and relevant type/layout decisions.
+
+The output contract is equally strict. Optimized lowering emits only ordinary
+scope-closed LIR. LIR does not contain `Demand`, demanded-known values,
+private-state values, finite callable-state alternatives, loop-demand nodes, or
+worker keys. ARC and backends consume ordinary LIR and explicit RC statements;
+they must not know whether the original source value was an iterator, stream,
+callable adapter, or private cursor.
+
+The following obsolete paths conflict with this contract and must stay deleted:
+
+- public or private `Append` step variants
+- explicit iterator-plan, stream-plan, or adapter-chain IR
+- source-form rewrites for `for`, `if`, `match`, `Iter.append`, or
+  `Stream.next!`
+- late cleanup passes that first materialize public wrappers and then try to
+  remove them
+- recursive direct-call expansion used as a substitute for loop-demand graph
+  nodes
+- final-code, symbol-name, wasm-byte, disassembly, target, or Rocci Bird
+  recognition rules
+
 None of those commitments is iterator-specific. They are the general optimized
 post-check lowering contract that happens to make `Iter` and `Stream` optimize
 to the Rust-like cursor shape when the checked program exposes finite callable
