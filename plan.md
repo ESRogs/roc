@@ -54,6 +54,24 @@ checks. The design is correct only when the optimized lowering consumes
 explicit compiler facts and emits ordinary scope-closed LIR with no hidden
 iterator, stream, wasm, builtin-name, or source-form knowledge.
 
+The latest reset failure exposed a more specific trap: a wrapper can be
+semantically transparent to optimized lowering even when no argument to the
+wrapper is itself a known value. Late LIR wrapper inlining can expose the real
+producer too late for demand propagation, at which point it is tempting to add
+cleanup rewrites or recursive inline paths. That is the wrong stage. Optimized
+lowering must consume explicit solved-inline wrapper decisions before demand
+propagation begins, and those decisions are ordinary checked compiler data.
+If a wrapper only becomes visible after public-value LIR has already been
+created, the producer stage is incomplete.
+
+The same failure also exposed demand fixed-point fragility. A fixed point has
+not grown merely because the next iteration allocated a fresh demand node,
+reordered equivalent entries, or preserved different temporary provenance.
+Loop-demand solving must converge by semantic equality of normalized demand
+graphs. Iteration limits are debug assertions for compiler bugs, not an
+optimization policy, and public materialization must never be used merely to
+make a recursive demand terminate.
+
 Every change starts from the contract, not from Rocci Bird or final wasm size.
 Rocci Bird is the motivating integration case, but it is not the design source
 of truth. If a Rocci Bird failure cannot be explained through `Demand`,
@@ -102,6 +120,11 @@ When a test fails, classify the failure before changing code:
 - Public observation: add materialization demand at the observation boundary.
 - Backend/ARC issue: first prove optimized lowering emitted ordinary
   scope-closed LIR; only then change ARC or backend code.
+- Late wrapper exposure: move explicit solved-inline wrapper data to optimized
+  lowering before demand propagation; do not rely on late LIR inline cleanup.
+- Fixed-point non-convergence: reduce to a demand-graph regression, then fix
+  demand normalization, reference closure, ordering, or equality. Do not add
+  caps, cutoffs, source-specific exits, or public materialization.
 
 The classification must produce one of these outputs before code changes
 continue:
@@ -140,6 +163,11 @@ following for the section just changed:
 - the relevant focused Zig target passes
 - the completion checklist was updated only for facts proven by tests or
   architecture checks
+- no temporary diagnostic prints, trace scaffolding, browser-refresh debugging,
+  or disassembly-derived recognition survived the local investigation
+- any new fixed-point loop is proved by a regression that converges because the
+  demand graph is semantically stable, not because an iteration limit or
+  fallback path stops it
 
 Do not check off a Rocci Bird item until the focused compiler tests for the
 underlying invariant have passed. Do not check off a compiler invariant because
@@ -265,11 +293,18 @@ Forbidden shapes:
   callable merely because capture shapes differ.
 - Keep callable alternatives private until source code observes a public
   callable boundary.
+- Treat explicit solved-inline wrapper bodies as producer facts for optimized
+  lowering. A transparent wrapper can expose a finite callable producer even
+  when the wrapper call has no known-value argument.
 - Add tests for one target, multiple targets, differing capture counts,
   differing capture indexes, omitted captures, callable reuse after optimized
-  call, and public callable crossing.
+  call, public callable crossing, and a user wrapper that exposes a builtin
+  iterator producer before demand propagation.
 - Do not normalize differing capture shapes by building public erased callables
   unless materialization demand explicitly requires a public callable value.
+- Do not depend on late LIR wrapper inlining to create the optimized shape. The
+  solved-inline plan is an input to optimized lowering, not a cleanup pass after
+  optimized lowering failed to see through a wrapper.
 
 ### 6. Loop Demand Fixed Points
 
@@ -287,6 +322,12 @@ Forbidden shapes:
 - If loop demand appears to need unbounded structural expansion, add or use a
   loop-demand graph reference. Do not cap the expansion or switch to public
   materialization to terminate it.
+- Add tests where two loop iterations produce freshly allocated but
+  semantically identical demands. Those tests must converge by normalized graph
+  equality, including active loop-demand references and closed references.
+- Demand equality, merge, and closure must be deterministic. Changing arena
+  allocation order, temporary ids, or source traversal order must not make an
+  unchanged demand look like growth.
 
 ### 7. Control Boundaries
 
@@ -320,6 +361,11 @@ Forbidden shapes:
 - A worker key is not complete until it includes every fact that can affect
   generated behavior. If two calls need different code, add the missing fact to
   `WorkerKey` instead of adding a side condition at the call site.
+- A direct call does not become eligible for optimized cloning because source
+  text looks wrapper-like or because LIR cleanup would later inline it. It is
+  eligible when explicit optimized context contains the necessary producer
+  facts: known argument values, solved-inline wrapper body data, or an existing
+  demand-keyed worker fact.
 
 ### 9. Public Boundaries And Effects
 
@@ -402,12 +448,20 @@ zig build minici
       point over body observations and reachable `continue` edges.
 - [ ] Loop-demand references are closed or resolved before worker,
       materialization, and LIR boundaries.
+- [ ] Demand fixed points compare normalized semantic demand graphs, not arena
+      identity, temporary provenance, or entry order.
+- [ ] A focused non-convergence regression covers repeated equal loop demands
+      with active and closed loop-demand references.
 - [ ] Primitive demanded values optimize without aggregate wrapping.
 - [ ] Primitive and single-field-record loop state optimize equivalently.
 - [ ] Sparse private state distinguishes omitted children from
       unknown-but-carried children.
 - [ ] Finite callable alternatives remain finite across differing capture
       shapes.
+- [ ] Explicit solved-inline wrapper bodies are available to optimized lowering
+      before demand propagation.
+- [ ] A user wrapper around a builtin iterator producer optimizes without
+      relying on late LIR wrapper cleanup.
 - [ ] Public materialization is explicit.
 - [ ] Private-state bodies are scope-closed before LIR.
 - [ ] Demand is threaded through fields, tuples, tags, callables, direct calls,
