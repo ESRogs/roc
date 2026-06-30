@@ -357,6 +357,8 @@ const WrapperAnalyzer = struct {
             },
             .tag => |tag| self.exprSpanIsInlineableWrapperBody(tag.payloads),
             .nominal => |backing| self.isInlineableWrapperBody(backing),
+            .call_value => |call| self.isInlineableWrapperBody(call.callee) and
+                self.exprSpanIsInlineableWrapperBody(call.args),
             .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
                 self.isInlineableWrapperBody(block.final_expr),
             else => false,

@@ -1600,8 +1600,8 @@ test "block wrapper with statements is not inlined" {
     , "wrapper", false);
 }
 
-test "call value wrapper is not inlined" {
-    try expectInlinePlanDecision(
+test "call value wrapper is optimized-inline eligible but not materialize-inline eligible" {
+    try expectInlinePlanDecisions(
         \\module [main]
         \\
         \\callee : U64 -> U64
@@ -1612,7 +1612,7 @@ test "call value wrapper is not inlined" {
         \\
         \\main : U64
         \\main = apply(callee, 41)
-    , "apply", false);
+    , "apply", true, false);
 }
 
 test "simple direct low-level wrapper is materialize-inline eligible" {
