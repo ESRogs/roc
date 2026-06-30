@@ -48,6 +48,14 @@ producing diagnostics, temporary refinement paths, source-shape repairs, and
 special-case fallbacks before the core contract was fully represented. The rest
 of this plan must be implemented with these guardrails.
 
+The reset failure was not a small coding mistake. It was a process failure:
+code was changed before the compiler fact being consumed was named, old paths
+were left alive next to new paths, and local test failures invited "just inline"
+or recursive expansion behavior instead of forcing the missing invariant into
+the producer stage. From this point forward, every implementation step follows
+the reset protocol below. If the protocol cannot be followed for a change, the
+plan or design is incomplete and must be fixed before code changes continue.
+
 The main lesson is that a passing Rocci Bird build or a smaller wasm file is
 not evidence that the compiler design is correct. Those are integration
 checks. The design is correct only when the optimized lowering consumes
@@ -153,6 +161,14 @@ If the local fix would need a phrase like "for now", "fallback", "special case",
 contract is missing an explicit fact, or the implementation is in the wrong
 stage.
 
+The same stop rule applies when a change introduces a broad expression-shape
+allowlist. A producer may classify a checked expression into an explicit fact,
+such as a transparent solved-inline wrapper body or a demanded private value.
+An optimized consumer must not keep its own informal list of expression forms
+that are "safe enough" to inline, materialize, or skip. If a consumer needs that
+answer, add the answer to the producer output and test the producer output
+directly.
+
 The same stop rule applies to "public compatibility" arguments. `Iter` and
 `Stream` keep their current public shape, and the optimizer must make that shape
 lower well. Do not change the public step union, add a private public-looking
@@ -168,6 +184,66 @@ Do not keep obsolete code beside replacement code unless both are permanent
 public paths described by this plan. Ordinary public-value lowering and
 optimized callable-state lowering are the two permanent paths; everything else
 is suspect until justified by the target contract.
+
+### Reset Implementation Protocol
+
+Each remaining implementation slice is executed in this order:
+
+1. Name the explicit compiler fact.
+
+   Write down which producer owns the fact, which consumer reads it, and why the
+   fact is sufficient. Examples: selected compile-time roots from checking,
+   solved-inline transparent wrapper bodies, sparse demanded capture indexes,
+   normalized loop-demand graph identity, or demand-keyed worker keys.
+
+   If the fact cannot be named this concretely, do not edit lowering code.
+
+2. Add the focused regression before the production change.
+
+   The test must fail for the missing fact and must assert the compiler
+   invariant, not the Rocci Bird symptom. Prefer LIR shape, checked output, or
+   producer-table assertions over wasm byte size. Browser behavior and wasm
+   disassembly are not acceptable first regressions.
+
+3. Delete contradicted old code in the same slice.
+
+   If the new fact replaces late wrapper cleanup, recursive call expansion,
+   dense placeholder state, public materialization used as termination, or
+   source-form handling, remove that old behavior while adding the new one. A
+   failing test after deletion means the new fact is incomplete; it is not a
+   reason to keep both paths.
+
+4. Implement the producer before the consumer.
+
+   The earlier compiler stage must emit explicit data. The optimized consumer
+   then reads that data through a narrow API. Do not make the consumer recover
+   the answer by walking source-like expression shape, debug names, builtin
+   names, proc ids, or LIR emitted by a previous attempt.
+
+5. Keep exactly one optimized consumer for each behavior.
+
+   A solved-inline wrapper fact, demand split, private-state decision, or worker
+   key must have one owner in the optimized pipeline. If the same wrapper can be
+   consumed both before demand propagation and later as LIR cleanup, one of the
+   consumers is wrong. Delete the wrong one before moving on.
+
+6. Prove the narrow invariant, then update the checklist.
+
+   Run the smallest focused Zig target that exercises the invariant. Check off
+   a plan item only when that focused test proves it. Rocci Bird size and
+   browser testing are final integration checks, not checklist proof for
+   compiler invariants.
+
+7. Scan for reset violations before committing.
+
+   Before each commit, verify that no temporary diagnostics, trace scaffolding,
+   hardcoded ids, source-form optimization rules, late cleanup rewrites, or
+   fallback terminology survived the diff. If a diff contains both an old path
+   and a replacement path, the commit is not done.
+
+This protocol intentionally makes progress smaller. It is cheaper to write
+three focused regressions and delete one obsolete path than to debug another
+large optimized build whose output happens to be smaller for the wrong reason.
 
 Before moving to the next numbered implementation section, verify all of the
 following for the section just changed:
@@ -456,6 +532,10 @@ zig build minici
       plans.
 - [x] Architecture checks reject committed trace/debug scaffolding and
       hardcoded local/proc/symbol recognition in optimized lowering.
+- [x] Reset implementation protocol records the failure mode from the aborted
+      wrapper/inline attempt: name the producer fact, add the focused
+      regression first, delete contradicted old paths, keep one consumer, and
+      treat Rocci Bird/wasm size only as integration validation.
 - [x] Optimized callable-state lowering is constructed only for `--opt=size`
       and `--opt=speed`.
 - [x] Non-optimized paths construct zero optimized demand/private-state/worker
@@ -478,9 +558,12 @@ zig build minici
       unknown-but-carried children.
 - [ ] Finite callable alternatives remain finite across differing capture
       shapes.
-- [ ] Explicit solved-inline wrapper bodies are available to optimized lowering
+- [x] Explicit solved-inline wrapper bodies are available to optimized lowering
       before demand propagation.
-- [ ] A user wrapper around a builtin iterator producer optimizes without
+- [x] Materialize-safe wrapper bodies are classified by the solved-inline
+      producer, including transitive direct-call wrappers whose callees already
+      have materialize-safe inline bodies.
+- [x] A user wrapper around a builtin iterator producer optimizes without
       relying on late LIR wrapper cleanup.
 - [ ] Public materialization is explicit.
 - [ ] Private-state bodies are scope-closed before LIR.

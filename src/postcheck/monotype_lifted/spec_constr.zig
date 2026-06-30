@@ -217,6 +217,7 @@ const Mono = @import("../monotype/ast.zig");
 const Type = @import("../monotype/type.zig");
 const Solved = @import("../lambda_solved/ast.zig");
 const SolvedType = @import("../lambda_solved/type.zig");
+const SolvedInline = @import("../solved_inline.zig");
 const check = @import("check");
 const names = check.CheckedNames;
 
@@ -224,14 +225,17 @@ const Allocator = std.mem.Allocator;
 
 /// Specialize calls and loop state whose values have known constructor structure.
 pub fn run(allocator: Allocator, program: *Ast.Program) Common.LowerError!void {
-    var optimized = try OptimizedContext.init(allocator, program, null);
+    var optimized = try OptimizedContext.init(allocator, program, null, .{});
     defer optimized.deinit();
     try optimized.run();
 }
 
 /// Specialize with Lambda Solved type data available for checked-call known_values.
 pub fn runWithSolved(allocator: Allocator, solved: *Solved.Program) Common.LowerError!void {
-    var optimized = try OptimizedContext.init(allocator, &solved.lifted, solved);
+    var inline_plan = try SolvedInline.analyze(allocator, .wrappers, solved);
+    defer inline_plan.deinit();
+
+    var optimized = try OptimizedContext.init(allocator, &solved.lifted, solved, inline_plan.view());
     defer optimized.deinit();
     try optimized.run();
 }
@@ -853,13 +857,19 @@ const OptimizedContext = struct {
     arena: std.heap.ArenaAllocator,
     program: *Ast.Program,
     solved: ?*const Solved.Program,
+    inline_plan: SolvedInline.Plan,
     plans: []FnPlan,
     original_bodies: []const ?Ast.ExprId,
     worker_worklist: std.ArrayList(WorkerJob),
     callable_specializations: std.ArrayList(CallableSpecialization),
     symbols: Common.SymbolGen,
 
-    fn init(allocator: Allocator, program: *Ast.Program, solved: ?*const Solved.Program) Allocator.Error!OptimizedContext {
+    fn init(
+        allocator: Allocator,
+        program: *Ast.Program,
+        solved: ?*const Solved.Program,
+        inline_plan: SolvedInline.Plan,
+    ) Allocator.Error!OptimizedContext {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
@@ -898,6 +908,7 @@ const OptimizedContext = struct {
             .arena = arena,
             .program = program,
             .solved = solved,
+            .inline_plan = inline_plan,
             .plans = plans,
             .original_bodies = &.{},
             .worker_worklist = .empty,
@@ -1099,6 +1110,18 @@ const OptimizedContext = struct {
         const index = @intFromEnum(fn_id);
         if (index >= self.original_bodies.len) return null;
         return self.original_bodies[index];
+    }
+
+    fn inlineBody(self: *const OptimizedContext, fn_id: Ast.FnId) ?Ast.ExprId {
+        const index = @intFromEnum(fn_id);
+        if (self.inline_plan.inline_bodies.len == 0 or index >= self.inline_plan.inline_bodies.len) return null;
+        return self.inline_plan.inline_bodies[index];
+    }
+
+    fn materializeInlineBody(self: *const OptimizedContext, fn_id: Ast.FnId) ?Ast.ExprId {
+        const index = @intFromEnum(fn_id);
+        if (self.inline_plan.materialize_bodies.len == 0 or index >= self.inline_plan.materialize_bodies.len) return null;
+        return self.inline_plan.materialize_bodies[index];
     }
 
     fn copyProcDebugName(self: *OptimizedContext, source_symbol: Common.Symbol, target_symbol: Common.Symbol) Allocator.Error!void {
@@ -3323,12 +3346,12 @@ const Cloner = struct {
             .call_proc => |call| {
                 if (call.is_cold) return .{ .expr = try self.cloneExprPlain(expr_id) };
                 if (!self.inline_direct_calls) return .{ .expr = try self.cloneExprPlain(expr_id) };
-                const has_known_value_arg = try self.directCallHasKnownValueArg(call.args);
-                if (self.inline_direct_requires_known_arg and !has_known_value_arg) {
+                const callee = Ast.callProcCallee(call);
+                if (!try self.directCallMayInlineForMaterialization(callee, call.args)) {
                     return .{ .expr = try self.cloneExprPlain(expr_id) };
                 }
                 return try self.inlineDirectCallValue(
-                    Ast.callProcCallee(call),
+                    callee,
                     call.args,
                     expr_id,
                     false,
@@ -3351,12 +3374,12 @@ const Cloner = struct {
             .call_proc => |call| {
                 if (call.is_cold) break :blk try self.cloneExprValue(expr_id);
                 if (!self.inline_direct_calls) break :blk try self.cloneExprValue(expr_id);
-                const has_known_value_arg = try self.directCallHasKnownValueArg(call.args);
-                if (self.inline_direct_requires_known_arg and !has_known_value_arg) {
+                const callee = Ast.callProcCallee(call);
+                if (!try self.directCallMayInlineForMaterialization(callee, call.args)) {
                     break :blk try self.materializeDirectCallBoundaryForDemand(expr_id, .materialize);
                 }
                 break :blk try self.inlineDirectCallValueWithDemand(
-                    Ast.callProcCallee(call),
+                    callee,
                     call.args,
                     expr_id,
                     .materialize,
@@ -3455,12 +3478,12 @@ const Cloner = struct {
                     .call_proc => |call| {
                         if (call.is_cold) break :blk try self.cloneExprValueDemandingKnownValue(expr_id);
                         if (!self.inline_direct_calls) break :blk try self.cloneExprValueDemandingKnownValue(expr_id);
-                        const has_known_value_arg = try self.directCallHasKnownValueArg(call.args);
-                        if (self.inline_direct_requires_known_arg and !has_known_value_arg) {
+                        const callee = Ast.callProcCallee(call);
+                        if (!try self.directCallMayInline(callee, call.args)) {
                             break :blk try self.materializeDirectCallBoundaryForDemand(expr_id, resolved_demand);
                         }
                         break :blk try self.inlineDirectCallValueWithDemand(
-                            Ast.callProcCallee(call),
+                            callee,
                             call.args,
                             expr_id,
                             resolved_demand,
@@ -5634,6 +5657,18 @@ const Cloner = struct {
         return false;
     }
 
+    fn directCallMayInline(self: *Cloner, callee: Ast.FnId, args_span: Ast.Span(Ast.ExprId)) Allocator.Error!bool {
+        if (!self.inline_direct_requires_known_arg) return true;
+        if (self.pass.inlineBody(callee) != null) return true;
+        return try self.directCallHasKnownValueArg(args_span);
+    }
+
+    fn directCallMayInlineForMaterialization(self: *Cloner, callee: Ast.FnId, args_span: Ast.Span(Ast.ExprId)) Allocator.Error!bool {
+        if (!self.inline_direct_requires_known_arg) return true;
+        if (self.pass.materializeInlineBody(callee) != null) return true;
+        return try self.directCallHasKnownValueArg(args_span);
+    }
+
     fn directCallActiveArgs(self: *Cloner, args_span: Ast.Span(Ast.ExprId)) Allocator.Error![]const ActiveInlineArg {
         const args = self.pass.program.exprSpan(args_span);
         const active_args = try self.pass.arena.allocator().alloc(ActiveInlineArg, args.len);
@@ -5779,6 +5814,23 @@ const Cloner = struct {
             } };
         }
         return .{ .expr = expr_id };
+    }
+
+    fn exprValueForDirectCallBoundaryArg(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
+        const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .call_proc => |call| {
+                if (!call.is_cold and self.inline_direct_calls) {
+                    const callee = Ast.callProcCallee(call);
+                    if (self.pass.materializeInlineBody(callee) != null) {
+                        return try self.inlineDirectCallValueWithDemand(callee, call.args, expr_id, .materialize);
+                    }
+                }
+            },
+            .comptime_branch_taken => |taken| return try self.exprValueForDirectCallBoundaryArg(taken.body),
+            else => {},
+        }
+        return try self.exprValueForDemandNoInline(expr_id);
     }
 
     fn exprValueForDemandNoInlineProtectingLocal(
@@ -8228,29 +8280,6 @@ const Cloner = struct {
             if (state_loop_iterations > 1000) Common.invariant("state loop demand feedback did not converge");
 
             const state_keys = try demandedKnownValueProducts(self.pass.allocator, self.pass.arena.allocator(), known_values);
-            const demanded_entry_values = try self.pass.allocator.alloc(Value, values.len);
-            defer self.pass.allocator.free(demanded_entry_values);
-            for (values, demands, demanded_entry_values) |value, demand, *out| {
-                out.* = try self.applyValueDemand(value, demand);
-            }
-
-            var entry_state_index: ?usize = null;
-            for (state_keys, 0..) |state_values, index| {
-                if (!demandedKnownValuesMatchValues(self.pass.program, state_values, demanded_entry_values)) continue;
-                if (entry_state_index != null) Common.invariant("state_loop edge matched multiple states");
-                entry_state_index = index;
-            }
-            const selected_entry_state_index = entry_state_index orelse {
-                if (compact_result != null) Common.invariant("optimized loop private result could not select an entry state");
-                const initial_span = (try self.valuesToOutputExprSpan(values)) orelse
-                    Common.invariant("optimized loop entry values could neither select a state nor be emitted as ordinary loop initials");
-                return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
-                    .params = loop.params,
-                    .initial_values = initial_span,
-                    .body = try self.cloneExpr(loop.body),
-                } } }) };
-            };
-
             const state_start_len = self.pass.program.state_loop_states.items.len;
             const state_start: u32 = @intCast(state_start_len);
             var states = std.ArrayList(SparseStateLoopState).empty;
@@ -8259,18 +8288,6 @@ const Cloner = struct {
             for (state_keys) |state_values| {
                 if (state_values.len != params.len) Common.invariant("state_loop key arity differed from loop params");
                 _ = try self.appendSparseState(&states, state_values);
-            }
-
-            const entry_state = states.items[selected_entry_state_index];
-
-            var entry_values = std.ArrayList(Ast.ExprId).empty;
-            defer entry_values.deinit(self.pass.allocator);
-            var entry_pending_lets = std.ArrayList(PendingLet).empty;
-            defer entry_pending_lets.deinit(self.pass.allocator);
-            for (entry_state.values, demanded_entry_values) |known_value, value| {
-                if (!try self.appendExprsFromDemandedKnownValueCollectingLets(known_value, value, &entry_values, &entry_pending_lets)) {
-                    Common.invariant("state_loop initial value could not be split into entry state params");
-                }
             }
 
             var state_demands_changed = false;
@@ -8288,6 +8305,43 @@ const Cloner = struct {
                 .changed = &state_demands_changed,
             });
             errdefer _ = self.state_loop_stack.pop();
+
+            const demanded_entry_values = try self.pass.allocator.alloc(Value, values.len);
+            defer self.pass.allocator.free(demanded_entry_values);
+            for (values, demands, demanded_entry_values) |value, demand, *out| {
+                out.* = try self.applyValueDemand(value, demand);
+            }
+
+            var entry_state_index: ?usize = null;
+            for (state_keys, 0..) |state_values, index| {
+                if (!demandedKnownValuesMatchValues(self.pass.program, state_values, demanded_entry_values)) continue;
+                if (entry_state_index != null) Common.invariant("state_loop edge matched multiple states");
+                entry_state_index = index;
+            }
+            const selected_entry_state_index = entry_state_index orelse {
+                _ = self.state_loop_stack.pop();
+                self.pass.program.state_loop_states.shrinkRetainingCapacity(state_start_len);
+                if (compact_result != null) Common.invariant("optimized loop private result could not select an entry state");
+                const initial_span = (try self.valuesToOutputExprSpan(values)) orelse
+                    Common.invariant("optimized loop entry values could neither select a state nor be emitted as ordinary loop initials");
+                return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
+                    .params = loop.params,
+                    .initial_values = initial_span,
+                    .body = try self.cloneExpr(loop.body),
+                } } }) };
+            };
+
+            const entry_state = states.items[selected_entry_state_index];
+
+            var entry_values = std.ArrayList(Ast.ExprId).empty;
+            defer entry_values.deinit(self.pass.allocator);
+            var entry_pending_lets = std.ArrayList(PendingLet).empty;
+            defer entry_pending_lets.deinit(self.pass.allocator);
+            for (entry_state.values, demanded_entry_values) |known_value, value| {
+                if (!try self.appendExprsFromDemandedKnownValueCollectingLets(known_value, value, &entry_values, &entry_pending_lets)) {
+                    Common.invariant("state_loop initial value could not be split into entry state params");
+                }
+            }
 
             var state_index: usize = 0;
             while (state_index < states.items.len) : (state_index += 1) {
@@ -8329,18 +8383,18 @@ const Cloner = struct {
             }
 
             if (state_demands_changed) {
-                for (demands) |*demand| {
-                    demand.* = try self.closeLoopDemandRefs(demand.*);
+                const closed_demands = try self.pass.allocator.alloc(ValueDemand, demands.len);
+                defer self.pass.allocator.free(closed_demands);
+                for (demands, closed_demands) |demand, *closed| {
+                    closed.* = try self.closeLoopDemandRefs(demand);
                 }
+                self.pass.program.state_loop_states.shrinkRetainingCapacity(state_start_len);
+                try self.refreshDemandedKnownValuesFromValueDemands(values, closed_demands, known_values);
+                _ = self.state_loop_stack.pop();
+                continue;
             }
 
             _ = self.state_loop_stack.pop();
-
-            if (state_demands_changed) {
-                self.pass.program.state_loop_states.shrinkRetainingCapacity(state_start_len);
-                try self.refreshDemandedKnownValuesFromValueDemands(values, demands, known_values);
-                continue;
-            }
 
             const state_span: Ast.Span(Ast.StateLoopState) = .{
                 .start = state_start,
@@ -17930,10 +17984,7 @@ const Cloner = struct {
         return switch (callee) {
             .callable => |callable| try self.callKnownCallableValueWithDemand(ty, callable, args_span, demand),
             .private_state => |private_state| switch (private_state) {
-                .callable => |callable| if (try self.privateStateCallableToCallableValue(callable)) |callable_value|
-                    try self.callKnownCallableValueWithDemand(ty, callable_value, args_span, demand)
-                else
-                    try self.inlinePrivateStateCallableCallValueWithDemand(ty, callable, args_span, demand),
+                .callable => |callable| try self.inlinePrivateStateCallableCallValueWithDemand(ty, callable, args_span, demand),
                 .compact_finite_callables => |finite_callables| try self.callCompactFiniteCallablesValueWithDemand(ty, finite_callables, args_span, demand),
                 .leaf => .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
                     .callee = try self.materialize(callee),
@@ -18855,7 +18906,7 @@ const Cloner = struct {
         const values = try self.pass.allocator.alloc(Ast.ExprId, source.len);
         defer self.pass.allocator.free(values);
         for (source, values) |expr, *out| {
-            const value = try self.exprValueForDemandNoInline(expr);
+            const value = try self.exprValueForDirectCallBoundaryArg(expr);
             out.* = if (valueIsExpr(value, expr))
                 try self.cloneExprPlain(expr)
             else

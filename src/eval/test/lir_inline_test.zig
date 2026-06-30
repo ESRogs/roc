@@ -494,6 +494,15 @@ fn expectInlinePlanDecision(
     fn_name: []const u8,
     expected: bool,
 ) anyerror!void {
+    try expectInlinePlanDecisions(source, fn_name, expected, null);
+}
+
+fn expectInlinePlanDecisions(
+    source: []const u8,
+    fn_name: []const u8,
+    expected_inline: bool,
+    expected_materialize: ?bool,
+) anyerror!void {
     const allocator = std.testing.allocator;
     var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, source, &.{}, try sharedPrePublishedBuiltin());
     defer helpers.cleanupParseAndCanonical(allocator, resources);
@@ -547,7 +556,10 @@ fn expectInlinePlanDecision(
 
         found = true;
         const fn_id: postcheck.MonotypeLifted.Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
-        try std.testing.expectEqual(expected, plan.bodyForFn(fn_id) != null);
+        try std.testing.expectEqual(expected_inline, plan.bodyForFn(fn_id) != null);
+        if (expected_materialize) |expected| {
+            try std.testing.expectEqual(expected, plan.materializeBodyForFn(fn_id) != null);
+        }
     }
 
     try std.testing.expect(found);
@@ -1322,12 +1334,12 @@ test "zero statement block wrapper is inlined" {
 
 test "low level wrapper is inlined when inline mode is enabled" {
     const allocator = std.testing.allocator;
-    var lowered_source = try lowerModule(allocator,
+    var lowered_source = try lowerModuleWithProcDebugNames(allocator,
         \\module [main]
         \\
         \\main : Str -> U64
         \\main = |str| Str.count_utf8_bytes(str)
-    , .optimized);
+    , .optimized, true);
     defer lowered_source.deinit(allocator);
 
     const shape = try collectProcShape(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
@@ -1565,8 +1577,8 @@ test "destination phase 6: string concat caller uses append variant" {
     const build_proc = try rootDirectCallTarget(allocator, &lowered_source.lowered);
     const build_shape = try collectProcShape(allocator, &lowered_source.lowered, build_proc);
 
-    try std.testing.expectEqual(@as(usize, 0), build_shape.direct_call_count);
-    try std.testing.expectEqual(@as(usize, 2), build_shape.str_concat_count);
+    try std.testing.expectEqual(@as(usize, 1), build_shape.direct_call_count);
+    try std.testing.expectEqual(@as(usize, 0), build_shape.str_concat_count);
     try std.testing.expectEqual(@as(usize, 2), try reachableProcShapeFieldTotal(allocator, &lowered_source.lowered, "str_concat_count"));
 }
 
@@ -1601,6 +1613,18 @@ test "call value wrapper is not inlined" {
         \\main : U64
         \\main = apply(callee, 41)
     , "apply", false);
+}
+
+test "simple direct low-level wrapper is materialize-inline eligible" {
+    try expectInlinePlanDecisions(
+        \\module [main]
+        \\
+        \\callee : U64 -> U64
+        \\callee = |x| x + 1
+        \\
+        \\main : U64 -> U64
+        \\main = |x| callee(x)
+    , "callee", true, true);
 }
 
 test "self-recursive direct wrapper is not inlined" {

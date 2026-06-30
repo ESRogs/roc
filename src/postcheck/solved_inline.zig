@@ -16,6 +16,7 @@ pub const Mode = enum {
 /// Immutable inline eligibility table consumed by later lowering stages.
 pub const Plan = struct {
     inline_bodies: []const ?Lifted.ExprId = &.{},
+    materialize_bodies: []const ?Lifted.ExprId = &.{},
 
     pub fn bodyForFn(self: Plan, fn_id: Lifted.FnId) ?Lifted.ExprId {
         if (self.inline_bodies.len == 0) return null;
@@ -26,24 +27,36 @@ pub const Plan = struct {
         }
         return self.inline_bodies[index];
     }
+
+    pub fn materializeBodyForFn(self: Plan, fn_id: Lifted.FnId) ?Lifted.ExprId {
+        if (self.materialize_bodies.len == 0) return null;
+
+        const index = @intFromEnum(fn_id);
+        if (index >= self.materialize_bodies.len) {
+            Common.invariant("inline plan did not contain a lifted function");
+        }
+        return self.materialize_bodies[index];
+    }
 };
 
 /// Allocator-owned storage for a post-check inline plan.
 pub const OwnedPlan = struct {
     allocator: std.mem.Allocator,
     inline_bodies: []?Lifted.ExprId,
+    materialize_bodies: []?Lifted.ExprId,
 
     pub fn empty(allocator: std.mem.Allocator) OwnedPlan {
-        return .{ .allocator = allocator, .inline_bodies = &.{} };
+        return .{ .allocator = allocator, .inline_bodies = &.{}, .materialize_bodies = &.{} };
     }
 
     pub fn deinit(self: *OwnedPlan) void {
         if (self.inline_bodies.len != 0) self.allocator.free(self.inline_bodies);
+        if (self.materialize_bodies.len != 0) self.allocator.free(self.materialize_bodies);
         self.* = empty(self.allocator);
     }
 
     pub fn view(self: *const OwnedPlan) Plan {
-        return .{ .inline_bodies = self.inline_bodies };
+        return .{ .inline_bodies = self.inline_bodies, .materialize_bodies = self.materialize_bodies };
     }
 };
 
@@ -95,9 +108,18 @@ const WrapperAnalyzer = struct {
 
         const inline_bodies = try allocator.alloc(?Lifted.ExprId, decisions.len);
         errdefer allocator.free(inline_bodies);
+        const materialize_bodies = try allocator.alloc(?Lifted.ExprId, decisions.len);
+        errdefer allocator.free(materialize_bodies);
         for (decisions, 0..) |decision, index| {
             inline_bodies[index] = switch (decision) {
                 .inline_body => |body| body,
+                .unknown,
+                .visiting,
+                .never,
+                => null,
+            };
+            materialize_bodies[index] = switch (decision) {
+                .inline_body => |body| if (analyzer.isMaterializeInlineBody(body)) body else null,
                 .unknown,
                 .visiting,
                 .never,
@@ -111,6 +133,7 @@ const WrapperAnalyzer = struct {
         return .{
             .allocator = allocator,
             .inline_bodies = inline_bodies,
+            .materialize_bodies = materialize_bodies,
         };
     }
 
@@ -217,6 +240,7 @@ const WrapperAnalyzer = struct {
             .static_data,
             .def_ref,
             => true,
+            .fn_ref => |target| self.fnHasNoCaptures(target),
             .static_data_candidate => |candidate| self.exprReadsOnlyInlineInputs(candidate.restored_expr, args, source_captures, solved_captures),
             .list,
             .tuple,
@@ -248,11 +272,6 @@ const WrapperAnalyzer = struct {
             .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
                 self.exprReadsOnlyInlineInputs(block.final_expr, args, source_captures, solved_captures),
             .lambda,
-            // A function reference can carry a nested body whose captures must
-            // be rebound for each inline site. This inliner only remaps the
-            // immediate callee body, so closure-producing wrappers are not
-            // transparent here.
-            .fn_ref,
             .fn_def,
             .let_,
             .match_,
@@ -306,6 +325,11 @@ const WrapperAnalyzer = struct {
         return false;
     }
 
+    fn fnHasNoCaptures(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) bool {
+        const fn_ = self.solved.lifted.fns.items[@intFromEnum(fn_id)];
+        return self.solved.lifted.typedLocalSpan(fn_.captures).len == 0;
+    }
+
     fn isInlineableWrapperBody(self: *const WrapperAnalyzer, expr_id: Lifted.ExprId) bool {
         const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
         return switch (expr.data) {
@@ -336,6 +360,62 @@ const WrapperAnalyzer = struct {
             .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
                 self.isInlineableWrapperBody(block.final_expr),
             else => false,
+        };
+    }
+
+    fn isMaterializeInlineBody(self: *const WrapperAnalyzer, expr_id: Lifted.ExprId) bool {
+        const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
+        return switch (expr.data) {
+            .local,
+            .unit,
+            .int_lit,
+            .frac_f32_lit,
+            .frac_f64_lit,
+            .dec_lit,
+            .str_lit,
+            .static_data,
+            .def_ref,
+            .fn_ref,
+            => true,
+            .fn_ref_captures => |fn_ref| self.exprSpanIsMaterializeInlineBody(fn_ref.captures),
+            .static_data_candidate => |candidate| self.isMaterializeInlineBody(candidate.restored_expr),
+            .call_proc => |call| !call.is_cold and
+                self.inlineDecisionIsMaterializeInlineBody(Lifted.callProcCallee(call)) and
+                self.exprSpanIsMaterializeInlineBody(call.args),
+            .low_level => |call| self.exprSpanIsMaterializeInlineBody(call.args),
+            .field_access => |field| self.isMaterializeInlineBody(field.receiver),
+            .tuple_access => |access| self.isMaterializeInlineBody(access.tuple),
+            .tuple,
+            .list,
+            => |items| self.exprSpanIsMaterializeInlineBody(items),
+            .record => |fields| {
+                for (self.solved.lifted.fieldExprSpan(fields)) |field| {
+                    if (!self.isMaterializeInlineBody(field.value)) return false;
+                }
+                return true;
+            },
+            .tag => |tag| self.exprSpanIsMaterializeInlineBody(tag.payloads),
+            .nominal => |backing| self.isMaterializeInlineBody(backing),
+            .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
+                self.isMaterializeInlineBody(block.final_expr),
+            else => false,
+        };
+    }
+
+    fn exprSpanIsMaterializeInlineBody(self: *const WrapperAnalyzer, span: Lifted.Span(Lifted.ExprId)) bool {
+        for (self.solved.lifted.exprSpan(span)) |expr| {
+            if (!self.isMaterializeInlineBody(expr)) return false;
+        }
+        return true;
+    }
+
+    fn inlineDecisionIsMaterializeInlineBody(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) bool {
+        return switch (self.decisions[@intFromEnum(fn_id)]) {
+            .inline_body => |body| self.isMaterializeInlineBody(body),
+            .unknown,
+            .visiting,
+            .never,
+            => false,
         };
     }
 

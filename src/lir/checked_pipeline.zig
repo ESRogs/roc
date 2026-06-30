@@ -86,13 +86,6 @@ pub const PostCheckLoweringMode = enum {
     pub fn isOptimized(self: PostCheckLoweringMode) bool {
         return self == .optimized;
     }
-
-    fn inlineMode(self: PostCheckLoweringMode) postcheck.SolvedInline.Mode {
-        return switch (self) {
-            .ordinary => .none,
-            .optimized => .wrappers,
-        };
-    }
 };
 
 /// Construction counts for post-check lowering families.
@@ -277,7 +270,7 @@ pub fn lowerCheckedModulesToLir(
     var solved_owned = true;
     errdefer if (solved_owned) solved.deinit();
 
-    var inline_plan = try postcheck.SolvedInline.analyze(allocator, target.post_check_lowering.inlineMode(), &solved);
+    var inline_plan = try postcheck.SolvedInline.analyze(allocator, .none, &solved);
     defer inline_plan.deinit();
 
     var lowered = try postcheck.SolvedLirLower.run(allocator, target.target_usize, solved, .{
