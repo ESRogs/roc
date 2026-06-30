@@ -147,6 +147,28 @@ capture indexes, loop-demand references, public materialization, scope closure,
 effect order, or ordinary-LIR output. Rocci Bird and disassembly checks come
 after those focused tests, not instead of them.
 
+The most recent false start exposed a simple but important process hole: adding
+a test near the suspected bug is not the same as adding a regression. A new
+test that already passes before the production change is useful coverage at
+best; it does not prove the missing invariant and must not unblock production
+edits. If a newly written test passes, either delete it before moving on or
+explicitly keep it as secondary coverage while a separate failing regression is
+named.
+
+An existing failing test may serve as the regression, but only if it is treated
+with the same discipline as a new one. Before editing production code, record
+the exact test filter, the failure mode, and the compiler invariant it proves.
+The failure must be the expected compiler invariant failure, not a parse error,
+missing platform, unrelated earlier assertion, or Rocci Bird/browser symptom.
+
+The finite-callable crash that triggered this reset is the template for future
+work. The relevant invariant is not "Rocci Bird gets smaller" or "the iterator
+pipeline happens to build." It is that demanded callable captures are keyed to
+the specific finite alternative being lowered. A merged capture-demand vector
+must never be replayed positionally against alternatives with different source
+capture layouts. That fact must be proved by a focused failing test before the
+producer/consumer contract changes.
+
 No implementation step may add a second path to keep progress moving. In
 particular, do not add:
 
@@ -259,6 +281,18 @@ Each remaining implementation slice is executed in this order:
    producer-table assertions over wasm byte size. Browser behavior and wasm
    disassembly are not acceptable first regressions.
 
+   If the first attempted regression passes, stop. Do not reinterpret that
+   passing test as evidence. Delete it or mark it as later coverage, then find
+   the actual failing invariant. A production diff may start only after there
+   is a named failing regression or a named existing failing test that has been
+   rerun with its exact filter.
+
+   For existing failures, write down the expected failure class before editing:
+   invariant panic, missing scope binding, non-convergence, wrong public
+   boundary materialization, wrong LIR shape, or wrong checked producer table.
+   If the test fails differently, classify the new failure first instead of
+   continuing with the planned fix.
+
 3. Delete contradicted old code in the same slice.
 
    If the new fact replaces late wrapper cleanup, recursive call expansion,
@@ -312,7 +346,15 @@ Each remaining implementation slice is executed in this order:
    browser testing are final integration checks, not checklist proof for
    compiler invariants.
 
-10. Scan for reset violations before committing.
+10. Clear failed experiments before implementing the next slice.
+
+   The working tree must not carry an exploratory test, diagnostic helper, or
+   partial production change that failed to reproduce the intended invariant.
+   If the experiment taught something real, move that lesson into this plan or
+   `design.md`; otherwise delete it before continuing. This prevents the next
+   slice from being built on accidental scaffolding.
+
+11. Scan for reset violations before committing.
 
    Before each commit, verify that no temporary diagnostics, trace scaffolding,
    hardcoded ids, source-form optimization rules, late cleanup rewrites, or
@@ -327,6 +369,11 @@ Before moving to the next numbered implementation section, verify all of the
 following for the section just changed:
 
 - every new behavior has a focused regression that fails without the change
+- any passing test added during investigation is either deleted before the
+  production slice or explicitly documented as secondary coverage, never as the
+  gating regression
+- any existing failing test used as the regression has its exact filter,
+  expected failure mode, and invariant recorded before production edits
 - no forbidden words or concepts were introduced into optimized lowering
 - replaced code was deleted in the same commit
 - the relevant focused Zig target passes
