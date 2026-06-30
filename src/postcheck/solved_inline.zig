@@ -270,6 +270,7 @@ const WrapperAnalyzer = struct {
             .crash,
             .comptime_exhaustiveness_failed,
             => false,
+            .fn_ref_captures => |fn_ref| self.exprSpanReadsOnlyInlineInputs(fn_ref.captures, args, source_captures, solved_captures),
         };
     }
 
@@ -318,6 +319,7 @@ const WrapperAnalyzer = struct {
             .static_data,
             .fn_ref,
             => true,
+            .fn_ref_captures => |fn_ref| self.exprSpanIsInlineableWrapperBody(fn_ref.captures),
             .call_proc, .low_level => true,
             .field_access => |field| self.isInlineableWrapperBody(field.receiver),
             .tuple_access => |access| self.isInlineableWrapperBody(access.tuple),
@@ -362,6 +364,7 @@ const WrapperAnalyzer = struct {
             .def_ref,
             .fn_ref,
             => {},
+            .fn_ref_captures => |fn_ref| try self.visitSpanCallees(fn_ref.captures),
             .static_data_candidate => |candidate| try self.visitBodyCallees(candidate.restored_expr),
             .list,
             .tuple,
@@ -514,6 +517,7 @@ fn exprContainsReturn(program: *const Lifted.Program, expr_id: Lifted.ExprId) bo
         .crash,
         .comptime_exhaustiveness_failed,
         => false,
+        .fn_ref_captures => |fn_ref| exprSpanContainsReturn(program, fn_ref.captures),
         .static_data_candidate => |candidate| exprContainsReturn(program, candidate.restored_expr),
         .list,
         .tuple,

@@ -527,6 +527,12 @@ const Lowerer = struct {
             .fn_def,
             => Common.invariant("pre-lift function expression reached Lambda Mono"),
             .fn_ref => |target| try self.lowerCallableValue(expr_id, target, ty),
+            .fn_ref_captures => |fn_ref| try self.lowerCallableValueWithCaptureExprs(
+                expr_id,
+                fn_ref.target,
+                fn_ref.captures,
+                ty,
+            ),
             .call_value => |call| try self.lowerValueCall(ty, call),
             .call_proc => |call| blk: {
                 const callee = Lifted.callProcCallee(call);
@@ -697,6 +703,47 @@ const Lowerer = struct {
         };
     }
 
+    fn lowerCallableValueWithCaptureExprs(
+        self: *Lowerer,
+        expr_id: Lifted.ExprId,
+        fn_id: Lifted.FnId,
+        capture_span: Lifted.Span(Lifted.ExprId),
+        ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprData {
+        const captures = self.memberCapturesForExpr(expr_id, fn_id);
+        const capture_exprs = self.solved.lifted.exprSpan(capture_span);
+        if (self.solved.types.captureSpan(captures).len != capture_exprs.len) {
+            Common.invariant("explicit function reference capture count differed from Lambda Solved member captures");
+        }
+
+        return switch (self.program.types.get(ty)) {
+            .callable => |variants| blk: {
+                const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
+                for (self.program.types.fnVariantSpan(variants)) |variant| {
+                    if (variant.source != fn_symbol) continue;
+                    break :blk .{ .callable = .{
+                        .ty = ty,
+                        .variant = variant.id,
+                        .payload = if (variant.capture_ty) |capture_ty| try self.buildCaptureRecordFromExprs(captures, capture_exprs, capture_ty) else null,
+                    } };
+                }
+                Common.invariant("finite callable type did not contain referenced function");
+            },
+            .erased_fn => |erased| blk: {
+                const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
+                for (self.program.types.fnVariantSpan(erased.members)) |variant| {
+                    if (variant.source != fn_symbol) continue;
+                    break :blk .{ .packed_erased_fn = .{
+                        .target = variant.target,
+                        .capture = if (variant.capture_ty) |capture_ty| try self.buildCaptureRecordFromExprs(captures, capture_exprs, capture_ty) else null,
+                    } };
+                }
+                Common.invariant("erased callable type did not contain referenced function");
+            },
+            else => Common.invariant("function value lowered to non-callable Lambda Mono type"),
+        };
+    }
+
     fn memberCapturesForExpr(self: *Lowerer, expr_id: Lifted.ExprId, fn_id: Lifted.FnId) SolvedType.Span {
         const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
         const expr_ty = self.solved.expr_tys.items[@intFromEnum(expr_id)];
@@ -806,6 +853,37 @@ const Lowerer = struct {
                 Common.invariant("callable capture payload fields differed from captured locals");
             }
             values[i] = try self.lowerCapturedValue(capture.local, field.ty);
+        }
+        return try self.program.addExpr(.{
+            .ty = capture_ty,
+            .data = .{ .capture_record = try self.program.addExprSpan(values) },
+        });
+    }
+
+    fn buildCaptureRecordFromExprs(
+        self: *Lowerer,
+        capture_span: SolvedType.Span,
+        capture_exprs: []const Lifted.ExprId,
+        capture_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        const captures = self.solved.types.captureSpan(capture_span);
+        const fields = switch (self.program.types.get(capture_ty)) {
+            .capture_record => |fields| self.program.types.captureFieldSpan(fields),
+            else => Common.invariant("callable capture payload was not a capture record"),
+        };
+        if (captures.len != fields.len or captures.len != capture_exprs.len) {
+            Common.invariant("explicit callable capture payload arity differed from captured locals");
+        }
+
+        const values = try self.scratch.allocator().alloc(Ast.ExprId, captures.len);
+        for (captures, fields, capture_exprs, 0..) |capture, field, capture_expr, i| {
+            if (capture.symbol != field.symbol or capture.binder != field.binder or capture.capture_id != field.capture_id) {
+                Common.invariant("callable capture payload fields differed from captured locals");
+            }
+            if (self.solved.types.root(capture.ty) != self.solved.types.root(self.solved.expr_tys.items[@intFromEnum(capture_expr)])) {
+                Common.invariant("explicit callable capture expression type differed from captured local type");
+            }
+            values[i] = try self.lowerExpr(capture_expr);
         }
         return try self.program.addExpr(.{
             .ty = capture_ty,

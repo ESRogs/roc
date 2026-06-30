@@ -360,6 +360,7 @@ const Lifter = struct {
             .comptime_exhaustiveness_failed,
             .fn_ref,
             => {},
+            .fn_ref_captures => |fn_ref| for (self.output.exprSpan(fn_ref.captures)) |capture| try self.rewriteExpr(capture),
             .static_data_candidate => |candidate| try self.rewriteExpr(candidate.restored_expr),
             .list,
             .tuple,
@@ -766,6 +767,9 @@ const CaptureSet = struct {
             => {},
             .static_data_candidate => |candidate| try self.collectExpr(candidate.restored_expr, bound),
             .fn_ref => |fn_id| try self.collectFnCaptures(fn_id, bound),
+            .fn_ref_captures => |fn_ref| {
+                for (input.exprSpan(fn_ref.captures)) |capture| try self.collectExpr(capture, bound);
+            },
             .fn_def => |fn_id| try self.collectFnCaptures(self.lifter.liftedFn(fn_id), bound),
             .list,
             .tuple,

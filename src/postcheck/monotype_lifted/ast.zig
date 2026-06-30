@@ -56,6 +56,8 @@ pub const Expr = Mono.Expr;
 
 /// Monotype Lifted expression forms.
 pub const ExprData = Mono.ExprData;
+/// Function value construction with explicit captures.
+pub const FnRefCaptures = Mono.FnRefCaptures;
 /// Identifier for one private optimized loop state.
 pub const StateLoopStateId = Mono.StateLoopStateId;
 /// Private optimized loop state shared with Monotype IR.

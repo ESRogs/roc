@@ -457,6 +457,10 @@ const Solver = struct {
             .fn_def,
             => Common.invariant("pre-lift function expression reached Lambda Solved"),
             .fn_ref => |fn_id| try self.unify(expected, self.program.fn_tys.items[@intFromEnum(fn_id)]),
+            .fn_ref_captures => |fn_ref| {
+                try self.unify(expected, self.program.fn_tys.items[@intFromEnum(fn_ref.target)]);
+                try self.expectFnRefCaptures(fn_ref);
+            },
             .call_value => |call| {
                 const func = try self.functionShape(try self.inferExpr(call.callee));
                 const args = self.program.lifted.exprSpan(call.args);
@@ -742,6 +746,18 @@ const Solver = struct {
         return self.resolveRoot(slot);
     }
 
+    fn expectFnRefCaptures(self: *Solver, fn_ref: Lifted.FnRefCaptures) Allocator.Error!void {
+        const target_fn = self.program.lifted.fns.items[@intFromEnum(fn_ref.target)];
+        const target_captures = self.program.lifted.typedLocalSpan(target_fn.captures);
+        const capture_exprs = self.program.lifted.exprSpan(fn_ref.captures);
+        if (target_captures.len != capture_exprs.len) {
+            Common.invariant("explicit function reference capture count differed from target function captures");
+        }
+        for (target_captures, capture_exprs) |capture, capture_expr| {
+            _ = try self.expectExpr(capture_expr, self.localTy(capture.local));
+        }
+    }
+
     fn exprSlot(self: *Solver, expr_id: Lifted.ExprId) Allocator.Error!Type.TypeVarId {
         const index = @intFromEnum(expr_id);
         if (self.expr_tys[index]) |ty| return ty;
@@ -750,6 +766,7 @@ const Solver = struct {
         const ty = switch (expr.data) {
             .local => |local| self.localTy(local),
             .fn_ref => |fn_id| self.program.fn_tys.items[@intFromEnum(fn_id)],
+            .fn_ref_captures => |fn_ref| self.program.fn_tys.items[@intFromEnum(fn_ref.target)],
             .call_proc => |call| (try self.functionShape(self.program.fn_tys.items[@intFromEnum(Lifted.callProcCallee(call))])).ret,
             else => try self.lowerTypeFresh(expr.ty),
         };
@@ -768,6 +785,7 @@ const Solver = struct {
         const ty = switch (expr.data) {
             .local => |local| self.localTy(local),
             .fn_ref => |fn_id| self.program.fn_tys.items[@intFromEnum(fn_id)],
+            .fn_ref_captures => |fn_ref| self.program.fn_tys.items[@intFromEnum(fn_ref.target)],
             .call_proc => |call| (try self.functionShape(self.program.fn_tys.items[@intFromEnum(Lifted.callProcCallee(call))])).ret,
             else => try self.lowerTypeFresh(expr.ty),
         };

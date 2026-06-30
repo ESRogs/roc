@@ -376,6 +376,16 @@ pub const StaticDataCandidate = struct {
     restored_expr: ExprId,
 };
 
+/// Function value construction with an explicit capture payload.
+///
+/// Plain `fn_ref` reads the target function's capture locals from the current
+/// lexical environment. This form is used after lifting when an optimizer has
+/// already computed the exact capture expressions for the function value.
+pub const FnRefCaptures = struct {
+    target: LiftedFnId,
+    captures: Span(ExprId),
+};
+
 /// Monotype expression forms.
 pub const ExprData = union(enum) {
     local: LocalId,
@@ -402,6 +412,7 @@ pub const ExprData = union(enum) {
     def_ref: DefId,
     fn_def: FnId,
     fn_ref: LiftedFnId,
+    fn_ref_captures: FnRefCaptures,
     call_value: CallValue,
     call_proc: CallProc,
     low_level: LowLevelCall,

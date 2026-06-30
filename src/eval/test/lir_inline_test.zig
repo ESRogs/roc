@@ -184,7 +184,7 @@ fn runLoweredWithHostEvents(
 fn expectOptimizedDbgEvents(source: []const u8, expected: []const []const u8) anyerror!void {
     const allocator = std.testing.allocator;
 
-    var optimized = try lowerModule(allocator, source, .optimized);
+    var optimized = try lowerModuleWithOptions(allocator, source, .optimized, .{ .proc_debug_names = true });
     defer optimized.deinit(allocator);
 
     var run = try runLoweredWithHostEvents(allocator, &optimized.lowered);
@@ -213,7 +213,7 @@ fn expectOptimizedHostEvents(
 ) anyerror!void {
     const allocator = std.testing.allocator;
 
-    var optimized = try lowerModule(allocator, source, .optimized);
+    var optimized = try lowerModuleWithOptions(allocator, source, .optimized, .{ .proc_debug_names = true });
     defer optimized.deinit(allocator);
 
     var run = try runLoweredWithHostEvents(allocator, &optimized.lowered);
@@ -1219,7 +1219,7 @@ fn hasGroupedStrMatchSet(shape: ProcShape) bool {
 fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_unsafe_count: usize) anyerror!void {
     const allocator = std.testing.allocator;
 
-    var optimized = try lowerModule(allocator, source, .optimized);
+    var optimized = try lowerModuleWithOptions(allocator, source, .optimized, .{ .proc_debug_names = true });
     defer optimized.deinit(allocator);
 
     try std.testing.expect(!try reachableIterCollectShape(allocator, &optimized.lowered, .specialized));
@@ -2219,6 +2219,29 @@ test "stream from iterator collect keeps finite step callables" {
     defer optimized.deinit(allocator);
 
     try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
+}
+
+test "optimized infinite custom iterator consumes finite prefix" {
+    const source =
+        \\module [main]
+        \\
+        \\main : U64
+        \\main = {
+        \\    adv : ((U64, U64) -> Try((U64, (U64, U64)), [NoMore]))
+        \\    adv = |(a, b)| Try.Ok((a, (b, a + b)))
+        \\
+        \\    fib_iter = Iter.custom((0.U64, 1.U64), Unknown, adv)
+        \\
+        \\    var $sum = 0.U64
+        \\    for f in fib_iter.take_first(5) {
+        \\        $sum = $sum + f
+        \\    }
+        \\    dbg $sum
+        \\    $sum
+        \\}
+    ;
+
+    try expectOptimizedDbgEvents(source, &.{"7"});
 }
 
 test "spec constr list filter-map loop does not produce unbound ARC locals" {
