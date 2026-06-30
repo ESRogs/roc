@@ -1336,13 +1336,11 @@ concrete monomorphic dispatcher type has already determined the owner.
 
 ### Optimized Callable-State And Control-Boundary Specialization
 
-This is the accepted long-term design for optimized callable-state lowering.
-The compiler must move directly to this architecture; there is no separate
-short-term iterator implementation, no cleanup pass to preserve, and no
-source-specific rule that should remain once this design is implemented. The
-target design is the long-term design. Implementation checkpoints may land
-incrementally, but they must be partial implementations of this architecture,
-not alternate mechanisms that later need to be removed.
+This is the design for optimized callable-state lowering. The compiler has one
+architecture for this optimization: producer-under-demand lowering that emits
+ordinary LIR before ARC and backend code generation. Iterator-specific systems,
+cleanup passes, source-specific rules, and alternate mechanisms are not part of
+the design.
 
 This optimizer runs only in optimized code-generation modes: `--opt=size` and
 `--opt=speed`. It does not run during `roc check`, compile-time evaluation,
@@ -1471,13 +1469,10 @@ straight public-value path; it must not construct optimized-demand data,
 attempt the optimized path speculatively, or depend on optimized state to
 preserve observable Roc behavior.
 
-The mode restriction does not make this a lesser or temporary design. It is the
-complete target design for generated-code optimization. Dev, check,
-interpreter, and compile-time-finalization paths have their own correct
-ordinary-public-value lowering architecture; they are not partial failed
-attempts at optimized lowering. Conversely, `--opt=size` and `--opt=speed` must
-not be ordinary lowering plus a later cleanup. They enter the optimized
-architecture from the beginning, before public wrappers are created.
+Dev, check, interpreter, and compile-time-finalization paths use the
+ordinary-public-value lowering architecture. `--opt=size` and `--opt=speed`
+enter optimized callable-state lowering from the beginning, before public
+wrappers are created.
 
 The implementation consequence is strict: the post-check driver first classifies
 the requested build into exactly one of two lowering families, then constructs
@@ -1798,22 +1793,6 @@ belongs to the optimized lowering context. If ordinary public-value lowering
 needs the same source program to compile, it must do so through the ordinary
 materializing path without constructing dormant optimized state.
 
-This mode gate is also a test boundary. Focused optimizer regressions must
-prove both sides of it: dev, check, interpreter, and compile-time-finalization
-paths do not construct optimized contexts, and `--opt=size` plus `--opt=speed`
-enter the same callable-state specialization path. Assertions about
-optimizer-owned data, such as sparse demand shape, finite callable alternatives,
-loop-demand fixed points, and public materialization boundaries, must be checked
-in both optimized modes unless the assertion is explicitly about a later
-backend size-vs-speed preference.
-
-The first accepted implementation checkpoint for this optimizer is therefore
-the gate itself. Before testing iterator-specific generated code, the compiler
-must prove that non-optimized paths cannot allocate optimized state and that the
-two optimized modes share the same producer-under-demand machinery. Later
-specialization tests may assume that boundary only after the gate has focused
-coverage.
-
 The optimized entrypoint may contain internal helper phases, but those phases
 are ordered by data dependency, not by source syntax:
 
@@ -1826,24 +1805,6 @@ are ordered by data dependency, not by source syntax:
 No phase may recover missing demand from names, lowered symbols, backend
 output, wasm bytes, disassembly, or completed LIR. If a later helper needs
 compiler data, the earlier clone-under-demand step must produce it explicitly.
-
-Current implementation work must therefore converge by replacing dense
-public-wrapper paths with this producer-under-demand lowering. A partial
-implementation that creates public wrappers, lowers them, and then removes them
-later is not this design. A partial implementation that recognizes `Iter`,
-`for`, `if`, `match`, wasm, Rocci Bird, or generated symbol names is also not
-this design. The transition is complete only when the same demand machinery
-explains optimized direct calls, branch results, match results, loop-carried
-state, finite callable alternatives, and public materialization boundaries.
-
-The implementation must prove that transition through compiler-owned data.
-The first proof is the mode boundary: non-optimized lowering constructs no
-optimized context, and both optimized modes construct the same optimized
-context. Later proofs are shape data produced by optimized lowering itself:
-result demand, sparse private state, finite callable alternatives, loop-demand
-fixed points, demand-keyed workers, and explicit materialization boundaries.
-Final wasm size and disassembly may confirm the result, but they are not the
-optimizer's source of truth.
 
 This boundary is about compiler cost and generated code quality, not
 correctness. Checking, static-dispatch finalization, compile-time root
@@ -2106,19 +2067,7 @@ from `roc check`, compile-time evaluation, dev builds, interpreter paths, or
 non-optimized builds. Those paths need correctness and diagnostics, not
 Rust-like generated-code specialization.
 
-The implementation order follows from that boundary. First the post-check
-driver must select one lowering context from explicit build-mode input. Then
-optimized lowering can introduce result demand, sparse private state, loop
-demand graph nodes, finite callable-state alternatives, and demand-keyed
-workers as data owned by that context. Later stages must see only ordinary LIR.
-If a private-state shape is discovered only by scanning completed LIR, generated
-symbols, wasm bytes, object bytes, or disassembly, the implementation has missed
-the producer-consumer boundary where that data should have been produced.
-
-The implementation must move directly to this design. There is no intermediate
-iterator-specific design to preserve, and no short-term fallback path to keep
-around after the generic mechanism exists. The optimized lowering pipeline is
-responsible for these pieces as one coherent system:
+The optimized lowering pipeline owns these pieces as one coherent system:
 
 - an explicit `--opt=size`/`--opt=speed` entrypoint gate
 - result demand as first-class optimizer data
@@ -2130,6 +2079,11 @@ responsible for these pieces as one coherent system:
   `continue` edges
 - demand-keyed optimized direct-call workers
 - explicit public materialization boundaries
+
+Later stages must see only ordinary LIR. If a private-state shape is discovered
+only by scanning completed LIR, generated symbols, wasm bytes, object bytes, or
+disassembly, the implementation has missed the producer-consumer boundary where
+that data should have been produced.
 
 If an optimized path needs information that is not available, the fix is to make
 an earlier stage produce that information explicitly. It is not acceptable to
