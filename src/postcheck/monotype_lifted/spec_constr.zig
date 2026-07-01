@@ -7481,7 +7481,12 @@ const Cloner = struct {
                 self.restore(change_start);
                 return try self.cloneStateLoopFromDemandedKnownValues(ty, loop, params, values, demanded_known_values, demands, result_demand);
             }
+            const body_scoped_start = self.scopedLocalsLen();
+            for (new_params.items) |new_param| {
+                try self.scoped_locals.append(self.pass.allocator, new_param.local);
+            }
             const body = try self.cloneExpr(loop.body);
+            self.restoreScopedLocals(body_scoped_start);
             _ = self.loop_stack.pop();
 
             if (valueDemandsRequirePrivateState(demands)) {
