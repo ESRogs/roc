@@ -3291,10 +3291,10 @@ const Cloner = struct {
             },
             .let_ => |let_| return try self.cloneLetValue(let_),
             .field_access => |field| {
-                if (try self.noteLoopDemandIfLocalExpr(
+                try self.noteLoopDemandIfLocalExpr(
                     field.receiver,
                     try self.pass.demandRecordField(field.field, .materialize),
-                )) return try self.uninitializedValue(expr.ty);
+                );
                 const receiver = try self.cloneExprValueDemandingKnownValue(field.receiver);
                 if (try self.fieldFromKnownValue(receiver, field.field)) |value| return value;
                 if (try self.solvedSingleCallable(expr_id)) |callable| return callable;
@@ -3308,10 +3308,10 @@ const Cloner = struct {
                 } } }) };
             },
             .tuple_access => |access| {
-                if (try self.noteLoopDemandIfLocalExpr(
+                try self.noteLoopDemandIfLocalExpr(
                     access.tuple,
                     try self.pass.demandTupleItem(access.elem_index, .materialize),
-                )) return try self.uninitializedValue(expr.ty);
+                );
                 const receiver = try self.cloneExprValueDemandingKnownValue(access.tuple);
                 if (try self.itemFromKnownValue(receiver, access.elem_index)) |value| return value;
                 if (try self.solvedSingleCallable(expr_id)) |callable| return callable;
@@ -3338,7 +3338,8 @@ const Cloner = struct {
             .block => |block| return try self.cloneBlockValue(expr.ty, block),
             .call_value => |call| {
                 const callee_demand = try self.callableDemandForCalleeExpr(call.callee);
-                if (try self.noteLoopDemandIfLocalExpr(call.callee, callee_demand)) return try self.uninitializedValue(expr.ty);
+                try self.noteLoopDemandIfLocalExpr(call.callee, callee_demand);
+                if (self.activeStateLoopDemandChanged()) return try self.uninitializedValue(expr.ty);
                 const callee = try self.cloneExprValueWithDemand(call.callee, callee_demand);
                 return try self.callKnownValue(expr.ty, callee, call.args, false);
             },
@@ -3365,7 +3366,8 @@ const Cloner = struct {
         const value = blk: switch (expr.data) {
             .call_value => |call| {
                 const callee_demand = try self.callableDemandForCalleeExprWithResultDemand(call.callee, .materialize);
-                if (try self.noteLoopDemandIfLocalExpr(call.callee, callee_demand)) break :blk try self.uninitializedValue(expr.ty);
+                try self.noteLoopDemandIfLocalExpr(call.callee, callee_demand);
+                if (self.activeStateLoopDemandChanged()) break :blk try self.uninitializedValue(expr.ty);
                 const callee = try self.cloneExprValueWithDemand(call.callee, callee_demand);
                 break :blk try self.callKnownValue(expr.ty, callee, call.args, true);
             },
@@ -3470,7 +3472,6 @@ const Cloner = struct {
                 const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
                 switch (expr.data) {
                     .local => |local| {
-                        if (try self.noteLoopDemandIfLocalExpr(expr_id, resolved_demand)) break :blk try self.uninitializedValue(expr.ty);
                         if (self.subst.get(local)) |value| break :blk try self.applyValueDemand(value, resolved_demand);
                         break :blk try self.cloneExprValueDemandingKnownValue(expr_id);
                     },
@@ -3490,7 +3491,8 @@ const Cloner = struct {
                     },
                     .call_value => |call| {
                         const callee_demand = try self.callableDemandForCalleeExprWithResultDemand(call.callee, resolved_demand);
-                        if (try self.noteLoopDemandIfLocalExpr(call.callee, callee_demand)) break :blk try self.uninitializedValue(expr.ty);
+                        try self.noteLoopDemandIfLocalExpr(call.callee, callee_demand);
+                        if (self.activeStateLoopDemandChanged()) break :blk try self.uninitializedValue(expr.ty);
                         const callee = try self.cloneExprValueWithDemand(call.callee, callee_demand);
                         break :blk try self.callKnownValueWithDemand(expr.ty, callee, call.args, resolved_demand);
                     },
@@ -7371,7 +7373,6 @@ const Cloner = struct {
             }
 
             if (try self.stabilizeLoopDemandsFromDemandedStateBodies(loop, params, values, demanded_known_values, demands, result_demand)) {
-                try self.refreshDemandedKnownValuesFromValueDemands(values, demands, demanded_known_values);
                 if (source_initials) |sources| {
                     const refreshed_values = try self.refreshedLoopInitialValues(values, sources, demands);
                     defer self.pass.allocator.free(refreshed_values);
@@ -8389,7 +8390,7 @@ const Cloner = struct {
                 const closed_demands = try self.pass.allocator.alloc(ValueDemand, demands.len);
                 defer self.pass.allocator.free(closed_demands);
                 for (demands, closed_demands) |demand, *closed| {
-                    closed.* = try self.closeFunctionDemandRefsInDemand(demand);
+                    closed.* = try self.closeLoopDemandRefs(demand);
                 }
                 self.pass.program.state_loop_states.shrinkRetainingCapacity(state_start_len);
                 try self.refreshDemandedKnownValuesFromValueDemands(values, closed_demands, known_values);
@@ -8638,12 +8639,6 @@ const Cloner = struct {
         value: Value,
         demand: ValueDemand,
     ) Common.LowerError!?DemandedKnownValue {
-        if (valueDemandRequiresPrivateState(demand)) {
-            if (try self.privateStateValueFromValueDemand(value, demand)) |private_state| {
-                return try self.demandedKnownValueFromPrivateStateLoopStateShape(private_state);
-            }
-        }
-
         if (try self.demandedKnownValueFromValueDemand(value, demand)) |demanded| {
             return demanded;
         }
@@ -10172,7 +10167,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         demand: ValueDemand,
-    ) Allocator.Error!bool {
+    ) Allocator.Error!void {
         if (self.loop_stack.getLastOrNull()) |loop| {
             for (loop.params, 0..) |param, index| {
                 if (index >= loop.demands.len) Common.invariant("loop demand index exceeded active loop state");
@@ -10180,16 +10175,15 @@ const Cloner = struct {
                 if (local_demand == .none) continue;
                 loop.demands[index] = try self.mergeActiveLoopParamDemand(loop, index, loop.demands[index], local_demand);
             }
-            return false;
+            return;
         }
-        const state_loop = self.state_loop_stack.getLastOrNull() orelse return false;
+        const state_loop = self.state_loop_stack.getLastOrNull() orelse return;
         for (state_loop.params, 0..) |param, index| {
             if (index >= state_loop.demands.len or index >= state_loop.values.len) Common.invariant("state loop demand index exceeded active loop state");
             const local_demand = try self.localDemandInExpr(param.local, expr_id, demand);
             if (local_demand == .none) continue;
             try self.mergeActiveStateLoopParamDemand(state_loop, index, local_demand);
         }
-        return state_loop.changed.*;
     }
 
     fn mergeActiveLoopParamDemand(
@@ -10248,10 +10242,7 @@ const Cloner = struct {
             const current = loop.demands[index];
             const normalized = try self.normalizeLoopValueParamDemand(loop.values[index], current);
             if (try self.valueDemandEqlInActiveContext(current, normalized)) break;
-            const current_closed = try self.closeFunctionDemandRefsInDemand(current);
-            const normalized_closed = try self.closeFunctionDemandRefsInDemand(normalized);
-            if (try self.valueDemandEqlInActiveContext(current_closed, normalized_closed)) break;
-            loop.demands[index] = normalized_closed;
+            loop.demands[index] = normalized;
             loop.changed.* = true;
             self.demand_cache_epoch += 1;
         }
@@ -10284,10 +10275,7 @@ const Cloner = struct {
         if (try self.valueDemandEqlInActiveContext(current, incoming)) return;
         const merged = try self.mergeValueDemand(current, incoming);
         if (try self.valueDemandEqlInActiveContext(current, merged)) return;
-        const current_closed = try self.closeFunctionDemandRefsInDemand(current);
-        const merged_closed = try self.closeFunctionDemandRefsInDemand(merged);
-        if (try self.valueDemandEqlInActiveContext(current_closed, merged_closed)) return;
-        loop.demands[index] = merged_closed;
+        loop.demands[index] = merged;
         loop.changed.* = true;
         self.demand_cache_epoch += 1;
     }
@@ -12782,10 +12770,10 @@ const Cloner = struct {
     }
 
     fn cloneFieldAccess(self: *Cloner, ty: Type.TypeId, field: anytype) Common.LowerError!Ast.ExprId {
-        if (try self.noteLoopDemandIfLocalExpr(
+        try self.noteLoopDemandIfLocalExpr(
             field.receiver,
             try self.pass.demandRecordField(field.field, .materialize),
-        )) return try self.addExpr(.{ .ty = ty, .data = .uninitialized });
+        );
         const receiver = try self.cloneExprValueDemandingKnownValue(field.receiver);
         if (try self.fieldFromKnownValue(receiver, field.field)) |value| return try self.materialize(value);
         return try self.addExpr(.{ .ty = ty, .data = .{ .field_access = .{
@@ -12795,10 +12783,10 @@ const Cloner = struct {
     }
 
     fn cloneTupleAccess(self: *Cloner, ty: Type.TypeId, access: anytype) Common.LowerError!Ast.ExprId {
-        if (try self.noteLoopDemandIfLocalExpr(
+        try self.noteLoopDemandIfLocalExpr(
             access.tuple,
             try self.pass.demandTupleItem(access.elem_index, .materialize),
-        )) return try self.addExpr(.{ .ty = ty, .data = .uninitialized });
+        );
         const receiver = try self.cloneExprValueDemandingKnownValue(access.tuple);
         if (try self.itemFromKnownValue(receiver, access.elem_index)) |value| return try self.materialize(value);
         return try self.addExpr(.{ .ty = ty, .data = .{ .tuple_access = .{
@@ -13827,113 +13815,6 @@ const Cloner = struct {
         var seen_ptrs = std.ArrayList(*const ValueDemand).empty;
         defer seen_ptrs.deinit(self.pass.allocator);
         return try self.closeLoopDemandRefsSeen(demand, &seen_nodes, &seen_ptrs);
-    }
-
-    fn closeFunctionDemandRefsInDemand(self: *Cloner, demand: ValueDemand) Allocator.Error!ValueDemand {
-        var seen_nodes = std.ArrayList(usize).empty;
-        defer seen_nodes.deinit(self.pass.allocator);
-        var seen_ptrs = std.ArrayList(*const ValueDemand).empty;
-        defer seen_ptrs.deinit(self.pass.allocator);
-        return try self.closeFunctionDemandRefsInDemandSeen(demand, &seen_nodes, &seen_ptrs);
-    }
-
-    fn closeFunctionDemandRefsInDemandSeen(
-        self: *Cloner,
-        demand: ValueDemand,
-        seen_nodes: *std.ArrayList(usize),
-        seen_ptrs: *std.ArrayList(*const ValueDemand),
-    ) Allocator.Error!ValueDemand {
-        return switch (demand) {
-            .none,
-            .materialize,
-            .loop_param,
-            => demand,
-            .fn_param => |demand_ref| blk: {
-                if (!self.functionDemandSlotIdIsActive(demand_ref)) {
-                    break :blk ValueDemand.none;
-                }
-                const root_ref = self.canonicalFunctionDemandSlotId(demand_ref);
-                for (seen_nodes.items) |seen_node| {
-                    if (seen_node == root_ref.node) break :blk ValueDemand.none;
-                }
-                try seen_nodes.append(self.pass.allocator, root_ref.node);
-                defer _ = seen_nodes.pop();
-
-                const resolved = self.activeFunctionDemandSlot(root_ref).*;
-                if (resolved == .fn_param and functionDemandSlotIdEql(resolved.fn_param, root_ref)) {
-                    break :blk ValueDemand.none;
-                }
-                break :blk try self.closeFunctionDemandRefsInDemandSeen(resolved, seen_nodes, seen_ptrs);
-            },
-            .record => |fields| blk: {
-                const closed_fields = try self.pass.arena.allocator().alloc(FieldDemand, fields.len);
-                for (fields, closed_fields) |field, *closed| {
-                    closed.* = .{
-                        .name = field.name,
-                        .demand = try self.pass.storedDemand(try self.closeFunctionDemandPtrRefsInDemandSeen(field.demand, seen_nodes, seen_ptrs)),
-                    };
-                }
-                break :blk ValueDemand{ .record = closed_fields };
-            },
-            .tuple => |items| blk: {
-                const closed_items = try self.pass.arena.allocator().alloc(ItemDemand, items.len);
-                for (items, closed_items) |item, *closed| {
-                    closed.* = .{
-                        .index = item.index,
-                        .demand = try self.pass.storedDemand(try self.closeFunctionDemandPtrRefsInDemandSeen(item.demand, seen_nodes, seen_ptrs)),
-                    };
-                }
-                break :blk ValueDemand{ .tuple = closed_items };
-            },
-            .tag => |tag| blk: {
-                const alternatives = try self.pass.arena.allocator().alloc(TagAlternativeDemand, tag.alternatives.len);
-                for (tag.alternatives, alternatives) |alternative, *closed_alternative| {
-                    const payloads = try self.pass.arena.allocator().alloc(ItemDemand, alternative.payloads.len);
-                    for (alternative.payloads, payloads) |payload, *closed_payload| {
-                        closed_payload.* = .{
-                            .index = payload.index,
-                            .demand = try self.pass.storedDemand(try self.closeFunctionDemandPtrRefsInDemandSeen(payload.demand, seen_nodes, seen_ptrs)),
-                        };
-                    }
-                    closed_alternative.* = .{
-                        .name = alternative.name,
-                        .payloads = payloads,
-                    };
-                }
-                break :blk ValueDemand{ .tag = .{ .alternatives = alternatives } };
-            },
-            .nominal => |backing| ValueDemand{
-                .nominal = try self.pass.storedDemand(try self.closeFunctionDemandPtrRefsInDemandSeen(backing, seen_nodes, seen_ptrs)),
-            },
-            .callable => |callable| blk: {
-                const captures = try self.pass.arena.allocator().alloc(ValueDemand, callable.captures.len);
-                for (callable.captures, captures) |capture, *closed_capture| {
-                    closed_capture.* = try self.closeFunctionDemandRefsInDemandSeen(capture, seen_nodes, seen_ptrs);
-                }
-                const result = if (callable.result) |result_demand|
-                    try self.pass.storedDemand(try self.closeFunctionDemandPtrRefsInDemandSeen(result_demand, seen_nodes, seen_ptrs))
-                else
-                    null;
-                break :blk ValueDemand{ .callable = .{
-                    .captures = captures,
-                    .result = result,
-                } };
-            },
-        };
-    }
-
-    fn closeFunctionDemandPtrRefsInDemandSeen(
-        self: *Cloner,
-        demand: *const ValueDemand,
-        seen_nodes: *std.ArrayList(usize),
-        seen_ptrs: *std.ArrayList(*const ValueDemand),
-    ) Allocator.Error!ValueDemand {
-        for (seen_ptrs.items) |seen_demand| {
-            if (seen_demand == demand) return .none;
-        }
-        try seen_ptrs.append(self.pass.allocator, demand);
-        defer _ = seen_ptrs.pop();
-        return try self.closeFunctionDemandRefsInDemandSeen(demand.*, seen_nodes, seen_ptrs);
     }
 
     fn closeLoopDemandRefsSeen(
@@ -18033,7 +17914,7 @@ const Cloner = struct {
             &.{};
         for (args, 0..) |arg_expr, index| {
             if (index < callee_uses.len and callee_uses[index]) {
-                if (try self.noteLoopDemandIfLocalExpr(arg_expr, callee_demands[index])) return try self.uninitializedValue(ty);
+                try self.noteLoopDemandIfLocalExpr(arg_expr, callee_demands[index]);
             }
             arg_values[index] = try self.cloneExprValue(arg_expr);
         }
@@ -18151,7 +18032,7 @@ const Cloner = struct {
         for (source_args, args, 0..) |source_arg, arg_expr, index| {
             const arg_demand = try self.functionLocalDemand(callable.fn_id, source_arg.local, demand);
             if (arg_demand != .none) {
-                if (try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand)) return try self.uninitializedValue(ty);
+                try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand);
                 arg_values[index] = try self.cloneExprValueWithDemand(arg_expr, arg_demand);
             } else if (try discardedExprIsEffectFree(self.pass.program, self.pass.allocator, arg_expr)) {
                 arg_values[index] = try self.exprValueForDemandNoInline(arg_expr);
@@ -18232,9 +18113,8 @@ const Cloner = struct {
                     try self.functionLocalDemand(callable.fn_id, source_capture.local, demand);
                 if (capture_demand != .none and self.subst.get(source_capture.local) != null) continue;
                 if (capture_demand != .none) {
-                    const capture_value = (try self.privateStateCallableCaptureValue(callable, index)) orelse {
+                    const capture_value = (try self.privateStateCallableCaptureValue(callable, index)) orelse
                         Common.invariant("sparse private callable was missing a demanded capture");
-                    };
                     const prepared = try self.valueForInlineLocal(source_capture.local, capture_value, body, &pending_lets);
                     try self.putSubst(source_capture.local, prepared);
                 }
@@ -18246,7 +18126,7 @@ const Cloner = struct {
         for (source_args, args, 0..) |source_arg, arg_expr, index| {
             const arg_demand = try self.functionLocalDemand(callable.fn_id, source_arg.local, demand);
             if (arg_demand != .none) {
-                if (try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand)) return try self.uninitializedValue(ty);
+                try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand);
                 arg_values[index] = try self.cloneExprValueWithDemand(arg_expr, arg_demand);
             } else {
                 arg_values[index] = try self.cloneExprValue(arg_expr);
@@ -18334,7 +18214,7 @@ const Cloner = struct {
         for (source_args, args, 0..) |source_arg, arg_expr, index| {
             const arg_demand = try self.functionLocalDemand(callable.fn_id, source_arg.local, demand);
             if (arg_demand != .none) {
-                if (try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand)) return try self.uninitializedValue(ty);
+                try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand);
                 arg_values[index] = try self.cloneExprValueWithDemand(arg_expr, arg_demand);
             } else {
                 arg_values[index] = try self.cloneExprValue(arg_expr);
@@ -18676,7 +18556,7 @@ const Cloner = struct {
             &.{};
         for (args, 0..) |arg_expr, index| {
             if (index < callee_uses.len and callee_uses[index]) {
-                if (try self.noteLoopDemandIfLocalExpr(arg_expr, callee_demands[index])) return try self.uninitializedValue(self.pass.program.exprs.items[@intFromEnum(original_expr)].ty);
+                try self.noteLoopDemandIfLocalExpr(arg_expr, callee_demands[index]);
             }
             arg_values[index] = if (index < callee_uses.len and callee_uses[index])
                 try self.cloneExprValueDemandingKnownValue(arg_expr)
@@ -18824,7 +18704,7 @@ const Cloner = struct {
         for (args, 0..) |arg_expr, index| {
             const arg_demand = arg_demands[index];
             if (arg_demand != .none) {
-                if (try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand)) return try self.uninitializedValue(self.pass.program.exprs.items[@intFromEnum(original_expr)].ty);
+                try self.noteLoopDemandIfLocalExpr(arg_expr, arg_demand);
                 arg_values[index] = try self.cloneExprValueWithDemand(arg_expr, arg_demand);
             } else if (try discardedExprIsEffectFree(self.pass.program, self.pass.allocator, arg_expr)) {
                 arg_values[index] = try self.exprValueForDemandNoInline(arg_expr);

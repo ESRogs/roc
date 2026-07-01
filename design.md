@@ -1459,8 +1459,8 @@ builder-owned data inside optimized lowering, not a stored public IR stage:
   value. It stores only demanded children. A missing child means not carried; a
   present unknown child means carried as a runtime leaf. For callable captures,
   a demanded child may also be represented by an explicit supplier reference to
-  an active loop state slot; that is distinct from both omission and structural
-  storage.
+  an active loop state value; that is distinct from omission, from a runtime
+  leaf, and from structural storage.
 - `FiniteCallableState` is ordinary lambda-set data plus demanded captures by
   original capture index. Different alternatives may have different capture
   indexes and counts without widening to a public erased callable.
@@ -1947,6 +1947,16 @@ scanning completed LIR, symbol names, generated code, wasm disassembly, or
 backend output. If a producer needs a private shape, that requirement must be
 visible as explicit demand at the point where the producer is cloned.
 
+Loop-carried state products are paired with their entry products. For each loop
+parameter, optimized lowering applies the normalized loop demand to the original
+entry value and derives both the state identity and the entry split from that
+same demanded value. If applying demand produces sparse private state, the loop
+state identity is the demanded private-state shape, not an unknown public leaf
+of the same type. If later loop-body demand grows, the demanded product is
+rebuilt from the original entry value under the grown demand. It is illegal to
+derive a state identity from a previously split sparse value, from an ordinary
+public `any` placeholder, or from a later materialization attempt.
+
 Known values are optimizer data, not runtime values. They are not limited to
 aggregate source syntax. Primitive leaves are first-class known values, so a
 `U64` loop cursor must optimize the same way whether it appears directly or
@@ -1964,12 +1974,38 @@ whose data is unknown means private state carries the runtime value but has no
 more precise structure.
 
 Callable captures have one additional private-state source: a capture may be
-supplied by an active loop state slot through a loop-demand node. This is how a
+supplied by an active loop state value through a loop-demand node. This is how a
 recursive iterator step closure can refer to the current cursor without storing
-the cursor inside itself and expanding forever. Supplier references are
-explicit optimizer data. They must not be inferred from source names, from a
-temporary substitution table, or from the fact that a capture happened to be
-available while cloning one particular body.
+the cursor inside itself and expanding forever.
+
+A loop supplier is a demanded/private value shape, not a demand tree. It is
+keyed by the active loop fixed point, the original loop parameter identity, and
+the demanded path from that parameter to the supplied value. The path uses the
+same checked child identities as sparse private state: record field name, tuple
+item index, tag payload identity, nominal backing, and callable capture index.
+The producer that creates the supplier must also merge the supplied capture's
+use demand back into the owning loop parameter demand at that path. Once that
+merge has happened, the supplier itself contributes zero state slots and zero
+compact-result slots. It is a reference to state already owned by the loop fixed
+point.
+
+Supplier references are explicit optimizer data. They must be produced from
+loop-state provenance: either the loop parameter itself or a generated private
+state local whose provenance records the original loop parameter and path. They
+must not be inferred from source names, debug ids, equality with the current
+sparse value, the incidental contents of a substitution table, or the fact that
+a capture happened to be available while cloning one particular body.
+
+A supplier reference may appear only inside optimized demanded/private callable
+state owned by the active loop fixed point. It is illegal at public
+materialization boundaries, worker boundaries, ordinary public callable
+materialization, stored constants, LIR, ARC, and backends. While inlining the
+callable body inside the owning fixed point, the consumer resolves the supplier
+by reading the current active loop parameter private value at the recorded path
+and binding the source capture local to that private value. If the reference
+cannot be resolved through the owning fixed point, that is a compiler bug; the
+consumer must not materialize the public callable or structurally expand the
+loop state to recover.
 
 Sparse demanded private state must not be forced through the ordinary dense
 public `Value` representation. Ordinary public values require all children
