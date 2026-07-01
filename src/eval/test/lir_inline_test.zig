@@ -1812,6 +1812,36 @@ test "direct range map collect uses direct list loop" {
     , 2);
 }
 
+test "local iterator append loop demands step captures across states" {
+    // The append step callable's appended-item capture is demanded only
+    // through the step-result `item` demand observed inside the loop body.
+    // That observation must reach the owning loop demand node so the state
+    // key carries the capture; otherwise the state callable is reconstructed
+    // without a capture its body demands.
+    const allocator = std.testing.allocator;
+    var optimized = try lowerModule(allocator,
+        \\module [main]
+        \\
+        \\Point : { x : I64 }
+        \\
+        \\points : () -> Iter(Point)
+        \\points = || [{ x: 1.I64 }, { x: 2 }].iter().append({ x: 3 })
+        \\
+        \\main : I64
+        \\main = {
+        \\    iter = points()
+        \\    var $sum = 0.I64
+        \\    for point in iter {
+        \\        $sum = $sum + point.x
+        \\    }
+        \\    $sum
+        \\}
+    , .optimized);
+    defer optimized.deinit(allocator);
+
+    try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
+}
+
 test "imported iterator producer keeps finite step callables" {
     const allocator = std.testing.allocator;
     const producer_module =

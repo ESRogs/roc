@@ -223,11 +223,20 @@ const names = check.CheckedNames;
 
 const Allocator = std.mem.Allocator;
 
+/// Optimized lowering's internal error set: resource failure plus the control
+/// signal that an owning state-loop fixed point's demand grew mid-clone. The
+/// signal is raised and consumed only inside this stage; the public entry
+/// points convert an escaped signal into an invariant violation.
+const LowerError = Common.LowerError || error{LoopStateDemandGrew};
+
 /// Specialize calls and loop state whose values have known constructor structure.
 pub fn run(allocator: Allocator, program: *Ast.Program) Common.LowerError!void {
     var optimized = try OptimizedContext.init(allocator, program, null, .{});
     defer optimized.deinit();
-    try optimized.run();
+    optimized.run() catch |err| switch (err) {
+        error.LoopStateDemandGrew => Common.invariant("loop-state demand growth signal escaped optimized lowering"),
+        else => |other| return other,
+    };
 }
 
 /// Specialize with Lambda Solved type data available for checked-call known_values.
@@ -237,7 +246,10 @@ pub fn runWithSolved(allocator: Allocator, solved: *Solved.Program) Common.Lower
 
     var optimized = try OptimizedContext.init(allocator, &solved.lifted, solved, inline_plan.view());
     defer optimized.deinit();
-    try optimized.run();
+    optimized.run() catch |err| switch (err) {
+        error.LoopStateDemandGrew => Common.invariant("loop-state demand growth signal escaped optimized lowering"),
+        else => |other| return other,
+    };
 }
 
 const KnownValue = union(enum) {
@@ -401,6 +413,16 @@ const PrivateStateCallable = struct {
     ty: Type.TypeId,
     fn_id: Ast.FnId,
     captures: []const PrivateStateIndexedValue,
+    /// Loop provenance, not state identity: set when this callable was
+    /// reconstructed from an active loop parameter's state key, so call sites
+    /// can return observed callable demand to the owning demand node. It
+    /// contributes no state slots and is excluded from private-state equality.
+    loop_origin: ?PrivateStateLoopOrigin = null,
+};
+
+const PrivateStateLoopOrigin = struct {
+    source_local: Ast.LocalId,
+    path: []const DemandPathStep,
 };
 
 const PrivateStateCompactFiniteTags = struct {
@@ -799,7 +821,7 @@ const LocalDemandFrame = struct {
 const LocalDemandCacheEntry = struct {
     demand_epoch: usize,
     subst_scope_id: usize,
-    context_has_active_refs: bool,
+    depends_on_active_demands: bool,
     local: Ast.LocalId,
     expr: Ast.ExprId,
     context: ValueDemand,
@@ -814,7 +836,7 @@ const LocalDemandCacheId = struct {
 const FunctionDemandCacheEntry = struct {
     demand_epoch: usize,
     subst_scope_id: usize,
-    result_has_active_refs: bool,
+    depends_on_active_demands: bool,
     fn_id: Ast.FnId,
     local: Ast.LocalId,
     result_demand: ValueDemand,
@@ -1092,7 +1114,7 @@ const OptimizedContext = struct {
         }
     }
 
-    fn run(self: *OptimizedContext) Common.LowerError!void {
+    fn run(self: *OptimizedContext) LowerError!void {
         const original_fn_count = self.plans.len;
         const original_bodies = try self.captureOriginalBodies(original_fn_count);
         defer self.allocator.free(original_bodies);
@@ -1141,7 +1163,7 @@ const OptimizedContext = struct {
         return original_bodies;
     }
 
-    fn collectArgUses(self: *OptimizedContext, original_fn_count: usize) Allocator.Error!void {
+    fn collectArgUses(self: *OptimizedContext, original_fn_count: usize) LowerError!void {
         var changed = true;
         var iterations: usize = 0;
         while (changed) {
@@ -1159,7 +1181,7 @@ const OptimizedContext = struct {
         }
     }
 
-    fn rewriteBaseBodies(self: *OptimizedContext, original_bodies: []const ?Ast.ExprId) Common.LowerError!void {
+    fn rewriteBaseBodies(self: *OptimizedContext, original_bodies: []const ?Ast.ExprId) LowerError!void {
         for (original_bodies, 0..) |maybe_body, index| {
             const body_expr = maybe_body orelse continue;
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
@@ -1178,7 +1200,7 @@ const OptimizedContext = struct {
         }
     }
 
-    fn createSpecializations(self: *OptimizedContext, original_bodies: []const ?Ast.ExprId) Common.LowerError!void {
+    fn createSpecializations(self: *OptimizedContext, original_bodies: []const ?Ast.ExprId) LowerError!void {
         while (self.worker_worklist.pop()) |job| {
             const source_index = @intFromEnum(job.source_fn);
             const source_body = original_bodies[source_index] orelse
@@ -1190,7 +1212,7 @@ const OptimizedContext = struct {
         }
     }
 
-    fn markArgUsesInExpr(self: *OptimizedContext, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) Allocator.Error!void {
+    fn markArgUsesInExpr(self: *OptimizedContext, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) LowerError!void {
         const expr = self.program.exprs.items[@intFromEnum(expr_id)];
         switch (expr.data) {
             .local => try self.markArgUseIfLocal(fn_id, expr_id, changed),
@@ -1365,7 +1387,7 @@ const OptimizedContext = struct {
         }
     }
 
-    fn markArgUsesInStmt(self: *OptimizedContext, fn_id: Ast.FnId, stmt_id: Ast.StmtId, changed: *bool) Allocator.Error!void {
+    fn markArgUsesInStmt(self: *OptimizedContext, fn_id: Ast.FnId, stmt_id: Ast.StmtId, changed: *bool) LowerError!void {
         switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
             .let_ => |let_| try self.markArgUsesInExpr(fn_id, let_.value, changed),
             .expr,
@@ -1377,7 +1399,7 @@ const OptimizedContext = struct {
         }
     }
 
-    fn markArgUseIfLocal(self: *OptimizedContext, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) Allocator.Error!void {
+    fn markArgUseIfLocal(self: *OptimizedContext, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) LowerError!void {
         try self.markArgDemandIfLocal(fn_id, expr_id, .materialize, changed);
     }
 
@@ -1387,7 +1409,7 @@ const OptimizedContext = struct {
         expr_id: Ast.ExprId,
         demand: ValueDemand,
         changed: *bool,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         if (demand == .none) return;
         const expr = self.program.exprs.items[@intFromEnum(expr_id)];
         switch (expr.data) {
@@ -1415,7 +1437,7 @@ const OptimizedContext = struct {
         expr_id: Ast.ExprId,
         demand: ValueDemand,
         changed: *bool,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         if (demand == .none) return;
         const local = localExpr(self.program, expr_id) orelse return;
         try self.markArgDemandForLocal(fn_id, local, demand, changed);
@@ -1427,7 +1449,7 @@ const OptimizedContext = struct {
         local: Ast.LocalId,
         demand: ValueDemand,
         changed: *bool,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         if (demand == .none) return;
         const args = self.program.typedLocalSpan(self.program.fns.items[@intFromEnum(fn_id)].args);
         for (args, 0..) |arg, index| {
@@ -1488,7 +1510,7 @@ const OptimizedContext = struct {
         return .{ .tuple = items };
     }
 
-    fn mergeValueDemand(self: *OptimizedContext, existing: ValueDemand, incoming: ValueDemand) Allocator.Error!ValueDemand {
+    fn mergeValueDemand(self: *OptimizedContext, existing: ValueDemand, incoming: ValueDemand) LowerError!ValueDemand {
         if (existing == .materialize or incoming == .materialize) return .materialize;
         if (existing == .none) return incoming;
         if (incoming == .none) return existing;
@@ -1533,7 +1555,7 @@ const OptimizedContext = struct {
         self: *OptimizedContext,
         existing: []const FieldDemand,
         incoming: []const FieldDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var fields = std.ArrayList(FieldDemand).empty;
         defer fields.deinit(self.allocator);
         try fields.appendSlice(self.allocator, existing);
@@ -1556,7 +1578,7 @@ const OptimizedContext = struct {
         self: *OptimizedContext,
         existing: []const ItemDemand,
         incoming: []const ItemDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var items = std.ArrayList(ItemDemand).empty;
         defer items.deinit(self.allocator);
         try items.appendSlice(self.allocator, existing);
@@ -1579,7 +1601,7 @@ const OptimizedContext = struct {
         self: *OptimizedContext,
         existing: []const TagAlternativeDemand,
         incoming: []const TagAlternativeDemand,
-    ) Allocator.Error![]const TagAlternativeDemand {
+    ) LowerError![]const TagAlternativeDemand {
         var alternatives = std.ArrayList(TagAlternativeDemand).empty;
         defer alternatives.deinit(self.allocator);
         try alternatives.appendSlice(self.allocator, existing);
@@ -1598,7 +1620,7 @@ const OptimizedContext = struct {
         return try self.arena.allocator().dupe(TagAlternativeDemand, alternatives.items);
     }
 
-    fn valueDemandFromDemandedKnownValue(self: *OptimizedContext, known_value: DemandedKnownValue) Allocator.Error!ValueDemand {
+    fn valueDemandFromDemandedKnownValue(self: *OptimizedContext, known_value: DemandedKnownValue) LowerError!ValueDemand {
         return switch (known_value) {
             .any,
             .leaf,
@@ -1655,7 +1677,7 @@ const OptimizedContext = struct {
     fn valueDemandItemsFromDemandedKnownIndexedValues(
         self: *OptimizedContext,
         indexed: []const DemandedKnownIndexedValue,
-    ) Allocator.Error![]const ItemDemand {
+    ) LowerError![]const ItemDemand {
         const items = try self.arena.allocator().alloc(ItemDemand, indexed.len);
         for (indexed, items) |item, *out| {
             out.* = .{
@@ -1666,7 +1688,7 @@ const OptimizedContext = struct {
         return items;
     }
 
-    fn valueDemandFromDemandedKnownCallable(self: *OptimizedContext, callable: DemandedKnownCallable) Allocator.Error!ValueDemand {
+    fn valueDemandFromDemandedKnownCallable(self: *OptimizedContext, callable: DemandedKnownCallable) LowerError!ValueDemand {
         var captures_len: usize = 0;
         for (callable.captures) |capture| {
             captures_len = @max(captures_len, @as(usize, capture.index) + 1);
@@ -1680,7 +1702,7 @@ const OptimizedContext = struct {
         return .{ .callable = .{ .captures = captures } };
     }
 
-    fn ensureCallPatternForValues(self: *OptimizedContext, fn_id: Ast.FnId, values: []const Value) Common.LowerError!void {
+    fn ensureCallPatternForValues(self: *OptimizedContext, fn_id: Ast.FnId, values: []const Value) LowerError!void {
         const raw = @intFromEnum(fn_id);
         if (raw >= self.plans.len) return;
 
@@ -1840,7 +1862,7 @@ const OptimizedContext = struct {
         for (known_values) |known_value| try self.appendDemandedKnownValueArgs(known_value.known_value, args);
     }
 
-    fn writeSpecialization(self: *OptimizedContext, source_fn_id: Ast.FnId, spec_index: usize, source_body: Ast.ExprId) Common.LowerError!void {
+    fn writeSpecialization(self: *OptimizedContext, source_fn_id: Ast.FnId, spec_index: usize, source_body: Ast.ExprId) LowerError!void {
         const source_fn = self.program.fns.items[@intFromEnum(source_fn_id)];
         const spec = &self.plans[@intFromEnum(source_fn_id)].specs.items[spec_index];
 
@@ -2152,6 +2174,7 @@ const Cloner = struct {
     current_loc: SourceLoc,
     current_region: Region,
     demand_cache_epoch: usize,
+    active_demand_resolves: usize,
     subst_scope_id: usize,
     next_subst_scope_id: usize,
     next_demand_frame_id: usize,
@@ -2190,6 +2213,7 @@ const Cloner = struct {
             .current_loc = SourceLoc.none,
             .current_region = Region.zero(),
             .demand_cache_epoch = 0,
+            .active_demand_resolves = 0,
             .subst_scope_id = 0,
             .next_subst_scope_id = 1,
             .next_demand_frame_id = 1,
@@ -2230,6 +2254,7 @@ const Cloner = struct {
             .current_loc = SourceLoc.none,
             .current_region = Region.zero(),
             .demand_cache_epoch = 0,
+            .active_demand_resolves = 0,
             .subst_scope_id = 0,
             .next_subst_scope_id = 1,
             .next_demand_frame_id = 1,
@@ -2309,7 +2334,7 @@ const Cloner = struct {
         return node_ids;
     }
 
-    fn bindCallPatternArgs(self: *Cloner, args_span: Ast.Span(Ast.TypedLocal)) Allocator.Error!void {
+    fn bindCallPatternArgs(self: *Cloner, args_span: Ast.Span(Ast.TypedLocal)) LowerError!void {
         const source_fn = self.pass.program.fns.items[@intFromEnum(self.source_fn)];
         const source_captures = try self.pass.allocator.dupe(Ast.TypedLocal, self.pass.program.typedLocalSpan(source_fn.captures));
         defer self.pass.allocator.free(source_captures);
@@ -2355,7 +2380,7 @@ const Cloner = struct {
         known_value: DemandedKnownValue,
         args: []const Ast.TypedLocal,
         index: *usize,
-    ) Allocator.Error!Value {
+    ) LowerError!Value {
         return switch (known_value) {
             .any,
             .leaf,
@@ -2458,7 +2483,7 @@ const Cloner = struct {
         finite_tags: DemandedKnownTags,
         args: []const Ast.TypedLocal,
         index: *usize,
-    ) Allocator.Error!Value {
+    ) LowerError!Value {
         if (index.* >= args.len) Common.invariant("finite tag value had no reserved selector arg");
         const selector_arg = args[index.*];
         index.* += 1;
@@ -2500,7 +2525,7 @@ const Cloner = struct {
         finite_callables: DemandedKnownCallables,
         args: []const Ast.TypedLocal,
         index: *usize,
-    ) Allocator.Error!Value {
+    ) LowerError!Value {
         if (index.* >= args.len) Common.invariant("finite callable value had no reserved selector arg");
         const selector_arg = args[index.*];
         index.* += 1;
@@ -3176,6 +3201,10 @@ const Cloner = struct {
                     .ty = callable.ty,
                     .fn_id = callable.fn_id,
                     .captures = captures,
+                    .loop_origin = .{
+                        .source_local = source_local,
+                        .path = try self.pass.arena.allocator().dupe(DemandPathStep, path.items),
+                    },
                 } };
             },
             .compact_finite_tags => |finite_tags| blk: {
@@ -3210,7 +3239,7 @@ const Cloner = struct {
         };
     }
 
-    fn cloneExpr(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Ast.ExprId {
+    fn cloneExpr(self: *Cloner, expr_id: Ast.ExprId) LowerError!Ast.ExprId {
         const saved_loc = self.current_loc;
         defer self.current_loc = saved_loc;
         const saved_region = self.current_region;
@@ -3221,7 +3250,7 @@ const Cloner = struct {
         return try self.materialize(try self.cloneExprValueWithDemand(expr_id, .materialize));
     }
 
-    fn cloneExprValue(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
+    fn cloneExprValue(self: *Cloner, expr_id: Ast.ExprId) LowerError!Value {
         const saved_loc = self.current_loc;
         defer self.current_loc = saved_loc;
         const saved_region = self.current_region;
@@ -3361,7 +3390,7 @@ const Cloner = struct {
         }
     }
 
-    fn cloneExprValueDemandingKnownValue(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
+    fn cloneExprValueDemandingKnownValue(self: *Cloner, expr_id: Ast.ExprId) LowerError!Value {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         const value = blk: switch (expr.data) {
             .call_value => |call| {
@@ -3404,7 +3433,7 @@ const Cloner = struct {
         return state_loop.changed.*;
     }
 
-    fn uninitializedValue(self: *Cloner, ty: Type.TypeId) Common.LowerError!Value {
+    fn uninitializedValue(self: *Cloner, ty: Type.TypeId) LowerError!Value {
         return .{ .expr = try self.addExpr(.{
             .ty = ty,
             .data = .uninitialized,
@@ -3431,7 +3460,7 @@ const Cloner = struct {
         break_ty: Type.TypeId,
         maybe_value: ?Ast.ExprId,
         default_demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const active_compact = self.activeCompactBreakForType(break_ty);
         const output_ty = if (active_compact) |active| switch (active) {
             .source => |result| result.ty,
@@ -3448,7 +3477,7 @@ const Cloner = struct {
         active_compact: ?ActiveCompactBreak,
         value: Ast.ExprId,
         default_demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         if (active_compact) |active| {
             return switch (active) {
                 .source => |result| blk: {
@@ -3462,7 +3491,7 @@ const Cloner = struct {
         return try self.materialize(try self.cloneExprValueWithDemand(value, self.activeBreakResultDemand(default_demand)));
     }
 
-    fn cloneExprValueWithDemand(self: *Cloner, expr_id: Ast.ExprId, demand: ValueDemand) Common.LowerError!Value {
+    fn cloneExprValueWithDemand(self: *Cloner, expr_id: Ast.ExprId, demand: ValueDemand) LowerError!Value {
         const resolved_demand = self.resolveLoopDemandRef(demand);
         return switch (resolved_demand) {
             .none => try self.cloneExprValue(expr_id),
@@ -3516,7 +3545,7 @@ const Cloner = struct {
         };
     }
 
-    fn callableDemandForCalleeExpr(self: *Cloner, expr_id: Ast.ExprId) Allocator.Error!ValueDemand {
+    fn callableDemandForCalleeExpr(self: *Cloner, expr_id: Ast.ExprId) LowerError!ValueDemand {
         if (try self.exprSubstitutedValueNoInline(expr_id)) |value| {
             if (try self.callableDemandForValue(value)) |demand| return demand;
         }
@@ -3530,7 +3559,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         if (try self.exprSubstitutedValueNoInline(expr_id)) |value| {
             if (try self.callableDemandForValueWithResultDemand(value, result_demand)) |demand| return demand;
         }
@@ -3540,7 +3569,7 @@ const Cloner = struct {
         return try self.callableDemandForKnownValueWithResultDemand(known_value, result_demand);
     }
 
-    fn callableDemandForValue(self: *Cloner, value: Value) Allocator.Error!?ValueDemand {
+    fn callableDemandForValue(self: *Cloner, value: Value) LowerError!?ValueDemand {
         return switch (value) {
             .callable => |callable| try self.callableDemandForFn(callable.fn_id, callable.captures.len),
             .finite_callables => |finite_callables| blk: {
@@ -3562,7 +3591,7 @@ const Cloner = struct {
         self: *Cloner,
         value: Value,
         result_demand: ValueDemand,
-    ) Allocator.Error!?ValueDemand {
+    ) LowerError!?ValueDemand {
         return switch (value) {
             .callable => |callable| try self.callableDemandForCallableValueWithResultDemand(callable, result_demand),
             .finite_callables => |finite_callables| blk: {
@@ -3580,7 +3609,7 @@ const Cloner = struct {
         };
     }
 
-    fn callableDemandForPrivateStateValue(self: *Cloner, value: PrivateStateValue) Allocator.Error!?ValueDemand {
+    fn callableDemandForPrivateStateValue(self: *Cloner, value: PrivateStateValue) LowerError!?ValueDemand {
         return switch (value) {
             .callable => |callable| blk: {
                 const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
@@ -3596,7 +3625,7 @@ const Cloner = struct {
         self: *Cloner,
         value: PrivateStateValue,
         result_demand: ValueDemand,
-    ) Allocator.Error!?ValueDemand {
+    ) LowerError!?ValueDemand {
         return switch (value) {
             .callable => |callable| try self.callableDemandForPrivateStateCallableWithResultDemand(callable, result_demand),
             .compact_finite_callables => |finite_callables| try self.callableDemandForDemandedKnownCallablesWithResultDemand(finite_callables.source, result_demand),
@@ -3625,7 +3654,7 @@ const Cloner = struct {
         self: *Cloner,
         callable: CallableValue,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(source_fn.captures);
         if (source_captures.len != callable.captures.len) {
@@ -3698,7 +3727,7 @@ const Cloner = struct {
         self: *Cloner,
         callable: PrivateStateCallable,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(source_fn.captures);
         if (source_captures.len == 0) return try self.callableDemandWithResult(&.{}, result_demand);
@@ -3765,7 +3794,7 @@ const Cloner = struct {
         return try self.callableDemandWithResult(captures, result_demand);
     }
 
-    fn callableDemandForKnownValue(self: *Cloner, known_value: KnownValue) Allocator.Error!ValueDemand {
+    fn callableDemandForKnownValue(self: *Cloner, known_value: KnownValue) LowerError!ValueDemand {
         return switch (known_value) {
             .callable => |callable| try self.callableDemandForFn(callable.fn_id, callable.captures.len),
             .finite_callables => |finite_callables| blk: {
@@ -3786,7 +3815,7 @@ const Cloner = struct {
         self: *Cloner,
         known_value: KnownValue,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         return switch (known_value) {
             .callable => |callable| try self.callableDemandForFnWithResultDemand(
                 callable.fn_id,
@@ -3814,7 +3843,7 @@ const Cloner = struct {
     fn callableDemandForDemandedKnownCallables(
         self: *Cloner,
         finite_callables: DemandedKnownCallables,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var demand: ValueDemand = .{ .callable = .{ .captures = &.{} } };
         for (finite_callables.alternatives) |alternative| {
             const source_fn = self.pass.program.fns.items[@intFromEnum(alternative.fn_id)];
@@ -3831,7 +3860,7 @@ const Cloner = struct {
         self: *Cloner,
         finite_callables: DemandedKnownCallables,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var demand: ValueDemand = .{ .callable = .{ .captures = &.{} } };
         for (finite_callables.alternatives) |alternative| {
             const source_fn = self.pass.program.fns.items[@intFromEnum(alternative.fn_id)];
@@ -3853,7 +3882,7 @@ const Cloner = struct {
         fn_id: Ast.FnId,
         capture_count: usize,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         const source_fn = self.pass.program.fns.items[@intFromEnum(fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(source_fn.captures);
         const captures = try self.pass.arena.allocator().alloc(ValueDemand, capture_count);
@@ -3875,7 +3904,7 @@ const Cloner = struct {
         fn_id: Ast.FnId,
         local: Ast.LocalId,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         const effective_result_demand = self.decompositionDemand(result_demand);
         var active_stack_index = self.demand_stack.items.len;
         while (active_stack_index > 0) {
@@ -3905,6 +3934,7 @@ const Cloner = struct {
 
         if (effective_result_demand == .none) return .none;
 
+        const demand_resolves_before = self.active_demand_resolves;
         const function_cache_key: FunctionDemandCacheId = .{
             .fn_id = @intFromEnum(fn_id),
             .local = @intFromEnum(local),
@@ -3914,7 +3944,7 @@ const Cloner = struct {
             while (cache_index > 0) {
                 cache_index -= 1;
                 const entry = self.function_demand_cache.items[indices.items[cache_index]];
-                if (entry.result_has_active_refs and entry.demand_epoch != self.demand_cache_epoch) continue;
+                if (entry.depends_on_active_demands and entry.demand_epoch != self.demand_cache_epoch) continue;
                 if (entry.subst_scope_id != self.subst_scope_id) continue;
                 if (!try self.valueDemandRefsAreActive(entry.result_demand)) continue;
                 if (!try self.valueDemandRefsAreActive(entry.demand)) continue;
@@ -3986,7 +4016,8 @@ const Cloner = struct {
         try self.function_demand_cache.append(self.pass.allocator, .{
             .demand_epoch = self.demand_cache_epoch,
             .subst_scope_id = self.subst_scope_id,
-            .result_has_active_refs = valueDemandContainsActiveRef(effective_result_demand),
+            .depends_on_active_demands = valueDemandContainsActiveRef(effective_result_demand) or
+                self.active_demand_resolves != demand_resolves_before,
             .fn_id = fn_id,
             .local = local,
             .result_demand = effective_result_demand,
@@ -4131,7 +4162,7 @@ const Cloner = struct {
         self: *Cloner,
         frame_index: usize,
         requested: ValueDemand,
-    ) Allocator.Error!?ValueDemand {
+    ) LowerError!?ValueDemand {
         if (requested == .none) return null;
         const frame = &self.demand_stack.items[frame_index];
         const active_result = frame.result orelse return null;
@@ -4191,7 +4222,7 @@ const Cloner = struct {
         self: *Cloner,
         fn_id: Ast.FnId,
         result_demand: ValueDemand,
-    ) Allocator.Error!?ValueDemand {
+    ) LowerError!?ValueDemand {
         var active_stack_index = self.demand_stack.items.len;
         while (active_stack_index > 0) {
             active_stack_index -= 1;
@@ -4276,7 +4307,7 @@ const Cloner = struct {
         return .{ .callable = .{ .captures = captures } };
     }
 
-    fn applyValueDemand(self: *Cloner, value: Value, demand: ValueDemand) Common.LowerError!Value {
+    fn applyValueDemand(self: *Cloner, value: Value, demand: ValueDemand) LowerError!Value {
         const resolved_demand = self.resolveLoopDemandRef(demand);
         return switch (resolved_demand) {
             .none => value,
@@ -4346,7 +4377,7 @@ const Cloner = struct {
         self: *Cloner,
         branch: MatchValueBranch,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source = branch.source orelse return try self.applyValueDemand(branch.body, demand);
 
         const change_start = self.changes.items.len;
@@ -4426,7 +4457,7 @@ const Cloner = struct {
         self: *Cloner,
         source: MatchValueBranchSource,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         return switch (source.read) {
             .none => try self.cloneExprValueWithDemand(source.body, demand),
             .callable_capture => |capture_read| blk: {
@@ -4443,7 +4474,7 @@ const Cloner = struct {
         self: *Cloner,
         value: Value,
         demand: ValueDemand,
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return try self.privateStateValueFromValueDemandCollectingLets(value, demand, null);
     }
 
@@ -4452,7 +4483,7 @@ const Cloner = struct {
         value: Value,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         const resolved_demand = self.resolveLoopDemandRef(demand);
         if (resolved_demand == .fn_param) {
             return null;
@@ -4806,6 +4837,10 @@ const Cloner = struct {
                     .private_state => |private_state| (privateStateCallable(private_state) orelse break :blk null).fn_id,
                     else => break :blk null,
                 };
+                const callable_loop_origin: ?PrivateStateLoopOrigin = switch (value) {
+                    .private_state => |private_state| (privateStateCallable(private_state) orelse break :blk null).loop_origin,
+                    else => null,
+                };
                 var captures = std.ArrayList(PrivateStateIndexedValue).empty;
                 defer captures.deinit(self.pass.allocator);
                 const capture_count = switch (value) {
@@ -4842,6 +4877,7 @@ const Cloner = struct {
                     .ty = callable_ty,
                     .fn_id = callable_fn_id,
                     .captures = private_captures,
+                    .loop_origin = callable_loop_origin,
                 } };
             },
         };
@@ -4850,7 +4886,7 @@ const Cloner = struct {
     fn finiteStateIdentityDemandFromCallableValue(
         self: *Cloner,
         callable: CallableValue,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         const captures = try self.pass.arena.allocator().alloc(ValueDemand, callable.captures.len);
         @memset(captures, .none);
         var has_capture_demand = false;
@@ -4865,7 +4901,7 @@ const Cloner = struct {
     fn finiteStateIdentityDemandFromPrivateCallable(
         self: *Cloner,
         callable: PrivateStateCallable,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var captures_len: usize = 0;
         for (callable.captures) |capture| {
             captures_len = @max(captures_len, @as(usize, capture.index) + 1);
@@ -4885,7 +4921,7 @@ const Cloner = struct {
     fn finiteStateIdentityDemandFromValue(
         self: *Cloner,
         value: Value,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         return switch (value) {
             .let_ => |let_value| try self.finiteStateIdentityDemandFromValue(let_value.body.*),
             .if_ => |if_value| blk: {
@@ -4972,7 +5008,7 @@ const Cloner = struct {
     fn finiteStateIdentityDemandFromPrivateState(
         self: *Cloner,
         value: PrivateStateValue,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         return switch (value) {
             .leaf => .none,
             .record => |record| blk: {
@@ -5037,7 +5073,7 @@ const Cloner = struct {
     fn finiteStateIdentityDemandFromKnownValue(
         self: *Cloner,
         known_value: KnownValue,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         const demanded = try materializedDemandedKnownValue(self.pass.arena.allocator(), known_value);
         return try self.finiteStateIdentityDemandFromDemandedKnownValue(demanded);
     }
@@ -5045,7 +5081,7 @@ const Cloner = struct {
     fn finiteStateIdentityDemandFromDemandedKnownValue(
         self: *Cloner,
         known_value: DemandedKnownValue,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         return switch (known_value) {
             .any,
             .leaf,
@@ -5159,7 +5195,7 @@ const Cloner = struct {
         value: Value,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         if (try self.privateStateValueFromValueDemandCollectingLets(value, demand, pending_lets)) |private_state| return private_state;
         return try self.privateStateLeafFromValue(value);
     }
@@ -5168,7 +5204,7 @@ const Cloner = struct {
         self: *Cloner,
         callable: PrivateStateCallable,
         index: usize,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (privateStateIndexedValueByIndex(callable.captures, @intCast(index))) |capture| {
             return Value{ .private_state = capture };
         }
@@ -5187,7 +5223,7 @@ const Cloner = struct {
         self: *Cloner,
         value: PrivateStateValue,
         pending_lets: []const PendingLet,
-    ) Common.LowerError!PrivateStateValue {
+    ) LowerError!PrivateStateValue {
         if (pending_lets.len == 0) return value;
 
         return switch (value) {
@@ -5258,6 +5294,7 @@ const Cloner = struct {
                     .ty = callable.ty,
                     .fn_id = callable.fn_id,
                     .captures = captures,
+                    .loop_origin = callable.loop_origin,
                 } };
             },
             .compact_finite_tags => |finite_tags| .{ .compact_finite_tags = .{
@@ -5279,7 +5316,7 @@ const Cloner = struct {
         };
     }
 
-    fn privateStateLeafFromValue(self: *Cloner, value: Value) Common.LowerError!?PrivateStateValue {
+    fn privateStateLeafFromValue(self: *Cloner, value: Value) LowerError!?PrivateStateValue {
         if (value == .private_state) {
             const expr = privateStateLeafExpr(value.private_state) orelse return null;
             if (try self.substitutedPrivateLeafValue(value.private_state)) |substituted| {
@@ -5307,7 +5344,7 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneFieldAccessValueWithDemand(self: *Cloner, ty: Type.TypeId, field: anytype, demand: ValueDemand) Common.LowerError!Value {
+    fn cloneFieldAccessValueWithDemand(self: *Cloner, ty: Type.TypeId, field: anytype, demand: ValueDemand) LowerError!Value {
         const receiver_demand = try self.pass.demandRecordField(field.field, demand);
         const receiver = try self.cloneExprValueWithDemand(field.receiver, receiver_demand);
         if (try self.fieldFromKnownValue(receiver, field.field)) |value| return try self.applyValueDemand(value, demand);
@@ -5322,7 +5359,7 @@ const Cloner = struct {
         } } }));
     }
 
-    fn cloneTupleAccessValueWithDemand(self: *Cloner, ty: Type.TypeId, access: anytype, demand: ValueDemand) Common.LowerError!Value {
+    fn cloneTupleAccessValueWithDemand(self: *Cloner, ty: Type.TypeId, access: anytype, demand: ValueDemand) LowerError!Value {
         const receiver_demand = try self.pass.demandTupleItem(access.elem_index, demand);
         const receiver = try self.cloneExprValueWithDemand(access.tuple, receiver_demand);
         if (try self.itemFromKnownValue(receiver, access.elem_index)) |value| return try self.applyValueDemand(value, demand);
@@ -5342,7 +5379,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         tag: anytype,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const tag_demand = switch (demand) {
             .tag => |tag_demand| tag_demand,
             else => return try self.cloneExprValueDemandingKnownValue(try self.addExpr(.{ .ty = ty, .data = .{
@@ -5404,7 +5441,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         fields_span: Ast.Span(Ast.FieldExpr),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const field_demands = switch (demand) {
             .record => |field_demands| field_demands,
             else => return try self.cloneExprValueDemandingKnownValue(try self.addExpr(.{ .ty = ty, .data = .{
@@ -5450,9 +5487,9 @@ const Cloner = struct {
         } } }, pending_lets.items, true);
     }
 
-    fn cloneLetValueWithDemand(self: *Cloner, let_: anytype, demand: ValueDemand) Common.LowerError!Value {
-        const value_demand = try self.patternDemandInExpr(let_.bind, let_.rest, demand);
-        const raw_value = try self.cloneExprValueWithDemand(let_.value, value_demand);
+    fn cloneLetValueWithDemand(self: *Cloner, let_: anytype, demand: ValueDemand) LowerError!Value {
+        var value_demand = try self.patternDemandInExpr(let_.bind, let_.rest, demand);
+        const raw_value = try self.cloneBindingValueWithExpandedDemand(let_.value, &value_demand);
         var pending_lets = std.ArrayList(PendingLet).empty;
         defer pending_lets.deinit(self.pass.allocator);
 
@@ -5524,7 +5561,7 @@ const Cloner = struct {
         } } }) };
     }
 
-    fn cloneBlockValueWithDemand(self: *Cloner, ty: Type.TypeId, block: anytype, demand: ValueDemand) Common.LowerError!Value {
+    fn cloneBlockValueWithDemand(self: *Cloner, ty: Type.TypeId, block: anytype, demand: ValueDemand) LowerError!Value {
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
         const scoped_start = self.scopedLocalsLen();
@@ -5560,7 +5597,7 @@ const Cloner = struct {
         } } }) };
     }
 
-    fn cloneIfValueWithDemand(self: *Cloner, ty: Type.TypeId, if_: anytype, demand: ValueDemand) Common.LowerError!Value {
+    fn cloneIfValueWithDemand(self: *Cloner, ty: Type.TypeId, if_: anytype, demand: ValueDemand) LowerError!Value {
         const source_branches = try self.pass.allocator.dupe(Ast.IfBranch, self.pass.program.ifBranchSpan(if_.branches));
         defer self.pass.allocator.free(source_branches);
 
@@ -5574,7 +5611,7 @@ const Cloner = struct {
         index: usize,
         final_else_expr: Ast.ExprId,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (index == source_branches.len) {
             return try self.cloneExprValueWithDemand(final_else_expr, demand);
         }
@@ -5621,14 +5658,14 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneScopedExprValueWithDemand(self: *Cloner, expr_id: Ast.ExprId, demand: ValueDemand) Common.LowerError!Value {
+    fn cloneScopedExprValueWithDemand(self: *Cloner, expr_id: Ast.ExprId, demand: ValueDemand) LowerError!Value {
         const change_start = self.changes.items.len;
         const value = try self.cloneExprValueWithDemand(expr_id, demand);
         self.restore(change_start);
         return value;
     }
 
-    fn ensureDemandedKnownValue(self: *Cloner, value: Value) Common.LowerError!Value {
+    fn ensureDemandedKnownValue(self: *Cloner, value: Value) LowerError!Value {
         if ((try self.pass.knownValueFromValue(value)) != null) return value;
         return switch (value) {
             .expr => |expr| blk: {
@@ -5693,7 +5730,7 @@ const Cloner = struct {
         } };
     }
 
-    fn directCallActiveArgsFromValues(self: *Cloner, values: []const Value) Allocator.Error![]const ActiveInlineArg {
+    fn directCallActiveArgsFromValues(self: *Cloner, values: []const Value) LowerError![]const ActiveInlineArg {
         const active_args = try self.pass.arena.allocator().alloc(ActiveInlineArg, values.len);
         for (values, 0..) |value, index| {
             active_args[index] = try self.directCallActiveArgFromValue(value);
@@ -5706,7 +5743,7 @@ const Cloner = struct {
         source_args: []const Ast.TypedLocal,
         arg_exprs: []const Ast.ExprId,
         values: []const Value,
-    ) Allocator.Error![]const ActiveInlineAlias {
+    ) LowerError![]const ActiveInlineAlias {
         if (source_args.len != values.len) Common.invariant("active alias arity differed from direct call arity");
         if (arg_exprs.len != values.len) Common.invariant("active alias expression arity differed from direct call arity");
 
@@ -5730,7 +5767,7 @@ const Cloner = struct {
         return try self.pass.arena.allocator().dupe(ActiveInlineAlias, aliases.items);
     }
 
-    fn directCallActiveArgFromValue(self: *Cloner, value: Value) Allocator.Error!ActiveInlineArg {
+    fn directCallActiveArgFromValue(self: *Cloner, value: Value) LowerError!ActiveInlineArg {
         if (value == .expr) {
             var seen = std.ArrayList(Ast.ExprId).empty;
             defer seen.deinit(self.pass.allocator);
@@ -5816,7 +5853,7 @@ const Cloner = struct {
         return .{ .expr = expr_id };
     }
 
-    fn exprValueForDirectCallBoundaryArg(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
+    fn exprValueForDirectCallBoundaryArg(self: *Cloner, expr_id: Ast.ExprId) LowerError!Value {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         switch (expr.data) {
             .call_proc => |call| {
@@ -6524,7 +6561,7 @@ const Cloner = struct {
         };
     }
 
-    fn callableValue(self: *Cloner, ty: Type.TypeId, fn_id: Ast.FnId) Common.LowerError!Value {
+    fn callableValue(self: *Cloner, ty: Type.TypeId, fn_id: Ast.FnId) LowerError!Value {
         const fn_ = self.pass.program.fns.items[@intFromEnum(fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(fn_.captures);
         const captures = try self.pass.arena.allocator().alloc(Value, source_captures.len);
@@ -6549,7 +6586,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         fn_id: Ast.FnId,
         capture_exprs: []const Ast.ExprId,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const fn_ = self.pass.program.fns.items[@intFromEnum(fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(fn_.captures);
         if (source_captures.len != capture_exprs.len) {
@@ -6614,7 +6651,7 @@ const Cloner = struct {
         } };
     }
 
-    fn solvedSingleCallable(self: *Cloner, expr_id: Ast.ExprId) Allocator.Error!?Value {
+    fn solvedSingleCallable(self: *Cloner, expr_id: Ast.ExprId) LowerError!?Value {
         const solved = self.pass.solved orelse return null;
         const member = self.pass.solvedSingleCallableMember(expr_id) orelse return null;
         const fn_id = self.pass.fnWithSymbol(member.lambda) orelse return null;
@@ -6645,7 +6682,7 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneExprPlain(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Ast.ExprId {
+    fn cloneExprPlain(self: *Cloner, expr_id: Ast.ExprId) LowerError!Ast.ExprId {
         const saved_loc = self.current_loc;
         defer self.current_loc = saved_loc;
         const saved_region = self.current_region;
@@ -6761,7 +6798,7 @@ const Cloner = struct {
         return try self.addExpr(.{ .ty = expr.ty, .data = data });
     }
 
-    fn cloneLetValue(self: *Cloner, let_: anytype) Common.LowerError!Value {
+    fn cloneLetValue(self: *Cloner, let_: anytype) LowerError!Value {
         const raw_value = try self.cloneExprValueDemandingKnownValue(let_.value);
         var pending_lets = std.ArrayList(PendingLet).empty;
         defer pending_lets.deinit(self.pass.allocator);
@@ -6844,7 +6881,7 @@ const Cloner = struct {
         } } }) };
     }
 
-    fn cloneLet(self: *Cloner, let_: anytype) Common.LowerError!Ast.ExprData {
+    fn cloneLet(self: *Cloner, let_: anytype) LowerError!Ast.ExprData {
         const value = try self.cloneExprValue(let_.value);
         const value_expr = try self.materialize(value);
         const change_start = self.changes.items.len;
@@ -6878,7 +6915,7 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneLetOfCase(self: *Cloner, let_: anytype, value_expr: Ast.ExprId) Common.LowerError!?Ast.ExprData {
+    fn cloneLetOfCase(self: *Cloner, let_: anytype, value_expr: Ast.ExprId) LowerError!?Ast.ExprData {
         const value_data = self.pass.program.exprs.items[@intFromEnum(value_expr)].data;
         const match = switch (value_data) {
             .match_ => |match| match,
@@ -6910,7 +6947,7 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneLetCaseBranchBody(self: *Cloner, let_: anytype, branch_body: Ast.ExprId) Common.LowerError!?Ast.ExprId {
+    fn cloneLetCaseBranchBody(self: *Cloner, let_: anytype, branch_body: Ast.ExprId) LowerError!?Ast.ExprId {
         const branch_expr = self.pass.program.exprs.items[@intFromEnum(branch_body)];
         switch (branch_expr.data) {
             .block => |block| {
@@ -6964,7 +7001,7 @@ const Cloner = struct {
         }
     }
 
-    fn cloneDivergentAtType(self: *Cloner, expr_id: Ast.ExprId, ty: Type.TypeId) Common.LowerError!?Ast.ExprId {
+    fn cloneDivergentAtType(self: *Cloner, expr_id: Ast.ExprId, ty: Type.TypeId) LowerError!?Ast.ExprId {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         return switch (expr.data) {
             .crash => |msg| try self.addExpr(.{ .ty = ty, .data = .{ .crash = msg } }),
@@ -6974,7 +7011,7 @@ const Cloner = struct {
         };
     }
 
-    fn scopedLocalValue(self: *Cloner, local: Ast.TypedLocal) Common.LowerError!?Value {
+    fn scopedLocalValue(self: *Cloner, local: Ast.TypedLocal) LowerError!?Value {
         if (!self.localCanBeReferencedDirectly(local.local)) return null;
         return .{ .expr = try self.addExpr(.{
             .ty = local.ty,
@@ -7085,7 +7122,7 @@ const Cloner = struct {
         }
     }
 
-    fn pushPendingLetScope(self: *Cloner, pending_lets: []const PendingLet) Common.LowerError!usize {
+    fn pushPendingLetScope(self: *Cloner, pending_lets: []const PendingLet) LowerError!usize {
         const scoped_start = self.scopedLocalsLen();
         try self.appendPendingLetScopedLocals(pending_lets);
         try self.bindPendingLetKnownValues(pending_lets);
@@ -7172,15 +7209,15 @@ const Cloner = struct {
         return false;
     }
 
-    fn cloneLoop(self: *Cloner, ty: Type.TypeId, loop: anytype) Common.LowerError!Ast.ExprId {
+    fn cloneLoop(self: *Cloner, ty: Type.TypeId, loop: anytype) LowerError!Ast.ExprId {
         return try self.cloneLoopWithDemand(ty, loop, .materialize);
     }
 
-    fn cloneLoopWithDemand(self: *Cloner, ty: Type.TypeId, loop: anytype, result_demand: ValueDemand) Common.LowerError!Ast.ExprId {
+    fn cloneLoopWithDemand(self: *Cloner, ty: Type.TypeId, loop: anytype, result_demand: ValueDemand) LowerError!Ast.ExprId {
         return try self.materialize(try self.cloneLoopValueWithDemand(ty, loop, result_demand));
     }
 
-    fn cloneLoopValueWithDemand(self: *Cloner, ty: Type.TypeId, loop: anytype, result_demand: ValueDemand) Common.LowerError!Value {
+    fn cloneLoopValueWithDemand(self: *Cloner, ty: Type.TypeId, loop: anytype, result_demand: ValueDemand) LowerError!Value {
         const params = try self.pass.allocator.dupe(Ast.TypedLocal, self.pass.program.typedLocalSpan(loop.params));
         defer self.pass.allocator.free(params);
         const initial_values = try self.pass.allocator.dupe(Ast.ExprId, self.pass.program.exprSpan(loop.initial_values));
@@ -7235,7 +7272,7 @@ const Cloner = struct {
         values: []const Value,
         demands: []ValueDemand,
         result_demand: ValueDemand,
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         if (!valueDemandsRequirePrivateState(demands)) return false;
 
         const demanded_known_values = try self.pass.allocator.alloc(DemandedKnownValue, values.len);
@@ -7250,7 +7287,7 @@ const Cloner = struct {
         values: []const Value,
         source_initials: []const ?ExprValueSource,
         demands: []const ValueDemand,
-    ) Common.LowerError![]Value {
+    ) LowerError![]Value {
         if (values.len != source_initials.len or values.len != demands.len) {
             Common.invariant("loop initial source/value/demand arity differed while refreshing values");
         }
@@ -7269,7 +7306,7 @@ const Cloner = struct {
         self: *Cloner,
         source: ExprValueSource,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
@@ -7301,7 +7338,7 @@ const Cloner = struct {
         source_initials: ?[]const ?ExprValueSource,
         initial_demands: []const ValueDemand,
         result_demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (try self.cloneLoopUnwrappedLet(ty, loop, params, values, source_initials, initial_demands, result_demand)) |unwrapped| return .{ .expr = unwrapped };
         if (try self.cloneLoopDistributedIf(ty, loop, params, values, source_initials, initial_demands, result_demand)) |distributed| return .{ .expr = distributed };
 
@@ -7366,7 +7403,7 @@ const Cloner = struct {
             const demands = try self.pass.arena.allocator().alloc(ValueDemand, values.len);
             const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, values.len);
             for (values, demands, demanded_known_values, 0..) |value, *demand_out, *known_out, index| {
-                const inferred_demand = initial_demands[index];
+                const inferred_demand = try self.loopSlotDemand(initial_demands[index]);
                 demand_out.* = inferred_demand;
                 const demanded_known = try self.demandedKnownValueFromLoopStateValueDemand(value, inferred_demand);
                 known_out.* = demanded_known orelse DemandedKnownValue{ .any = valueType(self.pass.program, value) };
@@ -7437,8 +7474,9 @@ const Cloner = struct {
                 try self.stabilizeLoopDemandsFromStateBodies(loop, params, known_values, demands, result_demand);
                 _ = self.loop_stack.pop();
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
-                for (known_values, values, demands, demanded_known_values) |known_value, value, demand, *out| {
-                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand);
+                for (known_values, values, demands, demanded_known_values) |known_value, value, *demand, *out| {
+                    demand.* = try self.loopSlotDemand(try self.expandLoopCallableCaptureDemands(value, demand.*));
+                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand.*);
                 }
                 self.restore(change_start);
                 return try self.cloneStateLoopFromDemandedKnownValues(ty, loop, params, values, demanded_known_values, demands, result_demand);
@@ -7448,8 +7486,9 @@ const Cloner = struct {
 
             if (valueDemandsRequirePrivateState(demands)) {
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
-                for (known_values, values, demands, demanded_known_values) |known_value, value, demand, *out| {
-                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand);
+                for (known_values, values, demands, demanded_known_values) |known_value, value, *demand, *out| {
+                    demand.* = try self.loopSlotDemand(try self.expandLoopCallableCaptureDemands(value, demand.*));
+                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand.*);
                 }
                 self.restore(change_start);
                 return try self.cloneStateLoopFromDemandedKnownValues(ty, loop, params, values, demanded_known_values, demands, result_demand);
@@ -7467,8 +7506,9 @@ const Cloner = struct {
             if (knownValuesContainFiniteState(known_values) or valueDemandsRequirePrivateState(demands)) {
                 try self.stabilizeLoopDemandsFromStateBodies(loop, params, known_values, demands, result_demand);
                 const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
-                for (known_values, values, demands, demanded_known_values) |known_value, value, demand, *out| {
-                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand);
+                for (known_values, values, demands, demanded_known_values) |known_value, value, *demand, *out| {
+                    demand.* = try self.loopSlotDemand(try self.expandLoopCallableCaptureDemands(value, demand.*));
+                    out.* = try self.demandedKnownValueFromLoopEntryDemand(value, known_value, demand.*);
                 }
                 if (demandedKnownValuesContainFiniteState(demanded_known_values) or valueDemandsRequirePrivateState(demands)) {
                     self.restore(change_start);
@@ -7510,7 +7550,7 @@ const Cloner = struct {
         value: Value,
         known_value: KnownValue,
         demand: ValueDemand,
-    ) Common.LowerError!DemandedKnownValue {
+    ) LowerError!DemandedKnownValue {
         const demanded_value = try self.applyValueDemand(value, demand);
         if (demanded_value == .private_state) {
             return try self.demandedKnownValueFromPrivateStateLoopStateShape(demanded_value.private_state);
@@ -7535,7 +7575,7 @@ const Cloner = struct {
         known_values: []const KnownValue,
         demands: []ValueDemand,
         result_demand: ValueDemand,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         var state_body_iterations: usize = 0;
         while (true) {
             state_body_iterations += 1;
@@ -7589,7 +7629,7 @@ const Cloner = struct {
         demanded_known_values: []DemandedKnownValue,
         demands: []ValueDemand,
         result_demand: ValueDemand,
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         const loop_known_values = try self.pass.allocator.alloc(KnownValue, values.len);
         defer self.pass.allocator.free(loop_known_values);
         for (values, loop_known_values) |value, *known_value| {
@@ -7670,7 +7710,7 @@ const Cloner = struct {
         expr_id: Ast.ExprId,
         result: CompactResult,
         demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         if (try self.cloneDivergentAtType(expr_id, result.ty)) |divergent| return divergent;
 
@@ -7705,7 +7745,7 @@ const Cloner = struct {
         block: anytype,
         result: CompactResult,
         demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
         const provenance_start = self.loopProvenanceLen();
@@ -7747,7 +7787,7 @@ const Cloner = struct {
         stmt_id: Ast.StmtId,
         result: CompactResult,
         demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const stmt = self.pass.program.stmts.items[@intFromEnum(stmt_id)];
         return switch (stmt) {
             .expr => |expr| try self.cloneCompactLoopBodyExpr(expr, result, demand),
@@ -7767,7 +7807,7 @@ const Cloner = struct {
         tail: BlockTail,
         result: CompactResult,
         demand: ValueDemand,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         const stmt = self.pass.program.stmts.items[@intFromEnum(stmt_id)];
         switch (stmt) {
             .expr => try self.cloneStmtInto(stmt_id, out, tail, demand),
@@ -7795,7 +7835,7 @@ const Cloner = struct {
         if_: anytype,
         result: CompactResult,
         demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const source_branches = try self.pass.allocator.dupe(Ast.IfBranch, self.pass.program.ifBranchSpan(if_.branches));
         defer self.pass.allocator.free(source_branches);
 
@@ -7819,7 +7859,7 @@ const Cloner = struct {
         match: anytype,
         result: CompactResult,
         demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const scrutinee_demand = try self.matchScrutineeDemand(match.branches, demand);
         const scrutinee = try self.materialize(try self.cloneExprValueWithDemand(match.scrutinee, scrutinee_demand));
 
@@ -7850,7 +7890,7 @@ const Cloner = struct {
         let_: anytype,
         result: CompactResult,
         demand: ValueDemand,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         if (exprAlwaysEscapesControlTransferDepth(self.pass.program, let_.value, 0, 0)) {
             return try self.cloneCompactLoopBodyExpr(let_.value, result, demand);
         }
@@ -7871,7 +7911,7 @@ const Cloner = struct {
         self: *Cloner,
         ty: Type.TypeId,
         demand: ValueDemand,
-    ) Common.LowerError!?CompactResult {
+    ) LowerError!?CompactResult {
         return switch (demand) {
             .none,
             .materialize,
@@ -7901,7 +7941,7 @@ const Cloner = struct {
     fn compactResultFromDemandedKnownValue(
         self: *Cloner,
         demanded: DemandedKnownValue,
-    ) Common.LowerError!CompactResult {
+    ) LowerError!CompactResult {
         const compact_demanded = try self.compactDemandedKnownValue(demanded);
         var slot_tys = std.ArrayList(Type.TypeId).empty;
         defer slot_tys.deinit(self.pass.allocator);
@@ -8008,7 +8048,7 @@ const Cloner = struct {
         self: *Cloner,
         demanded: DemandedKnownValue,
         slot_tys: []const Type.TypeId,
-    ) Common.LowerError!CompactResult {
+    ) LowerError!CompactResult {
         return CompactResult{
             .known_value = demanded,
             .ty = try self.compactSlotTupleType(slot_tys),
@@ -8042,7 +8082,7 @@ const Cloner = struct {
         self: *Cloner,
         result: CompactResult,
         value: Value,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         switch (value) {
             .let_ => |let_value| {
                 const scoped_start = self.scopedLocalsLen();
@@ -8115,7 +8155,7 @@ const Cloner = struct {
         compact_known_value: DemandedKnownValue,
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         return try self.appendExprsFromDemandedKnownValue(compact_known_value, value, out);
     }
 
@@ -8123,7 +8163,7 @@ const Cloner = struct {
         self: *Cloner,
         ty: Type.TypeId,
         leaf_exprs: []const Ast.ExprId,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         return switch (leaf_exprs.len) {
             0 => try self.addExpr(.{ .ty = ty, .data = .unit }),
             1 => leaf_exprs[0],
@@ -8138,7 +8178,7 @@ const Cloner = struct {
         compact_expr: Ast.ExprId,
         slot_tys: []const Type.TypeId,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!void {
+    ) LowerError!void {
         switch (slot_tys.len) {
             0 => {},
             1 => try out.append(self.pass.allocator, compact_expr),
@@ -8155,7 +8195,7 @@ const Cloner = struct {
         self: *Cloner,
         result: CompactResult,
         compact_expr: Ast.ExprId,
-    ) Common.LowerError!PrivateStateValue {
+    ) LowerError!PrivateStateValue {
         var leaf_exprs = std.ArrayList(Ast.ExprId).empty;
         defer leaf_exprs.deinit(self.pass.allocator);
         try self.appendCompactSlotExprs(compact_expr, result.slot_tys, &leaf_exprs);
@@ -8173,7 +8213,7 @@ const Cloner = struct {
         known_value: DemandedKnownValue,
         exprs: []const Ast.ExprId,
         index: *usize,
-    ) Common.LowerError!PrivateStateValue {
+    ) LowerError!PrivateStateValue {
         return switch (known_value) {
             .any,
             .leaf,
@@ -8254,7 +8294,7 @@ const Cloner = struct {
         known_values: []const DemandedKnownIndexedValue,
         exprs: []const Ast.ExprId,
         index: *usize,
-    ) Common.LowerError![]const PrivateStateIndexedValue {
+    ) LowerError![]const PrivateStateIndexedValue {
         const values = try self.pass.arena.allocator().alloc(PrivateStateIndexedValue, known_values.len);
         for (known_values, values) |known_value, *out| {
             out.* = .{
@@ -8274,7 +8314,7 @@ const Cloner = struct {
         known_values: []DemandedKnownValue,
         demands: []ValueDemand,
         result_demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const compact_result = try self.compactResultForDemand(ty, result_demand);
         const state_loop_ty = if (compact_result) |result| result.ty else ty;
 
@@ -8372,11 +8412,15 @@ const Cloner = struct {
 
                 const state_params_span = try self.pass.program.addTypedLocalSpan(state_params.items);
                 try self.state_param_stack.append(self.pass.allocator, state_params.items);
-                const state_body = if (compact_result) |result|
-                    try self.cloneCompactLoopBodyExpr(loop.body, result, result_demand)
-                else
-                    try self.materialize(try self.cloneExprValueWithDemand(loop.body, result_demand));
-                _ = self.state_param_stack.pop();
+                defer _ = self.state_param_stack.pop();
+                const maybe_state_body: ?Ast.ExprId = self.cloneStateLoopBodyExpr(loop.body, compact_result, result_demand) catch |err| switch (err) {
+                    error.LoopStateDemandGrew => blk: {
+                        if (!state_demands_changed) return err;
+                        break :blk null;
+                    },
+                    else => |other| return other,
+                };
+                const state_body = maybe_state_body orelse break;
 
                 if (state_demands_changed) break;
 
@@ -8393,8 +8437,8 @@ const Cloner = struct {
                     closed.* = try self.closeLoopDemandRefs(demand);
                 }
                 self.pass.program.state_loop_states.shrinkRetainingCapacity(state_start_len);
-                try self.refreshDemandedKnownValuesFromValueDemands(values, closed_demands, known_values);
                 _ = self.state_loop_stack.pop();
+                try self.refreshDemandedKnownValuesFromValueDemands(values, closed_demands, known_values);
                 continue;
             }
 
@@ -8426,6 +8470,16 @@ const Cloner = struct {
             }
             return .{ .expr = entry_expr };
         }
+    }
+
+    fn cloneStateLoopBodyExpr(
+        self: *Cloner,
+        body: Ast.ExprId,
+        compact_result: ?CompactResult,
+        result_demand: ValueDemand,
+    ) LowerError!Ast.ExprId {
+        if (compact_result) |result| return try self.cloneCompactLoopBodyExpr(body, result, result_demand);
+        return try self.materialize(try self.cloneExprValueWithDemand(body, result_demand));
     }
 
     fn knownValueProducts(self: *Cloner, known_values: []const KnownValue) Allocator.Error![]const []const KnownValue {
@@ -8609,10 +8663,13 @@ const Cloner = struct {
         self: *Cloner,
         demands: []const ValueDemand,
         values: []const Value,
-    ) Common.LowerError![]const DemandedKnownValue {
+    ) LowerError![]const DemandedKnownValue {
         if (demands.len != values.len) Common.invariant("state_loop demand arity differed from continue values");
         const demanded_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, values.len);
         try self.refreshDemandedKnownValuesFromValueDemands(values, demands, demanded_values);
+        for (demanded_values) |*demanded| {
+            demanded.* = try self.compactDemandedKnownValue(demanded.*);
+        }
         return demanded_values;
     }
 
@@ -8621,7 +8678,7 @@ const Cloner = struct {
         values: []const Value,
         demands: []const ValueDemand,
         out_values: []DemandedKnownValue,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         if (demands.len != values.len or out_values.len != values.len) {
             Common.invariant("state_loop demand/value arity differed while refreshing demanded state");
         }
@@ -8638,7 +8695,7 @@ const Cloner = struct {
         self: *Cloner,
         value: Value,
         demand: ValueDemand,
-    ) Common.LowerError!?DemandedKnownValue {
+    ) LowerError!?DemandedKnownValue {
         if (try self.demandedKnownValueFromValueDemand(value, demand)) |demanded| {
             return demanded;
         }
@@ -8657,7 +8714,7 @@ const Cloner = struct {
         self: *Cloner,
         value: Value,
         demand: ValueDemand,
-    ) Common.LowerError!?DemandedKnownValue {
+    ) LowerError!?DemandedKnownValue {
         if (try self.demandedKnownValueFromAvailableValueDemand(value, demand)) |demanded| {
             return demanded;
         }
@@ -8673,7 +8730,7 @@ const Cloner = struct {
         self: *Cloner,
         value: Value,
         demand: ValueDemand,
-    ) Common.LowerError!?DemandedKnownValue {
+    ) LowerError!?DemandedKnownValue {
         if (value == .private_state) {
             return try self.demandedKnownValueFromPrivateStateDemand(value.private_state, demand);
         }
@@ -8720,7 +8777,7 @@ const Cloner = struct {
         self: *Cloner,
         callable: CallableValue,
         demand: ValueDemand,
-    ) Common.LowerError!?DemandedKnownValue {
+    ) LowerError!?DemandedKnownValue {
         const resolved_demand = self.resolveLoopDemandRef(demand);
         const capture_demands = switch (resolved_demand) {
             .none => return null,
@@ -8776,7 +8833,7 @@ const Cloner = struct {
         self: *Cloner,
         record: RecordValue,
         demand: ValueDemand,
-    ) Common.LowerError!?DemandedKnownValue {
+    ) LowerError!?DemandedKnownValue {
         const resolved_demand = self.resolveLoopDemandRef(demand);
         var fields = std.ArrayList(DemandedKnownField).empty;
         defer fields.deinit(self.pass.allocator);
@@ -8825,7 +8882,7 @@ const Cloner = struct {
         self: *Cloner,
         value: PrivateStateValue,
         demand: ValueDemand,
-    ) Common.LowerError!?DemandedKnownValue {
+    ) LowerError!?DemandedKnownValue {
         self.demanded_known_depth += 1;
         defer self.demanded_known_depth -= 1;
         if (self.demanded_known_depth > 1000) Common.invariant("private-state demanded-known derivation did not converge");
@@ -9114,7 +9171,7 @@ const Cloner = struct {
         self: *Cloner,
         indexed: []const PrivateStateIndexedValue,
         demands: []const ItemDemand,
-    ) Common.LowerError!?[]const DemandedKnownIndexedValue {
+    ) LowerError!?[]const DemandedKnownIndexedValue {
         var values = std.ArrayList(DemandedKnownIndexedValue).empty;
         defer values.deinit(self.pass.allocator);
         for (demands) |demand| {
@@ -9133,7 +9190,7 @@ const Cloner = struct {
         self: *Cloner,
         callable: PrivateStateCallable,
         demands: []const ValueDemand,
-    ) Common.LowerError!?[]const DemandedKnownIndexedValue {
+    ) LowerError!?[]const DemandedKnownIndexedValue {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(source_fn.captures);
 
@@ -9166,7 +9223,7 @@ const Cloner = struct {
         source_initials: ?[]const ?ExprValueSource,
         initial_demands: []const ValueDemand,
         result_demand: ValueDemand,
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         for (values, 0..) |value, value_index| {
             const let_value = switch (value) {
                 .let_ => |let_value| let_value,
@@ -9209,7 +9266,7 @@ const Cloner = struct {
         source_initials: ?[]const ?ExprValueSource,
         initial_demands: []const ValueDemand,
         result_demand: ValueDemand,
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         for (values, 0..) |value, value_index| {
             const if_value = switch (value) {
                 .if_ => |if_value| if_value,
@@ -9518,7 +9575,7 @@ const Cloner = struct {
         };
     }
 
-    fn cloneBlock(self: *Cloner, ty: Type.TypeId, block: anytype) Common.LowerError!Ast.ExprId {
+    fn cloneBlock(self: *Cloner, ty: Type.TypeId, block: anytype) LowerError!Ast.ExprId {
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
         const scoped_start = self.scopedLocalsLen();
@@ -9542,11 +9599,11 @@ const Cloner = struct {
         } } });
     }
 
-    fn cloneBlockValue(self: *Cloner, ty: Type.TypeId, block: anytype) Common.LowerError!Value {
+    fn cloneBlockValue(self: *Cloner, ty: Type.TypeId, block: anytype) LowerError!Value {
         return try self.cloneBlockValueWithFinalDemand(ty, block, false);
     }
 
-    fn cloneBlockValueDemandingKnownValue(self: *Cloner, ty: Type.TypeId, block: anytype) Common.LowerError!Value {
+    fn cloneBlockValueDemandingKnownValue(self: *Cloner, ty: Type.TypeId, block: anytype) LowerError!Value {
         return try self.cloneBlockValueWithFinalDemand(ty, block, true);
     }
 
@@ -9555,7 +9612,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         block: anytype,
         demand_final_known_value: bool,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
         const scoped_start = self.scopedLocalsLen();
@@ -9600,7 +9657,7 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneContinue(self: *Cloner, ty: Type.TypeId, continue_: anytype) Common.LowerError!Ast.ExprData {
+    fn cloneContinue(self: *Cloner, ty: Type.TypeId, continue_: anytype) LowerError!Ast.ExprData {
         const loop = self.loop_stack.getLastOrNull() orelse {
             const state_loop = self.state_loop_stack.getLastOrNull() orelse return .{ .continue_ = .{
                 .values = try self.cloneExprSpan(continue_.values),
@@ -9645,7 +9702,7 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneStateContinue(self: *Cloner, ty: Type.TypeId, state_loop: SparseStateLoopPattern, continue_: anytype) Common.LowerError!Ast.ExprData {
+    fn cloneStateContinue(self: *Cloner, ty: Type.TypeId, state_loop: SparseStateLoopPattern, continue_: anytype) LowerError!Ast.ExprData {
         const values = self.pass.program.exprSpan(continue_.values);
         const source_values = try self.pass.allocator.dupe(Ast.ExprId, values);
         defer self.pass.allocator.free(source_values);
@@ -9687,7 +9744,7 @@ const Cloner = struct {
         } };
     }
 
-    fn stateLoopValueDemands(self: *Cloner, state_loop: SparseStateLoopPattern, arity: usize) Allocator.Error![]ValueDemand {
+    fn stateLoopValueDemands(self: *Cloner, state_loop: SparseStateLoopPattern, arity: usize) LowerError![]ValueDemand {
         const demands = try self.pass.allocator.alloc(ValueDemand, arity);
         @memset(demands, .none);
         if (state_loop.demands.len != arity) Common.invariant("state_loop analysis demand arity differed from state arity");
@@ -9717,7 +9774,7 @@ const Cloner = struct {
         control: IfValue,
         branch_index: usize,
         final_else: bool,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         for (original_values, selected_values, 0..) |original, *selected, index| {
             if (index == selected_index) continue;
             const other = switch (original) {
@@ -9781,7 +9838,7 @@ const Cloner = struct {
         selected_index: usize,
         control: MatchValue,
         branch_index: usize,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         for (original_values, selected_values, 0..) |original, *selected, index| {
             if (index == selected_index) continue;
             const other = switch (original) {
@@ -9798,7 +9855,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         state_loop: SparseStateLoopPattern,
         values: []const Value,
-    ) Common.LowerError!Ast.ExprData {
+    ) LowerError!Ast.ExprData {
         const demands = try self.stateLoopValueDemands(state_loop, values.len);
         defer self.pass.allocator.free(demands);
 
@@ -9923,7 +9980,7 @@ const Cloner = struct {
         self: *Cloner,
         value: Value,
         pending_statements: *std.ArrayList(Ast.StmtId),
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         return switch (value) {
             .let_ => |let_value| blk: {
                 try self.appendPendingLetStmts(let_value.lets, pending_statements);
@@ -10036,7 +10093,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         loop: LoopPattern,
         values: []const Value,
-    ) Common.LowerError!Ast.ExprData {
+    ) LowerError!Ast.ExprData {
         for (values, 0..) |value, value_index| {
             const let_value = switch (value) {
                 .let_ => |let_value| let_value,
@@ -10167,7 +10224,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         demand: ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         if (self.loop_stack.getLastOrNull()) |loop| {
             for (loop.params, 0..) |param, index| {
                 if (index >= loop.demands.len) Common.invariant("loop demand index exceeded active loop state");
@@ -10186,13 +10243,146 @@ const Cloner = struct {
         }
     }
 
+    const ActiveStateLoopParam = struct {
+        loop: SparseStateLoopPattern,
+        param_index: usize,
+    };
+
+    /// Loop-lifetime demand slots outlive every function-demand frame, so a
+    /// stored slot demand must not reference one: a frame reference stored in
+    /// a loop slot dies with its frame and silently swallows later merges.
+    /// Active references are resolved to their current frame-slot demand
+    /// (cutting self-references); references whose frame already ended carry
+    /// no demand, matching loop-demand closure.
+    fn loopSlotDemand(self: *Cloner, demand: ValueDemand) LowerError!ValueDemand {
+        var seen = std.ArrayList(usize).empty;
+        defer seen.deinit(self.pass.allocator);
+        return try self.loopSlotDemandSeen(demand, &seen);
+    }
+
+    fn loopSlotDemandSeen(
+        self: *Cloner,
+        demand: ValueDemand,
+        seen: *std.ArrayList(usize),
+    ) LowerError!ValueDemand {
+        return switch (demand) {
+            .none,
+            .materialize,
+            .loop_param,
+            => demand,
+            .fn_param => |demand_ref| blk: {
+                if (!self.functionDemandSlotIdIsActive(demand_ref)) break :blk .none;
+                const root_ref = self.canonicalFunctionDemandSlotId(demand_ref);
+                for (seen.items) |seen_node| {
+                    if (seen_node == root_ref.node) break :blk .none;
+                }
+                try seen.append(self.pass.allocator, root_ref.node);
+                defer _ = seen.pop();
+                const resolved = self.activeFunctionDemandSlot(root_ref).*;
+                if (resolved == .fn_param and functionDemandSlotIdEql(resolved.fn_param, root_ref)) break :blk .none;
+                break :blk try self.loopSlotDemandSeen(resolved, seen);
+            },
+            .record => |fields| blk: {
+                const closed_fields = try self.pass.arena.allocator().alloc(FieldDemand, fields.len);
+                for (fields, closed_fields) |field, *closed| {
+                    closed.* = .{
+                        .name = field.name,
+                        .demand = try self.pass.storedDemand(try self.loopSlotDemandSeen(field.demand.*, seen)),
+                    };
+                }
+                break :blk ValueDemand{ .record = closed_fields };
+            },
+            .tuple => |items| blk: {
+                const closed_items = try self.pass.arena.allocator().alloc(ItemDemand, items.len);
+                for (items, closed_items) |item, *closed| {
+                    closed.* = .{
+                        .index = item.index,
+                        .demand = try self.pass.storedDemand(try self.loopSlotDemandSeen(item.demand.*, seen)),
+                    };
+                }
+                break :blk ValueDemand{ .tuple = closed_items };
+            },
+            .tag => |tag| blk: {
+                const alternatives = try self.pass.arena.allocator().alloc(TagAlternativeDemand, tag.alternatives.len);
+                for (tag.alternatives, alternatives) |alternative, *closed_alternative| {
+                    const payloads = try self.pass.arena.allocator().alloc(ItemDemand, alternative.payloads.len);
+                    for (alternative.payloads, payloads) |payload, *closed_payload| {
+                        closed_payload.* = .{
+                            .index = payload.index,
+                            .demand = try self.pass.storedDemand(try self.loopSlotDemandSeen(payload.demand.*, seen)),
+                        };
+                    }
+                    closed_alternative.* = .{
+                        .name = alternative.name,
+                        .payloads = payloads,
+                    };
+                }
+                break :blk ValueDemand{ .tag = .{ .alternatives = alternatives } };
+            },
+            .nominal => |backing| ValueDemand{
+                .nominal = try self.pass.storedDemand(try self.loopSlotDemandSeen(backing.*, seen)),
+            },
+            .callable => |callable| blk: {
+                const captures = try self.pass.arena.allocator().alloc(ValueDemand, callable.captures.len);
+                for (callable.captures, captures) |capture, *closed_capture| {
+                    closed_capture.* = try self.loopSlotDemandSeen(capture, seen);
+                }
+                const result = if (callable.result) |result_demand|
+                    try self.pass.storedDemand(try self.loopSlotDemandSeen(result_demand.*, seen))
+                else
+                    null;
+                break :blk ValueDemand{ .callable = .{
+                    .captures = captures,
+                    .result = result,
+                } };
+            },
+        };
+    }
+
+    fn activeStateLoopOwningParam(self: *Cloner, source_local: Ast.LocalId) ?ActiveStateLoopParam {
+        var stack_index = self.state_loop_stack.items.len;
+        while (stack_index > 0) {
+            stack_index -= 1;
+            const loop = self.state_loop_stack.items[stack_index];
+            for (loop.params, 0..) |param, param_index| {
+                if (param.local != source_local) continue;
+                return .{ .loop = loop, .param_index = param_index };
+            }
+        }
+        return null;
+    }
+
+    fn noteLoopStateCallableDemand(
+        self: *Cloner,
+        callable: PrivateStateCallable,
+        origin: PrivateStateLoopOrigin,
+        source_captures: []const Ast.TypedLocal,
+        demand: ValueDemand,
+    ) LowerError!void {
+        const owner = self.activeStateLoopOwningParam(origin.source_local) orelse
+            Common.invariant("loop-state callable was called outside its owning loop fixed point");
+        const capture_demands = try self.pass.arena.allocator().alloc(ValueDemand, source_captures.len);
+        var has_observed_demand = demand != .none;
+        for (source_captures, capture_demands) |source_capture, *out| {
+            out.* = if (demand == .none)
+                self.plannedLocalDemand(callable.fn_id, source_capture.local)
+            else
+                try self.functionLocalDemand(callable.fn_id, source_capture.local, demand);
+            if (out.* != .none) has_observed_demand = true;
+        }
+        if (!has_observed_demand) return;
+        const callable_demand = try self.callableDemandWithResult(capture_demands, demand);
+        const observed = try self.demandAtPath(origin.path, callable_demand);
+        try self.mergeActiveStateLoopParamDemand(owner.loop, owner.param_index, observed);
+    }
+
     fn mergeActiveLoopParamDemand(
         self: *Cloner,
         loop: LoopPattern,
         index: usize,
         existing: ValueDemand,
         incoming: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         if (loop.source_values) |source_values| {
             if (index >= source_values.len) Common.invariant("loop source-value demand index exceeded active loop arity");
             return try self.mergeLoopValueParamDemand(source_values[index], existing, incoming);
@@ -10206,7 +10396,7 @@ const Cloner = struct {
         loop: SparseStateLoopPattern,
         index: usize,
         incoming: ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         if (index >= loop.values.len) Common.invariant("state loop source-value demand index exceeded active loop arity");
         if (incoming == .none) return;
 
@@ -10240,7 +10430,7 @@ const Cloner = struct {
             if (normalize_iterations > 1000) Common.invariant("state loop demand normalization did not converge");
 
             const current = loop.demands[index];
-            const normalized = try self.normalizeLoopValueParamDemand(loop.values[index], current);
+            const normalized = try self.loopSlotDemand(try self.normalizeLoopValueParamDemand(loop.values[index], current));
             if (try self.valueDemandEqlInActiveContext(current, normalized)) break;
             loop.demands[index] = normalized;
             loop.changed.* = true;
@@ -10270,12 +10460,13 @@ const Cloner = struct {
         loop: SparseStateLoopPattern,
         index: usize,
         incoming: ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         const current = loop.demands[index];
         if (try self.valueDemandEqlInActiveContext(current, incoming)) return;
         const merged = try self.mergeValueDemand(current, incoming);
-        if (try self.valueDemandEqlInActiveContext(current, merged)) return;
-        loop.demands[index] = merged;
+        const stored = try self.loopSlotDemand(merged);
+        if (try self.valueDemandEqlInActiveContext(current, stored)) return;
+        loop.demands[index] = stored;
         loop.changed.* = true;
         self.demand_cache_epoch += 1;
     }
@@ -10285,10 +10476,10 @@ const Cloner = struct {
         known_value: KnownValue,
         existing: ValueDemand,
         incoming: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         if (incoming == .loop_param) return existing;
         const merged = try self.mergeValueDemand(existing, incoming);
-        return try self.normalizeLoopParamDemand(known_value, merged);
+        return try self.loopSlotDemand(try self.normalizeLoopParamDemand(known_value, merged));
     }
 
     fn mergeLoopValueParamDemand(
@@ -10296,50 +10487,314 @@ const Cloner = struct {
         value: Value,
         existing: ValueDemand,
         incoming: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         if (incoming == .loop_param) return existing;
         const merged = try self.mergeValueDemand(existing, incoming);
-        return try self.normalizeLoopValueParamDemand(value, merged);
+        return try self.loopSlotDemand(try self.normalizeLoopValueParamDemand(value, merged));
     }
 
     fn normalizeLoopParamDemand(
         self: *Cloner,
         known_value: KnownValue,
         demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         switch (demand) {
             .none, .materialize => return demand,
             else => {},
         }
 
+        const expanded = try self.expandLoopCallableCaptureDemandsKnown(known_value, demand);
         const demanded = (try demandedKnownValueFromDemand(
             self,
             self.pass.program,
             self.pass.arena.allocator(),
             known_value,
-            demand,
-        )) orelse return demand;
+            expanded,
+        )) orelse return expanded;
 
         const state_shape = try self.pass.valueDemandFromDemandedKnownValue(demanded);
-        return try self.mergeValueDemand(demand, state_shape);
+        return try self.mergeValueDemand(expanded, state_shape);
+    }
+
+    fn expandLoopCallableCaptureDemandsKnown(
+        self: *Cloner,
+        known_value: KnownValue,
+        demand: ValueDemand,
+    ) LowerError!ValueDemand {
+        return switch (demand) {
+            .none,
+            .materialize,
+            .loop_param,
+            .fn_param,
+            .nominal,
+            .tuple,
+            .tag,
+            => demand,
+            .record => |field_demands| blk: {
+                var changed = false;
+                const expanded_fields = try self.pass.arena.allocator().alloc(FieldDemand, field_demands.len);
+                for (field_demands, expanded_fields) |field_demand, *out| {
+                    const field_known = fieldKnownValueFromKnownValue(self.pass.program, known_value, field_demand.name) orelse {
+                        out.* = field_demand;
+                        continue;
+                    };
+                    const expanded = try self.expandLoopCallableCaptureDemandsKnown(field_known, field_demand.demand.*);
+                    changed = true;
+                    out.* = .{
+                        .name = field_demand.name,
+                        .demand = try self.pass.storedDemand(expanded),
+                    };
+                }
+                break :blk if (changed) ValueDemand{ .record = expanded_fields } else demand;
+            },
+            .callable => |callable_demand| blk: {
+                const result_demand = callable_demand.result orelse break :blk demand;
+                var merged: ValueDemand = demand;
+                switch (known_value) {
+                    .callable => |callable| {
+                        const derived = try self.callableDemandForFnWithResultDemand(
+                            callable.fn_id,
+                            self.sourceCaptureCount(callable.fn_id),
+                            result_demand.*,
+                        );
+                        merged = try self.mergeValueDemand(merged, derived);
+                    },
+                    .finite_callables => |finite_callables| for (finite_callables.alternatives) |alternative| {
+                        const derived = try self.callableDemandForFnWithResultDemand(
+                            alternative.fn_id,
+                            self.sourceCaptureCount(alternative.fn_id),
+                            result_demand.*,
+                        );
+                        merged = try self.mergeValueDemand(merged, derived);
+                    },
+                    else => {},
+                }
+                break :blk merged;
+            },
+        };
     }
 
     fn normalizeLoopValueParamDemand(
         self: *Cloner,
         value: Value,
         demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         switch (demand) {
             .none, .materialize => return demand,
             else => {},
         }
 
-        const demanded = (try self.demandedKnownValueFromValueDemand(value, demand)) orelse return demand;
+        const expanded = try self.expandLoopCallableCaptureDemands(value, demand);
+        const demanded = (try self.demandedKnownValueFromValueDemand(value, expanded)) orelse return expanded;
         const state_shape = try self.pass.valueDemandFromDemandedKnownValue(demanded);
-        return try self.mergeValueDemand(demand, state_shape);
+        return try self.mergeValueDemand(expanded, state_shape);
     }
 
-    fn refineLoopKnownValueForValue(self: *Cloner, known_value: KnownValue, value: Value) Common.LowerError!KnownValue {
+    /// Normalized loop demand connects callable result demand to per-target
+    /// capture demand before any split consumes the demand vector. The
+    /// derivation is deliberately context-free: a loop state key serves every
+    /// iteration, so entry-known capture values must not prune capture demand
+    /// that only later iterations need.
+    fn expandLoopCallableCaptureDemands(
+        self: *Cloner,
+        value: Value,
+        demand: ValueDemand,
+    ) LowerError!ValueDemand {
+        switch (value) {
+            .let_ => |let_value| return try self.expandLoopCallableCaptureDemands(let_value.body.*, demand),
+            .expr_with_known_value => |known| if (known.value) |inner| {
+                return try self.expandLoopCallableCaptureDemands(inner.*, demand);
+            },
+            else => {},
+        }
+        return switch (demand) {
+            .none,
+            .materialize,
+            .loop_param,
+            .fn_param,
+            .nominal,
+            .tuple,
+            .tag,
+            => demand,
+            .record => |field_demands| blk: {
+                var changed = false;
+                const expanded_fields = try self.pass.arena.allocator().alloc(FieldDemand, field_demands.len);
+                for (field_demands, expanded_fields) |field_demand, *out| {
+                    const field_value = valueRecordFieldForDemand(self.pass.program, value, field_demand.name) orelse {
+                        out.* = field_demand;
+                        continue;
+                    };
+                    const expanded = try self.expandLoopCallableCaptureDemands(field_value, field_demand.demand.*);
+                    changed = true;
+                    out.* = .{
+                        .name = field_demand.name,
+                        .demand = try self.pass.storedDemand(expanded),
+                    };
+                }
+                break :blk if (changed) ValueDemand{ .record = expanded_fields } else demand;
+            },
+            .callable => |callable_demand| blk: {
+                const result_demand = callable_demand.result orelse break :blk demand;
+                var merged: ValueDemand = demand;
+                for (try self.callableTargetsForDemandExpansion(value)) |target| {
+                    const derived = try self.callableDemandForFnWithResultDemand(
+                        target.fn_id,
+                        target.capture_count,
+                        result_demand.*,
+                    );
+                    merged = try self.mergeValueDemand(merged, derived);
+                }
+                break :blk merged;
+            },
+        };
+    }
+
+    /// Clone a binding value under its derived demand, expanding callable
+    /// result demand against the cloned producer until the demand is stable.
+    /// Loop-carried bindings need this: demand derived from the binding's
+    /// consumers cannot include per-target capture demand until the producer
+    /// is cloned, and the binding is the last point where the original
+    /// producer can be recloned under the grown normalized demand.
+    fn cloneBindingValueWithExpandedDemand(
+        self: *Cloner,
+        value_expr: Ast.ExprId,
+        demand: *ValueDemand,
+    ) LowerError!Value {
+        if (!valueDemandContainsLoopParam(demand.*)) {
+            return try self.cloneExprValueWithDemand(value_expr, demand.*);
+        }
+        var expand_iterations: usize = 0;
+        while (true) {
+            expand_iterations += 1;
+            if (expand_iterations > 1000) Common.invariant("binding demand expansion did not converge");
+            const change_start = self.changes.items.len;
+            const cloned = try self.cloneExprValueWithDemand(value_expr, demand.*);
+            const expanded = try self.expandLoopCallableCaptureDemands(cloned, demand.*);
+            if (try self.valueDemandEqlInActiveContext(demand.*, expanded)) return cloned;
+            demand.* = expanded;
+            self.restore(change_start);
+        }
+    }
+
+    const CallableDemandExpansionTarget = struct {
+        fn_id: Ast.FnId,
+        capture_count: usize,
+    };
+
+    fn callableTargetsForDemandExpansion(self: *Cloner, value: Value) LowerError![]const CallableDemandExpansionTarget {
+        var targets = std.ArrayList(CallableDemandExpansionTarget).empty;
+        defer targets.deinit(self.pass.allocator);
+        switch (value) {
+            .callable => |callable| try targets.append(self.pass.allocator, .{
+                .fn_id = callable.fn_id,
+                .capture_count = self.sourceCaptureCount(callable.fn_id),
+            }),
+            .finite_callables => |finite_callables| for (finite_callables.alternatives) |alternative| {
+                try targets.append(self.pass.allocator, .{
+                    .fn_id = alternative.fn_id,
+                    .capture_count = self.sourceCaptureCount(alternative.fn_id),
+                });
+            },
+            .private_state => |private_state| {
+                if (privateStateCallable(private_state)) |private_callable| {
+                    try targets.append(self.pass.allocator, .{
+                        .fn_id = private_callable.fn_id,
+                        .capture_count = self.sourceCaptureCount(private_callable.fn_id),
+                    });
+                } else if (private_state == .compact_finite_callables) {
+                    for (private_state.compact_finite_callables.source.alternatives) |alternative| {
+                        try targets.append(self.pass.allocator, .{
+                            .fn_id = alternative.fn_id,
+                            .capture_count = self.sourceCaptureCount(alternative.fn_id),
+                        });
+                    }
+                }
+            },
+            .expr_with_known_value => |known| switch (known.known_value) {
+                .callable => |callable| try targets.append(self.pass.allocator, .{
+                    .fn_id = callable.fn_id,
+                    .capture_count = self.sourceCaptureCount(callable.fn_id),
+                }),
+                .finite_callables => |finite_callables| for (finite_callables.alternatives) |alternative| {
+                    try targets.append(self.pass.allocator, .{
+                        .fn_id = alternative.fn_id,
+                        .capture_count = self.sourceCaptureCount(alternative.fn_id),
+                    });
+                },
+                else => {},
+            },
+            else => {},
+        }
+        return try self.pass.arena.allocator().dupe(CallableDemandExpansionTarget, targets.items);
+    }
+
+    fn sourceCaptureCount(self: *Cloner, fn_id: Ast.FnId) usize {
+        const source_fn = self.pass.program.fns.items[@intFromEnum(fn_id)];
+        return self.pass.program.typedLocalSpan(source_fn.captures).len;
+    }
+
+    fn valueDemandContainsLoopParam(demand: ValueDemand) bool {
+        return switch (demand) {
+            .none, .materialize, .fn_param => false,
+            .loop_param => true,
+            .record => |fields| blk: {
+                for (fields) |field| {
+                    if (valueDemandContainsLoopParam(field.demand.*)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => |items| blk: {
+                for (items) |item| {
+                    if (valueDemandContainsLoopParam(item.demand.*)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tag => |tag| blk: {
+                for (tag.alternatives) |alternative| {
+                    for (alternative.payloads) |payload| {
+                        if (valueDemandContainsLoopParam(payload.demand.*)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .nominal => |backing| valueDemandContainsLoopParam(backing.*),
+            .callable => |callable| blk: {
+                for (callable.captures) |capture| {
+                    if (valueDemandContainsLoopParam(capture)) break :blk true;
+                }
+                if (callable.result) |result| {
+                    if (valueDemandContainsLoopParam(result.*)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn valueRecordFieldForDemand(program: *const Ast.Program, value: Value, name: names.RecordFieldNameId) ?Value {
+        return switch (value) {
+            .record => |record| blk: {
+                for (record.fields) |field| {
+                    if (program.names.recordFieldLabelTextEql(field.name, name)) break :blk field.value;
+                }
+                break :blk null;
+            },
+            .nominal => |nominal| valueRecordFieldForDemand(program, nominal.backing.*, name),
+            .private_state => |private_state| switch (private_state) {
+                .record => |record| blk: {
+                    const field_value = privateStateFieldByName(program, record.fields, name) orelse break :blk null;
+                    break :blk Value{ .private_state = field_value };
+                },
+                .nominal => |nominal| blk: {
+                    const backing = nominal.backing orelse break :blk null;
+                    break :blk valueRecordFieldForDemand(program, .{ .private_state = backing.* }, name);
+                },
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    fn refineLoopKnownValueForValue(self: *Cloner, known_value: KnownValue, value: Value) LowerError!KnownValue {
         if (knownValueMatchesValue(self.pass.program, known_value, value)) return known_value;
 
         return switch (known_value) {
@@ -10564,7 +11019,7 @@ const Cloner = struct {
         };
     }
 
-    fn valuesToExprSpan(self: *Cloner, values: []const Value) Common.LowerError!Ast.Span(Ast.ExprId) {
+    fn valuesToExprSpan(self: *Cloner, values: []const Value) LowerError!Ast.Span(Ast.ExprId) {
         const exprs = try self.pass.allocator.alloc(Ast.ExprId, values.len);
         defer self.pass.allocator.free(exprs);
         for (values, 0..) |value, index| {
@@ -10573,7 +11028,7 @@ const Cloner = struct {
         return try self.pass.program.addExprSpan(exprs);
     }
 
-    fn valuesToOutputExprSpan(self: *Cloner, values: []const Value) Common.LowerError!?Ast.Span(Ast.ExprId) {
+    fn valuesToOutputExprSpan(self: *Cloner, values: []const Value) LowerError!?Ast.Span(Ast.ExprId) {
         const exprs = try self.pass.allocator.alloc(Ast.ExprId, values.len);
         defer self.pass.allocator.free(exprs);
         for (values, 0..) |value, index| {
@@ -10582,7 +11037,7 @@ const Cloner = struct {
         return try self.pass.program.addExprSpan(exprs);
     }
 
-    fn ensureCallPatternForValues(self: *Cloner, fn_id: Ast.FnId, values: []const Value) Common.LowerError!void {
+    fn ensureCallPatternForValues(self: *Cloner, fn_id: Ast.FnId, values: []const Value) LowerError!void {
         const capture_values = try self.directCallCaptureValues(fn_id);
         defer if (capture_values) |captures| self.pass.allocator.free(captures);
         _ = try self.ensureCallPatternForValuesWithDemandAndCaptures(fn_id, capture_values, values, .materialize);
@@ -10593,7 +11048,7 @@ const Cloner = struct {
         fn_id: Ast.FnId,
         values: []const Value,
         result_demand: ValueDemand,
-    ) Common.LowerError!?usize {
+    ) LowerError!?usize {
         const capture_values = try self.directCallCaptureValues(fn_id);
         defer if (capture_values) |captures| self.pass.allocator.free(captures);
         return try self.ensureCallPatternForValuesWithDemandAndCaptures(fn_id, capture_values, values, result_demand);
@@ -10605,7 +11060,7 @@ const Cloner = struct {
         capture_values: ?[]const Value,
         values: []const Value,
         result_demand: ValueDemand,
-    ) Common.LowerError!?usize {
+    ) LowerError!?usize {
         const raw = @intFromEnum(fn_id);
         if (raw >= self.pass.plans.len) return null;
         const closed_result_demand = try self.closeLoopDemandRefs(result_demand);
@@ -10670,7 +11125,7 @@ const Cloner = struct {
         self: *Cloner,
         fn_id: Ast.FnId,
         spec_index: usize,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         const raw = @intFromEnum(fn_id);
         if (raw >= self.pass.plans.len) Common.invariant("reserved call-pattern source fn exceeded plan count");
         const spec = self.pass.plans[raw].specs.items[spec_index];
@@ -10715,7 +11170,7 @@ const Cloner = struct {
         callee: Ast.FnId,
         is_cold: bool,
         values: []const Value,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const capture_values = try self.directCallCaptureValues(callee);
         defer if (capture_values) |captures| self.pass.allocator.free(captures);
         return try self.directCallExprFromValuesAndCaptures(ty, callee, is_cold, capture_values, values);
@@ -10728,7 +11183,7 @@ const Cloner = struct {
         is_cold: bool,
         capture_values: ?[]const Value,
         values: []const Value,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const raw = @intFromEnum(callee);
         if (!is_cold and raw < self.pass.plans.len) {
             if (self.record_call_patterns) {
@@ -10781,7 +11236,7 @@ const Cloner = struct {
         is_cold: bool,
         values: []const Value,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (demand == .none or demand == .materialize) {
             return .{ .expr = try self.directCallExprFromValues(ty, callee, is_cold, values) };
         }
@@ -10799,7 +11254,7 @@ const Cloner = struct {
         capture_values: ?[]const Value,
         values: []const Value,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const closed_demand = try self.closeLoopDemandRefs(demand);
         if (closed_demand == .none or closed_demand == .materialize) {
             return .{ .expr = try self.directCallExprFromValuesAndCaptures(ty, callee, is_cold, capture_values, values) };
@@ -10853,7 +11308,7 @@ const Cloner = struct {
         capture_values: ?[]const Value,
         values: []const Value,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         var has_capture_pattern = false;
         for (pattern.captures) |known_value| {
             if (known_value == .split) {
@@ -10924,7 +11379,7 @@ const Cloner = struct {
         known_value: KnownValue,
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         switch (known_value) {
             .any => {
                 const expr = (try self.outputExprFromValue(value)) orelse return false;
@@ -10938,7 +11393,7 @@ const Cloner = struct {
         }
     }
 
-    fn cloneCallProcExpr(self: *Cloner, ty: Type.TypeId, call: @import("../monotype/ast.zig").CallProc) Common.LowerError!Ast.ExprId {
+    fn cloneCallProcExpr(self: *Cloner, ty: Type.TypeId, call: @import("../monotype/ast.zig").CallProc) LowerError!Ast.ExprId {
         const data = try self.cloneCallProcData(call);
         const cloned_call = switch (data) {
             .call_proc => |cloned| cloned,
@@ -10948,7 +11403,7 @@ const Cloner = struct {
         return try self.wrapDirectCallCaptureLets(ty, Ast.callProcCallee(cloned_call), call_expr);
     }
 
-    fn cloneCallProcData(self: *Cloner, call: @import("../monotype/ast.zig").CallProc) Common.LowerError!Ast.ExprData {
+    fn cloneCallProcData(self: *Cloner, call: @import("../monotype/ast.zig").CallProc) LowerError!Ast.ExprData {
         if (call.is_cold) {
             return .{ .call_proc = .{
                 .callee = call.callee,
@@ -11009,7 +11464,7 @@ const Cloner = struct {
         } };
     }
 
-    fn wrapDirectCallCaptureLets(self: *Cloner, ty: Type.TypeId, callee: Ast.FnId, call_expr: Ast.ExprId) Common.LowerError!Ast.ExprId {
+    fn wrapDirectCallCaptureLets(self: *Cloner, ty: Type.TypeId, callee: Ast.FnId, call_expr: Ast.ExprId) LowerError!Ast.ExprId {
         const callee_fn = self.pass.program.fns.items[@intFromEnum(callee)];
         const captures = self.pass.program.typedLocalSpan(callee_fn.captures);
         if (captures.len == 0) return call_expr;
@@ -11050,7 +11505,7 @@ const Cloner = struct {
         callee: Ast.FnId,
         capture_values: []const Value,
         call_expr: Ast.ExprId,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const callee_fn = self.pass.program.fns.items[@intFromEnum(callee)];
         const captures = self.pass.program.typedLocalSpan(callee_fn.captures);
         if (captures.len != capture_values.len) Common.invariant("direct call capture value count differed from callee capture arity");
@@ -11088,11 +11543,11 @@ const Cloner = struct {
         known_value: KnownValue,
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         return try self.appendFieldReadExprsFromValue(known_value, value, out);
     }
 
-    fn privateStateOutputExpr(self: *Cloner, value: PrivateStateValue) Common.LowerError!?Ast.ExprId {
+    fn privateStateOutputExpr(self: *Cloner, value: PrivateStateValue) LowerError!?Ast.ExprId {
         const leaf_expr = privateStateLeafExpr(value) orelse return null;
         const substituted = (try self.substitutedPrivateLeafValue(value)) orelse return leaf_expr;
         if (substituted == .private_state and privateStateEql(self.pass.program, substituted.private_state, value)) {
@@ -11101,11 +11556,11 @@ const Cloner = struct {
         return (try self.outputExprFromSubstitutedLeafValue(substituted)) orelse leaf_expr;
     }
 
-    fn outputExprFromSubstitutedLeafValue(self: *Cloner, value: Value) Common.LowerError!?Ast.ExprId {
+    fn outputExprFromSubstitutedLeafValue(self: *Cloner, value: Value) LowerError!?Ast.ExprId {
         return try self.outputExprFromValue(value);
     }
 
-    fn outputExprFromValue(self: *Cloner, value: Value) Common.LowerError!?Ast.ExprId {
+    fn outputExprFromValue(self: *Cloner, value: Value) LowerError!?Ast.ExprId {
         if (value == .expr) {
             if (!self.exprReferencesAvailableBindings(value.expr)) return null;
             return value.expr;
@@ -11136,7 +11591,7 @@ const Cloner = struct {
         self: *Cloner,
         value: Value,
         pending_lets: []const PendingLet,
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         if (pending_lets.len == 0) return try self.outputExprFromValue(value);
 
         const scoped_start = self.scopedLocalsLen();
@@ -11247,7 +11702,7 @@ const Cloner = struct {
         };
     }
 
-    fn substitutedKnownExprValue(self: *Cloner, known: ExprWithKnownValue) Common.LowerError!?Value {
+    fn substitutedKnownExprValue(self: *Cloner, known: ExprWithKnownValue) LowerError!?Value {
         var seen = std.ArrayList(Ast.ExprId).empty;
         defer seen.deinit(self.pass.allocator);
         return try self.substitutedExprValueAvoidingCycles(known.expr, &seen);
@@ -11257,7 +11712,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         seen: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const substituted = (try self.substitutedExistingFieldOrTupleReadValue(expr_id, seen)) orelse return null;
         if (valueIsExpr(substituted, expr_id)) return null;
         if (!sameType(self.pass.program, self.pass.program.exprs.items[@intFromEnum(expr_id)].ty, valueType(self.pass.program, substituted))) {
@@ -11280,7 +11735,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         seen: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         for (seen.items) |seen_expr| {
             if (seen_expr == expr_id) return null;
         }
@@ -11306,7 +11761,7 @@ const Cloner = struct {
         self: *Cloner,
         known_value: KnownValue,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!void {
+    ) LowerError!void {
         switch (known_value) {
             .any,
             .leaf,
@@ -11345,7 +11800,7 @@ const Cloner = struct {
         self: *Cloner,
         known_value: DemandedKnownValue,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!void {
+    ) LowerError!void {
         switch (known_value) {
             .any,
             .leaf,
@@ -11395,7 +11850,7 @@ const Cloner = struct {
         known_value: KnownValue,
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         switch (known_value) {
             .any,
             .leaf,
@@ -11593,7 +12048,7 @@ const Cloner = struct {
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         if (value == .let_) {
             const let_value = value.let_;
             try self.appendPendingLetsUnique(pending_lets, let_value.lets);
@@ -11612,7 +12067,7 @@ const Cloner = struct {
         known_value: DemandedKnownValue,
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         var pending_lets = std.ArrayList(PendingLet).empty;
         defer pending_lets.deinit(self.pass.allocator);
 
@@ -11634,7 +12089,7 @@ const Cloner = struct {
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         if (value == .let_) {
             const let_value = value.let_;
             try self.appendPendingLetsUnique(pending_lets, let_value.lets);
@@ -11921,7 +12376,7 @@ const Cloner = struct {
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         switch (value) {
             .let_ => |let_value| {
                 try self.appendPendingLetsUnique(pending_lets, let_value.lets);
@@ -11995,7 +12450,7 @@ const Cloner = struct {
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         switch (value) {
             .let_ => |let_value| {
                 try self.appendPendingLetsUnique(pending_lets, let_value.lets);
@@ -12068,7 +12523,7 @@ const Cloner = struct {
         finite_tags: DemandedKnownTags,
         value: Value,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         switch (value) {
             .let_ => |let_value| {
                 const change_start = self.changes.items.len;
@@ -12147,7 +12602,7 @@ const Cloner = struct {
         finite_tags: DemandedKnownTags,
         finite_value: FiniteTagsValue,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         if (!sameType(self.pass.program, finite_tags.ty, finite_value.ty)) return null;
         if (finite_value.alternatives.len == 0) Common.invariant("finite tag compact construction had no alternatives");
         if (finite_value.alternatives.len == 1) {
@@ -12176,7 +12631,7 @@ const Cloner = struct {
         finite_tags: DemandedKnownTags,
         tag: TagValue,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         const alternative_index = demandedTagAlternativeIndex(self.pass.program, finite_tags.alternatives, tag.name) orelse return null;
         const alternative = finite_tags.alternatives[alternative_index];
         var payload_exprs = std.ArrayList(Ast.ExprId).empty;
@@ -12195,7 +12650,7 @@ const Cloner = struct {
         finite_tags: DemandedKnownTags,
         tag: PrivateStateTag,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         const alternative_index = demandedTagAlternativeIndex(self.pass.program, finite_tags.alternatives, tag.name) orelse return null;
         const alternative = finite_tags.alternatives[alternative_index];
         var payload_exprs = std.ArrayList(Ast.ExprId).empty;
@@ -12211,7 +12666,7 @@ const Cloner = struct {
         self: *Cloner,
         finite_tags: DemandedKnownTags,
         expr: Ast.ExprId,
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         const source_tags = tagUnionTypeTags(self.pass.program, finite_tags.ty) orelse return null;
         const compact_ty = try self.pass.compactFiniteTagsType(finite_tags);
         const branches = try self.pass.allocator.alloc(Ast.Branch, source_tags.len);
@@ -12278,7 +12733,7 @@ const Cloner = struct {
         finite_tags: DemandedKnownTags,
         alternative_index: usize,
         payload_exprs: []const Ast.ExprId,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const compact_ty = try self.pass.compactFiniteTagsType(finite_tags);
         if (finite_tags.alternatives.len == 1) {
             if (alternative_index != 0) Common.invariant("singleton compact finite tag used a nonzero alternative index");
@@ -12296,7 +12751,7 @@ const Cloner = struct {
         finite_callables: DemandedKnownCallables,
         value: Value,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         switch (value) {
             .let_ => |let_value| {
                 const change_start = self.changes.items.len;
@@ -12372,7 +12827,7 @@ const Cloner = struct {
         finite_callables: DemandedKnownCallables,
         finite_value: FiniteCallablesValue,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         if (!sameType(self.pass.program, finite_callables.ty, finite_value.ty)) return null;
         if (finite_value.alternatives.len == 0) Common.invariant("finite callable compact construction had no alternatives");
         if (finite_value.alternatives.len == 1) {
@@ -12401,7 +12856,7 @@ const Cloner = struct {
         finite_callables: DemandedKnownCallables,
         callable: CallableValue,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         const alternative_index = demandedCallableAlternativeIndex(self.pass.program, finite_callables.alternatives, callable.ty, callable.fn_id) orelse return null;
         const alternative = finite_callables.alternatives[alternative_index];
         var capture_exprs = std.ArrayList(Ast.ExprId).empty;
@@ -12418,7 +12873,7 @@ const Cloner = struct {
         finite_callables: DemandedKnownCallables,
         callable: PrivateStateCallable,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         const alternative_index = demandedCallableAlternativeIndex(self.pass.program, finite_callables.alternatives, callable.ty, callable.fn_id) orelse return null;
         const alternative = finite_callables.alternatives[alternative_index];
         var capture_exprs = std.ArrayList(Ast.ExprId).empty;
@@ -12435,7 +12890,7 @@ const Cloner = struct {
         finite_callables: DemandedKnownCallables,
         alternative_index: usize,
         capture_exprs: []const Ast.ExprId,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const compact_ty = try self.pass.compactFiniteCallablesType(finite_callables);
         if (finite_callables.alternatives.len == 1) {
             if (alternative_index != 0) Common.invariant("singleton compact finite callable used a nonzero alternative index");
@@ -12452,7 +12907,7 @@ const Cloner = struct {
         self: *Cloner,
         scrutinee: Ast.ExprId,
         ty: Type.TypeId,
-    ) Common.LowerError!?MatchValue {
+    ) LowerError!?MatchValue {
         const tags = tagUnionTypeTags(self.pass.program, ty) orelse return null;
         if (tags.len == 0) return null;
 
@@ -12506,7 +12961,7 @@ const Cloner = struct {
         known_value: DemandedKnownValue,
         if_value: IfValue,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         const demand = try self.pass.valueDemandFromDemandedKnownValue(known_value);
         var final_leaves = std.ArrayList(Ast.ExprId).empty;
         defer final_leaves.deinit(self.pass.allocator);
@@ -12557,7 +13012,7 @@ const Cloner = struct {
         known_value: DemandedKnownValue,
         match_value: MatchValue,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         const demand = try self.pass.valueDemandFromDemandedKnownValue(known_value);
         var branch_leaf_sets = std.ArrayList([]Ast.ExprId).empty;
         defer {
@@ -12611,7 +13066,7 @@ const Cloner = struct {
         callable: DemandedKnownCallable,
         capture_index: u32,
         capture_demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const branches = try self.pass.arena.allocator().alloc(IfValueBranch, if_value.branches.len);
         var capture_ty: ?Type.TypeId = null;
         const callable_demand = try self.callableCaptureDemand(capture_index, capture_demand);
@@ -12644,7 +13099,7 @@ const Cloner = struct {
         callable: DemandedKnownCallable,
         capture_index: u32,
         capture_demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const branches = try self.pass.arena.allocator().alloc(MatchValueBranch, match_value.branches.len);
         var capture_ty: ?Type.TypeId = null;
         const callable_demand = try self.callableCaptureDemand(capture_index, capture_demand);
@@ -12700,7 +13155,7 @@ const Cloner = struct {
         value: Value,
         callable: DemandedKnownCallable,
         capture_index: u32,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (value == .let_) {
             const capture = (try self.callableCaptureFromValue(value.let_.body.*, callable, capture_index)) orelse return null;
             return try self.wrapPendingLets(capture, value.let_.lets, true);
@@ -12748,7 +13203,7 @@ const Cloner = struct {
         return callable_value.captures[capture_index];
     }
 
-    fn selectorLiteral(self: *Cloner, value: u64) Common.LowerError!Ast.ExprId {
+    fn selectorLiteral(self: *Cloner, value: u64) LowerError!Ast.ExprId {
         const selector_ty = try self.pass.primitiveType(.u64);
         return try self.addExpr(.{
             .ty = selector_ty,
@@ -12756,7 +13211,7 @@ const Cloner = struct {
         });
     }
 
-    fn selectorEquals(self: *Cloner, selector: Ast.ExprId, value: u64) Common.LowerError!Ast.ExprId {
+    fn selectorEquals(self: *Cloner, selector: Ast.ExprId, value: u64) LowerError!Ast.ExprId {
         const bool_ty = try self.pass.primitiveType(.bool);
         const literal = try self.selectorLiteral(value);
         const args = try self.pass.program.addExprSpan(&.{ selector, literal });
@@ -12769,7 +13224,7 @@ const Cloner = struct {
         });
     }
 
-    fn cloneFieldAccess(self: *Cloner, ty: Type.TypeId, field: anytype) Common.LowerError!Ast.ExprId {
+    fn cloneFieldAccess(self: *Cloner, ty: Type.TypeId, field: anytype) LowerError!Ast.ExprId {
         try self.noteLoopDemandIfLocalExpr(
             field.receiver,
             try self.pass.demandRecordField(field.field, .materialize),
@@ -12782,7 +13237,7 @@ const Cloner = struct {
         } } });
     }
 
-    fn cloneTupleAccess(self: *Cloner, ty: Type.TypeId, access: anytype) Common.LowerError!Ast.ExprId {
+    fn cloneTupleAccess(self: *Cloner, ty: Type.TypeId, access: anytype) LowerError!Ast.ExprId {
         try self.noteLoopDemandIfLocalExpr(
             access.tuple,
             try self.pass.demandTupleItem(access.elem_index, .materialize),
@@ -12795,7 +13250,7 @@ const Cloner = struct {
         } } });
     }
 
-    fn fieldFromKnownValue(self: *Cloner, receiver: Value, field: names.RecordFieldNameId) Common.LowerError!?Value {
+    fn fieldFromKnownValue(self: *Cloner, receiver: Value, field: names.RecordFieldNameId) LowerError!?Value {
         if (receiver == .let_) {
             const let_value = receiver.let_;
             const field_value = (try self.fieldFromKnownValue(let_value.body.*, field)) orelse return null;
@@ -12874,7 +13329,7 @@ const Cloner = struct {
         return valueFromProjectedExpr(field_expr, field_known_value);
     }
 
-    fn itemFromKnownValue(self: *Cloner, receiver: Value, index: u32) Common.LowerError!?Value {
+    fn itemFromKnownValue(self: *Cloner, receiver: Value, index: u32) LowerError!?Value {
         if (receiver == .let_) {
             const let_value = receiver.let_;
             const item_value = (try self.itemFromKnownValue(let_value.body.*, index)) orelse return null;
@@ -12953,7 +13408,7 @@ const Cloner = struct {
         return valueFromProjectedExpr(item_expr, item_known_value);
     }
 
-    fn cloneIfValue(self: *Cloner, ty: Type.TypeId, if_: anytype) Common.LowerError!Value {
+    fn cloneIfValue(self: *Cloner, ty: Type.TypeId, if_: anytype) LowerError!Value {
         const source_branches = try self.pass.allocator.dupe(Ast.IfBranch, self.pass.program.ifBranchSpan(if_.branches));
         defer self.pass.allocator.free(source_branches);
 
@@ -12966,7 +13421,7 @@ const Cloner = struct {
         source_branches: []const Ast.IfBranch,
         index: usize,
         final_else: Ast.ExprId,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (index == source_branches.len) {
             return try self.cloneExprValueDemandingKnownValue(final_else);
         }
@@ -13012,7 +13467,7 @@ const Cloner = struct {
         } };
     }
 
-    fn cloneScopedExprValueDemandingKnownValue(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
+    fn cloneScopedExprValueDemandingKnownValue(self: *Cloner, expr_id: Ast.ExprId) LowerError!Value {
         const change_start = self.changes.items.len;
         const value = try self.cloneExprValueDemandingKnownValue(expr_id);
         self.restore(change_start);
@@ -13025,7 +13480,7 @@ const Cloner = struct {
         finite_bool: FiniteTagsValue,
         true_value: Value,
         false_value: Value,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (finite_bool.alternatives.len == 0) {
             Common.invariant("finite Bool value had no alternatives");
         }
@@ -13064,7 +13519,7 @@ const Cloner = struct {
         match: @import("../monotype/ast.zig").MatchExpr,
         scrutinee_known_value: ?KnownValue,
         scrutinee_value: ?Value,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_branches = try self.pass.allocator.dupe(Ast.Branch, self.pass.program.branchSpan(match.branches));
         defer self.pass.allocator.free(source_branches);
 
@@ -13125,7 +13580,7 @@ const Cloner = struct {
         scrutinee_known_value: ?KnownValue,
         scrutinee_value: ?Value,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_branches = try self.pass.allocator.dupe(Ast.Branch, self.pass.program.branchSpan(match.branches));
         defer self.pass.allocator.free(source_branches);
 
@@ -13183,7 +13638,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         scrutinee: Value,
         match: @import("../monotype/ast.zig").MatchExpr,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         return switch (scrutinee) {
             .let_ => |let_value| blk: {
                 const change_start = self.changes.items.len;
@@ -13209,7 +13664,7 @@ const Cloner = struct {
         scrutinee: Value,
         match: @import("../monotype/ast.zig").MatchExpr,
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         return switch (scrutinee) {
             .let_ => |let_value| blk: {
                 const change_start = self.changes.items.len;
@@ -13232,7 +13687,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         if_value: IfValue,
         match: @import("../monotype/ast.zig").MatchExpr,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const branches = try self.pass.arena.allocator().alloc(IfValueBranch, if_value.branches.len);
         for (if_value.branches, 0..) |branch, index| {
             branches[index] = .{
@@ -13257,7 +13712,7 @@ const Cloner = struct {
         if_value: IfValue,
         match: @import("../monotype/ast.zig").MatchExpr,
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const branches = try self.pass.arena.allocator().alloc(IfValueBranch, if_value.branches.len);
         for (if_value.branches, 0..) |branch, index| {
             const body = (try self.cloneMatchScrutineeBranchValueWithDemand(ty, branch.body, match, demand)) orelse {
@@ -13286,7 +13741,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         match_value: MatchValue,
         outer_match: @import("../monotype/ast.zig").MatchExpr,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const branches = try self.pass.arena.allocator().alloc(MatchValueBranch, match_value.branches.len);
         for (match_value.branches, 0..) |branch, index| {
             const scoped_start = self.scopedLocalsLen();
@@ -13315,7 +13770,7 @@ const Cloner = struct {
         match_value: MatchValue,
         outer_match: @import("../monotype/ast.zig").MatchExpr,
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const outer_scrutinee_demand = try self.matchScrutineeDemand(outer_match.branches, demand);
         const branches = try self.pass.arena.allocator().alloc(MatchValueBranch, match_value.branches.len);
         for (match_value.branches, 0..) |branch, index| {
@@ -13341,7 +13796,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         scrutinee: Value,
         match: @import("../monotype/ast.zig").MatchExpr,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const scrutinee_demand = try self.matchScrutineeDemand(match.branches, .materialize);
         const demanded_scrutinee = try self.applyValueDemand(scrutinee, scrutinee_demand);
         if (try self.simplifyKnownMatchValueMode(ty, demanded_scrutinee, match.branches, .strict, true)) |value| return value;
@@ -13360,7 +13815,7 @@ const Cloner = struct {
         scrutinee: Value,
         match: @import("../monotype/ast.zig").MatchExpr,
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const scrutinee_demand = try self.matchScrutineeDemand(match.branches, demand);
         const demanded_scrutinee = try self.applyValueDemand(scrutinee, scrutinee_demand);
         if (try self.simplifyKnownMatchValueWithDemandMode(ty, demanded_scrutinee, match.branches, demand, .speculative)) |value| return value;
@@ -13378,7 +13833,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         branches: Ast.Span(Ast.Branch),
         comptime_site: ?Ast.ComptimeSiteId,
-    ) Common.LowerError!?MatchValueBranchSource {
+    ) LowerError!?MatchValueBranchSource {
         const source = maybe_source orelse return null;
         if (source.read != .none) return null;
         return MatchValueBranchSource{
@@ -13397,7 +13852,7 @@ const Cloner = struct {
         };
     }
 
-    fn cloneMatch(self: *Cloner, ty: Type.TypeId, match: @import("../monotype/ast.zig").MatchExpr) Common.LowerError!Ast.ExprId {
+    fn cloneMatch(self: *Cloner, ty: Type.TypeId, match: @import("../monotype/ast.zig").MatchExpr) LowerError!Ast.ExprId {
         const scrutinee = try self.cloneMatchScrutineeValue(match, .materialize);
         if (try self.simplifyKnownMatch(ty, scrutinee, match.branches)) |body| return body;
 
@@ -13415,7 +13870,7 @@ const Cloner = struct {
         self: *Cloner,
         source_scrutinee: Ast.ExprId,
         demanded_scrutinee: Value,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_ty = self.pass.program.exprs.items[@intFromEnum(source_scrutinee)].ty;
         if (!sameType(self.pass.program, source_ty, valueType(self.pass.program, demanded_scrutinee))) {
             return try self.cloneExprValueWithDemand(source_scrutinee, .materialize);
@@ -13431,7 +13886,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         match: @import("../monotype/ast.zig").MatchExpr,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const scrutinee = try self.cloneMatchScrutineeValue(match, demand);
         if (try self.simplifyKnownMatchValueWithDemand(ty, scrutinee, match.branches, demand)) |value| return value;
         if (try self.cloneMatchStructuredScrutineeValueWithDemand(ty, scrutinee, match, demand)) |value| return value;
@@ -13442,13 +13897,13 @@ const Cloner = struct {
         return try self.cloneMatchJoinedValueWithDemand(ty, scrutinee_expr, match, scrutinee_known_value, public_scrutinee, demand);
     }
 
-    fn cloneMatchScrutineeValue(self: *Cloner, match: @import("../monotype/ast.zig").MatchExpr, result_demand: ValueDemand) Common.LowerError!Value {
+    fn cloneMatchScrutineeValue(self: *Cloner, match: @import("../monotype/ast.zig").MatchExpr, result_demand: ValueDemand) LowerError!Value {
         const demand = try self.matchScrutineeDemand(match.branches, result_demand);
         if (demand == .none) return try self.cloneExprValueDemandingKnownValue(match.scrutinee);
         return try self.cloneExprValueWithDemand(match.scrutinee, demand);
     }
 
-    fn matchScrutineeDemand(self: *Cloner, branches_span: Ast.Span(Ast.Branch), result_demand: ValueDemand) Allocator.Error!ValueDemand {
+    fn matchScrutineeDemand(self: *Cloner, branches_span: Ast.Span(Ast.Branch), result_demand: ValueDemand) LowerError!ValueDemand {
         var demand: ValueDemand = .none;
         for (self.pass.program.branchSpan(branches_span)) |branch| {
             var branch_demand = try self.patternDemandInExpr(branch.pat, branch.body, result_demand);
@@ -13464,7 +13919,7 @@ const Cloner = struct {
         self: *Cloner,
         branches: []const MatchValueBranch,
         result_demand: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var demand: ValueDemand = .none;
         for (branches) |branch| {
             var branch_demand = try self.patternDemandInValue(branch.pat, branch.body, result_demand);
@@ -13476,7 +13931,7 @@ const Cloner = struct {
         return demand;
     }
 
-    fn patternDemandInExpr(self: *Cloner, pat_id: Ast.PatId, expr_id: Ast.ExprId, context: ValueDemand) Allocator.Error!ValueDemand {
+    fn patternDemandInExpr(self: *Cloner, pat_id: Ast.PatId, expr_id: Ast.ExprId, context: ValueDemand) LowerError!ValueDemand {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         return switch (pat.data) {
             .bind => |local| try self.localDemandInExpr(local, expr_id, context),
@@ -13552,7 +14007,7 @@ const Cloner = struct {
         };
     }
 
-    fn patternDemandInValue(self: *Cloner, pat_id: Ast.PatId, value: Value, context: ValueDemand) Allocator.Error!ValueDemand {
+    fn patternDemandInValue(self: *Cloner, pat_id: Ast.PatId, value: Value, context: ValueDemand) LowerError!ValueDemand {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         return switch (pat.data) {
             .bind => |local| try self.localDemandInValue(local, value, context),
@@ -13628,7 +14083,7 @@ const Cloner = struct {
         };
     }
 
-    fn localDemandInExpr(self: *Cloner, local: Ast.LocalId, expr_id: Ast.ExprId, context: ValueDemand) Allocator.Error!ValueDemand {
+    fn localDemandInExpr(self: *Cloner, local: Ast.LocalId, expr_id: Ast.ExprId, context: ValueDemand) LowerError!ValueDemand {
         if (context == .none) return .none;
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         if (expr.data == .local and expr.data.local == local) return context;
@@ -13642,7 +14097,7 @@ const Cloner = struct {
             while (cache_index > 0) {
                 cache_index -= 1;
                 const entry = self.local_demand_cache.items[indices.items[cache_index]];
-                if (entry.context_has_active_refs and entry.demand_epoch != self.demand_cache_epoch) continue;
+                if (entry.depends_on_active_demands and entry.demand_epoch != self.demand_cache_epoch) continue;
                 if (entry.subst_scope_id != self.subst_scope_id) continue;
                 if (!try self.valueDemandRefsAreActive(entry.context)) continue;
                 if (!try self.valueDemandRefsAreActive(entry.demand)) continue;
@@ -13651,13 +14106,15 @@ const Cloner = struct {
             }
         }
 
+        const demand_resolves_before = self.active_demand_resolves;
         var demand: ValueDemand = .none;
         try self.mergeLocalDemandInExpr(local, expr_id, context, &demand);
         const local_cache_entry_index = self.local_demand_cache.items.len;
         try self.local_demand_cache.append(self.pass.allocator, .{
             .demand_epoch = self.demand_cache_epoch,
             .subst_scope_id = self.subst_scope_id,
-            .context_has_active_refs = valueDemandContainsActiveRef(context),
+            .depends_on_active_demands = valueDemandContainsActiveRef(context) or
+                self.active_demand_resolves != demand_resolves_before,
             .local = local,
             .expr = expr_id,
             .context = context,
@@ -13669,7 +14126,7 @@ const Cloner = struct {
         return demand;
     }
 
-    fn localDemandInValue(self: *Cloner, local: Ast.LocalId, value: Value, context: ValueDemand) Allocator.Error!ValueDemand {
+    fn localDemandInValue(self: *Cloner, local: Ast.LocalId, value: Value, context: ValueDemand) LowerError!ValueDemand {
         var demand: ValueDemand = .none;
         try self.mergeLocalDemandInValue(local, value, context, &demand);
         return demand;
@@ -13791,6 +14248,7 @@ const Cloner = struct {
     fn resolveLoopDemandRef(self: *Cloner, demand: ValueDemand) ValueDemand {
         return switch (demand) {
             .loop_param => |index| blk: {
+                self.active_demand_resolves +%= 1;
                 if (self.loop_stack.getLastOrNull()) |loop| {
                     if (index >= loop.demands.len) Common.invariant("loop demand reference index exceeded active loop arity");
                     break :blk loop.demands[index];
@@ -13802,6 +14260,7 @@ const Cloner = struct {
                 Common.invariant("loop demand reference escaped active loop demand solving");
             },
             .fn_param => |demand_ref| blk: {
+                self.active_demand_resolves +%= 1;
                 const resolved_ref = self.canonicalFunctionDemandSlotId(demand_ref);
                 break :blk self.activeFunctionDemandSlot(resolved_ref).*;
             },
@@ -14055,7 +14514,7 @@ const Cloner = struct {
         };
     }
 
-    fn mergeValueDemand(self: *Cloner, existing: ValueDemand, incoming: ValueDemand) Allocator.Error!ValueDemand {
+    fn mergeValueDemand(self: *Cloner, existing: ValueDemand, incoming: ValueDemand) LowerError!ValueDemand {
         self.merge_value_demand_depth += 1;
         defer self.merge_value_demand_depth -= 1;
         if (self.merge_value_demand_depth > 1000) Common.invariant("value demand merge recursion did not converge");
@@ -14153,7 +14612,7 @@ const Cloner = struct {
         self: *Cloner,
         existing: []const FieldDemand,
         incoming: []const FieldDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var fields = std.ArrayList(FieldDemand).empty;
         defer fields.deinit(self.pass.allocator);
         try fields.appendSlice(self.pass.allocator, existing);
@@ -14175,7 +14634,7 @@ const Cloner = struct {
         self: *Cloner,
         existing: []const ItemDemand,
         incoming: []const ItemDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var items = std.ArrayList(ItemDemand).empty;
         defer items.deinit(self.pass.allocator);
         try items.appendSlice(self.pass.allocator, existing);
@@ -14198,7 +14657,7 @@ const Cloner = struct {
         self: *Cloner,
         existing: []const TagAlternativeDemand,
         incoming: []const TagAlternativeDemand,
-    ) Allocator.Error![]const TagAlternativeDemand {
+    ) LowerError![]const TagAlternativeDemand {
         var alternatives = std.ArrayList(TagAlternativeDemand).empty;
         defer alternatives.deinit(self.pass.allocator);
         try alternatives.appendSlice(self.pass.allocator, existing);
@@ -14246,7 +14705,7 @@ const Cloner = struct {
         self: *Cloner,
         root_ref: FunctionDemandSlotId,
         incoming: ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         const slot = self.activeFunctionDemandSlot(root_ref);
         const current = if (slot.* == .fn_param and functionDemandSlotIdEql(slot.fn_param, root_ref)) .none else slot.*;
         if (try self.valueDemandEqlInActiveContext(current, incoming)) return;
@@ -14254,7 +14713,7 @@ const Cloner = struct {
         self.demand_cache_epoch += 1;
     }
 
-    fn mergeFunctionDemandSlotId(self: *Cloner, demand_ref: FunctionDemandSlotId, incoming: ValueDemand) Allocator.Error!FunctionDemandSlotId {
+    fn mergeFunctionDemandSlotId(self: *Cloner, demand_ref: FunctionDemandSlotId, incoming: ValueDemand) LowerError!FunctionDemandSlotId {
         const root_ref = self.canonicalFunctionDemandSlotId(demand_ref);
         if (incoming == .fn_param) return try self.mergeFunctionDemandSlotIds(root_ref, incoming.fn_param);
 
@@ -14285,7 +14744,7 @@ const Cloner = struct {
         return root_ref;
     }
 
-    fn mergeFunctionDemandSlotIds(self: *Cloner, lhs: FunctionDemandSlotId, rhs: FunctionDemandSlotId) Allocator.Error!FunctionDemandSlotId {
+    fn mergeFunctionDemandSlotIds(self: *Cloner, lhs: FunctionDemandSlotId, rhs: FunctionDemandSlotId) LowerError!FunctionDemandSlotId {
         const lhs_root = self.canonicalFunctionDemandSlotId(lhs);
         const rhs_root = self.canonicalFunctionDemandSlotId(rhs);
         if (functionDemandSlotIdEql(lhs_root, rhs_root)) return lhs_root;
@@ -14306,7 +14765,7 @@ const Cloner = struct {
         return root_ref;
     }
 
-    fn mergeLocalDemand(self: *Cloner, out: *ValueDemand, incoming: ValueDemand) Allocator.Error!void {
+    fn mergeLocalDemand(self: *Cloner, out: *ValueDemand, incoming: ValueDemand) LowerError!void {
         out.* = try self.mergeValueDemand(out.*, incoming);
     }
 
@@ -14345,7 +14804,7 @@ const Cloner = struct {
         return current;
     }
 
-    fn demandForSplitLocal(self: *Cloner, source_local: Ast.LocalId, expr_local: Ast.LocalId, context: ValueDemand) Allocator.Error!ValueDemand {
+    fn demandForSplitLocal(self: *Cloner, source_local: Ast.LocalId, expr_local: Ast.LocalId, context: ValueDemand) LowerError!ValueDemand {
         if (source_local == expr_local) return context;
         var demand: ValueDemand = .none;
         if (self.loop_stack.getLastOrNull()) |loop| {
@@ -14799,7 +15258,7 @@ const Cloner = struct {
         value: PrivateStateValue,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         var path = std.ArrayList(DemandPathStep).empty;
         defer path.deinit(self.pass.allocator);
         return self.mergeLocalDemandInPrivateStateValueAtPath(local, null, value, context, &path, out);
@@ -14812,7 +15271,7 @@ const Cloner = struct {
         path: []const DemandPathStep,
         demand: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         const source = subst_local orelse return;
         const path_demand = try self.demandAtPath(path, demand);
         const split_demand = try self.demandForSplitLocal(local, source, path_demand);
@@ -14827,7 +15286,7 @@ const Cloner = struct {
         context: ValueDemand,
         path: *std.ArrayList(DemandPathStep),
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         switch (value) {
             .leaf => |leaf| try self.mergeLocalDemandInExpr(local, leaf.expr, context, out),
             .record => |record| {
@@ -15003,7 +15462,7 @@ const Cloner = struct {
         value: Value,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         switch (value) {
             .private_state => |private_state| {
                 var path = std.ArrayList(DemandPathStep).empty;
@@ -15020,7 +15479,7 @@ const Cloner = struct {
         capture: Ast.TypedLocal,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         if (context == .none) return;
 
         if (capture.local == local) {
@@ -15041,7 +15500,7 @@ const Cloner = struct {
         value: PendingLetValue,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         const expr = switch (value) {
             .source => |expr| expr,
             .cloned => |expr| expr,
@@ -15055,7 +15514,7 @@ const Cloner = struct {
         value: Value,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         switch (value) {
             .expr => |expr_id| try self.mergeLocalDemandInExpr(local, expr_id, context, out),
             .expr_with_known_value => |known_value_expr| {
@@ -15205,7 +15664,7 @@ const Cloner = struct {
         expr_id: Ast.ExprId,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         if (context == .none) return;
         for (self.local_demand_stack.items) |frame| {
             if (frame.local == local and frame.expr == expr_id and try self.valueDemandEqlInActiveContext(frame.context, context)) return;
@@ -15506,7 +15965,7 @@ const Cloner = struct {
         tail: BlockTail,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         switch (self.pass.program.stmts.items[@intFromEnum(stmt_id)]) {
             .let_ => |let_| {
                 const value_demand = if (let_.recursive)
@@ -15543,7 +16002,7 @@ const Cloner = struct {
         pat_id: Ast.PatId,
         tail: BlockTail,
         context: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         return switch (pat.data) {
             .bind => |local| try self.localDemandInBlockTail(local, tail, context),
@@ -15624,7 +16083,7 @@ const Cloner = struct {
         local: Ast.LocalId,
         tail: BlockTail,
         context: ValueDemand,
-    ) Allocator.Error!ValueDemand {
+    ) LowerError!ValueDemand {
         var demand: ValueDemand = .none;
         for (tail.statements, 0..) |stmt, index| {
             try self.mergeLocalDemandInStmtTail(local, stmt, .{
@@ -15642,7 +16101,7 @@ const Cloner = struct {
         call: anytype,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         const args = self.pass.program.exprSpan(call.args);
         if (try self.exprSubstitutedValueNoInline(call.callee)) |value| {
             if (try self.mergeCallValueArgDemandsForValue(local, value, args, context, out)) return;
@@ -15675,7 +16134,7 @@ const Cloner = struct {
         args: []const Ast.ExprId,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!bool {
+    ) LowerError!bool {
         switch (value) {
             .callable => |callable| {
                 try self.mergeCallableArgDemandsInExpr(local, callable.fn_id, args, context, out);
@@ -15711,7 +16170,7 @@ const Cloner = struct {
         args: []const Ast.ExprId,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         const source_fn = self.pass.program.fns.items[@intFromEnum(fn_id)];
         const source_args = self.pass.program.typedLocalSpan(source_fn.args);
         if (source_args.len != args.len) {
@@ -15735,7 +16194,7 @@ const Cloner = struct {
         call: anytype,
         context: ValueDemand,
         out: *ValueDemand,
-    ) Allocator.Error!void {
+    ) LowerError!void {
         const args = self.pass.program.exprSpan(call.args);
         if (call.is_cold) {
             for (args) |arg| try self.mergeLocalDemandInExpr(local, arg, .materialize, out);
@@ -15770,7 +16229,7 @@ const Cloner = struct {
         }
     }
 
-    fn loopParamDemands(self: *Cloner, loop: anytype, result_demand: ValueDemand) Allocator.Error![]ValueDemand {
+    fn loopParamDemands(self: *Cloner, loop: anytype, result_demand: ValueDemand) LowerError![]ValueDemand {
         const params = self.pass.program.typedLocalSpan(loop.params);
         const initials = self.pass.program.exprSpan(loop.initial_values);
         if (params.len != initials.len) Common.invariant("loop parameter count differed from initial value count while computing demand");
@@ -15832,14 +16291,14 @@ const Cloner = struct {
         return .materialize;
     }
 
-    fn simplifyKnownMatch(self: *Cloner, ty: Type.TypeId, scrutinee: Value, branches_span: Ast.Span(Ast.Branch)) Common.LowerError!?Ast.ExprId {
+    fn simplifyKnownMatch(self: *Cloner, ty: Type.TypeId, scrutinee: Value, branches_span: Ast.Span(Ast.Branch)) LowerError!?Ast.ExprId {
         if (try self.simplifyKnownMatchValueWithKnownValuePreservation(ty, scrutinee, branches_span, false)) |value| {
             return try self.materialize(value);
         }
         return null;
     }
 
-    fn simplifyKnownMatchValue(self: *Cloner, ty: Type.TypeId, scrutinee: Value, branches_span: Ast.Span(Ast.Branch)) Common.LowerError!?Value {
+    fn simplifyKnownMatchValue(self: *Cloner, ty: Type.TypeId, scrutinee: Value, branches_span: Ast.Span(Ast.Branch)) LowerError!?Value {
         return try self.simplifyKnownMatchValueWithKnownValuePreservation(ty, scrutinee, branches_span, true);
     }
 
@@ -15849,7 +16308,7 @@ const Cloner = struct {
         scrutinee: Value,
         branches_span: Ast.Span(Ast.Branch),
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         return try self.simplifyKnownMatchValueWithDemandMode(ty, scrutinee, branches_span, demand, .strict);
     }
 
@@ -15860,7 +16319,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         demand: ValueDemand,
         mode: KnownMatchMode,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         switch (scrutinee) {
             .expr,
             .expr_with_known_value,
@@ -15968,7 +16427,7 @@ const Cloner = struct {
         if_value: IfValue,
         branches_span: Ast.Span(Ast.Branch),
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const branches = try self.pass.arena.allocator().alloc(IfValueBranch, if_value.branches.len);
         for (if_value.branches, 0..) |branch, index| {
             const simplified = try self.simplifyKnownMatchValueWithDemandMode(ty, branch.body, branches_span, demand, .speculative);
@@ -15996,7 +16455,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         demand: ValueDemand,
         mode: KnownMatchMode,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (finite_tags.alternatives.len == 0) {
             Common.invariant("finite tag match had no alternatives");
         }
@@ -16035,7 +16494,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         demand: ValueDemand,
         mode: KnownMatchMode,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (finite_tags.source.alternatives.len == 1) {
             const private_tag = try self.compactFiniteTagPrivateStateFromExpr(finite_tags.source, finite_tags.compact_expr);
             return try self.simplifyKnownMatchValueWithDemandMode(
@@ -16062,7 +16521,7 @@ const Cloner = struct {
         scrutinee: Value,
         branches_span: Ast.Span(Ast.Branch),
         preserve_branch_known_value: bool,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         return try self.simplifyKnownMatchValueMode(ty, scrutinee, branches_span, .strict, preserve_branch_known_value);
     }
 
@@ -16073,7 +16532,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         mode: KnownMatchMode,
         preserve_branch_known_value: bool,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         switch (scrutinee) {
             .expr,
             .expr_with_known_value,
@@ -16178,7 +16637,7 @@ const Cloner = struct {
         if_value: IfValue,
         branches_span: Ast.Span(Ast.Branch),
         preserve_branch_known_value: bool,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const branches = try self.pass.arena.allocator().alloc(IfValueBranch, if_value.branches.len);
         for (if_value.branches, 0..) |branch, index| {
             const simplified = try self.simplifyKnownMatchValueMode(ty, branch.body, branches_span, .speculative, preserve_branch_known_value);
@@ -16205,7 +16664,7 @@ const Cloner = struct {
         match_value: MatchValue,
         branches_span: Ast.Span(Ast.Branch),
         preserve_branch_known_value: bool,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const branches = try self.pass.arena.allocator().alloc(MatchValueBranch, match_value.branches.len);
         for (match_value.branches, 0..) |branch, index| {
             const simplified = try self.simplifyKnownMatchValueMode(ty, branch.body, branches_span, .speculative, preserve_branch_known_value);
@@ -16232,7 +16691,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         mode: KnownMatchMode,
         preserve_branch_known_value: bool,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (finite_tags.alternatives.len == 0) {
             Common.invariant("finite tag match had no alternatives");
         }
@@ -16271,7 +16730,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         mode: KnownMatchMode,
         preserve_branch_known_value: bool,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (finite_tags.source.alternatives.len == 1) {
             const private_tag = try self.compactFiniteTagPrivateStateFromExpr(finite_tags.source, finite_tags.compact_expr);
             return try self.simplifyKnownMatchValueMode(
@@ -16296,7 +16755,7 @@ const Cloner = struct {
         self: *Cloner,
         source: DemandedKnownTags,
         compact_expr: Ast.ExprId,
-    ) Common.LowerError!PrivateStateTag {
+    ) LowerError!PrivateStateTag {
         if (source.alternatives.len != 1) Common.invariant("compact singleton tag reconstruction got multiple alternatives");
         const alternative = source.alternatives[0];
 
@@ -16325,7 +16784,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         demand: ValueDemand,
         mode: KnownMatchMode,
-    ) Common.LowerError!?[]const MatchValueBranch {
+    ) LowerError!?[]const MatchValueBranch {
         const source = finite_tags.source;
         const branches = try self.pass.arena.allocator().alloc(MatchValueBranch, source.alternatives.len);
         for (source.alternatives, branches) |alternative, *branch| {
@@ -16362,7 +16821,7 @@ const Cloner = struct {
         branches_span: Ast.Span(Ast.Branch),
         mode: KnownMatchMode,
         preserve_branch_known_value: bool,
-    ) Common.LowerError!?[]const MatchValueBranch {
+    ) LowerError!?[]const MatchValueBranch {
         const source = finite_tags.source;
         const branches = try self.pass.arena.allocator().alloc(MatchValueBranch, source.alternatives.len);
         for (source.alternatives, branches) |alternative, *branch| {
@@ -16398,7 +16857,7 @@ const Cloner = struct {
         finite_tags: PrivateStateCompactFiniteTags,
         active: CompactFiniteTagActive,
         branches_span: Ast.Span(Ast.Branch),
-    ) Common.LowerError!MatchValueBranchSource {
+    ) LowerError!MatchValueBranchSource {
         const source_scrutinee = try self.privateStateExprWithUninitializedHoles(.{ .tag = active.private_state });
         const source_body = try self.addExpr(.{ .ty = ty, .data = .{ .match_ = .{
             .scrutinee = source_scrutinee,
@@ -16421,7 +16880,7 @@ const Cloner = struct {
     fn privateStateExprWithUninitializedHoles(
         self: *Cloner,
         value: PrivateStateValue,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         return switch (value) {
             .leaf => |leaf| leaf.expr,
             .tag => |tag| blk: {
@@ -16534,7 +16993,7 @@ const Cloner = struct {
         self: *Cloner,
         source: DemandedKnownTags,
         alternative: DemandedKnownTag,
-    ) Common.LowerError!CompactFiniteTagActive {
+    ) LowerError!CompactFiniteTagActive {
         const compact_ty = try self.pass.compactFiniteTagsType(source);
         var slot_tys = std.ArrayList(Type.TypeId).empty;
         defer slot_tys.deinit(self.pass.allocator);
@@ -16587,7 +17046,7 @@ const Cloner = struct {
         context: ValueDemand,
         unsafe_count: usize,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!MatchBindResult {
+    ) LowerError!MatchBindResult {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         switch (pat.data) {
             .bind => |local| {
@@ -16781,7 +17240,7 @@ const Cloner = struct {
         body: Ast.ExprId,
         unsafe_count: usize,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const uses = localUseCountInExpr(self.pass.program, local, body);
         if (self.valueCanSubstitute(value) or
             (unsafe_count == 1 and uses == 1 and localUseBeforeEffect(self.pass.program, local, body) and self.valueCanMaterializePublic(value)))
@@ -16797,7 +17256,7 @@ const Cloner = struct {
         value: Value,
         body: Ast.ExprId,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const uses = localMaxUseCountPerPathInExpr(self.pass.program, local, body);
         if (uses == 0) return value;
         if (self.valueCanSubstitute(value) or
@@ -16879,7 +17338,7 @@ const Cloner = struct {
     fn structuredValueFromExprWithKnownValue(
         self: *Cloner,
         known_value_expr: ExprWithKnownValue,
-    ) Common.LowerError!?*const Value {
+    ) LowerError!?*const Value {
         if (known_value_expr.value) |value| return value;
         const structured = (try self.structuredValueFromExpr(known_value_expr.expr, known_value_expr.known_value)) orelse return null;
         return try self.copyValue(structured);
@@ -16889,7 +17348,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         known_value: KnownValue,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (try self.exprSubstitutedValueNoInline(expr_id)) |substituted| return substituted;
 
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
@@ -16993,7 +17452,7 @@ const Cloner = struct {
         };
     }
 
-    fn tryMakeReusableForMatch(self: *Cloner, value: Value, pending_lets: *std.ArrayList(PendingLet)) Common.LowerError!?Value {
+    fn tryMakeReusableForMatch(self: *Cloner, value: Value, pending_lets: *std.ArrayList(PendingLet)) LowerError!?Value {
         const pending_start = pending_lets.items.len;
         const change_start = self.changes.items.len;
         const result = try self.makeReusableForMatchOrNull(value, pending_lets);
@@ -17005,12 +17464,12 @@ const Cloner = struct {
         return result.?;
     }
 
-    fn makeReusableForMatch(self: *Cloner, value: Value, pending_lets: *std.ArrayList(PendingLet)) Common.LowerError!Value {
+    fn makeReusableForMatch(self: *Cloner, value: Value, pending_lets: *std.ArrayList(PendingLet)) LowerError!Value {
         return (try self.tryMakeReusableForMatch(value, pending_lets)) orelse
             Common.invariant("value could not be made reusable for match");
     }
 
-    fn makeReusableForMatchOrNull(self: *Cloner, value: Value, pending_lets: *std.ArrayList(PendingLet)) Common.LowerError!?Value {
+    fn makeReusableForMatchOrNull(self: *Cloner, value: Value, pending_lets: *std.ArrayList(PendingLet)) LowerError!?Value {
         if (projectableExprFromValue(value)) |expr| {
             var seen = std.ArrayList(Ast.ExprId).empty;
             defer seen.deinit(self.pass.allocator);
@@ -17223,7 +17682,7 @@ const Cloner = struct {
         self: *Cloner,
         value: PrivateStateValue,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return try self.makePrivateStateReusableForMatchOrNull(value, pending_lets);
     }
 
@@ -17231,7 +17690,7 @@ const Cloner = struct {
         self: *Cloner,
         value: PrivateStateValue,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!PrivateStateValue {
+    ) LowerError!PrivateStateValue {
         return (try self.tryMakePrivateStateReusableForMatch(value, pending_lets)) orelse
             Common.invariant("private state could not be made reusable for match");
     }
@@ -17240,7 +17699,7 @@ const Cloner = struct {
         self: *Cloner,
         value: PrivateStateValue,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return switch (value) {
             .leaf => |leaf| .{ .leaf = .{
                 .ty = leaf.ty,
@@ -17309,6 +17768,7 @@ const Cloner = struct {
                     .ty = callable.ty,
                     .fn_id = callable.fn_id,
                     .captures = captures,
+                    .loop_origin = callable.loop_origin,
                 } };
             },
             .compact_finite_tags => |finite_tags| .{ .compact_finite_tags = .{
@@ -17326,7 +17786,7 @@ const Cloner = struct {
         self: *Cloner,
         expr: Ast.ExprId,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         const pending_start = pending_lets.items.len;
         const result = try self.makeExprReusableForMatchOrNull(expr, pending_lets);
         if (result == null) {
@@ -17340,7 +17800,7 @@ const Cloner = struct {
         self: *Cloner,
         expr: Ast.ExprId,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         return (try self.tryMakeExprReusableForMatch(expr, pending_lets)) orelse
             Common.invariant("expression could not be made reusable for match");
     }
@@ -17349,7 +17809,7 @@ const Cloner = struct {
         self: *Cloner,
         expr: Ast.ExprId,
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         if (self.exprCanSubstitute(expr)) return expr;
         if (exprContainsEscapingControlTransfer(self.pass.program, expr)) return expr;
 
@@ -17372,7 +17832,7 @@ const Cloner = struct {
         self: *Cloner,
         expr: Ast.ExprId,
         previous_pending_lets: []const PendingLet,
-    ) Common.LowerError!?PendingLetValue {
+    ) LowerError!?PendingLetValue {
         if (self.exprReferencesAvailableBindings(expr)) return .{ .cloned = expr };
         if (try self.exprReferencesAvailableBindingsWithPendingLets(expr, previous_pending_lets)) {
             return .{ .source = expr };
@@ -17388,7 +17848,7 @@ const Cloner = struct {
         self: *Cloner,
         expr: Ast.ExprId,
         pending_lets: []const PendingLet,
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
@@ -17511,7 +17971,7 @@ const Cloner = struct {
         if_value: IfValue,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return switch (demand) {
             .tag => try self.privateFiniteTagsFromIfDemand(if_value, demand, pending_lets),
             .callable => try self.privateFiniteCallablesFromIfDemand(if_value, demand, pending_lets),
@@ -17524,7 +17984,7 @@ const Cloner = struct {
         match_value: MatchValue,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return switch (demand) {
             .tag => try self.privateFiniteTagsFromMatchDemand(match_value, demand, pending_lets),
             .callable => try self.privateFiniteCallablesFromMatchDemand(match_value, demand, pending_lets),
@@ -17537,7 +17997,7 @@ const Cloner = struct {
         if_value: IfValue,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return try self.privateCompactFiniteCallablesFromDemand(.{ .if_ = if_value }, demand, pending_lets);
     }
 
@@ -17546,7 +18006,7 @@ const Cloner = struct {
         match_value: MatchValue,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return try self.privateCompactFiniteCallablesFromDemand(.{ .match_ = match_value }, demand, pending_lets);
     }
 
@@ -17555,7 +18015,7 @@ const Cloner = struct {
         if_value: IfValue,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return try self.privateCompactFiniteTagsFromDemand(.{ .if_ = if_value }, demand, pending_lets);
     }
 
@@ -17564,7 +18024,7 @@ const Cloner = struct {
         match_value: MatchValue,
         demand: ValueDemand,
         pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         return try self.privateCompactFiniteTagsFromDemand(.{ .match_ = match_value }, demand, pending_lets);
     }
 
@@ -17573,7 +18033,7 @@ const Cloner = struct {
         value: Value,
         demand: ValueDemand,
         maybe_pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         const known_value = (try self.knownValueFromValueAllowingSparsePrivateState(value)) orelse KnownValue{ .any = valueType(self.pass.program, value) };
         const demanded = (try demandedKnownValueFromDemand(
             self,
@@ -17610,7 +18070,7 @@ const Cloner = struct {
         value: Value,
         demand: ValueDemand,
         maybe_pending_lets: ?*std.ArrayList(PendingLet),
-    ) Common.LowerError!?PrivateStateValue {
+    ) LowerError!?PrivateStateValue {
         const known_value = (try self.knownValueFromValueAllowingSparsePrivateState(value)) orelse return null;
         const demanded = (try demandedKnownValueFromDemand(
             self,
@@ -17687,7 +18147,7 @@ const Cloner = struct {
         };
     }
 
-    fn wrapPendingLets(self: *Cloner, body: Value, pending_lets: []const PendingLet, preserve_known_value: bool) Common.LowerError!Value {
+    fn wrapPendingLets(self: *Cloner, body: Value, pending_lets: []const PendingLet, preserve_known_value: bool) LowerError!Value {
         if (pending_lets.len == 0) return body;
 
         if (self.valueContainsEscapingControlTransfer(body)) {
@@ -17720,7 +18180,7 @@ const Cloner = struct {
         return .{ .expr = result };
     }
 
-    fn controlTransferValueExpr(self: *Cloner, value: Value) Common.LowerError!?Ast.ExprId {
+    fn controlTransferValueExpr(self: *Cloner, value: Value) LowerError!?Ast.ExprId {
         return switch (value) {
             .expr => |expr| expr,
             .let_ => |let_value| blk: {
@@ -17736,7 +18196,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         body: Value,
         pending_lets: []const PendingLet,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const body_expr = (try self.controlTransferValueExpr(body)) orelse return null;
         return Value{ .expr = try self.wrapPendingLetsAroundExpr(ty, body_expr, pending_lets) };
     }
@@ -17746,7 +18206,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         body_expr: Ast.ExprId,
         pending_lets: []const PendingLet,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         var result = body_expr;
         var index = pending_lets.len;
         while (index > 0) {
@@ -17780,7 +18240,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         body_expr: Ast.ExprId,
         pending_lets: []const PendingLet,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         if (pending_lets.len == 0) return body_expr;
 
         var statements = std.ArrayList(Ast.StmtId).empty;
@@ -17797,7 +18257,7 @@ const Cloner = struct {
         } } });
     }
 
-    fn pendingLetValueExpr(self: *Cloner, value: PendingLetValue) Common.LowerError!Ast.ExprId {
+    fn pendingLetValueExpr(self: *Cloner, value: PendingLetValue) LowerError!Ast.ExprId {
         return switch (value) {
             .source => |expr| try self.cloneExpr(expr),
             .cloned => |expr| expr,
@@ -17809,7 +18269,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         scrutinee_expr: Ast.ExprId,
         outer_branches_span: Ast.Span(Ast.Branch),
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const scrutinee_data = self.pass.program.exprs.items[@intFromEnum(scrutinee_expr)].data;
         const inner_match = switch (scrutinee_data) {
             .match_ => |match| match,
@@ -17850,7 +18310,7 @@ const Cloner = struct {
         callable: CallableValue,
         args_span: Ast.Span(Ast.ExprId),
         demand_result_known_value: bool,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         for (self.inline_stack.items) |active| {
             if (active.fn_id == callable.fn_id) {
                 return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
@@ -17957,7 +18417,7 @@ const Cloner = struct {
         callee: Value,
         args_span: Ast.Span(Ast.ExprId),
         demand_result_known_value: bool,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         return switch (callee) {
             .callable => |callable| try self.inlineCallableCallValue(ty, callable, args_span, demand_result_known_value),
             .private_state => |private_state| switch (private_state) {
@@ -17984,7 +18444,7 @@ const Cloner = struct {
         callee: Value,
         args_span: Ast.Span(Ast.ExprId),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         return switch (callee) {
             .callable => |callable| try self.callKnownCallableValueWithDemand(ty, callable, args_span, demand),
             .private_state => |private_state| switch (private_state) {
@@ -18011,7 +18471,7 @@ const Cloner = struct {
         callable: CallableValue,
         args_span: Ast.Span(Ast.ExprId),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const source_args = try self.pass.allocator.dupe(Ast.TypedLocal, self.pass.program.typedLocalSpan(source_fn.args));
         defer self.pass.allocator.free(source_args);
@@ -18058,7 +18518,7 @@ const Cloner = struct {
         callable: PrivateStateCallable,
         args_span: Ast.Span(Ast.ExprId),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const body = self.pass.originalBody(callable.fn_id) orelse switch (source_fn.body) {
             .roc => |body| body,
@@ -18094,6 +18554,10 @@ const Cloner = struct {
             if (capture.index >= source_captures.len) Common.invariant("private callable capture index exceeded lifted function capture count");
         }
 
+        if (callable.loop_origin) |origin| {
+            try self.noteLoopStateCallableDemand(callable, origin, source_captures, demand);
+        }
+
         var pending_lets = std.ArrayList(PendingLet).empty;
         defer pending_lets.deinit(self.pass.allocator);
 
@@ -18113,8 +18577,14 @@ const Cloner = struct {
                     try self.functionLocalDemand(callable.fn_id, source_capture.local, demand);
                 if (capture_demand != .none and self.subst.get(source_capture.local) != null) continue;
                 if (capture_demand != .none) {
-                    const capture_value = (try self.privateStateCallableCaptureValue(callable, index)) orelse
+                    const capture_value = (try self.privateStateCallableCaptureValue(callable, index)) orelse {
+                        if (callable.loop_origin) |origin| {
+                            if (self.activeStateLoopOwningParam(origin.source_local)) |owner| {
+                                if (owner.loop.changed.*) return error.LoopStateDemandGrew;
+                            }
+                        }
                         Common.invariant("sparse private callable was missing a demanded capture");
+                    };
                     const prepared = try self.valueForInlineLocal(source_capture.local, capture_value, body, &pending_lets);
                     try self.putSubst(source_capture.local, prepared);
                 }
@@ -18164,7 +18634,7 @@ const Cloner = struct {
         callable: CallableValue,
         args_span: Ast.Span(Ast.ExprId),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const body = self.pass.originalBody(callable.fn_id) orelse switch (source_fn.body) {
             .roc => |body| body,
@@ -18252,7 +18722,7 @@ const Cloner = struct {
         finite_callables: PrivateStateCompactFiniteCallables,
         args_span: Ast.Span(Ast.ExprId),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (finite_callables.source.alternatives.len == 0) {
             Common.invariant("compact finite callable value had no alternatives");
         }
@@ -18324,7 +18794,7 @@ const Cloner = struct {
         self: *Cloner,
         source: DemandedKnownCallables,
         compact_expr: Ast.ExprId,
-    ) Common.LowerError!PrivateStateCallable {
+    ) LowerError!PrivateStateCallable {
         if (source.alternatives.len != 1) Common.invariant("compact singleton callable reconstruction got multiple alternatives");
         const alternative = source.alternatives[0];
 
@@ -18352,7 +18822,7 @@ const Cloner = struct {
         finite_callables: FiniteCallablesValue,
         args_span: Ast.Span(Ast.ExprId),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (finite_callables.alternatives.len == 0) {
             Common.invariant("finite callable value had no alternatives");
         }
@@ -18384,7 +18854,7 @@ const Cloner = struct {
         if_value: IfValue,
         args_span: Ast.Span(Ast.ExprId),
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const branches = try self.pass.arena.allocator().alloc(IfValueBranch, if_value.branches.len);
         for (if_value.branches, 0..) |branch, index| {
             branches[index] = .{
@@ -18401,7 +18871,7 @@ const Cloner = struct {
         } };
     }
 
-    fn privateStateCallableValue(self: *Cloner, value: PrivateStateValue) Common.LowerError!?CallableValue {
+    fn privateStateCallableValue(self: *Cloner, value: PrivateStateValue) LowerError!?CallableValue {
         return switch (value) {
             .callable => |callable| try self.privateStateCallableToCallableValue(callable),
             .nominal => |nominal| if (nominal.backing) |backing| try self.privateStateCallableValue(backing.*) else null,
@@ -18409,7 +18879,7 @@ const Cloner = struct {
         };
     }
 
-    fn privateStateCallableToCallableValue(self: *Cloner, callable: PrivateStateCallable) Common.LowerError!?CallableValue {
+    fn privateStateCallableToCallableValue(self: *Cloner, callable: PrivateStateCallable) LowerError!?CallableValue {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(source_fn.captures);
         const captures = try self.pass.arena.allocator().alloc(Value, source_captures.len);
@@ -18449,7 +18919,7 @@ const Cloner = struct {
         finite_callables: FiniteCallablesValue,
         args_span: Ast.Span(Ast.ExprId),
         demand_result_known_value: bool,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (finite_callables.alternatives.len == 0) {
             Common.invariant("finite callable value had no alternatives");
         }
@@ -18481,7 +18951,7 @@ const Cloner = struct {
         if_value: IfValue,
         args_span: Ast.Span(Ast.ExprId),
         demand_result_known_value: bool,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const branches = try self.pass.arena.allocator().alloc(IfValueBranch, if_value.branches.len);
         for (if_value.branches, 0..) |branch, index| {
             branches[index] = .{
@@ -18504,7 +18974,7 @@ const Cloner = struct {
         args_span: Ast.Span(Ast.ExprId),
         original_expr: Ast.ExprId,
         demand_result_known_value: bool,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callee)];
         const body = self.pass.originalBody(callee) orelse switch (source_fn.body) {
             .roc => |body| body,
@@ -18636,7 +19106,7 @@ const Cloner = struct {
         args_span: Ast.Span(Ast.ExprId),
         original_expr: Ast.ExprId,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callee)];
         const body = self.pass.originalBody(callee) orelse switch (source_fn.body) {
             .roc => |body| body,
@@ -18858,7 +19328,7 @@ const Cloner = struct {
         self: *Cloner,
         original_expr: Ast.ExprId,
         demand: ValueDemand,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         const original = self.pass.program.exprs.items[@intFromEnum(original_expr)];
         if (original.data == .call_proc and !original.data.call_proc.is_cold) {
             const call_expr = try self.cloneDirectCallBoundaryExpr(original.ty, original.data.call_proc);
@@ -18895,7 +19365,7 @@ const Cloner = struct {
         self: *Cloner,
         ty: Type.TypeId,
         call: @import("../monotype/ast.zig").CallProc,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const callee = Ast.callProcCallee(call);
         const call_expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_proc = .{
             .callee = call.callee,
@@ -18908,7 +19378,7 @@ const Cloner = struct {
     fn cloneDirectCallBoundaryArgs(
         self: *Cloner,
         span: Ast.Span(Ast.ExprId),
-    ) Common.LowerError!Ast.Span(Ast.ExprId) {
+    ) LowerError!Ast.Span(Ast.ExprId) {
         const source = try self.pass.allocator.dupe(Ast.ExprId, self.pass.program.exprSpan(span));
         defer self.pass.allocator.free(source);
 
@@ -18924,7 +19394,7 @@ const Cloner = struct {
         return try self.pass.program.addExprSpan(values);
     }
 
-    fn directCallCaptureValues(self: *Cloner, fn_id: Ast.FnId) Common.LowerError!?[]const Value {
+    fn directCallCaptureValues(self: *Cloner, fn_id: Ast.FnId) LowerError!?[]const Value {
         const source_fn = self.pass.program.fns.items[@intFromEnum(fn_id)];
         const captures = self.pass.program.typedLocalSpan(source_fn.captures);
         const values = try self.pass.allocator.alloc(Value, captures.len);
@@ -18959,7 +19429,7 @@ const Cloner = struct {
         return true;
     }
 
-    fn directInlineCaptureValue(self: *Cloner, capture: Ast.TypedLocal) Common.LowerError!?Value {
+    fn directInlineCaptureValue(self: *Cloner, capture: Ast.TypedLocal) LowerError!?Value {
         if (self.subst.get(capture.local)) |value| return value;
         return try self.scopedLocalValue(capture);
     }
@@ -18969,7 +19439,7 @@ const Cloner = struct {
         value: Value,
         field: names.RecordFieldNameId,
         ty: Type.TypeId,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (fieldFromValue(self.pass.program, value, field)) |field_value| return field_value;
         if (value == .let_) {
             const let_value = value.let_;
@@ -19057,7 +19527,7 @@ const Cloner = struct {
         field: names.RecordFieldNameId,
         ty: Type.TypeId,
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const resolved_demand = self.resolveLoopDemandRef(demand);
         if (resolved_demand == .none) return try self.fieldFromPatternValue(value, field, ty);
         if (resolved_demand == .loop_param) Common.invariant("loop demand reference did not resolve before field read");
@@ -19144,7 +19614,7 @@ const Cloner = struct {
         value: Value,
         index: u32,
         ty: Type.TypeId,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         if (itemFromValue(value, index)) |item_value| return item_value;
         if (value == .let_) {
             const let_value = value.let_;
@@ -19233,7 +19703,7 @@ const Cloner = struct {
         index: u32,
         ty: Type.TypeId,
         demand: ValueDemand,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const resolved_demand = self.resolveLoopDemandRef(demand);
         if (resolved_demand == .none) return try self.itemFromPatternValue(value, index, ty);
         if (resolved_demand == .loop_param) Common.invariant("loop demand reference did not resolve before tuple item read");
@@ -19320,7 +19790,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         ty: Type.TypeId,
-    ) Common.LowerError!?Ast.ExprId {
+    ) LowerError!?Ast.ExprId {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         const block = switch (expr.data) {
             .block => |block| block,
@@ -19338,12 +19808,12 @@ const Cloner = struct {
         } } });
     }
 
-    fn substitutedPrivateLeafValue(self: *Cloner, value: PrivateStateValue) Common.LowerError!?Value {
+    fn substitutedPrivateLeafValue(self: *Cloner, value: PrivateStateValue) LowerError!?Value {
         const leaf_expr = privateStateLeafExpr(value) orelse return null;
         return try self.substitutedFieldOrTupleReadValue(leaf_expr);
     }
 
-    fn substitutedFieldOrTupleReadValue(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!?Value {
+    fn substitutedFieldOrTupleReadValue(self: *Cloner, expr_id: Ast.ExprId) LowerError!?Value {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         return switch (expr.data) {
             .local => |local| self.subst.get(local),
@@ -19360,7 +19830,7 @@ const Cloner = struct {
         };
     }
 
-    fn normalizedPrivateStateValue(self: *Cloner, value: PrivateStateValue) Common.LowerError!PrivateStateValue {
+    fn normalizedPrivateStateValue(self: *Cloner, value: PrivateStateValue) LowerError!PrivateStateValue {
         return switch (value) {
             .leaf => |leaf| blk: {
                 const substituted = (try self.substitutedPrivateLeafValue(value)) orelse break :blk value;
@@ -19439,6 +19909,7 @@ const Cloner = struct {
                     .ty = callable.ty,
                     .fn_id = callable.fn_id,
                     .captures = captures,
+                    .loop_origin = callable.loop_origin,
                 } };
             },
             .compact_finite_tags,
@@ -19450,7 +19921,7 @@ const Cloner = struct {
     fn projectablePatternValue(
         self: *Cloner,
         value: Value,
-    ) Common.LowerError!Value {
+    ) LowerError!Value {
         if (projectableExprFromValue(value)) |expr| {
             if (canReadFieldsFromExpr(self.pass.program, expr)) return value;
         }
@@ -19461,7 +19932,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         field: names.RecordFieldNameId,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         const fields_span = switch (expr.data) {
             .record => |fields| fields,
@@ -19483,7 +19954,7 @@ const Cloner = struct {
         self: *Cloner,
         expr_id: Ast.ExprId,
         index: u32,
-    ) Common.LowerError!?Value {
+    ) LowerError!?Value {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         const items_span = switch (expr.data) {
             .tuple => |items| items,
@@ -19497,7 +19968,7 @@ const Cloner = struct {
         } } };
     }
 
-    fn bindPatToValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!bool {
+    fn bindPatToValue(self: *Cloner, pat_id: Ast.PatId, value: Value) LowerError!bool {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         switch (pat.data) {
             .bind => |local| {
@@ -19597,7 +20068,7 @@ const Cloner = struct {
         pat_id: Ast.PatId,
         value: Value,
         demand: ValueDemand,
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         if (demand == .none) return true;
         if (demand == .materialize) return try self.bindPatToValue(pat_id, value);
 
@@ -19689,12 +20160,12 @@ const Cloner = struct {
         }
     }
 
-    fn bindPatToReusableValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!bool {
+    fn bindPatToReusableValue(self: *Cloner, pat_id: Ast.PatId, value: Value) LowerError!bool {
         if (!self.valueCanSubstitute(value)) return false;
         return try self.bindPatToValue(pat_id, value);
     }
 
-    fn bindPatToSingleUseTailValue(self: *Cloner, pat_id: Ast.PatId, value: Value, tail: BlockTail) Common.LowerError!bool {
+    fn bindPatToSingleUseTailValue(self: *Cloner, pat_id: Ast.PatId, value: Value, tail: BlockTail) LowerError!bool {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         switch (pat.data) {
             .bind => |local| {
@@ -19722,19 +20193,19 @@ const Cloner = struct {
         }
     }
 
-    fn bindPatToSingleUseRestValue(self: *Cloner, pat_id: Ast.PatId, value: Value, rest: Ast.ExprId) Common.LowerError!bool {
+    fn bindPatToSingleUseRestValue(self: *Cloner, pat_id: Ast.PatId, value: Value, rest: Ast.ExprId) LowerError!bool {
         return try self.bindPatToSingleUseTailValue(pat_id, value, .{
             .statements = &.{},
             .final_expr = rest,
         });
     }
 
-    fn bindPatToMaterializedKnownValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!bool {
+    fn bindPatToMaterializedKnownValue(self: *Cloner, pat_id: Ast.PatId, value: Value) LowerError!bool {
         const known_value = (try self.pass.knownValueFromValue(value)) orelse return false;
         return try self.bindPatToExprWithKnownValueAndValue(pat_id, known_value, value);
     }
 
-    fn bindPatToExprWithKnownValue(self: *Cloner, pat_id: Ast.PatId, known_value: KnownValue) Common.LowerError!bool {
+    fn bindPatToExprWithKnownValue(self: *Cloner, pat_id: Ast.PatId, known_value: KnownValue) LowerError!bool {
         return try self.bindPatToExprWithKnownValueAndValue(pat_id, known_value, null);
     }
 
@@ -19743,7 +20214,7 @@ const Cloner = struct {
         pat_id: Ast.PatId,
         known_value: KnownValue,
         maybe_value: ?Value,
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         switch (pat.data) {
             .bind => |local| {
@@ -19840,7 +20311,7 @@ const Cloner = struct {
         self: *Cloner,
         pat_id: Ast.PatId,
         known_value: KnownValue,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         switch (pat.data) {
             .bind => |local| try self.upgradePatternBindLocalWithKnownValue(local, known_value),
@@ -19988,7 +20459,7 @@ const Cloner = struct {
         out: *std.ArrayList(Ast.StmtId),
         tail: BlockTail,
         context: ValueDemand,
-    ) Common.LowerError!void {
+    ) LowerError!void {
         const saved_loc = self.current_loc;
         defer self.current_loc = saved_loc;
         const saved_region = self.current_region;
@@ -20000,14 +20471,14 @@ const Cloner = struct {
         const cloned: Ast.Stmt = switch (stmt) {
             .uninitialized => |pat| .{ .uninitialized = try self.clonePat(pat) },
             .let_ => |let_| blk: {
-                const pattern_demand: ValueDemand = if (let_.recursive)
+                var pattern_demand: ValueDemand = if (let_.recursive)
                     .materialize
                 else
                     try self.patternDemandInBlockTail(let_.pat, tail, context);
                 var value = if (let_.recursive)
                     try self.cloneExprValue(let_.value)
                 else
-                    try self.cloneExprValueWithDemand(let_.value, pattern_demand);
+                    try self.cloneBindingValueWithExpandedDemand(let_.value, &pattern_demand);
                 if (!let_.recursive) {
                     while (value == .let_) {
                         try self.appendPendingLetStmts(value.let_.lets, out);
@@ -20101,7 +20572,7 @@ const Cloner = struct {
         }
     }
 
-    fn cloneStmtExpr(self: *Cloner, expr_id: Ast.ExprId, context: ValueDemand) Common.LowerError!Ast.ExprId {
+    fn cloneStmtExpr(self: *Cloner, expr_id: Ast.ExprId, context: ValueDemand) LowerError!Ast.ExprId {
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
         return switch (expr.data) {
             .break_,
@@ -20119,7 +20590,7 @@ const Cloner = struct {
         self: *Cloner,
         pending_lets: []const PendingLet,
         out: *std.ArrayList(Ast.StmtId),
-    ) Common.LowerError!void {
+    ) LowerError!void {
         for (pending_lets) |pending| {
             const pat = try self.pass.program.addPat(.{
                 .ty = pending.ty,
@@ -20135,7 +20606,7 @@ const Cloner = struct {
         }
     }
 
-    fn bindPendingLetKnownValues(self: *Cloner, pending_lets: []const PendingLet) Common.LowerError!void {
+    fn bindPendingLetKnownValues(self: *Cloner, pending_lets: []const PendingLet) LowerError!void {
         for (pending_lets) |pending| {
             const known_value = pending.known_value orelse continue;
             const local_expr = try self.addExpr(.{
@@ -20198,7 +20669,7 @@ const Cloner = struct {
         return true;
     }
 
-    fn cloneExprSpan(self: *Cloner, span: Ast.Span(Ast.ExprId)) Common.LowerError!Ast.Span(Ast.ExprId) {
+    fn cloneExprSpan(self: *Cloner, span: Ast.Span(Ast.ExprId)) LowerError!Ast.Span(Ast.ExprId) {
         const source = try self.pass.allocator.dupe(Ast.ExprId, self.pass.program.exprSpan(span));
         defer self.pass.allocator.free(source);
 
@@ -20218,7 +20689,7 @@ const Cloner = struct {
         return try self.pass.program.addPatSpan(values);
     }
 
-    fn cloneFieldExprSpan(self: *Cloner, span: Ast.Span(Ast.FieldExpr)) Common.LowerError!Ast.Span(Ast.FieldExpr) {
+    fn cloneFieldExprSpan(self: *Cloner, span: Ast.Span(Ast.FieldExpr)) LowerError!Ast.Span(Ast.FieldExpr) {
         const source = try self.pass.allocator.dupe(Ast.FieldExpr, self.pass.program.fieldExprSpan(span));
         defer self.pass.allocator.free(source);
 
@@ -20252,7 +20723,7 @@ const Cloner = struct {
         self: *Cloner,
         span: Ast.Span(Ast.Branch),
         scrutinee_known_value: ?KnownValue,
-    ) Common.LowerError!Ast.Span(Ast.Branch) {
+    ) LowerError!Ast.Span(Ast.Branch) {
         const source = try self.pass.allocator.dupe(Ast.Branch, self.pass.program.branchSpan(span));
         defer self.pass.allocator.free(source);
 
@@ -20281,7 +20752,7 @@ const Cloner = struct {
         return try self.pass.program.addBranchSpan(values.items);
     }
 
-    fn cloneIfBranchSpan(self: *Cloner, span: Ast.Span(Ast.IfBranch)) Common.LowerError!Ast.Span(Ast.IfBranch) {
+    fn cloneIfBranchSpan(self: *Cloner, span: Ast.Span(Ast.IfBranch)) LowerError!Ast.Span(Ast.IfBranch) {
         const source = try self.pass.allocator.dupe(Ast.IfBranch, self.pass.program.ifBranchSpan(span));
         defer self.pass.allocator.free(source);
 
@@ -20298,7 +20769,7 @@ const Cloner = struct {
         return try self.pass.program.addIfBranchSpan(values);
     }
 
-    fn cloneStateLoopExprData(self: *Cloner, state_loop: anytype) Common.LowerError!Ast.ExprData {
+    fn cloneStateLoopExprData(self: *Cloner, state_loop: anytype) LowerError!Ast.ExprData {
         const source = try self.pass.allocator.dupe(Ast.StateLoopState, self.pass.program.stateLoopStateSpan(state_loop.states));
         defer self.pass.allocator.free(source);
 
@@ -20377,7 +20848,7 @@ const Cloner = struct {
         return false;
     }
 
-    fn cloneStateContinueExprData(self: *Cloner, continue_: anytype) Common.LowerError!Ast.ExprData {
+    fn cloneStateContinueExprData(self: *Cloner, continue_: anytype) LowerError!Ast.ExprData {
         if (self.state_loop_state_map.get(continue_.target_state)) |target_state| {
             return .{ .state_continue = .{
                 .target_state = target_state,
@@ -20399,7 +20870,7 @@ const Cloner = struct {
         Common.invariant("state_continue reached SpecConstr clone before its state_loop reserved the target state");
     }
 
-    fn materialize(self: *Cloner, value: Value) Common.LowerError!Ast.ExprId {
+    fn materialize(self: *Cloner, value: Value) LowerError!Ast.ExprId {
         switch (value) {
             .expr => |expr| {
                 if (self.exprReferencesAvailableBindings(expr)) return expr;
@@ -20512,7 +20983,7 @@ const Cloner = struct {
         }
     }
 
-    fn materializePublic(self: *Cloner, value: Value) Common.LowerError!Ast.ExprId {
+    fn materializePublic(self: *Cloner, value: Value) LowerError!Ast.ExprId {
         switch (value) {
             .expr => |expr| return expr,
             .expr_with_known_value => |known_value_expr| {
@@ -20602,7 +21073,7 @@ const Cloner = struct {
         }
     }
 
-    fn publicValueFromPrivateState(self: *Cloner, private_state: PrivateStateValue) Common.LowerError!Value {
+    fn publicValueFromPrivateState(self: *Cloner, private_state: PrivateStateValue) LowerError!Value {
         return switch (private_state) {
             .leaf => |leaf| .{ .expr = leaf.expr },
             .tag => |tag| .{ .tag = try self.publicTagValueFromPrivateState(tag) },
@@ -20644,7 +21115,7 @@ const Cloner = struct {
         };
     }
 
-    fn publicTagValueFromPrivateState(self: *Cloner, tag: PrivateStateTag) Common.LowerError!TagValue {
+    fn publicTagValueFromPrivateState(self: *Cloner, tag: PrivateStateTag) LowerError!TagValue {
         const expected_payloads = tagTypePayloads(self.pass.program, tag.ty, tag.name) orelse
             Common.invariant("private tag referenced a tag absent from its type");
         return .{
@@ -20655,7 +21126,7 @@ const Cloner = struct {
         };
     }
 
-    fn publicCallableValueFromPrivateState(self: *Cloner, callable: PrivateStateCallable) Common.LowerError!CallableValue {
+    fn publicCallableValueFromPrivateState(self: *Cloner, callable: PrivateStateCallable) LowerError!CallableValue {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(source_fn.captures);
         const captures = try self.pass.arena.allocator().alloc(Value, source_captures.len);
@@ -20682,7 +21153,7 @@ const Cloner = struct {
         };
     }
 
-    fn materializePublicCallable(self: *Cloner, callable: CallableValue) Common.LowerError!Ast.ExprId {
+    fn materializePublicCallable(self: *Cloner, callable: CallableValue) LowerError!Ast.ExprId {
         if (!self.callableCapturesCanMaterializePublic(callable)) {
             return try self.materializeCallable(callable);
         }
@@ -20699,7 +21170,7 @@ const Cloner = struct {
         );
     }
 
-    fn finiteTagsAsIfValue(self: *Cloner, finite_tags: FiniteTagsValue) Common.LowerError!Value {
+    fn finiteTagsAsIfValue(self: *Cloner, finite_tags: FiniteTagsValue) LowerError!Value {
         if (finite_tags.alternatives.len == 0) {
             Common.invariant("finite tag value had no alternatives");
         }
@@ -20725,7 +21196,7 @@ const Cloner = struct {
         } };
     }
 
-    fn finiteCallablesAsIfValue(self: *Cloner, finite_callables: FiniteCallablesValue) Common.LowerError!Value {
+    fn finiteCallablesAsIfValue(self: *Cloner, finite_callables: FiniteCallablesValue) LowerError!Value {
         if (finite_callables.alternatives.len == 0) {
             Common.invariant("finite callable value had no alternatives");
         }
@@ -20751,7 +21222,7 @@ const Cloner = struct {
         } };
     }
 
-    fn materializeCallable(self: *Cloner, callable: CallableValue) Common.LowerError!Ast.ExprId {
+    fn materializeCallable(self: *Cloner, callable: CallableValue) LowerError!Ast.ExprId {
         const fn_ = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const captures = self.pass.program.typedLocalSpan(fn_.captures);
         if (captures.len != callable.captures.len) {
@@ -20800,7 +21271,7 @@ const Cloner = struct {
         } } });
     }
 
-    fn specializedCallableRef(self: *Cloner, callable: CallableValue) Common.LowerError!Ast.ExprId {
+    fn specializedCallableRef(self: *Cloner, callable: CallableValue) LowerError!Ast.ExprId {
         const capture_patterns = try self.callableCapturePatterns(callable);
         if (self.existingCallableSpecialization(callable.fn_id, capture_patterns)) |existing| {
             const existing_fn = self.pass.program.fns.items[@intFromEnum(existing)];
@@ -20908,7 +21379,7 @@ const Cloner = struct {
         return result;
     }
 
-    fn callableCapturePatterns(self: *Cloner, callable: CallableValue) Common.LowerError![]const ?DemandedKnownValue {
+    fn callableCapturePatterns(self: *Cloner, callable: CallableValue) LowerError![]const ?DemandedKnownValue {
         const source_fn = self.pass.program.fns.items[@intFromEnum(callable.fn_id)];
         const source_captures = self.pass.program.typedLocalSpan(source_fn.captures);
         if (source_captures.len != callable.captures.len) {
@@ -20973,7 +21444,7 @@ const Cloner = struct {
         captures_span: Ast.Span(Ast.TypedLocal),
         capture_patterns: []const ?DemandedKnownValue,
         values: []const Value,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         var flattened = std.ArrayList(Ast.ExprId).empty;
         defer flattened.deinit(self.pass.allocator);
         var pending_lets = std.ArrayList(PendingLet).empty;
@@ -21006,7 +21477,7 @@ const Cloner = struct {
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         if (value == .let_) {
             const let_value = value.let_;
             try self.appendPendingLetsUnique(pending_lets, let_value.lets);
@@ -21038,7 +21509,7 @@ const Cloner = struct {
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
         pending_lets: *std.ArrayList(PendingLet),
-    ) Common.LowerError!bool {
+    ) LowerError!bool {
         const demanded = try materializedDemandedKnownValue(self.pass.arena.allocator(), known_value);
         return try self.appendCaptureExprsFromDemandedKnownValue(demanded, value, out, pending_lets);
     }
@@ -21049,7 +21520,7 @@ const Cloner = struct {
         fn_id: Ast.FnId,
         captures_span: Ast.Span(Ast.TypedLocal),
         values: []const Value,
-    ) Common.LowerError!Ast.ExprId {
+    ) LowerError!Ast.ExprId {
         const captures = try self.pass.allocator.dupe(Ast.TypedLocal, self.pass.program.typedLocalSpan(captures_span));
         defer self.pass.allocator.free(captures);
         if (captures.len != values.len) {
@@ -21135,7 +21606,7 @@ const Cloner = struct {
         return expr_id;
     }
 
-    fn addStmt(self: *Cloner, stmt: Ast.Stmt) Allocator.Error!Ast.StmtId {
+    fn addStmt(self: *Cloner, stmt: Ast.Stmt) LowerError!Ast.StmtId {
         const saved_loc = self.pass.program.current_loc;
         defer self.pass.program.current_loc = saved_loc;
         const saved_region = self.pass.program.current_region;
@@ -24042,7 +24513,7 @@ fn demandedKnownValueFromDemand(
     arena: Allocator,
     known_value: KnownValue,
     demand: ValueDemand,
-) Allocator.Error!?DemandedKnownValue {
+) LowerError!?DemandedKnownValue {
     return switch (demand) {
         .none => null,
         .materialize => try materializedDemandedKnownValue(arena, known_value),
@@ -24355,7 +24826,7 @@ fn effectiveCallableDemandForTarget(
     fn_id: Ast.FnId,
     known_capture_count: usize,
     projection: CallableDemandProjection,
-) Allocator.Error!CallableDemand {
+) LowerError!CallableDemand {
     const capture_count = sourceCaptureCountForTarget(program, fn_id, known_capture_count);
     var effective = try projectCallableDemandForTarget(arena, base_demand, capture_count, projection);
     if (cloner) |active_cloner| {
@@ -24594,7 +25065,7 @@ fn demandedKnownCapturesFromDemand(
     fn_id: Ast.FnId,
     captures: []const KnownValue,
     demand: CallableDemand,
-) Allocator.Error![]const DemandedKnownIndexedValue {
+) LowerError![]const DemandedKnownIndexedValue {
     var demanded = std.ArrayList(DemandedKnownIndexedValue).empty;
     defer demanded.deinit(arena);
     for (demand.captures, 0..) |capture_demand, index| {

@@ -1973,6 +1973,39 @@ index. A missing child means private state does not carry it. A present child
 whose data is unknown means private state carries the runtime value but has no
 more precise structure.
 
+Loop-carried private state also identifies its origin. When optimized lowering
+reconstructs loop-parameter private state for a state body, every private
+callable in that reconstruction records the owning loop parameter and the
+demanded path from that parameter to the callable. This origin is provenance,
+not state identity: it contributes no state slots and does not participate in
+private-state equality. It exists because a loop-state callable is the loop
+state at that path, so what its call sites observe is loop-parameter demand.
+
+Calling a loop-state callable is a loop body observation. The loop parameter
+local itself is substituted away while a state body is cloned, so ordinary
+local-demand observation cannot see it, and split-local provenance only carries
+demand for generated leaf locals. The callable's result demand has no leaf to
+attach to, and demanded-known callable products do not store result demand, so
+no other channel can return it to the demand owner. Therefore the
+private-callable call lowering must merge the observed callable demand — the
+per-alternative derived capture demands together with the observed result
+demand — into the owning loop parameter demand at the recorded origin path.
+Without this channel the loop demand node keeps a stale callable result demand,
+per-alternative capture derivation under that stale result correctly omits
+captures that later iterations need, and the state key can never carry them.
+
+When this observation grows the owning loop demand while a state body is being
+cloned from the now-stale state key, the state-body clone cannot bind a
+demanded capture that the stale key omitted. That is not a missing-capture
+compiler bug and not a site for placeholder values: the owning state-loop fixed
+point must abort the stale state-body clone and re-key from the original entry
+values under the grown normalized demand, exactly as it already does when
+demand grows between state bodies. Exactly one owner reacts to this growth: the
+state-loop fixed point that owns the grown parameter. A nested fixed point that
+observes the abort without its own demand having grown must pass the abort to
+its owner. A demanded capture that is absent when the owning loop demand did
+not grow remains an invariant violation.
+
 Callable captures have one additional private-state source: a capture may be
 supplied by an active loop state value through a loop-demand node. This is how a
 recursive iterator step closure can refer to the current cursor without storing
