@@ -1860,6 +1860,56 @@ test "non-inlined call list argument keeps let-bound leaves available" {
     defer optimized.deinit(allocator);
 }
 
+test "boundary field access projects private leaf branch" {
+    // A record consumed only through demanded field accesses splits into a
+    // sparse private product, and an if branch whose value is an opaque call
+    // result is carried whole as a private leaf. A boundary argument that
+    // projects a field from such an if value must project through every
+    // branch — including the leaf branch, whose field is an ordinary field
+    // access on the carried public value — rather than materialize the
+    // sparse receiver whole.
+    const allocator = std.testing.allocator;
+    var optimized = try lowerModule(allocator,
+        \\module [main]
+        \\
+        \\countdown : U64 -> U64
+        \\countdown = |x| {
+        \\    if x > 3 {
+        \\        return 0
+        \\    }
+        \\    x + 1
+        \\}
+        \\
+        \\load : U64 -> { score : U64, hi : U64, pad : U64 }
+        \\load = |seed| {
+        \\    if seed == 0 {
+        \\        { score: 0, hi: 1, pad: 2 }
+        \\    } else {
+        \\        load(seed - 1)
+        \\    }
+        \\}
+        \\
+        \\use : { score : U64, hi : U64, pad : U64 }, U64 -> U64
+        \\use = |state, mode| {
+        \\    match countdown(state.score) {
+        \\        1 => state.hi + mode
+        \\        other => other
+        \\    }
+        \\}
+        \\
+        \\main : U64
+        \\main = {
+        \\    state = if countdown(3) == 1 {
+        \\        { score: 10, hi: 20, pad: 30 }
+        \\    } else {
+        \\        load(7)
+        \\    }
+        \\    use(state, 1)
+        \\}
+    , .optimized);
+    defer optimized.deinit(allocator);
+}
+
 test "local iterator append loop demands step captures across states" {
     // The append step callable's appended-item capture is demanded only
     // through the step-result `item` demand observed inside the loop body.

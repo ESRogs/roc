@@ -2166,6 +2166,7 @@ const Cloner = struct {
     state_loop_stack: std.ArrayList(SparseStateLoopPattern),
     state_param_stack: std.ArrayList([]const Ast.TypedLocal),
     scoped_locals: std.ArrayList(Ast.LocalId),
+    demanded_known_ref_nodes: std.ArrayList(usize),
     active_pending_lets: std.ArrayList(PendingLet),
     inline_direct_calls: bool,
     inline_direct_requires_known_arg: bool,
@@ -2206,6 +2207,7 @@ const Cloner = struct {
             .state_loop_stack = .empty,
             .state_param_stack = .empty,
             .scoped_locals = .empty,
+            .demanded_known_ref_nodes = .empty,
             .active_pending_lets = .empty,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = true,
@@ -2248,6 +2250,7 @@ const Cloner = struct {
             .state_loop_stack = .empty,
             .state_param_stack = .empty,
             .scoped_locals = .empty,
+            .demanded_known_ref_nodes = .empty,
             .active_pending_lets = .empty,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = false,
@@ -2278,6 +2281,7 @@ const Cloner = struct {
     fn deinit(self: *Cloner) void {
         self.active_pending_lets.deinit(self.pass.allocator);
         self.scoped_locals.deinit(self.pass.allocator);
+        self.demanded_known_ref_nodes.deinit(self.pass.allocator);
         self.state_param_stack.deinit(self.pass.allocator);
         self.state_loop_stack.deinit(self.pass.allocator);
         self.deinitDemandCacheIndexes();
@@ -6707,6 +6711,20 @@ const Cloner = struct {
         self.current_region = self.pass.program.exprRegion(expr_id);
 
         const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
+        if (expr.data == .local) {
+            // A plain-cloned region is ordinary public output. A local with
+            // no available output binding cannot be referenced there; its
+            // substituted value is the binding's only source, so that value
+            // is emitted in place.
+            if (self.subst.get(expr.data.local)) |value| substitute: {
+                if (valueIsExpr(value, expr_id)) break :substitute;
+                if (localAliasFromValue(self.pass.program, value)) |alias| {
+                    if (alias == expr.data.local) break :substitute;
+                }
+                if (self.exprReferencesAvailableBindings(expr_id)) break :substitute;
+                return try self.materialize(value);
+            }
+        }
         const data: Ast.ExprData = switch (expr.data) {
             .local => |local| blk: {
                 break :blk .{ .local = local };
@@ -8939,6 +8957,24 @@ const Cloner = struct {
         self.demanded_known_depth += 1;
         defer self.demanded_known_depth -= 1;
         if (self.demanded_known_depth > 1000) Common.invariant("private-state demanded-known derivation did not converge");
+
+        // A recursive callable's capture demand re-enters its own demand
+        // reference; the shape a re-entered reference demands is the value
+        // carried whole, which keeps the derived state finite.
+        var tracked_node: ?usize = null;
+        if (demand == .fn_param) {
+            const root_ref = self.canonicalFunctionDemandSlotId(demand.fn_param);
+            for (self.demanded_known_ref_nodes.items) |seen| {
+                if (seen == root_ref.node) {
+                    return try self.demandedKnownValueFromPrivateStateShape(value);
+                }
+            }
+            try self.demanded_known_ref_nodes.append(self.pass.allocator, root_ref.node);
+            tracked_node = root_ref.node;
+        }
+        defer if (tracked_node != null) {
+            _ = self.demanded_known_ref_nodes.pop();
+        };
 
         const resolved_demand = self.resolveLoopDemandRef(demand);
         if (value == .leaf) {
@@ -13376,8 +13412,22 @@ const Cloner = struct {
 
         if (receiver == .private_state) {
             // A carried private child is the same checked data as the public
-            // field, so projection through the checked identity is exact; a
+            // field, so projection through the checked identity is exact. A
+            // carried leaf is one whole public value, so its field projects
+            // as an ordinary field access on the carried expression. A
             // missing child keeps the public-boundary invariant intact.
+            var private_receiver = receiver.private_state;
+            while (private_receiver == .nominal) {
+                private_receiver = (private_receiver.nominal.backing orelse break).*;
+            }
+            if (private_receiver == .leaf) {
+                const leaf = private_receiver.leaf;
+                const field_ty = recordFieldType(self.pass.program, leaf.ty, field) orelse return null;
+                return Value{ .expr = try self.addExpr(.{ .ty = field_ty, .data = .{ .field_access = .{
+                    .receiver = leaf.expr,
+                    .field = field,
+                } } }) };
+            }
             const field_value = privateStateField(self.pass.program, receiver.private_state, field) orelse return null;
             return Value{ .private_state = field_value };
         }
@@ -17366,7 +17416,21 @@ const Cloner = struct {
             return value;
         }
         if (!self.valueCanMaterializePublic(value)) return value;
-        return try self.makeReusableForMatch(value, pending_lets);
+        if (try self.makeReusableForMatchOrNull(value, pending_lets)) |reusable| return reusable;
+        // A value with no reusable form is bound once at the call entry,
+        // where its bindings are valid, exactly as an ordinary call would
+        // evaluate the argument; the body references the bound local.
+        const value_ty = valueType(self.pass.program, value);
+        const bound_local = try self.pass.program.addLocal(self.pass.symbols.fresh(), value_ty);
+        try pending_lets.append(self.pass.allocator, .{
+            .local = bound_local,
+            .ty = value_ty,
+            .value = .{ .cloned = try self.materialize(value) },
+        });
+        return .{ .expr = try self.addExpr(.{
+            .ty = value_ty,
+            .data = .{ .local = bound_local },
+        }) };
     }
 
     /// A raw value substituted into an inlined body may be re-materialized at
