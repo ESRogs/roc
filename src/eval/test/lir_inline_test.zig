@@ -1860,6 +1860,42 @@ test "non-inlined call list argument keeps let-bound leaves available" {
     defer optimized.deinit(allocator);
 }
 
+test "multi-use match binding emits branch bodies once" {
+    // A control-flow value re-emits its branch bodies wherever it
+    // materializes, so a let-bound match consumed by more than one
+    // materializing use must be emitted once at its binding statement and
+    // referenced; otherwise every use duplicates every branch body.
+    const allocator = std.testing.allocator;
+    var optimized = try lowerModule(allocator,
+        \\module [main]
+        \\
+        \\route : U64 -> U64
+        \\route = |x| {
+        \\    if x > 3 {
+        \\        return 0
+        \\    }
+        \\    x + 1
+        \\}
+        \\
+        \\label : U64 -> Str
+        \\label = |n| {
+        \\    state = match route(n) {
+        \\        0 => Str.concat("a", "0")
+        \\        1 => Str.concat("b", "1")
+        \\        2 => Str.concat("c", "2")
+        \\        _ => Str.concat("d", "?")
+        \\    }
+        \\    Str.concat(state, state)
+        \\}
+        \\
+        \\main : Str
+        \\main = label(9)
+    , .optimized);
+    defer optimized.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "str_concat_count"));
+}
+
 test "boundary field access projects private leaf branch" {
     // A record consumed only through demanded field accesses splits into a
     // sparse private product, and an if branch whose value is an opaque call

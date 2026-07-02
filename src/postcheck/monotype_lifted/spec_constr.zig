@@ -20419,6 +20419,22 @@ const Cloner = struct {
         return try self.bindPatToValue(pat_id, value);
     }
 
+    fn valueMaterializesControlFlow(value: Value) bool {
+        return switch (value) {
+            .if_, .match_ => true,
+            .nominal => |nominal| valueMaterializesControlFlow(nominal.backing.*),
+            else => false,
+        };
+    }
+
+    fn patBindsLocalWithMultipleTailUses(self: *Cloner, pat_id: Ast.PatId, tail: BlockTail) bool {
+        const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
+        return switch (pat.data) {
+            .bind => |local| localMaxUseCountPerPathInBlockTail(self.pass.program, local, tail) > 1,
+            else => false,
+        };
+    }
+
     fn bindPatToSingleUseTailValue(self: *Cloner, pat_id: Ast.PatId, value: Value, tail: BlockTail) LowerError!bool {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         switch (pat.data) {
@@ -20736,43 +20752,53 @@ const Cloner = struct {
                     try self.cloneExprValue(let_.value)
                 else
                     try self.cloneBindingValueWithExpandedDemand(let_.value, &pattern_demand);
+                var emit_shared_control_flow = false;
                 if (!let_.recursive) {
                     while (value == .let_) {
                         try self.appendPendingLetStmts(value.let_.lets, out);
                         value = value.let_.body.*;
                     }
 
-                    var pending_lets = std.ArrayList(PendingLet).empty;
-                    defer pending_lets.deinit(self.pass.allocator);
+                    // A control-flow value re-emits its branch bodies at
+                    // every materializing use, so a binding consumed on some
+                    // path more than once is emitted here once; the uses
+                    // reference the bound local.
+                    emit_shared_control_flow = pattern_demand == .materialize and
+                        valueMaterializesControlFlow(value) and
+                        self.patBindsLocalWithMultipleTailUses(let_.pat, tail);
+                    if (!emit_shared_control_flow) {
+                        var pending_lets = std.ArrayList(PendingLet).empty;
+                        defer pending_lets.deinit(self.pass.allocator);
 
-                    const reusable_pending_start = pending_lets.items.len;
-                    if (try self.tryMakeReusableForMatch(value, &pending_lets)) |reusable| {
+                        const reusable_pending_start = pending_lets.items.len;
+                        if (try self.tryMakeReusableForMatch(value, &pending_lets)) |reusable| {
+                            const bind_change_start = self.changes.items.len;
+                            if (try self.bindPatToReusableValue(let_.pat, reusable)) {
+                                try self.appendPendingLetStmts(pending_lets.items, out);
+                                return;
+                            }
+                            self.restore(bind_change_start);
+                            pending_lets.shrinkRetainingCapacity(reusable_pending_start);
+                        }
+
                         const bind_change_start = self.changes.items.len;
-                        if (try self.bindPatToReusableValue(let_.pat, reusable)) {
-                            try self.appendPendingLetStmts(pending_lets.items, out);
+                        if (try self.bindPatToSingleUseTailValue(let_.pat, value, tail)) {
                             return;
                         }
                         self.restore(bind_change_start);
-                        pending_lets.shrinkRetainingCapacity(reusable_pending_start);
-                    }
 
-                    const bind_change_start = self.changes.items.len;
-                    if (try self.bindPatToSingleUseTailValue(let_.pat, value, tail)) {
-                        return;
+                        const demanded_drop_discards_effect = pattern_demand == .none and
+                            !(try discardedExprIsEffectFree(self.pass.program, self.pass.allocator, let_.value));
+                        if (!demanded_drop_discards_effect and
+                            try self.bindPatToDemandedValue(let_.pat, value, pattern_demand))
+                        {
+                            return;
+                        }
+                        self.restore(bind_change_start);
                     }
-                    self.restore(bind_change_start);
-
-                    const demanded_drop_discards_effect = pattern_demand == .none and
-                        !(try discardedExprIsEffectFree(self.pass.program, self.pass.allocator, let_.value));
-                    if (!demanded_drop_discards_effect and
-                        try self.bindPatToDemandedValue(let_.pat, value, pattern_demand))
-                    {
-                        return;
-                    }
-                    self.restore(bind_change_start);
                 }
                 const value_expr = try self.materialize(value);
-                if (!let_.recursive and try self.bindPatToReusableValue(let_.pat, value)) {
+                if (!let_.recursive and !emit_shared_control_flow and try self.bindPatToReusableValue(let_.pat, value)) {
                     return;
                 }
                 _ = try self.bindPatToMaterializedKnownValue(let_.pat, value);
