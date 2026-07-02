@@ -4629,14 +4629,21 @@ test "iterdiff: bounded list map collect agrees across inline modes" {
 }
 
 // Pre-existing divergence: a filter-like adapter (`keep_if`) diverges between
-// the two lowerings under the optimized mode, independent of its consumer. The
-// naive (`.none`) lowering evaluates correctly and returns the filtered list;
-// the optimized (`.wrappers`) lowering HANGS in an unterminated step loop (the
-// fused `keep_if` Skip result never reaches Done), for BOTH the `.collect()`
-// consumer and a hand-written `for`/append loop consumer. Minimal repro:
+// the two lowerings under the optimized mode, independent of its consumer, and
+// the seed+step representation does NOT fix it: it is an optimizer (spec_constr)
+// miscompile, not a representation issue. The naive (`.none`) lowering evaluates
+// correctly and returns the filtered list; the optimized (`.wrappers`) lowering
+// HANGS in an unterminated step loop, for BOTH the `.collect()` consumer and a
+// hand-written `for`/append loop consumer. Minimal repro:
 // `[1.I64, 2, 3].iter().keep_if(|n| n > 1).collect()` returns `[2, 3]` under
-// `.none` but does not terminate under `.wrappers`. Committed commented-out
-// because a hanging test cannot run in the suite.
+// `.none` but does not terminate under `.wrappers`. Root cause, confirmed from
+// the lowered LIR: the collect loop correctly builds the advanced source-iterator
+// box each iteration, but spec_constr sets the loop-carried iterator parameter
+// back to its ORIGINAL entry box (`set l28 := l2`) on the loop back-edge instead
+// of the advanced box, so the source index never advances and `keep_if` yields
+// Skip forever. Same spec_constr entry-known loop-state reset bug as the custom
+// divergence below. MUST stay commented out because a hanging test cannot run in
+// the suite; see the Phase 1 report for the minimized repro.
 //
 // test "iterdiff: bounded list map keep_if collect agrees across inline modes" {
 //     try expectSameObservationsAcrossInlineModes(
@@ -4775,33 +4782,36 @@ test "iterdiff: stream per-element effects agree across inline modes" {
 
 // Pre-existing divergence: a bounded prefix (`take_first`) of an infinite custom
 // iterator (`Iter.custom`, the Fibonacci unfold below) diverges between the two
-// lowerings. Running both under the differential harness, the naive (`.none`)
-// run and the optimized (`.wrappers`) run disagree on the produced element
-// sequence: the naive run's first `dbg` element is `1` while the optimized
-// run's first `dbg` element is `0`. The existing test "optimized infinite
-// custom iterator consumes finite prefix" independently fails on this tree,
-// confirming the custom-iterator path is broken here. Committed commented-out
-// until the internal representation is fixed.
-//
-// test "iterdiff: infinite custom iterator bounded prefix agrees across inline modes" {
-//     try expectSameObservationsAcrossInlineModes(
-//         \\module [main]
-//         \\
-//         \\main : U64
-//         \\main = {
-//         \\    adv : ((U64, U64) -> Try((U64, (U64, U64)), [NoMore]))
-//         \\    adv = |(a, b)| Try.Ok((a, (b, a + b)))
-//         \\    fib_iter = Iter.custom((0.U64, 1.U64), Unknown, adv)
-//         \\    var $sum = 0.U64
-//         \\    for f in fib_iter.take_first(8) {
-//         \\        dbg f
-//         \\        $sum = $sum + f
-//         \\    }
-//         \\    dbg $sum
-//         \\    $sum
-//         \\}
-//     );
-// }
+// lowerings, and the seed+step representation does NOT fix it: the divergence is
+// an optimizer (spec_constr) miscompile, not a representation issue. The naive
+// (`.none`) run yields the correct sequence 0,1,1,2,3,5,8,13; the optimized
+// (`.wrappers`) run yields 0,0,0,0,0,0,0,0 (sum 0). Root cause, confirmed from
+// the lowered LIR: the custom step correctly computes the advanced `next_seed`,
+// but spec_constr rebuilds the successor iterator re-reading the ORIGINAL
+// captured seed instead of `next_seed` (the seed's initial value is entry-known,
+// so spec_constr treats a runtime-varying loop-carried field as loop-invariant
+// and freezes it). The `keep_if` hang above is the same bug on a loop-carried
+// iterator box. Activated as an active-failing genuine divergence per the Phase
+// 1 gate (both modes disagree). See Phase 1 report for the minimized repro.
+test "iterdiff: infinite custom iterator bounded prefix agrees across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : U64
+        \\main = {
+        \\    adv : ((U64, U64) -> Try((U64, (U64, U64)), [NoMore]))
+        \\    adv = |(a, b)| Try.Ok((a, (b, a + b)))
+        \\    fib_iter = Iter.custom((0.U64, 1.U64), Unknown, adv)
+        \\    var $sum = 0.U64
+        \\    for f in fib_iter.take_first(8) {
+        \\        dbg f
+        \\        $sum = $sum + f
+        \\    }
+        \\    dbg $sum
+        \\    $sum
+        \\}
+    );
+}
 
 // Acceptance pending fusion: tier-one LIR identity (iter_fusion_design.md
 // Acceptance item 2). A bounded `list.iter().map(f).collect()` whose
