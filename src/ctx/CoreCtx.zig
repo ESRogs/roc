@@ -383,7 +383,9 @@ pub const max_file_size = std.math.maxInt(u32);
 /// Wraps an `Io` and intercepts `readFile` for a single path,
 /// returning `content` instead of reading from disk.
 ///
-/// All other vtable functions (writeFile, fileExists, stat, …) delegate to `base`.
+/// Canonicalization of the overridden path returns `path` directly, allowing
+/// virtual files to participate in path-derived package identity. All other
+/// vtable functions (writeFile, fileExists, stat, …) delegate to `base`.
 /// This is safe when `base` is `Io.os()` or `Io.default()` because those vtable
 /// functions ignore their `ctx` argument — so passing a `ReadFileOverride` pointer
 /// as `ctx` causes no harm.
@@ -407,6 +409,7 @@ pub const ReadFileOverride = struct {
     pub fn io(self: *@This()) Self {
         var v = self.base.vtable;
         v.readFile = &readFileOverrideFn;
+        v.canonicalize = &canonicalizeOverrideFn;
         return .{ .ctx = @ptrCast(self), .vtable = v, .std_io = self.base.std_io, .gpa = self.base.gpa, .arena = self.base.arena };
     }
 };
@@ -416,6 +419,13 @@ fn readFileOverrideFn(ctx: ?*anyopaque, std_io: std.Io, path: []const u8, alloca
     if (std.mem.eql(u8, path, self.path))
         return allocator.dupe(u8, self.content) catch return error.OutOfMemory;
     return self.base.vtable.readFile(self.base.ctx, std_io, path, allocator);
+}
+
+fn canonicalizeOverrideFn(ctx: ?*anyopaque, std_io: std.Io, path: []const u8, allocator: Allocator) CanonicalizeError![]const u8 {
+    const self: *ReadFileOverride = @ptrCast(@alignCast(ctx.?));
+    if (std.mem.eql(u8, path, self.path))
+        return allocator.dupe(u8, self.path) catch return error.OutOfMemory;
+    return self.base.vtable.canonicalize(self.base.ctx, std_io, path, allocator);
 }
 
 const is_freestanding = builtin.os.tag == .freestanding;
@@ -636,12 +646,42 @@ fn osJoinPath(_: ?*anyopaque, _: std.Io, parts: []const []const u8, allocator: A
 }
 
 fn osCanonicalize(_: ?*anyopaque, std_io: std.Io, path: []const u8, allocator: Allocator) CanonicalizeError![]const u8 {
-    return std.Io.Dir.cwd().realPathFileAlloc(std_io, path, allocator) catch |err| return switch (err) {
+    if (comptime builtin.link_libc and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        return osCanonicalizeLibc(path, allocator);
+    }
+
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = [_]u8{0} ** std.Io.Dir.max_path_bytes;
+    const len = std.Io.Dir.cwd().realPathFile(std_io, path, &buffer) catch |err| return switch (err) {
         error.FileNotFound => error.FileNotFound,
         error.AccessDenied => error.AccessDenied,
-        error.OutOfMemory => error.OutOfMemory,
         else => error.IoError,
     };
+    return allocator.dupe(u8, buffer[0..len]) catch error.OutOfMemory;
+}
+
+fn osCanonicalizeLibc(path: []const u8, allocator: Allocator) CanonicalizeError![]const u8 {
+    if (std.mem.findScalar(u8, path, 0) != null) return error.IoError;
+    if (path.len >= std.posix.PATH_MAX) return error.IoError;
+
+    var path_buffer: [std.posix.PATH_MAX]u8 = [_]u8{0} ** std.posix.PATH_MAX;
+    @memcpy(path_buffer[0..path.len], path);
+    const path_z = path_buffer[0..path.len :0];
+
+    var resolved_buffer: [std.posix.PATH_MAX]u8 = [_]u8{0} ** std.posix.PATH_MAX;
+    while (true) {
+        if (std.c.realpath(path_z, resolved_buffer[0..].ptr)) |resolved| {
+            std.debug.assert(resolved == resolved_buffer[0..].ptr);
+            const len = std.mem.findScalar(u8, &resolved_buffer, 0) orelse resolved_buffer.len;
+            return allocator.dupe(u8, resolved_buffer[0..len]) catch error.OutOfMemory;
+        }
+
+        switch (@as(std.posix.E, @enumFromInt(std.c._errno().*))) {
+            .INTR => continue,
+            .NOENT, .NOTDIR => return error.FileNotFound,
+            .ACCES => return error.AccessDenied,
+            else => return error.IoError,
+        }
+    }
 }
 
 fn osMakePath(_: ?*anyopaque, std_io: std.Io, path: []const u8) MakePathError!void {
@@ -813,8 +853,11 @@ fn testingJoinPath(_: ?*anyopaque, _: std.Io, parts: []const []const u8, allocat
     return std.fs.path.join(allocator, parts);
 }
 
-fn testingCanonicalize(_: ?*anyopaque, _: std.Io, _: []const u8, _: Allocator) CanonicalizeError![]const u8 {
-    @panic("canonicalize should not be called in this test");
+fn testingCanonicalize(_: ?*anyopaque, _: std.Io, path: []const u8, allocator: Allocator) CanonicalizeError![]const u8 {
+    // Tests have no real filesystem to resolve against; the lexically
+    // normalized path is the canonical form, matching the identity fallback
+    // used for paths with no on-disk resolution.
+    return std.fs.path.resolve(allocator, &.{path}) catch error.OutOfMemory;
 }
 
 fn testingMakePath(_: ?*anyopaque, _: std.Io, _: []const u8) MakePathError!void {
