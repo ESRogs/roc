@@ -8,6 +8,7 @@ import pf.TypeRepr exposing [TypeRepr]
 import pf.AbiLayout exposing [AbiLayout]
 import pf.AbiFieldLayout exposing [AbiFieldLayout]
 import pf.AbiTagLayout exposing [AbiTagLayout]
+import pf.AbiWidth exposing [AbiWidth]
 import pf.ArgShape exposing [ArgShape]
 import pf.GlueInput exposing [GlueInput]
 import pf.TypeNamePlan exposing [TypeNamePlan]
@@ -100,19 +101,23 @@ type_name_roots_zig = |hosted_functions, provides_list, type_table| {
 	var $roots = []
 
 	for func in hosted_functions {
-		$roots = $roots.append({
-			alias_base: name_to_struct_name(func.name),
-			module_base: hosted_module_name_to_struct_name(func.name),
-			type_id: func.ret_type_id,
-		})
+		$roots = $roots.append(
+			{
+				alias_base: name_to_struct_name(func.name),
+				module_base: hosted_module_name_to_struct_name(func.name),
+				type_id: func.ret_type_id,
+			},
+		)
 	}
 
 	for entry in provides_list {
-		$roots = $roots.append({
-			alias_base: name_to_struct_name(entry.name),
-			module_base: hosted_module_name_to_struct_name(entry.name),
-			type_id: TypeNamePlan.from_table(type_table).provided_entry_root_type_id(entry),
-		})
+		$roots = $roots.append(
+			{
+				alias_base: name_to_struct_name(entry.name),
+				module_base: hosted_module_name_to_struct_name(entry.name),
+				type_id: TypeNamePlan.from_table(type_table).provided_entry_root_type_id(entry),
+			},
+		)
 	}
 
 	$roots
@@ -133,28 +138,40 @@ type_id_to_zig = |type_table, duplicate_tag_names, preferred_names, type_id| {
 ## Render one `extern struct` field declaration for a record field. Unnamed
 ## nominal-record padding fields become fixed-size byte arrays (`[size]u8`);
 ## named fields use their resolved Zig type.
-zig_record_field_decl = |type_table, duplicate_tag_names, preferred_names, field, is_wasm32| {
+zig_record_field_decl = |type_table, duplicate_tag_names, preferred_names, field, width| {
 	field_name = name_to_zig_quoted_ident(field.name)
 	zig_type = if field.is_padding {
-		size = if is_wasm32 { field.size32 } else { field.size64 }
-		"[${U64.to_str(size)}]u8"
+		"[${U64.to_str(AbiFieldLayout.size(field, width))}]u8"
 	} else {
 		type_id_to_zig(type_table, duplicate_tag_names, preferred_names, field.type_id)
 	}
 	"    ${field_name}: ${zig_type},\n"
 }
 
-zig_record_fields_decl = |type_table, duplicate_tag_names, preferred_names, fields, is_wasm32| {
+## Fields arrive in committed layout order (valid at both pointer widths);
+## only per-width padding byte counts differ between the two renderings.
+zig_record_fields_decl = |type_table, duplicate_tag_names, preferred_names, fields, width| {
 	var $field_strs = ""
-	for field in AbiFieldLayout.sort_by_target_offset(fields, is_wasm32) {
-		$field_strs = Str.concat($field_strs, zig_record_field_decl(type_table, duplicate_tag_names, preferred_names, field, is_wasm32))
+	for field in fields {
+		$field_strs = Str.concat($field_strs, zig_record_field_decl(type_table, duplicate_tag_names, preferred_names, field, width))
 	}
 	$field_strs
 }
 
 zig_record_layout_assertions = |type_name, abi_layout| {
 	if abi_layout.size64 > 0 or abi_layout.size32 > 0 {
-		"comptime {\n    if (@sizeOf(usize) == 8) {\n        if (@sizeOf(${type_name}) != ${U64.to_str(abi_layout.size64)}) @compileError(\"${type_name} size mismatch\");\n        if (@alignOf(${type_name}) != ${U64.to_str(abi_layout.alignment64)}) @compileError(\"${type_name} alignment mismatch\");\n    }\n    if (@sizeOf(usize) == 4) {\n        if (@sizeOf(${type_name}) != ${U64.to_str(abi_layout.size32)}) @compileError(\"${type_name} size mismatch\");\n        if (@alignOf(${type_name}) != ${U64.to_str(abi_layout.alignment32)}) @compileError(\"${type_name} alignment mismatch\");\n    }\n}\n\n"
+		block =
+			\\comptime {
+			\\    if (@sizeOf(usize) == 8) {
+			\\        if (@sizeOf(${type_name}) != ${U64.to_str(abi_layout.size64)}) @compileError("${type_name} size mismatch");
+			\\        if (@alignOf(${type_name}) != ${U64.to_str(abi_layout.alignment64)}) @compileError("${type_name} alignment mismatch");
+			\\    }
+			\\    if (@sizeOf(usize) == 4) {
+			\\        if (@sizeOf(${type_name}) != ${U64.to_str(abi_layout.size32)}) @compileError("${type_name} size mismatch");
+			\\        if (@alignOf(${type_name}) != ${U64.to_str(abi_layout.alignment32)}) @compileError("${type_name} alignment mismatch");
+			\\    }
+			\\}
+		"${block}\n\n"
 	} else {
 		""
 	}
@@ -162,22 +179,41 @@ zig_record_layout_assertions = |type_name, abi_layout| {
 
 zig_payload_layout_assertions = |type_name, tag_layout| {
 	if tag_layout.payload_size64 > 0 or tag_layout.payload_size32 > 0 {
-		"comptime {\n    if (@sizeOf(usize) == 8) {\n        if (@sizeOf(${type_name}) != ${U64.to_str(tag_layout.payload_size64)}) @compileError(\"${type_name} size mismatch\");\n        if (@alignOf(${type_name}) != ${U64.to_str(tag_layout.payload_alignment64)}) @compileError(\"${type_name} alignment mismatch\");\n    }\n    if (@sizeOf(usize) == 4) {\n        if (@sizeOf(${type_name}) != ${U64.to_str(tag_layout.payload_size32)}) @compileError(\"${type_name} size mismatch\");\n        if (@alignOf(${type_name}) != ${U64.to_str(tag_layout.payload_alignment32)}) @compileError(\"${type_name} alignment mismatch\");\n    }\n}\n\n"
+		block =
+			\\comptime {
+			\\    if (@sizeOf(usize) == 8) {
+			\\        if (@sizeOf(${type_name}) != ${U64.to_str(tag_layout.payload_size64)}) @compileError("${type_name} size mismatch");
+			\\        if (@alignOf(${type_name}) != ${U64.to_str(tag_layout.payload_alignment64)}) @compileError("${type_name} alignment mismatch");
+			\\    }
+			\\    if (@sizeOf(usize) == 4) {
+			\\        if (@sizeOf(${type_name}) != ${U64.to_str(tag_layout.payload_size32)}) @compileError("${type_name} size mismatch");
+			\\        if (@alignOf(${type_name}) != ${U64.to_str(tag_layout.payload_alignment32)}) @compileError("${type_name} alignment mismatch");
+			\\    }
+			\\}
+		"${block}\n\n"
 	} else {
 		""
 	}
 }
 
-zig_record_struct_decl = |doc, struct_name, native_field_strs, wasm32_field_strs, native_method_decls, wasm32_method_decls, abi_layout| {
+zig_record_struct_decl = |doc, struct_name, field_strs64, field_strs32, method_decls64, method_decls32, abi_layout| {
 	assertions = zig_record_layout_assertions(struct_name, abi_layout)
-	"${doc}pub const ${struct_name} = if (@sizeOf(usize) == 4) extern struct {\n${wasm32_field_strs}${wasm32_method_decls}} else extern struct {\n${native_field_strs}${native_method_decls}};\n\n${assertions}"
+	decl =
+		\\pub const ${struct_name} = if (@sizeOf(usize) == 4) extern struct {
+		\\${field_strs32}${method_decls32}} else extern struct {
+		\\${field_strs64}${method_decls64}};
+	"${doc}${decl}\n\n${assertions}"
 }
 
 zig_payload_struct_decl = |doc, struct_name, type_table, duplicate_tag_names, preferred_names, fields, tag_layout| {
-	native_field_strs = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, fields, Bool.False)
-	wasm32_field_strs = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, fields, Bool.True)
+	field_strs64 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, fields, Pointer64)
+	field_strs32 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, fields, Pointer32)
 	assertions = zig_payload_layout_assertions(struct_name, tag_layout)
-	"${doc}pub const ${struct_name} = if (@sizeOf(usize) == 4) extern struct {\n${wasm32_field_strs}} else extern struct {\n${native_field_strs}};\n\n${assertions}"
+	decl =
+		\\pub const ${struct_name} = if (@sizeOf(usize) == 4) extern struct {
+		\\${field_strs32}} else extern struct {
+		\\${field_strs64}};
+	"${doc}${decl}\n\n${assertions}"
 }
 
 ## Convert a TypeRepr to its Zig type string
@@ -247,11 +283,8 @@ abi_record_fields = |abi_layout| abi_layout.record_fields()
 abi_tag_layouts : AbiLayout -> List(AbiTagLayout)
 abi_tag_layouts = |abi_layout| abi_layout.tag_layouts()
 
-abi_discriminant_offset64 : AbiLayout -> U64
-abi_discriminant_offset64 = |abi_layout| abi_layout.discriminant_offset64()
-
-abi_discriminant_offset32 : AbiLayout -> U64
-abi_discriminant_offset32 = |abi_layout| abi_layout.discriminant_offset32()
+abi_discriminant_offset : AbiLayout, AbiWidth -> U64
+abi_discriminant_offset = |abi_layout, width| abi_layout.discriminant_offset(width)
 
 abi_discriminant_size : AbiLayout -> U64
 abi_discriminant_size = |abi_layout| abi_layout.discriminant_size()
@@ -268,7 +301,7 @@ resolve_tag_union_type = |type_table, duplicate_tag_names, preferred_names, type
 			} else {
 				"*anyopaque"
 			}
-	}
+		}
 }
 
 ## Generate the RocList(T) generic type function (static Zig code)
@@ -525,14 +558,14 @@ generate_element_type_structs = |type_table, duplicate_tag_names, preferred_name
 						$seen_names = $seen_names.append(struct_name)
 
 						abi_fields = abi_record_fields(type_info.layout)
-						native_field_strs = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, abi_fields, Bool.False)
-						wasm32_field_strs = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, abi_fields, Bool.True)
-						wasm32_method_decls = generate_record_refcount_methods(type_table, duplicate_tag_names, preferred_names, abi_fields)
-						native_method_decls = generate_record_refcount_methods(type_table, duplicate_tag_names, preferred_names, abi_fields)
+						field_strs64 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, abi_fields, Pointer64)
+						field_strs32 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, abi_fields, Pointer32)
+						method_decls32 = generate_record_refcount_methods(type_table, duplicate_tag_names, preferred_names, abi_fields)
+						method_decls64 = generate_record_refcount_methods(type_table, duplicate_tag_names, preferred_names, abi_fields)
 
 						$structs = Str.concat(
 							$structs,
-							zig_record_struct_decl("/// Element type for ${rec.name}\n", struct_name, native_field_strs, wasm32_field_strs, native_method_decls, wasm32_method_decls, type_info.layout),
+							zig_record_struct_decl("/// Element type for ${rec.name}\n", struct_name, field_strs64, field_strs32, method_decls64, method_decls32, type_info.layout),
 						)
 					}
 				}
@@ -670,8 +703,8 @@ generate_single_tag_union = |type_table, duplicate_tag_names, preferred_names, t
 
 		# Payload extern union
 		var $union_fields = ""
-		var $native_accessors = ""
-		var $wasm32_accessors = ""
+		var $accessors64 = ""
+		var $accessors32 = ""
 		var $union_tag_idx = 0
 		for union_tag in tu.tags {
 			tag_layout = abi_tag_at(abi_tags, $union_tag_idx)
@@ -685,27 +718,57 @@ generate_single_tag_union = |type_table, duplicate_tag_names, preferred_names, t
 					Err(_) => "*anyopaque"
 				}
 				$union_fields = Str.concat($union_fields, "        ${snake}: ${zig_type},\n")
-				$native_accessors = Str.concat($native_accessors, "    pub fn payload_${snake}(self: *const @This()) ${zig_type} {\n        return self.payload.${snake};\n    }\n")
-				$wasm32_accessors = Str.concat($wasm32_accessors, "    pub fn payload_${snake}(self: *const @This()) ${zig_type} {\n        const ptr: *const ${zig_type} = @ptrCast(@alignCast(&self.payload));\n        return ptr.*;\n    }\n")
+				$accessors64 = Str.concat($accessors64, "    pub fn payload_${snake}(self: *const @This()) ${zig_type} {\n        return self.payload.${snake};\n    }\n")
+				$accessors32 = Str.concat($accessors32, "    pub fn payload_${snake}(self: *const @This()) ${zig_type} {\n        const ptr: *const ${zig_type} = @ptrCast(@alignCast(&self.payload));\n        return ptr.*;\n    }\n")
 			} else {
 				tuple_name = "${struct_name}${capitalize_first(union_tag.name)}Payload"
 				$union_fields = Str.concat($union_fields, "        ${snake}: ${tuple_name},\n")
-				$native_accessors = Str.concat($native_accessors, "    pub fn payload_${snake}(self: *const @This()) ${tuple_name} {\n        return self.payload.${snake};\n    }\n")
-				$wasm32_accessors = Str.concat($wasm32_accessors, "    pub fn payload_${snake}(self: *const @This()) ${tuple_name} {\n        const ptr: *const ${tuple_name} = @ptrCast(@alignCast(&self.payload));\n        return ptr.*;\n    }\n")
+				$accessors64 = Str.concat($accessors64, "    pub fn payload_${snake}(self: *const @This()) ${tuple_name} {\n        return self.payload.${snake};\n    }\n")
+				$accessors32 = Str.concat($accessors32, "    pub fn payload_${snake}(self: *const @This()) ${tuple_name} {\n        const ptr: *const ${tuple_name} = @ptrCast(@alignCast(&self.payload));\n        return ptr.*;\n    }\n")
 			}
 			$union_tag_idx = $union_tag_idx + 1
 		}
 
 		# Comptime assertions
-		wasm32_method_decls = generate_tag_union_refcount_method_delegates(struct_name)
-		native_method_decls = generate_tag_union_refcount_method_delegates(struct_name)
+		method_decls32 = generate_tag_union_refcount_method_delegates(struct_name)
+		method_decls64 = generate_tag_union_refcount_method_delegates(struct_name)
 		assertions = if abi_layout.size64 > 0 or abi_layout.size32 > 0 {
-			"comptime {\n    if (@sizeOf(usize) == 8) {\n        if (@sizeOf(${struct_name}) != ${U64.to_str(abi_layout.size64)}) @compileError(\"${struct_name} size mismatch\");\n        if (@alignOf(${struct_name}) != ${U64.to_str(abi_layout.alignment64)}) @compileError(\"${struct_name} alignment mismatch\");\n        if (@offsetOf(${struct_name}, \"tag\") != ${U64.to_str(abi_discriminant_offset64(abi_layout))}) @compileError(\"${struct_name} tag offset mismatch\");\n    }\n    if (@sizeOf(usize) == 4) {\n        if (@sizeOf(${struct_name}) != ${U64.to_str(abi_layout.size32)}) @compileError(\"${struct_name} size mismatch\");\n        if (@alignOf(${struct_name}) != ${U64.to_str(abi_layout.alignment32)}) @compileError(\"${struct_name} alignment mismatch\");\n        if (@offsetOf(${struct_name}, \"tag\") != ${U64.to_str(abi_discriminant_offset32(abi_layout))}) @compileError(\"${struct_name} tag offset mismatch\");\n    }\n}\n\n"
+			block =
+				\\comptime {
+				\\    if (@sizeOf(usize) == 8) {
+				\\        if (@sizeOf(${struct_name}) != ${U64.to_str(abi_layout.size64)}) @compileError("${struct_name} size mismatch");
+				\\        if (@alignOf(${struct_name}) != ${U64.to_str(abi_layout.alignment64)}) @compileError("${struct_name} alignment mismatch");
+				\\        if (@offsetOf(${struct_name}, "tag") != ${U64.to_str(abi_discriminant_offset(abi_layout, Pointer64))}) @compileError("${struct_name} tag offset mismatch");
+				\\    }
+				\\    if (@sizeOf(usize) == 4) {
+				\\        if (@sizeOf(${struct_name}) != ${U64.to_str(abi_layout.size32)}) @compileError("${struct_name} size mismatch");
+				\\        if (@alignOf(${struct_name}) != ${U64.to_str(abi_layout.alignment32)}) @compileError("${struct_name} alignment mismatch");
+				\\        if (@offsetOf(${struct_name}, "tag") != ${U64.to_str(abi_discriminant_offset(abi_layout, Pointer32))}) @compileError("${struct_name} tag offset mismatch");
+				\\    }
+				\\}
+			"${block}\n\n"
 		} else {
 			""
 		}
 
-		"${$tuple_structs}/// Tag discriminant for ${tu.name}.\npub const ${struct_name}Tag = enum(${disc_type}) {\n${$enum_variants}};\n\n/// Payload union for ${tu.name}.\npub const ${payload_union_name} = extern union {\n${$union_fields}};\n\n/// Tag union: ${tu.name}\npub const ${struct_name} = if (@sizeOf(usize) == 4) extern struct {\n    payload: [${U64.to_str(abi_discriminant_offset32(abi_layout))}]u8 align(${U64.to_str(abi_layout.alignment32)}),\n    tag: ${struct_name}Tag,\n${$wasm32_accessors}${wasm32_method_decls}} else extern struct {\n    payload: ${payload_union_name},\n    tag: ${struct_name}Tag,\n${$native_accessors}${native_method_decls}};\n\n${assertions}"
+		decl =
+			\\/// Tag discriminant for ${tu.name}.
+			\\pub const ${struct_name}Tag = enum(${disc_type}) {
+			\\${$enum_variants}};
+			\\
+			\\/// Payload union for ${tu.name}.
+			\\pub const ${payload_union_name} = extern union {
+			\\${$union_fields}};
+			\\
+			\\/// Tag union: ${tu.name}
+			\\pub const ${struct_name} = if (@sizeOf(usize) == 4) extern struct {
+			\\    payload: [${U64.to_str(abi_discriminant_offset(abi_layout, Pointer32))}]u8 align(${U64.to_str(abi_layout.alignment32)}),
+			\\    tag: ${struct_name}Tag,
+			\\${$accessors32}${method_decls32}} else extern struct {
+			\\    payload: ${payload_union_name},
+			\\    tag: ${struct_name}Tag,
+			\\${$accessors64}${method_decls64}};
+		"${$tuple_structs}${decl}\n\n${assertions}"
 	}
 }
 
@@ -776,7 +839,7 @@ decref_stmt_for_repr = |type_table, duplicate_tag_names, preferred_names, _type_
 						"    decrefBoxWith(@ptrCast(${expr}), @alignOf(${inner_zig}), false, null, roc_host);\n"
 					}
 				}
-		}
+			}
 		RocRecord(rec) => {
 			if rec.name == "" {
 				""
@@ -813,7 +876,7 @@ incref_stmt_for_repr = |type_table, duplicate_tag_names, preferred_names, _type_
 			match type_table.get(inner_id) {
 				RocFunction(_) => "    increfErasedCallable(${expr}, amount);\n"
 				_ => "    increfBox(@ptrCast(${expr}), amount);\n"
-		}
+			}
 		RocRecord(rec) => {
 			if rec.name == "" {
 				""
@@ -958,13 +1021,16 @@ tag_payload_refcount_uses_param = |type_table, tag, mode| {
 		return Bool.False
 	}
 
-	List.any(tag.payload, |payload_id| {
-		if mode == "decref" {
-			decref_stmt_uses_roc_host_for_type_id(type_table, payload_id)
-		} else {
-			incref_stmt_uses_amount_for_type_id(type_table, payload_id)
-		}
-	})
+	List.any(
+		tag.payload,
+		|payload_id| {
+			if mode == "decref" {
+				decref_stmt_uses_roc_host_for_type_id(type_table, payload_id)
+			} else {
+				incref_stmt_uses_amount_for_type_id(type_table, payload_id)
+			}
+		},
+	)
 }
 
 tag_union_refcount_uses_param = |type_table, tu, mode| {
@@ -986,8 +1052,16 @@ generate_tag_union_refcount_helpers = |type_table, duplicate_tag_names, preferre
 
 	decref_uses_param = tag_union_refcount_uses_param(type_table, tu, "decref")
 	incref_uses_param = tag_union_refcount_uses_param(type_table, tu, "incref")
-	decref_unused = if decref_uses_param { "" } else { "    _ = roc_host;\n" }
-	incref_unused = if incref_uses_param { "" } else { "    _ = amount;\n" }
+	decref_unused = if decref_uses_param {
+		""
+	} else {
+		"    _ = roc_host;\n"
+	}
+	incref_unused = if incref_uses_param {
+		""
+	} else {
+		"    _ = amount;\n"
+	}
 
 	"fn decref${struct_name}(value: ${struct_name}, roc_host: *RocHost) void {\n${decref_unused}    switch (value.tag) {\n${$decref_branches}    }\n}\n\nfn incref${struct_name}(value: ${struct_name}, amount: isize) void {\n${incref_unused}    switch (value.tag) {\n${$incref_branches}    }\n}\n\n"
 }
@@ -1094,7 +1168,7 @@ generate_platform_type_aliases_zig = |hosted_functions, provides_list, type_tabl
 					RocTagUnion(tu) => add_tag_union_aliases_zig($state, plan.alias, target, tu)
 					_ => add_type_alias_zig($state, plan.alias, target)
 				}
-		}
+			}
 	}
 
 	if $state.content == "" {
@@ -1595,13 +1669,13 @@ generate_all_record_structs = |hosted_functions, type_table, duplicate_tag_names
 		match arg_shape.record_lookup(func.ret_type_id) {
 			ArgRecordFound(record) => {
 				struct_name = name_to_struct_name(func.name)
-				native_fields = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Bool.False)
-				wasm32_fields = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Bool.True)
+				fields64 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Pointer64)
+				fields32 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Pointer32)
 
 				doc = "/// Return type record for ${func.name}\n/// Fields ordered by compiler-emitted ABI offsets.\n"
 				$structs = Str.concat(
 					$structs,
-					zig_record_struct_decl(doc, "${struct_name}RetRecord", native_fields, wasm32_fields, "", "", record.layout),
+					zig_record_struct_decl(doc, "${struct_name}RetRecord", fields64, fields32, "", "", record.layout),
 				)
 			}
 			ArgNotRecord => {}
@@ -1628,11 +1702,11 @@ generate_args_struct = |func, type_table, duplicate_tag_names, preferred_names| 
 	match arg_shape.hosted_args(func) {
 		NoMeaningfulArgs => ""
 		SingleRecordArg(record) => {
-			native_fields = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Bool.False)
-			wasm32_fields = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Bool.True)
+			fields64 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Pointer64)
+			fields32 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, record.fields, Pointer32)
 
 			doc = "/// Arguments for ${func.name}\n/// Roc signature: ${func.type_str}\n/// Refcounted fields are owned by the hosted function.\n"
-			zig_record_struct_decl(doc, "${struct_name}Args", native_fields, wasm32_fields, "", "", record.layout)
+			zig_record_struct_decl(doc, "${struct_name}Args", fields64, fields32, "", "", record.layout)
 		}
 		PositionalArgs(arg_type_ids) => {
 			var $positional_fields = ""

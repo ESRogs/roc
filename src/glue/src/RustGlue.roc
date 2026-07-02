@@ -8,6 +8,7 @@ import pf.TypeRepr exposing [TypeRepr]
 import pf.AbiLayout exposing [AbiLayout]
 import pf.AbiFieldLayout exposing [AbiFieldLayout]
 import pf.AbiTagLayout exposing [AbiTagLayout]
+import pf.AbiWidth exposing [AbiWidth]
 import pf.ArgShape exposing [ArgShape]
 import pf.GlueInput exposing [GlueInput]
 import pf.TypeNamePlan exposing [TypeNamePlan]
@@ -52,21 +53,22 @@ type_id_to_rust = |type_table, duplicate_names, preferred_names, type_id| {
 ## Render one struct field declaration for a record field. Unnamed
 ## nominal-record padding fields become fixed-size byte arrays (`[u8; size]`);
 ## named fields use their resolved Rust type.
-rust_record_field_decl = |type_table, duplicate_names, preferred_names, field, is_wasm32| {
+rust_record_field_decl = |type_table, duplicate_names, preferred_names, field, width| {
 	field_name = name_to_rust_field_ident(field.name)
 	rust_type = if field.is_padding {
-		size = if is_wasm32 { field.size32 } else { field.size64 }
-		"[u8; ${U64.to_str(size)}]"
+		"[u8; ${U64.to_str(AbiFieldLayout.size(field, width))}]"
 	} else {
 		type_id_to_rust(type_table, duplicate_names, preferred_names, field.type_id)
 	}
 	"    pub ${field_name}: ${rust_type},\n"
 }
 
-rust_record_fields_decl = |type_table, duplicate_names, preferred_names, fields, is_wasm32| {
+## Fields arrive in committed layout order (valid at both pointer widths);
+## only per-width padding byte counts differ between the two renderings.
+rust_record_fields_decl = |type_table, duplicate_names, preferred_names, fields, width| {
 	var $field_strs = ""
-	for field in AbiFieldLayout.sort_by_target_offset(fields, is_wasm32) {
-		$field_strs = Str.concat($field_strs, rust_record_field_decl(type_table, duplicate_names, preferred_names, field, is_wasm32))
+	for field in fields {
+		$field_strs = Str.concat($field_strs, rust_record_field_decl(type_table, duplicate_names, preferred_names, field, width))
 	}
 	$field_strs
 }
@@ -141,7 +143,7 @@ resolve_tag_union_type_rust = |type_table, duplicate_names, preferred_names, typ
 			} else {
 				"*mut c_void"
 			}
-	}
+		}
 }
 
 ## Determine whether a type is refcounted (heap-allocated).
@@ -161,11 +163,8 @@ abi_record_fields = |abi_layout| abi_layout.record_fields()
 abi_tag_layouts : AbiLayout -> List(AbiTagLayout)
 abi_tag_layouts = |abi_layout| abi_layout.tag_layouts()
 
-abi_discriminant_offset64 : AbiLayout -> U64
-abi_discriminant_offset64 = |abi_layout| abi_layout.discriminant_offset64()
-
-abi_discriminant_offset32 : AbiLayout -> U64
-abi_discriminant_offset32 = |abi_layout| abi_layout.discriminant_offset32()
+abi_discriminant_offset : AbiLayout, AbiWidth -> U64
+abi_discriminant_offset = |abi_layout, width| abi_layout.discriminant_offset(width)
 
 abi_discriminant_size : AbiLayout -> U64
 abi_discriminant_size = |abi_layout| abi_layout.discriminant_size()
@@ -297,19 +296,23 @@ type_name_roots_rust = |hosted_functions, provides_list, type_table| {
 	var $roots = []
 
 	for func in hosted_functions {
-		$roots = $roots.append({
-			alias_base: name_to_struct_name(func.name),
-			module_base: hosted_module_name_to_struct_name(func.name),
-			type_id: func.ret_type_id,
-		})
+		$roots = $roots.append(
+			{
+				alias_base: name_to_struct_name(func.name),
+				module_base: hosted_module_name_to_struct_name(func.name),
+				type_id: func.ret_type_id,
+			},
+		)
 	}
 
 	for entry in provides_list {
-		$roots = $roots.append({
-			alias_base: name_to_struct_name(entry.name),
-			module_base: hosted_module_name_to_struct_name(entry.name),
-			type_id: TypeNamePlan.from_table(type_table).provided_entry_root_type_id(entry),
-		})
+		$roots = $roots.append(
+			{
+				alias_base: name_to_struct_name(entry.name),
+				module_base: hosted_module_name_to_struct_name(entry.name),
+				type_id: TypeNamePlan.from_table(type_table).provided_entry_root_type_id(entry),
+			},
+		)
 	}
 
 	$roots
@@ -363,7 +366,7 @@ generate_platform_type_aliases_rust = |hosted_functions, provides_list, type_tab
 					RocTagUnion(tu) => add_tag_union_aliases_rust($state, plan.alias, target, tu)
 					_ => add_type_alias_rust($state, plan.alias, target)
 				}
-		}
+			}
 	}
 
 	if $state.content == "" {
@@ -504,7 +507,16 @@ abi_tag_has_payload = |tag| tag.payload_size32 > 0 or tag.payload_size64 > 0
 
 rust_layout_assertions = |type_name, abi_layout| {
 	if abi_layout.size64 > 0 or abi_layout.size32 > 0 {
-		"#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size64)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment64)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size32)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment32)}, \"${type_name} alignment mismatch\");\n\n"
+		block =
+			\\#[cfg(target_pointer_width = "64")]
+			\\const _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size64)}, "${type_name} size mismatch");
+			\\#[cfg(target_pointer_width = "64")]
+			\\const _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment64)}, "${type_name} alignment mismatch");
+			\\#[cfg(target_pointer_width = "32")]
+			\\const _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size32)}, "${type_name} size mismatch");
+			\\#[cfg(target_pointer_width = "32")]
+			\\const _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment32)}, "${type_name} alignment mismatch");
+		"${block}\n\n"
 	} else {
 		""
 	}
@@ -512,7 +524,20 @@ rust_layout_assertions = |type_name, abi_layout| {
 
 rust_tag_union_layout_assertions = |type_name, abi_layout| {
 	if abi_layout.size64 > 0 or abi_layout.size32 > 0 {
-		"#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size64)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment64)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(abi_discriminant_offset64(abi_layout))}, \"${type_name} tag offset mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size32)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment32)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(abi_discriminant_offset32(abi_layout))}, \"${type_name} tag offset mismatch\");\n\n"
+		block =
+			\\#[cfg(target_pointer_width = "64")]
+			\\const _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size64)}, "${type_name} size mismatch");
+			\\#[cfg(target_pointer_width = "64")]
+			\\const _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment64)}, "${type_name} alignment mismatch");
+			\\#[cfg(target_pointer_width = "64")]
+			\\const _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(abi_discriminant_offset(abi_layout, Pointer64))}, "${type_name} tag offset mismatch");
+			\\#[cfg(target_pointer_width = "32")]
+			\\const _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size32)}, "${type_name} size mismatch");
+			\\#[cfg(target_pointer_width = "32")]
+			\\const _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment32)}, "${type_name} alignment mismatch");
+			\\#[cfg(target_pointer_width = "32")]
+			\\const _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(abi_discriminant_offset(abi_layout, Pointer32))}, "${type_name} tag offset mismatch");
+		"${block}\n\n"
 	} else {
 		""
 	}
@@ -520,28 +545,61 @@ rust_tag_union_layout_assertions = |type_name, abi_layout| {
 
 rust_payload_layout_assertions = |type_name, tag_layout| {
 	if tag_layout.payload_size64 > 0 or tag_layout.payload_size32 > 0 {
-		"#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_size64)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_alignment64)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_size32)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_alignment32)}, \"${type_name} alignment mismatch\");\n\n"
+		block =
+			\\#[cfg(target_pointer_width = "64")]
+			\\const _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_size64)}, "${type_name} size mismatch");
+			\\#[cfg(target_pointer_width = "64")]
+			\\const _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_alignment64)}, "${type_name} alignment mismatch");
+			\\#[cfg(target_pointer_width = "32")]
+			\\const _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_size32)}, "${type_name} size mismatch");
+			\\#[cfg(target_pointer_width = "32")]
+			\\const _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_alignment32)}, "${type_name} alignment mismatch");
+		"${block}\n\n"
 	} else {
 		""
 	}
 }
 
 generate_record_struct_decl_rust = |doc, struct_name, type_table, duplicate_names, preferred_names, fields, _anonymous, abi_layout| {
-	native_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.False)
-	wasm32_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.True)
+	field_strs64 = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Pointer64)
+	field_strs32 = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Pointer32)
 	assertions = rust_layout_assertions(struct_name, abi_layout)
 
-	struct_decl = "${doc}#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${wasm32_field_strs}}\n\n${doc}#[cfg(not(target_pointer_width = \"32\"))]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${native_field_strs}}\n\n"
+	struct_decl =
+		\\${doc}#[cfg(target_pointer_width = "32")]
+		\\#[repr(C)]
+		\\#[derive(Clone, Copy)]
+		\\pub struct ${struct_name} {
+		\\${field_strs32}}
+		\\
+		\\${doc}#[cfg(not(target_pointer_width = "32"))]
+		\\#[repr(C)]
+		\\#[derive(Clone, Copy)]
+		\\pub struct ${struct_name} {
+		\\${field_strs64}}
 
-	"${struct_decl}${assertions}"
+	"${struct_decl}\n\n${assertions}"
 }
 
 generate_payload_struct_decl_rust = |doc, struct_name, type_table, duplicate_names, preferred_names, fields, tag_layout| {
-	native_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.False)
-	wasm32_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.True)
+	field_strs64 = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Pointer64)
+	field_strs32 = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Pointer32)
 	assertions = rust_payload_layout_assertions(struct_name, tag_layout)
 
-	"${doc}#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${wasm32_field_strs}}\n\n${doc}#[cfg(not(target_pointer_width = \"32\"))]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${native_field_strs}}\n\n${assertions}"
+	struct_decl =
+		\\${doc}#[cfg(target_pointer_width = "32")]
+		\\#[repr(C)]
+		\\#[derive(Clone, Copy)]
+		\\pub struct ${struct_name} {
+		\\${field_strs32}}
+		\\
+		\\${doc}#[cfg(not(target_pointer_width = "32"))]
+		\\#[repr(C)]
+		\\#[derive(Clone, Copy)]
+		\\pub struct ${struct_name} {
+		\\${field_strs64}}
+
+	"${struct_decl}\n\n${assertions}"
 }
 
 # =============================================================================
@@ -1561,7 +1619,45 @@ generate_single_tag_union_rust = |type_table, duplicate_names, preferred_names, 
 		assertions = rust_tag_union_layout_assertions(struct_name, abi_layout)
 		alignment_marker = "${struct_name}PayloadAlignment"
 
-		"${$tuple_structs}/// Tag discriminant for ${tu.name}.\n#[repr(${disc_type})]\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ${struct_name}Tag {\n${$enum_variants}}\n\n#[repr(C)]\n#[derive(Clone, Copy)]\npub union ${struct_name}Payload {\n${$union_fields}}\n\n#[cfg(target_pointer_width = \"32\")]\n#[repr(align(${U64.to_str(abi_layout.alignment32)}))]\n#[derive(Clone, Copy)]\npub struct ${alignment_marker};\n\n/// Tag union: ${tu.name}\n#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n    pub _payload_alignment: [${alignment_marker}; 0],\n    pub payload: [u8; ${U64.to_str(abi_discriminant_offset32(abi_layout))}],\n    pub tag: ${struct_name}Tag,\n}\n\n/// Tag union: ${tu.name}\n#[cfg(not(target_pointer_width = \"32\"))]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n    pub payload: ${struct_name}Payload,\n    pub tag: ${struct_name}Tag,\n}\n\nimpl ${struct_name} {\n${$payload_accessors}}\n\n${assertions}"
+		decl =
+			\\/// Tag discriminant for ${tu.name}.
+			\\#[repr(${disc_type})]
+			\\#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+			\\pub enum ${struct_name}Tag {
+			\\${$enum_variants}}
+			\\
+			\\#[repr(C)]
+			\\#[derive(Clone, Copy)]
+			\\pub union ${struct_name}Payload {
+			\\${$union_fields}}
+			\\
+			\\#[cfg(target_pointer_width = "32")]
+			\\#[repr(align(${U64.to_str(abi_layout.alignment32)}))]
+			\\#[derive(Clone, Copy)]
+			\\pub struct ${alignment_marker};
+			\\
+			\\/// Tag union: ${tu.name}
+			\\#[cfg(target_pointer_width = "32")]
+			\\#[repr(C)]
+			\\#[derive(Clone, Copy)]
+			\\pub struct ${struct_name} {
+			\\    pub _payload_alignment: [${alignment_marker}; 0],
+			\\    pub payload: [u8; ${U64.to_str(abi_discriminant_offset(abi_layout, Pointer32))}],
+			\\    pub tag: ${struct_name}Tag,
+			\\}
+			\\
+			\\/// Tag union: ${tu.name}
+			\\#[cfg(not(target_pointer_width = "32"))]
+			\\#[repr(C)]
+			\\#[derive(Clone, Copy)]
+			\\pub struct ${struct_name} {
+			\\    pub payload: ${struct_name}Payload,
+			\\    pub tag: ${struct_name}Tag,
+			\\}
+			\\
+			\\impl ${struct_name} {
+			\\${$payload_accessors}}
+		"${$tuple_structs}${decl}\n\n${assertions}"
 	}
 }
 
