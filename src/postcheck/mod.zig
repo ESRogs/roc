@@ -42,3 +42,18 @@ test "postcheck declarations are referenced" {
     std.testing.refAllDecls(@import("monotype/serialize.zig"));
     std.testing.refAllDecls(@import("monotype/solve.zig"));
 }
+
+test "lambda solved unification loop is iterative" {
+    const source = @embedFile("lambda_solved/solve.zig");
+    const unify_start = std.mem.indexOf(u8, source, "    fn unify(self: *Solver") orelse
+        @panic("lambda solved unify function not found");
+    const transparent_alias_start = std.mem.indexOfPos(u8, source, unify_start, "    fn transparentAliasBacking") orelse
+        @panic("lambda solved transparent alias helper not found");
+    const unify_source = source[unify_start..transparent_alias_start];
+
+    try std.testing.expect(std.mem.indexOf(u8, unify_source, "try self.unify(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unify_source, "try self.unifySpans(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unify_source, "try self.unifyFields(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unify_source, "try self.unifyTags(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unify_source, "try self.unifyCaptures(") == null);
+}

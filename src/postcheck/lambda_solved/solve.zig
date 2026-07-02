@@ -25,6 +25,48 @@ const UnifyPair = struct {
     }
 };
 
+const UnifyFinishAction = union(enum) {
+    link_rhs_to_lhs: struct {
+        lhs: Type.TypeVarId,
+        rhs: Type.TypeVarId,
+    },
+    link_lhs_to_rhs: struct {
+        lhs: Type.TypeVarId,
+        rhs: Type.TypeVarId,
+    },
+    link_var_to_root: struct {
+        var_: Type.TypeVarId,
+        target: Type.TypeVarId,
+    },
+    set_left_erased_link_right: struct {
+        lhs: Type.TypeVarId,
+        rhs: Type.TypeVarId,
+        source_fn_ty: Type.names.TypeDigest,
+        members: Type.Span,
+    },
+    set_left_lambda_set_link_right: struct {
+        lhs: Type.TypeVarId,
+        rhs: Type.TypeVarId,
+        members: Type.Span,
+    },
+};
+
+const UnifyFrame = union(enum) {
+    process: struct {
+        lhs: Type.TypeVarId,
+        rhs: Type.TypeVarId,
+    },
+    finish: struct {
+        pair: UnifyPair,
+        action: UnifyFinishAction,
+    },
+};
+
+const CaptureSpanPair = struct {
+    lhs: Type.Span,
+    rhs: Type.Span,
+};
+
 /// Solve lambda-set relationships in a lifted Monotype program.
 pub fn run(
     allocator: Allocator,
@@ -57,6 +99,7 @@ const Solver = struct {
     loop_params: std.ArrayList(Type.Span),
     return_contexts: std.ArrayList(ReturnContext),
     active_unifications: std.AutoHashMap(UnifyPair, void),
+    unify_stack: std.ArrayList(UnifyFrame),
 
     const FunctionShape = struct {
         args: Type.Span,
@@ -105,10 +148,12 @@ const Solver = struct {
             .loop_params = .empty,
             .return_contexts = .empty,
             .active_unifications = std.AutoHashMap(UnifyPair, void).init(allocator),
+            .unify_stack = .empty,
         };
     }
 
     fn deinit(self: *Solver) void {
+        self.unify_stack.deinit(self.allocator);
         self.active_unifications.deinit();
         self.return_contexts.deinit(self.allocator);
         self.loop_params.deinit(self.allocator);
@@ -1200,6 +1245,46 @@ const Solver = struct {
     }
 
     fn unify(self: *Solver, lhs: Type.TypeVarId, rhs: Type.TypeVarId) Allocator.Error!void {
+        std.debug.assert(self.unify_stack.items.len == 0);
+        std.debug.assert(self.active_unifications.count() == 0);
+        defer self.unify_stack.clearRetainingCapacity();
+        try self.pushUnifyPair(&self.unify_stack, lhs, rhs);
+
+        while (self.unify_stack.pop()) |frame| {
+            switch (frame) {
+                .process => |process| try self.processUnifyPair(&self.unify_stack, process.lhs, process.rhs),
+                .finish => |finish| {
+                    self.applyUnifyFinish(finish.action);
+                    _ = self.active_unifications.remove(finish.pair);
+                },
+            }
+        }
+    }
+
+    fn transparentAliasBacking(content: Type.Content) ?Type.TypeVarId {
+        return switch (content) {
+            .named => |named| if (named.kind == .alias)
+                (named.backing orelse Common.invariant("transparent alias reached Lambda Solved without a backing type")).ty
+            else
+                null,
+            else => null,
+        };
+    }
+
+    fn pushUnifyPair(self: *Solver, stack: *std.ArrayList(UnifyFrame), lhs: Type.TypeVarId, rhs: Type.TypeVarId) Allocator.Error!void {
+        try stack.append(self.allocator, .{ .process = .{ .lhs = lhs, .rhs = rhs } });
+    }
+
+    fn pushFinish(
+        self: *Solver,
+        stack: *std.ArrayList(UnifyFrame),
+        pair: UnifyPair,
+        action: UnifyFinishAction,
+    ) Allocator.Error!void {
+        try stack.append(self.allocator, .{ .finish = .{ .pair = pair, .action = action } });
+    }
+
+    fn processUnifyPair(self: *Solver, stack: *std.ArrayList(UnifyFrame), lhs: Type.TypeVarId, rhs: Type.TypeVarId) Allocator.Error!void {
         const a = self.program.types.root(lhs);
         const b = self.program.types.root(rhs);
         if (a == b) return;
@@ -1229,16 +1314,16 @@ const Solver = struct {
         const pair = UnifyPair.init(a, b);
         const active_entry = try self.active_unifications.getOrPut(pair);
         if (active_entry.found_existing) return;
-        defer _ = self.active_unifications.remove(pair);
+        errdefer _ = self.active_unifications.remove(pair);
 
         if (transparentAliasBacking(left)) |backing| {
-            try self.unify(backing, b);
-            self.program.types.set(a, .{ .link = self.program.types.root(backing) });
+            try self.pushFinish(stack, pair, .{ .link_var_to_root = .{ .var_ = a, .target = backing } });
+            try self.pushUnifyPair(stack, backing, b);
             return;
         }
         if (transparentAliasBacking(right)) |backing| {
-            try self.unify(a, backing);
-            self.program.types.set(b, .{ .link = self.program.types.root(backing) });
+            try self.pushFinish(stack, pair, .{ .link_var_to_root = .{ .var_ = b, .target = backing } });
+            try self.pushUnifyPair(stack, a, backing);
             return;
         }
 
@@ -1249,11 +1334,15 @@ const Solver = struct {
                         Common.invariant("primitive types failed Lambda Solved unification");
                     }
                     self.program.types.set(b, .{ .link = a });
+                    _ = self.active_unifications.remove(pair);
                 },
                 else => Common.invariant("primitive type failed Lambda Solved unification"),
             },
             .zst => switch (right) {
-                .zst => self.program.types.set(b, .{ .link = a }),
+                .zst => {
+                    self.program.types.set(b, .{ .link = a });
+                    _ = self.active_unifications.remove(pair);
+                },
                 else => Common.invariant("zero-sized type failed Lambda Solved unification"),
             },
             .erased => |left_erased| switch (right) {
@@ -1261,77 +1350,98 @@ const Solver = struct {
                     if (!std.mem.eql(u8, left_erased.source_fn_ty.bytes[0..], right_erased.source_fn_ty.bytes[0..])) {
                         Common.invariant("erased callable source function types failed Lambda Solved unification");
                     }
-                    self.program.types.set(a, .{ .erased = .{
+                    var capture_pairs = std.ArrayList(CaptureSpanPair).empty;
+                    defer capture_pairs.deinit(self.allocator);
+                    const merged = try self.mergeLambdaSets(left_erased.members, right_erased.members, &capture_pairs);
+                    try self.pushFinish(stack, pair, .{ .set_left_erased_link_right = .{
+                        .lhs = a,
+                        .rhs = b,
                         .source_fn_ty = left_erased.source_fn_ty,
-                        .members = try self.mergeLambdaSets(left_erased.members, right_erased.members),
+                        .members = merged,
                     } });
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushCaptureSpanPairs(stack, capture_pairs.items);
                 },
                 .lambda_set => |right_members| {
-                    self.program.types.set(a, .{ .erased = .{
+                    var capture_pairs = std.ArrayList(CaptureSpanPair).empty;
+                    defer capture_pairs.deinit(self.allocator);
+                    const merged = try self.mergeLambdaSets(left_erased.members, right_members, &capture_pairs);
+                    try self.pushFinish(stack, pair, .{ .set_left_erased_link_right = .{
+                        .lhs = a,
+                        .rhs = b,
                         .source_fn_ty = left_erased.source_fn_ty,
-                        .members = try self.mergeLambdaSets(left_erased.members, right_members),
+                        .members = merged,
                     } });
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushCaptureSpanPairs(stack, capture_pairs.items);
                 },
                 else => Common.invariant("erased callable type failed Lambda Solved unification"),
             },
             .lambda_set => |left_members| switch (right) {
                 .erased => |right_erased| {
-                    self.program.types.set(a, .{ .erased = .{
+                    var capture_pairs = std.ArrayList(CaptureSpanPair).empty;
+                    defer capture_pairs.deinit(self.allocator);
+                    const merged = try self.mergeLambdaSets(left_members, right_erased.members, &capture_pairs);
+                    try self.pushFinish(stack, pair, .{ .set_left_erased_link_right = .{
+                        .lhs = a,
+                        .rhs = b,
                         .source_fn_ty = right_erased.source_fn_ty,
-                        .members = try self.mergeLambdaSets(left_members, right_erased.members),
+                        .members = merged,
                     } });
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushCaptureSpanPairs(stack, capture_pairs.items);
                 },
                 .lambda_set => |right_members| {
-                    const merged = try self.mergeLambdaSets(left_members, right_members);
-                    self.program.types.set(a, .{ .lambda_set = merged });
-                    self.program.types.set(b, .{ .link = a });
+                    var capture_pairs = std.ArrayList(CaptureSpanPair).empty;
+                    defer capture_pairs.deinit(self.allocator);
+                    const merged = try self.mergeLambdaSets(left_members, right_members, &capture_pairs);
+                    try self.pushFinish(stack, pair, .{ .set_left_lambda_set_link_right = .{
+                        .lhs = a,
+                        .rhs = b,
+                        .members = merged,
+                    } });
+                    try self.pushCaptureSpanPairs(stack, capture_pairs.items);
                 },
                 else => Common.invariant("lambda set failed Lambda Solved unification"),
             },
             .func => |left_fn| switch (right) {
                 .func => |right_fn| {
-                    try self.unifySpans(left_fn.args, right_fn.args, "function argument lists failed Lambda Solved unification");
-                    try self.unify(left_fn.callable, right_fn.callable);
-                    try self.unify(left_fn.ret, right_fn.ret);
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
+                    try self.pushUnifyPair(stack, left_fn.ret, right_fn.ret);
+                    try self.pushUnifyPair(stack, left_fn.callable, right_fn.callable);
+                    try self.pushSpanPairs(stack, left_fn.args, right_fn.args, "function argument lists failed Lambda Solved unification");
                 },
                 else => Common.invariant("function type failed Lambda Solved unification"),
             },
             .list => |left_elem| switch (right) {
                 .list => |right_elem| {
-                    try self.unify(left_elem, right_elem);
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
+                    try self.pushUnifyPair(stack, left_elem, right_elem);
                 },
                 else => Common.invariant("list type failed Lambda Solved unification"),
             },
             .box => |left_elem| switch (right) {
                 .box => |right_elem| {
-                    try self.unify(left_elem, right_elem);
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
+                    try self.pushUnifyPair(stack, left_elem, right_elem);
                 },
                 else => Common.invariant("box type failed Lambda Solved unification"),
             },
             .tuple => |left_items| switch (right) {
                 .tuple => |right_items| {
-                    try self.unifySpans(left_items, right_items, "tuple item lists failed Lambda Solved unification");
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
+                    try self.pushSpanPairs(stack, left_items, right_items, "tuple item lists failed Lambda Solved unification");
                 },
                 else => Common.invariant("tuple type failed Lambda Solved unification"),
             },
             .record => |left_fields| switch (right) {
                 .record => |right_fields| {
-                    try self.unifyFields(left_fields, right_fields);
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
+                    try self.pushFieldPairs(stack, left_fields, right_fields);
                 },
                 else => Common.invariant("record type failed Lambda Solved unification"),
             },
             .tag_union => |left_tags| switch (right) {
                 .tag_union => |right_tags| {
-                    try self.unifyTags(left_tags, right_tags);
-                    self.program.types.set(b, .{ .link = a });
+                    try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
+                    try self.pushTagPairs(stack, left_tags, right_tags);
                 },
                 else => Common.invariant("tag-union type failed Lambda Solved unification"),
             },
@@ -1343,28 +1453,26 @@ const Solver = struct {
                     {
                         Common.invariant("named type identity failed Lambda Solved unification");
                     }
-                    try self.unifySpans(left_named.args, right_named.args, "named type arguments failed Lambda Solved unification");
-                    // Aliases have already been unwrapped above. Generated
-                    // opaque evidence uses its backing only to carry generated
-                    // compile-time evidence rows, so two values with the same nominal
-                    // identity may intentionally have different backing rows.
+
                     if (isGeneratedOpaqueEvidenceOwner(left_named.builtin_owner) or
                         isGeneratedOpaqueEvidenceOwner(right_named.builtin_owner))
                     {
                         if (self.generatedOpaqueEvidenceScore(right_named) > self.generatedOpaqueEvidenceScore(left_named)) {
-                            self.program.types.set(a, .{ .link = b });
+                            try self.pushFinish(stack, pair, .{ .link_lhs_to_rhs = .{ .lhs = a, .rhs = b } });
                         } else {
-                            self.program.types.set(b, .{ .link = a });
+                            try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
                         }
+                        try self.pushSpanPairs(stack, left_named.args, right_named.args, "named type arguments failed Lambda Solved unification");
                     } else {
+                        try self.pushFinish(stack, pair, .{ .link_rhs_to_lhs = .{ .lhs = a, .rhs = b } });
                         if (left_named.backing) |left_backing| {
                             const right_backing = right_named.backing orelse Common.invariant("named type backing differed during Lambda Solved unification");
                             if (left_backing.use != right_backing.use) Common.invariant("named type backing use differed during Lambda Solved unification");
-                            try self.unify(left_backing.ty, right_backing.ty);
+                            try self.pushUnifyPair(stack, left_backing.ty, right_backing.ty);
                         } else if (right_named.backing != null) {
                             Common.invariant("named type backing differed during Lambda Solved unification");
                         }
-                        self.program.types.set(b, .{ .link = a });
+                        try self.pushSpanPairs(stack, left_named.args, right_named.args, "named type arguments failed Lambda Solved unification");
                     }
                 },
                 else => Common.invariant("named type failed Lambda Solved unification"),
@@ -1373,46 +1481,66 @@ const Solver = struct {
         }
     }
 
-    fn transparentAliasBacking(content: Type.Content) ?Type.TypeVarId {
-        return switch (content) {
-            .named => |named| if (named.kind == .alias)
-                (named.backing orelse Common.invariant("transparent alias reached Lambda Solved without a backing type")).ty
-            else
-                null,
-            else => null,
-        };
-    }
-
-    fn unifySpans(self: *Solver, lhs: Type.Span, rhs: Type.Span, comptime message: []const u8) Allocator.Error!void {
-        if (lhs.count() != rhs.count()) Common.invariant(message);
-        for (0..lhs.count()) |i| {
-            const left_ty = self.program.types.spanItem(lhs, i);
-            const right_ty = self.program.types.spanItem(rhs, i);
-            try self.unify(left_ty, right_ty);
+    fn applyUnifyFinish(self: *Solver, action: UnifyFinishAction) void {
+        switch (action) {
+            .link_rhs_to_lhs => |link| self.program.types.set(link.rhs, .{ .link = link.lhs }),
+            .link_lhs_to_rhs => |link| self.program.types.set(link.lhs, .{ .link = link.rhs }),
+            .link_var_to_root => |link| self.program.types.set(link.var_, .{ .link = self.program.types.root(link.target) }),
+            .set_left_erased_link_right => |set| {
+                self.program.types.set(set.lhs, .{ .erased = .{
+                    .source_fn_ty = set.source_fn_ty,
+                    .members = set.members,
+                } });
+                self.program.types.set(set.rhs, .{ .link = set.lhs });
+            },
+            .set_left_lambda_set_link_right => |set| {
+                self.program.types.set(set.lhs, .{ .lambda_set = set.members });
+                self.program.types.set(set.rhs, .{ .link = set.lhs });
+            },
         }
     }
 
-    fn unifyFields(self: *Solver, lhs: Type.Span, rhs: Type.Span) Allocator.Error!void {
+    fn pushSpanPairs(self: *Solver, stack: *std.ArrayList(UnifyFrame), lhs: Type.Span, rhs: Type.Span, comptime message: []const u8) Allocator.Error!void {
+        if (lhs.count() != rhs.count()) Common.invariant(message);
+        var i = lhs.count();
+        while (i > 0) {
+            i -= 1;
+            const left_ty = self.program.types.spanItem(lhs, i);
+            const right_ty = self.program.types.spanItem(rhs, i);
+            try self.pushUnifyPair(stack, left_ty, right_ty);
+        }
+    }
+
+    fn pushFieldPairs(self: *Solver, stack: *std.ArrayList(UnifyFrame), lhs: Type.Span, rhs: Type.Span) Allocator.Error!void {
         if (lhs.count() != rhs.count()) Common.invariant("record field count failed Lambda Solved unification");
-        for (0..lhs.count()) |i| {
+        var i = lhs.count();
+        while (i > 0) {
+            i -= 1;
             const left_field = self.program.types.fieldItem(lhs, i);
             const right_field = self.program.types.fieldItem(rhs, i);
             if (left_field.name != right_field.name) Common.invariant("record field order failed Lambda Solved unification");
-            try self.unify(left_field.ty, right_field.ty);
+            try self.pushUnifyPair(stack, left_field.ty, right_field.ty);
         }
     }
 
-    fn unifyTags(self: *Solver, lhs: Type.Span, rhs: Type.Span) Allocator.Error!void {
+    fn pushTagPairs(self: *Solver, stack: *std.ArrayList(UnifyFrame), lhs: Type.Span, rhs: Type.Span) Allocator.Error!void {
         if (lhs.count() != rhs.count()) Common.invariant("tag count failed Lambda Solved unification");
-        for (0..lhs.count()) |i| {
+        var i = lhs.count();
+        while (i > 0) {
+            i -= 1;
             const left_tag = self.program.types.tagItem(lhs, i);
             const right_tag = self.program.types.tagItem(rhs, i);
             if (left_tag.name != right_tag.name) Common.invariant("tag order failed Lambda Solved unification");
-            try self.unifySpans(left_tag.payloads, right_tag.payloads, "tag payload count failed Lambda Solved unification");
+            try self.pushSpanPairs(stack, left_tag.payloads, right_tag.payloads, "tag payload count failed Lambda Solved unification");
         }
     }
 
-    fn mergeLambdaSets(self: *Solver, lhs: Type.Span, rhs: Type.Span) Allocator.Error!Type.Span {
+    fn mergeLambdaSets(
+        self: *Solver,
+        lhs: Type.Span,
+        rhs: Type.Span,
+        capture_pairs: *std.ArrayList(CaptureSpanPair),
+    ) Allocator.Error!Type.Span {
         var members = std.ArrayList(Type.FnMember).empty;
         defer members.deinit(self.allocator);
 
@@ -1424,7 +1552,10 @@ const Solver = struct {
             for (members.items) |left_member| {
                 if (left_member.lambda != right_member.lambda) continue;
                 found = true;
-                try self.unifyCaptures(left_member.captures, right_member.captures);
+                try capture_pairs.append(self.allocator, .{
+                    .lhs = left_member.captures,
+                    .rhs = right_member.captures,
+                });
                 break;
             }
             if (!found) try members.append(self.allocator, right_member);
@@ -1433,15 +1564,25 @@ const Solver = struct {
         return try self.program.types.addMembers(members.items);
     }
 
-    fn unifyCaptures(self: *Solver, lhs: Type.Span, rhs: Type.Span) Allocator.Error!void {
+    fn pushCaptureSpanPairs(self: *Solver, stack: *std.ArrayList(UnifyFrame), pairs: []const CaptureSpanPair) Allocator.Error!void {
+        var i = pairs.len;
+        while (i > 0) {
+            i -= 1;
+            try self.pushCapturePairs(stack, pairs[i].lhs, pairs[i].rhs);
+        }
+    }
+
+    fn pushCapturePairs(self: *Solver, stack: *std.ArrayList(UnifyFrame), lhs: Type.Span, rhs: Type.Span) Allocator.Error!void {
         if (lhs.count() != rhs.count()) Common.invariant("capture count failed Lambda Solved unification");
-        for (0..lhs.count()) |i| {
+        var i = lhs.count();
+        while (i > 0) {
+            i -= 1;
             const left_capture = self.program.types.captureItem(lhs, i);
             const right_capture = self.program.types.captureItem(rhs, i);
             if (left_capture.capture_id != right_capture.capture_id) {
                 Common.invariant("capture identity failed Lambda Solved unification");
             }
-            try self.unify(left_capture.ty, right_capture.ty);
+            try self.pushUnifyPair(stack, left_capture.ty, right_capture.ty);
         }
     }
 
