@@ -3235,17 +3235,33 @@ const Lowerer = struct {
         if (solved_args.len != lifted_args.len) Common.invariant("direct Lambda Mono function arity changed after Lambda Solved");
         if (arg_locals.len != lifted_args.len) Common.invariant("inline call argument count differed from function arity");
 
+        // An inlined parameter binds a fresh local for the duration of the
+        // inlined body and shadows any enclosing binding of the same lifted
+        // local. A closure nested in the callee reuses the callee's parameter
+        // ids as its capture ids, so when the enclosing function being lowered
+        // captures those same ids, the parameter binding must win over the
+        // capture binding. Shadow both `local_map` and the capture table so a
+        // capture-record read (`captureBindingForLocal`) cannot resolve a
+        // parameter reference back to the enclosing capture.
         const saved = try self.allocator.alloc(?LIR.LocalId, lifted_args.len);
         defer self.allocator.free(saved);
+        const saved_captures = try self.allocator.alloc(?CaptureBinding, lifted_args.len);
+        defer self.allocator.free(saved_captures);
+        try self.captures.ensureUnusedCapacity(@intCast(lifted_args.len));
         for (lifted_args, 0..) |arg, i| {
             saved[i] = self.local_map[@intFromEnum(arg.local)];
+            saved_captures[i] = self.captures.get(arg.local);
         }
         for (lifted_args, 0..) |arg, i| {
             self.local_map[@intFromEnum(arg.local)] = arg_locals[i];
+            _ = self.captures.remove(arg.local);
         }
         defer {
             for (lifted_args, 0..) |arg, i| {
                 self.local_map[@intFromEnum(arg.local)] = saved[i];
+                if (saved_captures[i]) |capture| {
+                    self.captures.putAssumeCapacity(arg.local, capture);
+                }
             }
         }
 
