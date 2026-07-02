@@ -4535,3 +4535,321 @@ test "spec constr specializes match-joined record state carried by while loop" {
     try std.testing.expect(!try reachableProcShape(allocator, &unoptimized.lowered, branchJoinedRecordStateWorkerIsSpecialized));
     try std.testing.expect(try reachableProcShape(allocator, &unoptimized.lowered, branchJoinedRecordStateWorkerIsGeneric));
 }
+
+// ============================================================================
+// Iterator-fusion differential harness (iter_fusion_design.md Phase 0).
+//
+// Each `iterdiff:` test lowers ONE Roc source under two inline modes and runs
+// both through the interpreter against `RuntimeHostEnv`, then asserts the two
+// runs are observationally identical:
+//
+//   * `.wrappers` is the optimized/inlined lowering (the closest proxy the tree
+//     has for "fused" until real stream fusion lands; when fusion is
+//     implemented it composes into this same mode, so these tests keep guarding
+//     it).
+//   * `.none` is the naive, un-inlined lowering ("unfused").
+//
+// The two runs must agree on:
+//   * crash-versus-no-crash (`RecordedRun.termination`), and
+//   * the full ordered host-effect trace (`RecordedRun.events`): every `dbg`,
+//     `expect` failure, and crash message, in order.
+//
+// Result VALUES are observed through the effect trace: each pipeline `dbg`s its
+// result (and, where useful, each element as it is produced). `dbg` renders a
+// value structurally and pointer-independently (e.g. `[6, 8, 10, 12]`), so a
+// `dbg` of the collected List/Set output is a complete, allocation-independent
+// value assertion that lives inside the compared trace. Ordered per-element
+// `dbg`s additionally pin element order and effect ordering (design invariants
+// 4 and 5). Allocation counts are intentionally NOT compared: fusing away
+// adapter objects legitimately changes how much a run allocates.
+//
+// A test that fails or crashes here on the current tree is a genuine
+// pre-existing divergence between the optimized and naive lowerings, not a test
+// bug; such cases are committed commented-out with a `// Pre-existing
+// divergence:` marker rather than weakened to pass.
+// ============================================================================
+
+fn expectRecordedRunsEqual(
+    expected: eval.RuntimeHostEnv.RecordedRun,
+    actual: eval.RuntimeHostEnv.RecordedRun,
+) TestError!void {
+    // crash-versus-no-crash
+    try std.testing.expectEqual(expected.termination, actual.termination);
+
+    // full ordered effect trace (dbg values, expect failures, crash messages)
+    try std.testing.expectEqual(expected.events.len, actual.events.len);
+    for (expected.events, actual.events) |expected_event, actual_event| {
+        try std.testing.expectEqual(
+            std.meta.activeTag(expected_event),
+            std.meta.activeTag(actual_event),
+        );
+        try std.testing.expectEqualStrings(expected_event.bytes(), actual_event.bytes());
+    }
+}
+
+fn expectSameObservationsAcrossInlineModes(source: []const u8) TestError!void {
+    const allocator = std.testing.allocator;
+
+    var optimized = try lowerModule(allocator, source, .wrappers);
+    defer optimized.deinit(allocator);
+
+    var naive = try lowerModule(allocator, source, .none);
+    defer naive.deinit(allocator);
+
+    var naive_run = try runLoweredWithHostEvents(allocator, &naive.lowered);
+    defer naive_run.deinit(allocator);
+
+    var optimized_run = try runLoweredWithHostEvents(allocator, &optimized.lowered);
+    defer optimized_run.deinit(allocator);
+
+    try expectRecordedRunsEqual(naive_run, optimized_run);
+}
+
+test "iterdiff: bounded list map collect agrees across inline modes" {
+    // Map over a statically-known list, collected into a List, then reduced to a
+    // scalar. The `dbg` of the collected list is the structural (allocation-
+    // independent) value assertion; `dbg` of the scalar pins the fold result.
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : I64
+        \\main = {
+        \\    doubled : List(I64)
+        \\    doubled =
+        \\        [1.I64, 2, 3, 4, 5, 6]
+        \\            .iter()
+        \\            .map(|n| n * 2)
+        \\            .collect()
+        \\    total = List.sum(doubled)
+        \\    dbg doubled
+        \\    dbg total
+        \\    total
+        \\}
+    );
+}
+
+// Pre-existing divergence: a filter-like adapter (`keep_if`) diverges between
+// the two lowerings under the optimized mode, independent of its consumer. The
+// naive (`.none`) lowering evaluates correctly and returns the filtered list;
+// the optimized (`.wrappers`) lowering HANGS in an unterminated step loop (the
+// fused `keep_if` Skip result never reaches Done), for BOTH the `.collect()`
+// consumer and a hand-written `for`/append loop consumer. Minimal repro:
+// `[1.I64, 2, 3].iter().keep_if(|n| n > 1).collect()` returns `[2, 3]` under
+// `.none` but does not terminate under `.wrappers`. Committed commented-out
+// because a hanging test cannot run in the suite.
+//
+// test "iterdiff: bounded list map keep_if collect agrees across inline modes" {
+//     try expectSameObservationsAcrossInlineModes(
+//         \\module [main]
+//         \\
+//         \\main : I64
+//         \\main = {
+//         \\    doubled : List(I64)
+//         \\    doubled =
+//         \\        [1.I64, 2, 3, 4, 5, 6]
+//         \\            .iter()
+//         \\            .map(|n| n * 2)
+//         \\            .keep_if(|n| n > 5)
+//         \\            .collect()
+//         \\    total = List.sum(doubled)
+//         \\    dbg doubled
+//         \\    dbg total
+//         \\    total
+//         \\}
+//     );
+// }
+
+test "iterdiff: if-chosen iterator chains consumed by one loop agree across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : I64
+        \\main = {
+        \\    threshold = 4.I64
+        \\    chosen : Iter(I64)
+        \\    chosen =
+        \\        if threshold > 3 {
+        \\            [1.I64, 2, 3].iter().map(|n| n * 10)
+        \\        } else {
+        \\            [4.I64, 5, 6].iter().keep_if(|n| n > 4)
+        \\        }
+        \\    var $sum = 0.I64
+        \\    for x in chosen {
+        \\        dbg x
+        \\        $sum = $sum + x
+        \\    }
+        \\    dbg $sum
+        \\    $sum
+        \\}
+    );
+}
+
+test "iterdiff: set materialized mid-pipeline then iterated agrees across inline modes" {
+    // Design invariant 4: constructing a Set from the elements really runs, so
+    // its deduplication happens exactly where written; the pipeline then keeps
+    // iterating over the materialized result. Both lowerings must observe the
+    // same deduplicated element sequence and the same collected output.
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : I64
+        \\main = {
+        \\    deduped : Set(I64)
+        \\    deduped = Set.from_list([3.I64, 1, 2, 2, 3, 1, 4, 3])
+        \\    doubled : List(I64)
+        \\    doubled =
+        \\        deduped
+        \\            .to_list()
+        \\            .iter()
+        \\            .map(|n| n * 2)
+        \\            .collect()
+        \\    dbg deduped.to_list()
+        \\    dbg doubled
+        \\    List.sum(doubled)
+        \\}
+    );
+}
+
+test "iterdiff: coarse custom is_eq set dedup keeps same representative across inline modes" {
+    // Design invariant 6: the optimizer must never use a user `is_eq` result to
+    // substitute one value for another. `Bucket.is_eq` compares only `key`, so
+    // deduplication is a coarse quotient; `tag` is the representative-
+    // distinguishing observer. Both lowerings must keep the SAME surviving
+    // representative (identical ordered `tag` trace), never a different one the
+    // quotient happens to call equal.
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\Bucket := { key : I64, tag : I64 }.{
+        \\    is_eq : Bucket, Bucket -> Bool
+        \\    is_eq = |a, b| a.key == b.key
+        \\}
+        \\
+        \\main : I64
+        \\main = {
+        \\    buckets : List(Bucket)
+        \\    buckets = [
+        \\        { key: 1, tag: 100 },
+        \\        { key: 2, tag: 200 },
+        \\        { key: 1, tag: 999 },
+        \\        { key: 2, tag: 888 },
+        \\        { key: 3, tag: 300 },
+        \\    ]
+        \\    deduped : Set(Bucket)
+        \\    deduped = Set.from_list(buckets)
+        \\    var $tag_sum = 0.I64
+        \\    for b in deduped.to_list().iter() {
+        \\        dbg b.tag
+        \\        $tag_sum = $tag_sum + b.tag
+        \\    }
+        \\    dbg $tag_sum
+        \\    $tag_sum
+        \\}
+    );
+}
+
+test "iterdiff: stream per-element effects agree across inline modes" {
+    // Design invariant 5: a Stream pipeline's observable effect trace is the
+    // per-element, innermost-first pull order, and every lowering must
+    // reproduce it exactly. The effectful `map!` step `dbg`s each element as it
+    // is pulled, so the ordered trace pins effect order across inline modes.
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : () => List(I64)
+        \\main = || {
+        \\    stream =
+        \\        [1.I64, 2, 3]
+        \\            .iter()
+        \\            .stream()
+        \\            .map!(|n| {
+        \\                dbg n
+        \\                n * 2
+        \\            })
+        \\    result = Stream.collect!(stream)
+        \\    dbg result
+        \\    result
+        \\}
+    );
+}
+
+// Pre-existing divergence: a bounded prefix (`take_first`) of an infinite custom
+// iterator (`Iter.custom`, the Fibonacci unfold below) diverges between the two
+// lowerings. Running both under the differential harness, the naive (`.none`)
+// run and the optimized (`.wrappers`) run disagree on the produced element
+// sequence: the naive run's first `dbg` element is `1` while the optimized
+// run's first `dbg` element is `0`. The existing test "optimized infinite
+// custom iterator consumes finite prefix" independently fails on this tree,
+// confirming the custom-iterator path is broken here. Committed commented-out
+// until the internal representation is fixed.
+//
+// test "iterdiff: infinite custom iterator bounded prefix agrees across inline modes" {
+//     try expectSameObservationsAcrossInlineModes(
+//         \\module [main]
+//         \\
+//         \\main : U64
+//         \\main = {
+//         \\    adv : ((U64, U64) -> Try((U64, (U64, U64)), [NoMore]))
+//         \\    adv = |(a, b)| Try.Ok((a, (b, a + b)))
+//         \\    fib_iter = Iter.custom((0.U64, 1.U64), Unknown, adv)
+//         \\    var $sum = 0.U64
+//         \\    for f in fib_iter.take_first(8) {
+//         \\        dbg f
+//         \\        $sum = $sum + f
+//         \\    }
+//         \\    dbg $sum
+//         \\    $sum
+//         \\}
+//     );
+// }
+
+// Acceptance pending fusion: tier-one LIR identity (iter_fusion_design.md
+// Acceptance item 2). A bounded `list.iter().map(f).collect()` whose
+// construction is statically known at its consuming loop must lower to the same
+// generated-code shape as the hand-written loop — same op counts by the shape
+// helpers, no adapter dispatch, no extra allocation. This CANNOT pass until
+// stream fusion is implemented (today the optimized lowering still emits adapter
+// wrappers and separate collect allocation the loop does not), so it is
+// committed commented-out to keep the suite baseline unchanged.
+//
+// test "iterdiff: tier-one map collect matches hand-written loop shape" {
+//     const allocator = std.testing.allocator;
+//     const iter_source =
+//         \\module [main]
+//         \\
+//         \\main : List(I64)
+//         \\main =
+//         \\    [1.I64, 2, 3, 4, 5, 6]
+//         \\        .iter()
+//         \\        .map(|n| n * 2)
+//         \\        .collect()
+//     ;
+//     const loop_source =
+//         \\module [main]
+//         \\
+//         \\main : List(I64)
+//         \\main = {
+//         \\    var $out = []
+//         \\    for n in [1.I64, 2, 3, 4, 5, 6] {
+//         \\        $out = $out.append(n * 2)
+//         \\    }
+//         \\    $out
+//         \\}
+//     ;
+//
+//     var iter_lowered = try lowerModule(allocator, iter_source, .wrappers);
+//     defer iter_lowered.deinit(allocator);
+//     var loop_lowered = try lowerModule(allocator, loop_source, .wrappers);
+//     defer loop_lowered.deinit(allocator);
+//
+//     inline for (.{
+//         "erased_call_count",        "packed_erased_fn_count", "low_level_count",
+//         "list_with_capacity_count", "list_reserve_count",     "list_append_unsafe_count",
+//         "switch_count",             "join_count",             "jump_count",
+//         "direct_call_count",
+//     }) |field_name| {
+//         const loop_total = try reachableProcShapeFieldTotal(allocator, &loop_lowered.lowered, field_name);
+//         const iter_total = try reachableProcShapeFieldTotal(allocator, &iter_lowered.lowered, field_name);
+//         try std.testing.expectEqual(loop_total, iter_total);
+//     }
+// }
