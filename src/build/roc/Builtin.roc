@@ -2883,31 +2883,35 @@ Builtin :: [].{
 		## ```
 		take_first : Iter(item), U64 -> Iter(item)
 		take_first = |iterator, n|
-			if n == 0 {
-				range_done()
-			} else {
-				match iterator {
-					{ len_if_known, .. } =>
-						iter_from_step(
-							match len_if_known {
-								Known(len) => Known(
-									if len < n {
-										len
-									} else {
-										n
-									},
-								)
-								Unknown => Unknown
-							},
-							||
+			match iterator {
+				{ len_if_known, .. } =>
+					iter_from_step(
+						match len_if_known {
+							Known(len) => Known(
+								if len < n {
+									len
+								} else {
+									n
+								},
+							)
+							Unknown => if n == 0 {
+								Known(0)
+							} else {
+								Unknown
+							}
+						},
+						||
+							if n == 0 {
+								Done
+							} else {
 								match Iter.next(iterator) {
 									Done => Done
 									Skip({ rest }) => Skip({ rest: Iter.take_first(rest, n) })
 									One({ item, rest }) => One({ item, rest: Iter.take_first(rest, n - 1) })
-								},
-						)
-					}
-			}
+								}
+							},
+					)
+				}
 
 		## Returns an iterator that skips the first `n` items of this iterator.
 		## If the source has `n` or fewer items, the result is empty.
@@ -2918,31 +2922,32 @@ Builtin :: [].{
 		## ```
 		drop_first : Iter(item), U64 -> Iter(item)
 		drop_first = |iterator, n|
-			if n == 0 {
-				iterator
-			} else {
-				match iterator {
-					{ len_if_known, .. } =>
-						iter_from_step(
-							match len_if_known {
-								Known(len) => Known(
-									if len < n {
-										0
-									} else {
-										len - n
-									},
-								)
-								Unknown => Unknown
-							},
-							||
-								match Iter.next(iterator) {
-									Done => Done
-									Skip({ rest }) => Skip({ rest: Iter.drop_first(rest, n) })
-									One({ item: _, rest }) => Skip({ rest: Iter.drop_first(rest, n - 1) })
+			match iterator {
+				{ len_if_known, .. } =>
+					iter_from_step(
+						match len_if_known {
+							Known(len) => Known(
+								if len < n {
+									0
+								} else {
+									len - n
 								},
-						)
-					}
-			}
+							)
+							Unknown => Unknown
+						},
+						||
+							match Iter.next(iterator) {
+								Done => Done
+								Skip({ rest }) => Skip({ rest: Iter.drop_first(rest, n) })
+								One({ item, rest }) =>
+									if n == 0 {
+										One({ item, rest: Iter.drop_first(rest, 0) })
+									} else {
+										Skip({ rest: Iter.drop_first(rest, n - 1) })
+									}
+							},
+					)
+				}
 
 		## Returns an iterator that yields the last `n` items of this iterator.
 		## If the source has fewer than `n` items, all of them are yielded.
@@ -3002,31 +3007,39 @@ Builtin :: [].{
 		## ```
 		step_by : Iter(item), U64 -> Iter(item)
 		step_by = |iterator, n|
-			if n == 0 {
-				range_done()
-			} else {
-				match iterator {
-					{ len_if_known, .. } =>
-						iter_from_step(
-							match len_if_known {
-								Known(len) => Known(
+			match iterator {
+				{ len_if_known, .. } =>
+					iter_from_step(
+						match len_if_known {
+							Known(len) => if n == 0 {
+								Known(0)
+							} else {
+								Known(
 									if len == 0 {
 										0
 									} else {
 										(len - 1) / n + 1
 									},
 								)
-								Unknown => Unknown
-							},
-							||
+							}
+							Unknown => if n == 0 {
+								Known(0)
+							} else {
+								Unknown
+							}
+						},
+						||
+							if n == 0 {
+								Done
+							} else {
 								match Iter.next(iterator) {
 									Done => Done
 									Skip({ rest }) => Skip({ rest: Iter.step_by(rest, n) })
 									One({ item, rest }) => One({ item, rest: Iter.step_by(Iter.drop_first(rest, n - 1), n) })
-								},
-						)
-					}
-			}
+								}
+							},
+					)
+				}
 
 		## Returns an iterator that yields this iterator's items in reverse order.
 		##
