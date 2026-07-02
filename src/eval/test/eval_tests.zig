@@ -5,6 +5,7 @@ const regression_repros = @import("eval_regression_repros.zig");
 const trmc_tests = @import("eval_trmc_tests.zig");
 const closure_recursion_tests = @import("eval_closure_recursion_tests.zig");
 const comptime_finalization_tests = @import("eval_comptime_finalization_tests.zig");
+const crypto_tests = @import("eval_crypto_tests.zig");
 const highest_lowest_tests = @import("eval_highest_lowest_tests.zig");
 const issue_tests = @import("eval_issue_tests.zig");
 const interpreter_style_tests = @import("eval_interpreter_style_tests.zig");
@@ -1516,6 +1517,63 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "223" },
     },
     .{ .name = "inspect: typed identity closure on string", .source = "(|s| s)(\"Test\")", .expected = .{ .inspect_str = "\"Test\"" } },
+
+    // CaptureId regression suite: exercises the canonical-CaptureId join through
+    // nested/curried closures, closures held before application, capture-set
+    // reshaping, and captures that also appear inside call arguments.
+    // Repro for issue 9897 ("function reference capture count differs from its
+    // target"): the middle closure is bound and applied separately, so each
+    // fn_ref must carry exactly its target's capture slots.
+    .{
+        .name = "capture-id: nested closure held before application",
+        .source =
+        \\{
+        \\    make = |x| |y| |z| x + y + z
+        \\    partial = make(1.I64)(2.I64)
+        \\    partial(3.I64)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "6" },
+    },
+    // Repro for PR 9874's order-sensitivity: a 5-deep curried chain, each level
+    // adding a capture, so the capture spans must stay canonically ordered.
+    .{
+        .name = "capture-id: five-deep curried capture chain",
+        .source = "(|a| |b| |c| |d| |e| a + b + c + d + e)(1.I64)(2.I64)(3.I64)(4.I64)(5.I64)",
+        .expected = .{ .inspect_str = "15" },
+    },
+    // A captured variable that also appears inside a record argument to the
+    // closure it is passed to, reshaped by specialization.
+    .{
+        .name = "capture-id: captured var also used in a record argument",
+        .source =
+        \\{
+        \\    outer = |seed| {
+        \\        inner = |next, arg| seed + next.n + arg
+        \\        inner({ n: seed }, seed * 10.I64)
+        \\    }
+        \\    outer(2.I64)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "24" },
+    },
+    // Two sibling closures capture the same outer binding via a shared helper,
+    // so the capture-set fixpoint must give both the same canonical CaptureId.
+    .{
+        .name = "capture-id: sibling closures share one captured binding",
+        .source =
+        \\{
+        \\    base = 10.I64
+        \\    pick = |flag| {
+        \\        add = |n| base + n
+        \\        sub = |n| base - n
+        \\        if flag add(3.I64) else sub(3.I64)
+        \\    }
+        \\    pick(True) + pick(False)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "20" },
+    },
 
     // Untyped closures, HOFs, and recursion
     .{
@@ -4855,4 +4913,4 @@ const core_tests = [_]TestCase{
     },
 };
 
-pub const tests = core_tests ++ comptime_finalization_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests;
+pub const tests = core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests;

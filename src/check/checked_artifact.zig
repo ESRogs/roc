@@ -1386,11 +1386,18 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
                     .primitive,
                     .list,
                     .box,
+                    .dict,
+                    .set,
                     .parse_tag_union_spec,
                     .fields,
                     .field,
                     => break :blk true,
-                    .bool_tag_union => {},
+                    .bool_tag_union,
+                    .crypto_sha256_digest,
+                    .crypto_sha256_hasher,
+                    .crypto_blake3_digest,
+                    .crypto_blake3_hasher,
+                    => {},
                 },
                 .opaque_without_backing => break :blk true,
                 else => {},
@@ -2083,6 +2090,8 @@ pub const StaticDispatchPlanId = static_dispatch.StaticDispatchPlanId;
 pub const IteratorForPlanId = static_dispatch.IteratorForPlanId;
 /// Public `PatternBinderId` declaration.
 pub const PatternBinderId = checked_ids.PatternBinderId;
+/// Public `CaptureId` declaration.
+pub const CaptureId = checked_ids.CaptureId;
 
 /// Public `CheckedTypeRoot` declaration.
 pub const CheckedTypeRoot = struct {
@@ -2249,9 +2258,15 @@ pub const CheckedBuiltinNominal = enum {
     dec,
     list,
     box,
+    dict,
+    set,
     parse_tag_union_spec,
     fields,
     field,
+    crypto_sha256_digest,
+    crypto_sha256_hasher,
+    crypto_blake3_digest,
+    crypto_blake3_hasher,
 };
 
 /// Public `CheckedPrimitive` declaration.
@@ -2279,9 +2294,15 @@ pub const CheckedBuiltinRuntimeEncoding = union(enum) {
     bool_tag_union,
     list,
     box,
+    dict,
+    set,
     parse_tag_union_spec,
     fields,
     field,
+    crypto_sha256_digest,
+    crypto_sha256_hasher,
+    crypto_blake3_digest,
+    crypto_blake3_hasher,
 };
 
 /// Public `builtinRuntimeEncoding` function.
@@ -2304,9 +2325,15 @@ pub fn builtinRuntimeEncoding(builtin_nominal: CheckedBuiltinNominal) CheckedBui
         .dec => .{ .primitive = .dec },
         .list => .list,
         .box => .box,
+        .dict => .dict,
+        .set => .set,
         .parse_tag_union_spec => .parse_tag_union_spec,
         .fields => .fields,
         .field => .field,
+        .crypto_sha256_digest => .crypto_sha256_digest,
+        .crypto_sha256_hasher => .crypto_sha256_hasher,
+        .crypto_blake3_digest => .crypto_blake3_digest,
+        .crypto_blake3_hasher => .crypto_blake3_hasher,
     };
 }
 
@@ -6248,9 +6275,15 @@ fn checkedBuiltinNominalForIdent(module_env: *const ModuleEnv, ident: base.Ident
     if (ident.eql(common.dec) or ident.eql(common.dec_type)) return .dec;
     if (ident.eql(common.list) or ident.eql(common.builtin_list)) return .list;
     if (ident.eql(common.box) or ident.eql(common.builtin_box)) return .box;
-    if (ident.eql(common.builtin_parse_tag_union_spec)) return .parse_tag_union_spec;
-    if (ident.eql(common.builtin_str_field_names)) return .fields;
-    if (ident.eql(common.builtin_str_field_name)) return .field;
+    if (ident.eql(common.dict) or ident.eql(common.builtin_dict)) return .dict;
+    if (ident.eql(common.set) or ident.eql(common.builtin_set)) return .set;
+    if (ident.eql(common.builtin_encoding_parse_tag_union_spec)) return .parse_tag_union_spec;
+    if (ident.eql(common.builtin_encoding_field_names)) return .fields;
+    if (ident.eql(common.builtin_encoding_field_name)) return .field;
+    if (ident.eql(common.builtin_crypto_sha256_digest)) return .crypto_sha256_digest;
+    if (ident.eql(common.builtin_crypto_sha256_hasher)) return .crypto_sha256_hasher;
+    if (ident.eql(common.builtin_crypto_blake3_digest)) return .crypto_blake3_digest;
+    if (ident.eql(common.builtin_crypto_blake3_hasher)) return .crypto_blake3_hasher;
     return null;
 }
 
@@ -6654,6 +6687,10 @@ pub const CheckedExhaustivenessSiteTable = struct {
 pub const CheckedCapture = struct {
     pattern: CheckedPatternId,
     scope_depth: u32,
+    /// Canonical identity of the captured binding, carried immutably through
+    /// every post-check IR. Derived from the capture's binder, so it is a pure
+    /// function of (module name, source bytes) and cache-safe to serialize.
+    capture_id: CaptureId,
 };
 
 /// Public `CheckedRecordDestructKind` declaration.
@@ -10502,9 +10539,11 @@ const CheckedBodyPayloadCopier = struct {
         const out = try self.allocator.alloc(CheckedCapture, source.len);
         for (source, 0..) |capture_idx, i| {
             const capture = self.module.moduleEnvConst().store.getCapture(capture_idx);
+            const binder = try self.patternBinder(capture.pattern_idx);
             out[i] = .{
                 .pattern = self.checkedPattern(capture.pattern_idx),
                 .scope_depth = capture.scope_depth,
+                .capture_id = CaptureId.fromBinder(binder),
             };
         }
         return out;
@@ -10834,9 +10873,15 @@ pub fn builtinNominalAcceptsNumeralLiteral(builtin_nominal: CheckedBuiltinNomina
         .str,
         .list,
         .box,
+        .dict,
+        .set,
         .parse_tag_union_spec,
         .fields,
         .field,
+        .crypto_sha256_digest,
+        .crypto_sha256_hasher,
+        .crypto_blake3_digest,
+        .crypto_blake3_hasher,
         => false,
     };
 }
@@ -14508,6 +14553,7 @@ fn specializeResolvedStaticDispatchPlanCallables(
     allocator: Allocator,
     names: *canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
+    module_idx: u32,
     artifact_key: CheckedModuleArtifactKey,
     available_artifacts: []const ImportedModuleView,
     plans: *static_dispatch.StaticDispatchPlanTable,
@@ -14521,6 +14567,7 @@ fn specializeResolvedStaticDispatchPlanCallables(
             allocator,
             names,
             store,
+            module_idx,
             artifact_key,
             available_artifacts,
             target,
@@ -14539,12 +14586,24 @@ fn projectResolvedDispatchTargetCallable(
     allocator: Allocator,
     names: *canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
+    module_idx: u32,
     artifact_key: CheckedModuleArtifactKey,
     available_artifacts: []const ImportedModuleView,
     target: static_dispatch.MethodTarget,
 ) Allocator.Error!CheckedTypeId {
     const target_key = switch (target.kind) {
         .local_proc => return target.callable_ty,
+        .generated_structural_parser,
+        .generated_structural_encoder,
+        => {
+            if (target.module_idx == module_idx) return target.callable_ty;
+            const imported = importedModuleViewByModuleIndex(available_artifacts, target.module_idx) orelse {
+                checkedArtifactInvariant("resolved generated structural dispatch target artifact was not available during checked publication", .{});
+            };
+            var projector = CheckedTypeStoreImportProjector.init(allocator, store, names, imported);
+            defer projector.deinit();
+            return try projector.project(target.callable_ty);
+        },
         .procedure => |procedure| checkedArtifactKeyFromArtifactRef(procedure.template.artifact),
     };
     if (checkedArtifactKeyEql(target_key, artifact_key)) return target.callable_ty;
@@ -15513,6 +15572,16 @@ fn importedModuleViewByKey(
 ) ?ImportedModuleView {
     for (artifacts) |artifact| {
         if (std.meta.eql(artifact.key.bytes, key.bytes)) return artifact;
+    }
+    return null;
+}
+
+fn importedModuleViewByModuleIndex(
+    artifacts: []const ImportedModuleView,
+    module_idx: u32,
+) ?ImportedModuleView {
+    for (artifacts) |artifact| {
+        if (artifact.module_identity.module_idx == module_idx) return artifact;
     }
     return null;
 }
@@ -19996,12 +20065,25 @@ fn checkedTypeHasNoReachableCallableSlotsInner(
                     .parse_tag_union_spec,
                     .fields,
                     .field,
+                    .crypto_sha256_digest,
+                    .crypto_sha256_hasher,
+                    .crypto_blake3_digest,
+                    .crypto_blake3_hasher,
                     => break :blk true,
                     .list,
                     .box,
                     => {
                         if (nominal.args.len != 1) checkedArtifactInvariant("builtin container nominal had non-unary args", .{});
                         break :blk try checkedTypeHasNoReachableCallableSlotsInner(checked_types, nominal.args[0], active);
+                    },
+                    .set => {
+                        if (nominal.args.len != 1) checkedArtifactInvariant("builtin Set nominal had non-unary args", .{});
+                        break :blk try checkedTypeHasNoReachableCallableSlotsInner(checked_types, nominal.args[0], active);
+                    },
+                    .dict => {
+                        if (nominal.args.len != 2) checkedArtifactInvariant("builtin Dict nominal had non-binary args", .{});
+                        if (!try checkedTypeHasNoReachableCallableSlotsInner(checked_types, nominal.args[0], active)) break :blk false;
+                        break :blk try checkedTypeHasNoReachableCallableSlotsInner(checked_types, nominal.args[1], active);
                     },
                 }
             }
@@ -24739,7 +24821,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 5;
+    const serialized_layout_version: u32 = 7;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -26849,6 +26931,7 @@ pub fn publishFromTypedModule(
         allocator,
         &canonical_names,
         checked_types,
+        module_idx,
         artifact_key,
         inputs.available_artifacts,
         &static_dispatch_plans,
@@ -28576,8 +28659,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x33, 0xA8, 0x21, 0x31, 0xEE, 0x36, 0x52, 0x92, 0x6F, 0x71, 0x2B, 0x42, 0x59, 0xE3, 0xB5, 0x57,
-        0xF1, 0x2D, 0xDB, 0xD1, 0x82, 0x87, 0xB9, 0x3E, 0xB7, 0x97, 0xF9, 0xAE, 0x11, 0xAE, 0xFE, 0xB2,
+        0xFB, 0x58, 0xCC, 0xA0, 0x31, 0xE8, 0x80, 0x87, 0x26, 0x9D, 0x4E, 0x1B, 0xA4, 0xA5, 0x46, 0x0F,
+        0xE0, 0xCF, 0x29, 0x42, 0xE1, 0xC9, 0x31, 0x09, 0xE0, 0xFC, 0xBC, 0x64, 0x2B, 0x21, 0xCD, 0xF6,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

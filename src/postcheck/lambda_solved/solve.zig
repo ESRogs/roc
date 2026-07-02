@@ -397,6 +397,7 @@ const Solver = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             .uninitialized,
             .uninitialized_payload,
             .crash,
@@ -454,12 +455,15 @@ const Solver = struct {
             .fn_ref => |fn_ref| {
                 try self.unify(expected, self.program.fn_tys.items[@intFromEnum(fn_ref.fn_id)]);
                 const captures = self.liftedCapturesForFn(fn_ref.fn_id);
-                const capture_exprs = self.lifted.exprSpan(fn_ref.captures);
-                if (captures.len != capture_exprs.len) {
+                const capture_operands = self.lifted.captureOperandSpan(fn_ref.captures);
+                if (captures.len != capture_operands.len) {
                     Common.invariant("function reference capture count differs from its target");
                 }
-                for (captures, capture_exprs) |capture, capture_expr| {
-                    _ = try self.expectExpr(capture_expr, self.localTy(capture.local));
+                for (captures, capture_operands) |capture, operand| {
+                    if (operand.id != self.lifted.captureIdOfLocal(capture.local)) {
+                        Common.invariant("function reference capture operand CaptureId did not match its slot");
+                    }
+                    _ = try self.expectExpr(operand.value, self.localTy(capture.local));
                 }
             },
             .call_value => |call| {
@@ -482,10 +486,13 @@ const Solver = struct {
                             _ = try self.expectExpr(arg, self.program.types.spanItem(func.args, i));
                         }
                         const captures = self.liftedCapturesForFn(callee);
-                        const capture_exprs = self.lifted.exprSpan(call.captures);
-                        if (captures.len != capture_exprs.len) Common.invariant("procedure call capture count differs from its callee");
-                        for (captures, capture_exprs) |capture, capture_expr| {
-                            _ = try self.expectExpr(capture_expr, self.localTy(capture.local));
+                        const capture_operands = self.lifted.captureOperandSpan(call.captures);
+                        if (captures.len != capture_operands.len) Common.invariant("procedure call capture count differs from its callee");
+                        for (captures, capture_operands) |capture, operand| {
+                            if (operand.id != self.lifted.captureIdOfLocal(capture.local)) {
+                                Common.invariant("procedure call capture operand CaptureId did not match its slot");
+                            }
+                            _ = try self.expectExpr(operand.value, self.localTy(capture.local));
                         }
                     },
                     .imported => {
@@ -1124,6 +1131,17 @@ const Solver = struct {
             },
             .dict_pseudo_seed => expectLowLevelArity(op, args, 0),
             .hasher_finish => expectLowLevelArity(op, args, 1),
+            .crypto_sha256_hash_bytes,
+            .crypto_sha256_hasher_finish,
+            .crypto_blake3_hash_bytes,
+            .crypto_blake3_hasher_finish,
+            => expectLowLevelArity(op, args, 1),
+            .crypto_sha256_hasher_empty,
+            .crypto_blake3_hasher_empty,
+            => expectLowLevelArity(op, args, 0),
+            .crypto_sha256_hasher_write,
+            .crypto_blake3_hasher_write,
+            => expectLowLevelArity(op, args, 2),
             .hasher_write_bool,
             .hasher_write_u8,
             .hasher_write_u16,
@@ -1420,11 +1438,7 @@ const Solver = struct {
         for (0..lhs.count()) |i| {
             const left_capture = self.program.types.captureItem(lhs, i);
             const right_capture = self.program.types.captureItem(rhs, i);
-            if (left_capture.local != right_capture.local or
-                left_capture.symbol != right_capture.symbol or
-                left_capture.binder != right_capture.binder or
-                left_capture.capture_id != right_capture.capture_id)
-            {
+            if (left_capture.capture_id != right_capture.capture_id) {
                 Common.invariant("capture identity failed Lambda Solved unification");
             }
             try self.unify(left_capture.ty, right_capture.ty);

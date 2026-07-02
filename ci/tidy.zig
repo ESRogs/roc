@@ -298,10 +298,10 @@ const Errors = struct {
     pub fn addDisallowedBuiltinType(errors: *Errors, file: SourceFile, offset: usize, name: []const u8) void {
         errors.emit(
             "{s}:{d}: error: '{s}' is exposed as a top-level Builtin type. The only types allowed " ++
-                "directly under Builtin are: Str, Hasher, Iter, Stream, List, Bool, Box, Try, Dict, Set, Num. " ++
+                "directly under Builtin are: Str, Hasher, Iter, Stream, List, Bool, Box, Try, Dict, Set, Num, Encoding, Crypto. " ++
                 "Make '{s}' private by moving it below the exposed Builtin block (to the module's top level), " ++
                 "unless a user-facing method needs it and would break without it — in which case nest it under a " ++
-                "logical Builtin type instead (e.g. DictBucket under Dict, ParseTagUnionSpec under Str).\n",
+                "logical Builtin type instead (e.g. DictBucket under Dict, ParseTagUnionSpec under Encoding).\n",
             .{ file.path, file.lineNumber(offset), name, name },
         );
     }
@@ -367,7 +367,7 @@ fn tidyFile(
 /// type must either be private (declared below the exposed block, at the module's
 /// top level) or nested under one of these.
 const allowed_builtin_types = [_][]const u8{
-    "Str", "Hasher", "Iter", "Stream", "List", "Bool", "Box", "Try", "Dict", "Set", "Num",
+    "Str", "Hasher", "Iter", "Stream", "List", "Bool", "Box", "Try", "Dict", "Set", "Num", "Encoding", "Crypto",
 };
 
 fn isAllowedBuiltinType(name: []const u8) bool {
@@ -1121,7 +1121,11 @@ const DeadFilesDetector = struct {
     }
 };
 
-/// Lists all files in the repository using git ls-files.
+/// Lists all files in the repository.
+///
+/// Prefers `git ls-files` (matching CI, which runs in a git checkout). Falls
+/// back to `jj file list` so the check also runs in a non-colocated jj
+/// workspace, where there is no `.git` for git to use.
 fn listFilePaths(allocator: Allocator, io: std.Io) ![][]const u8 {
     var result: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -1131,26 +1135,46 @@ fn listFilePaths(allocator: Allocator, io: std.Io) ![][]const u8 {
         result.deinit(allocator);
     }
 
-    const run_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "ls-files", "-z" },
-    });
-    defer allocator.free(run_result.stdout);
+    // git ls-files -z: null-separated, exact CI behavior.
+    if (try runForStdout(allocator, io, &.{ "git", "ls-files", "-z" })) |stdout| {
+        defer allocator.free(stdout);
+        try appendListedPaths(allocator, &result, stdout, 0);
+        return result.toOwnedSlice(allocator);
+    }
+
+    // Fall back to jj for a non-colocated jj workspace: newline-separated.
+    if (try runForStdout(allocator, io, &.{ "jj", "file", "list" })) |stdout| {
+        defer allocator.free(stdout);
+        try appendListedPaths(allocator, &result, stdout, '\n');
+        return result.toOwnedSlice(allocator);
+    }
+
+    return error.GitFailed;
+}
+
+/// Runs `argv`, returning its stdout on success (caller owns it) or null if the
+/// command is missing or exits non-zero. Only allocation failures propagate.
+fn runForStdout(allocator: Allocator, io: std.Io, argv: []const []const u8) !?[]u8 {
+    const run_result = std.process.run(allocator, io, .{ .argv = argv }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null, // command not found / failed to spawn
+    };
     defer allocator.free(run_result.stderr);
+    if (run_result.term != .exited or run_result.term.exited != 0) {
+        allocator.free(run_result.stdout);
+        return null;
+    }
+    return run_result.stdout;
+}
 
-    const files = run_result.stdout;
-    if (run_result.term != .exited or run_result.term.exited != 0) return error.GitFailed;
-
-    if (files.len == 0) return result.toOwnedSlice(allocator);
-
-    // git ls-files -z outputs null-separated paths
-    var lines = std.mem.splitScalar(u8, files, 0);
+/// Splits `output` on `separator` and appends each non-skipped path to `result`.
+fn appendListedPaths(allocator: Allocator, result: *std.ArrayList([]const u8), output: []const u8, separator: u8) !void {
+    var lines = std.mem.splitScalar(u8, output, separator);
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if (shouldSkipListedFile(line)) continue;
         try result.append(allocator, try allocator.dupe(u8, line));
     }
-
-    return result.toOwnedSlice(allocator);
 }
 
 fn shouldSkipTopLevelDir(path: []const u8) bool {
