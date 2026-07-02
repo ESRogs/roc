@@ -2175,6 +2175,7 @@ const Cloner = struct {
     current_region: Region,
     demand_cache_epoch: usize,
     active_demand_resolves: usize,
+    inline_safe_binding_check: bool,
     subst_scope_id: usize,
     next_subst_scope_id: usize,
     next_demand_frame_id: usize,
@@ -2214,6 +2215,7 @@ const Cloner = struct {
             .current_region = Region.zero(),
             .demand_cache_epoch = 0,
             .active_demand_resolves = 0,
+            .inline_safe_binding_check = false,
             .subst_scope_id = 0,
             .next_subst_scope_id = 1,
             .next_demand_frame_id = 1,
@@ -2255,6 +2257,7 @@ const Cloner = struct {
             .current_region = Region.zero(),
             .demand_cache_epoch = 0,
             .active_demand_resolves = 0,
+            .inline_safe_binding_check = false,
             .subst_scope_id = 0,
             .next_subst_scope_id = 1,
             .next_demand_frame_id = 1,
@@ -5540,6 +5543,11 @@ const Cloner = struct {
         self.restore(pending_change_start);
 
         const value_expr = try self.materialize(raw_value);
+        // The emitted let expression binds these locals for the rest being
+        // cloned; the scope is restored once the rest is built.
+        const let_scoped_start = self.scopedLocalsLen();
+        defer self.restoreScopedLocals(let_scoped_start);
+        try self.appendPatternScopedLocals(let_.bind);
         const change_start = self.changes.items.len;
         if (try self.bindPatToMaterializedKnownValue(let_.bind, raw_value)) {
             const rest_value = try self.cloneExprValueWithDemand(let_.rest, demand);
@@ -6487,8 +6495,16 @@ const Cloner = struct {
     }
 
     fn localBindingAvailableInLexicalScope(self: *Cloner, local: Ast.LocalId, scope: ?*const AvailableBindingScope) bool {
-        for (self.scoped_locals.items) |scoped_local| {
-            if (scoped_local == local) return true;
+        if (self.inline_safe_binding_check) {
+            // An inline argument may be re-materialized wherever the inlined
+            // body reaches a public boundary, so bindings that lapse with the
+            // current region are not enough: only pending lets (re-emitted at
+            // any consumer) qualify from the dynamic scope list.
+            if (self.pendingLetIsActive(local)) return true;
+        } else {
+            for (self.scoped_locals.items) |scoped_local| {
+                if (scoped_local == local) return true;
+            }
         }
         for (self.loop_stack.items) |loop| {
             if (localInTypedLocalSpan(loop.params, local)) return true;
@@ -15984,10 +16000,18 @@ const Cloner = struct {
     ) LowerError!void {
         switch (self.pass.program.stmts.items[@intFromEnum(stmt_id)]) {
             .let_ => |let_| {
-                const value_demand = if (let_.recursive)
+                var value_demand: ValueDemand = if (let_.recursive)
                     .materialize
                 else
                     try self.patternDemandInBlockTail(let_.pat, tail, context);
+                // A let whose pattern demands nothing still evaluates its
+                // init when the init is not discardable, so the init remains
+                // a use site for locals it references.
+                if (value_demand == .none and
+                    !(try discardedExprIsEffectFree(self.pass.program, self.pass.allocator, let_.value)))
+                {
+                    value_demand = .materialize;
+                }
                 try self.mergeLocalDemandInExpr(local, let_.value, value_demand, out);
             },
             .expr,
@@ -17276,12 +17300,102 @@ const Cloner = struct {
         const uses = localMaxUseCountPerPathInExpr(self.pass.program, local, body);
         if (uses == 0) return value;
         if (self.valueCanSubstitute(value) or
-            (uses == 1 and localUseBeforeEffect(self.pass.program, local, body) and self.valueCanMaterializePublic(value)))
+            (uses == 1 and localUseBeforeEffect(self.pass.program, local, body) and
+                self.valueCanMaterializePublic(value) and self.valueReferencesInlineSafeBindings(value)))
         {
             return value;
         }
         if (!self.valueCanMaterializePublic(value)) return value;
         return try self.makeReusableForMatch(value, pending_lets);
+    }
+
+    /// A raw value substituted into an inlined body may be re-materialized at
+    /// any public boundary the body reaches, so its expressions must reference
+    /// only bindings that stay available there: direct references, active
+    /// pending lets, and loop or state parameters. Region-scoped bindings do
+    /// not qualify; such values are bound to a pending let instead.
+    fn valueReferencesInlineSafeBindings(self: *Cloner, value: Value) bool {
+        self.inline_safe_binding_check = true;
+        defer self.inline_safe_binding_check = false;
+        return self.valueLeafExprsReferenceAvailableBindings(value);
+    }
+
+    fn valueLeafExprsReferenceAvailableBindings(self: *Cloner, value: Value) bool {
+        return switch (value) {
+            .expr => |expr| self.exprReferencesAvailableBindings(expr),
+            .expr_with_known_value => |known_value_expr| self.exprReferencesAvailableBindings(known_value_expr.expr),
+            .let_ => |let_value| blk: {
+                for (let_value.lets) |pending| {
+                    const init_expr = switch (pending.value) {
+                        .source => |source| source,
+                        .cloned => |cloned| cloned,
+                    };
+                    if (!self.exprReferencesAvailableBindings(init_expr)) break :blk false;
+                }
+                break :blk self.valueLeafExprsReferenceAvailableBindings(let_value.body.*);
+            },
+            .if_ => |if_value| blk: {
+                for (if_value.branches) |branch| {
+                    if (!self.exprReferencesAvailableBindings(branch.cond)) break :blk false;
+                    if (!self.valueLeafExprsReferenceAvailableBindings(branch.body)) break :blk false;
+                }
+                break :blk self.valueLeafExprsReferenceAvailableBindings(if_value.final_else.*);
+            },
+            .match_ => |match_value| blk: {
+                if (!self.exprReferencesAvailableBindings(match_value.scrutinee)) break :blk false;
+                for (match_value.branches) |branch| {
+                    if (branch.guard) |guard| {
+                        if (!self.exprReferencesAvailableBindings(guard)) break :blk false;
+                    }
+                    if (!self.valueLeafExprsReferenceAvailableBindings(branch.body)) break :blk false;
+                }
+                break :blk true;
+            },
+            .tag => |tag| blk: {
+                for (tag.payloads) |payload| {
+                    if (!self.valueLeafExprsReferenceAvailableBindings(payload)) break :blk false;
+                }
+                break :blk true;
+            },
+            .record => |record| blk: {
+                for (record.fields) |field| {
+                    if (!self.valueLeafExprsReferenceAvailableBindings(field.value)) break :blk false;
+                }
+                break :blk true;
+            },
+            .tuple => |tuple| blk: {
+                for (tuple.items) |item| {
+                    if (!self.valueLeafExprsReferenceAvailableBindings(item)) break :blk false;
+                }
+                break :blk true;
+            },
+            .nominal => |nominal| self.valueLeafExprsReferenceAvailableBindings(nominal.backing.*),
+            .callable => |callable| blk: {
+                for (callable.captures) |capture| {
+                    if (!self.valueLeafExprsReferenceAvailableBindings(capture)) break :blk false;
+                }
+                break :blk true;
+            },
+            .finite_tags => |finite_tags| blk: {
+                if (!self.exprReferencesAvailableBindings(finite_tags.selector)) break :blk false;
+                for (finite_tags.alternatives) |alternative| {
+                    for (alternative.payloads) |payload| {
+                        if (!self.valueLeafExprsReferenceAvailableBindings(payload)) break :blk false;
+                    }
+                }
+                break :blk true;
+            },
+            .finite_callables => |finite_callables| blk: {
+                if (!self.exprReferencesAvailableBindings(finite_callables.selector)) break :blk false;
+                for (finite_callables.alternatives) |alternative| {
+                    for (alternative.captures) |capture| {
+                        if (!self.valueLeafExprsReferenceAvailableBindings(capture)) break :blk false;
+                    }
+                }
+                break :blk true;
+            },
+            .private_state => true,
+        };
     }
 
     fn unsafeLeafCount(self: *Cloner, value: Value) usize {
@@ -20524,7 +20638,11 @@ const Cloner = struct {
                     }
                     self.restore(bind_change_start);
 
-                    if (try self.bindPatToDemandedValue(let_.pat, value, pattern_demand)) {
+                    const demanded_drop_discards_effect = pattern_demand == .none and
+                        !(try discardedExprIsEffectFree(self.pass.program, self.pass.allocator, let_.value));
+                    if (!demanded_drop_discards_effect and
+                        try self.bindPatToDemandedValue(let_.pat, value, pattern_demand))
+                    {
                         return;
                     }
                     self.restore(bind_change_start);
@@ -20671,7 +20789,18 @@ const Cloner = struct {
                 .let_ => |let_| let_,
                 .expr => |expr| {
                     if (try discardedExprIsEffectFree(self.pass.program, self.pass.allocator, expr)) continue;
-                    return false;
+                    // An effectful statement rides along as a pending let on a
+                    // fresh ignored local so a structured block value can
+                    // escape without materializing; the pending let emits the
+                    // effect, in order, wherever the value is consumed.
+                    const stmt_ty = self.pass.program.exprs.items[@intFromEnum(expr)].ty;
+                    const fresh_local = try self.pass.program.addLocal(self.pass.symbols.fresh(), stmt_ty);
+                    try out.append(self.pass.allocator, .{
+                        .local = fresh_local,
+                        .ty = stmt_ty,
+                        .value = .{ .source = expr },
+                    });
+                    continue;
                 },
                 else => return false,
             };
@@ -20903,6 +21032,21 @@ const Cloner = struct {
                 }
                 const cloned = try self.cloneExprPlain(expr);
                 if (!self.exprReferencesAvailableBindings(cloned)) {
+                    const cloned_items = self.pass.program.exprs.items[@intFromEnum(cloned)].data;
+                    if (cloned_items == .list) {
+                        for (self.pass.program.exprSpan(cloned_items.list)) |elem| {
+                            const elem_data = self.pass.program.exprs.items[@intFromEnum(elem)].data;
+                            std.debug.print(" elem={s}", .{@tagName(elem_data)});
+                            if (elem_data == .local) {
+                                std.debug.print("(l{d} pending={any} direct={any})", .{
+                                    @intFromEnum(elem_data.local),
+                                    self.pendingLetIsActive(elem_data.local),
+                                    self.localCanBeReferencedDirectly(elem_data.local),
+                                });
+                            }
+                        }
+                    }
+                    std.debug.print("\n", .{});
                     Common.invariant("materialized expression still referenced unavailable bindings");
                 }
                 return cloned;
