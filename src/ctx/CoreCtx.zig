@@ -646,13 +646,42 @@ fn osJoinPath(_: ?*anyopaque, _: std.Io, parts: []const []const u8, allocator: A
 }
 
 fn osCanonicalize(_: ?*anyopaque, std_io: std.Io, path: []const u8, allocator: Allocator) CanonicalizeError![]const u8 {
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (comptime builtin.link_libc and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        return osCanonicalizeLibc(path, allocator);
+    }
+
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = [_]u8{0} ** std.Io.Dir.max_path_bytes;
     const len = std.Io.Dir.cwd().realPathFile(std_io, path, &buffer) catch |err| return switch (err) {
         error.FileNotFound => error.FileNotFound,
         error.AccessDenied => error.AccessDenied,
         else => error.IoError,
     };
     return allocator.dupe(u8, buffer[0..len]) catch error.OutOfMemory;
+}
+
+fn osCanonicalizeLibc(path: []const u8, allocator: Allocator) CanonicalizeError![]const u8 {
+    if (std.mem.findScalar(u8, path, 0) != null) return error.IoError;
+    if (path.len >= std.posix.PATH_MAX) return error.IoError;
+
+    var path_buffer: [std.posix.PATH_MAX]u8 = [_]u8{0} ** std.posix.PATH_MAX;
+    @memcpy(path_buffer[0..path.len], path);
+    const path_z = path_buffer[0..path.len :0];
+
+    var resolved_buffer: [std.posix.PATH_MAX]u8 = [_]u8{0} ** std.posix.PATH_MAX;
+    while (true) {
+        if (std.c.realpath(path_z, resolved_buffer[0..].ptr)) |resolved| {
+            std.debug.assert(resolved == resolved_buffer[0..].ptr);
+            const len = std.mem.findScalar(u8, &resolved_buffer, 0) orelse resolved_buffer.len;
+            return allocator.dupe(u8, resolved_buffer[0..len]) catch error.OutOfMemory;
+        }
+
+        switch (@as(std.posix.E, @enumFromInt(std.c._errno().*))) {
+            .INTR => continue,
+            .NOENT, .NOTDIR => return error.FileNotFound,
+            .ACCES => return error.AccessDenied,
+            else => return error.IoError,
+        }
+    }
 }
 
 fn osMakePath(_: ?*anyopaque, std_io: std.Io, path: []const u8) MakePathError!void {
