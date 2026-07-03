@@ -12962,7 +12962,20 @@ const EvidencePass = struct {
                         const node = try self.evidenceNodeForTarget(target, constraint_fn_var);
                         return .{ .direct = node };
                     }
+                    // The dispatcher has an owner but this publication's
+                    // registry views missed the method. That is EITHER a type
+                    // the checker chose a derived structural implementation
+                    // for, OR a registry-visibility gap (e.g. platform
+                    // relation modules are not in `available`). Committing to
+                    // `structural` here would contradict monotype's
+                    // program-wide lookup; distinguishing the two needs the
+                    // checker's recorded structural decisions (the eq/hash
+                    // class migration). Until then the plan stays unresolved
+                    // and owner derivation decides.
+                    self.unresolved_count += 1;
+                    return .unresolved_checked_plan;
                 }
+                // No owner head: a genuinely structural shape.
                 if (structural_kind) |kind| return .{ .structural = kind };
                 // Checking already reported the missing method; the site is
                 // erroneous.
