@@ -569,10 +569,12 @@ fn resolveBindings(solver: *Solver, local_count: usize) SolveError!BindingResult
             cursor = solver.defs[cursor].borrow_capable;
         };
 
-        const leader_once_bound = paramIsBorrowed(solver, chain_leader) or switch (solver.defs[chain_leader]) {
-            .fresh, .borrow_capable => true,
-            .none, .multi => false,
-        };
+        const leader_once_bound = paramIsBorrowed(solver, chain_leader) or
+            leaderIsInitializedJoinParam(solver, chain_leader) or
+            switch (solver.defs[chain_leader]) {
+                .fresh, .borrow_capable => true,
+                .none, .multi => false,
+            };
         const leader_is_anchor = solver.rc_local[chain_leader] and leader_once_bound and
             (!borrowed.isSet(chain_leader) or paramIsBorrowed(solver, chain_leader));
 
@@ -607,6 +609,18 @@ fn borrowQualifies(solver: *const Solver, index: u32) bool {
         .borrow_capable => true,
         .none, .multi, .fresh => false,
     };
+}
+
+/// A join parameter carries exactly one ownership unit into the join body at
+/// every jump and holds it live across the whole body (released on exit paths,
+/// transferred on back edges), so it anchors borrows just like an owned local
+/// bound once: a borrow anchored on it is live for the whole body. Emission
+/// keeps a join parameter's unit alive through the body already (its releases
+/// belong to the join traversal, not to per-use death scans), so anchoring a
+/// borrow here emits no retain/release pair. A maybe-uninitialized join
+/// parameter may hold no unit on some entry, so it cannot anchor a borrow.
+fn leaderIsInitializedJoinParam(solver: *const Solver, index: u32) bool {
+    return solver.join_param.isSet(index) and !solver.maybe_uninitialized_join_param.isSet(index);
 }
 
 /// Reports the borrowed-parameter lender mask when every `ret` in the body

@@ -4837,6 +4837,70 @@ test "iterdiff: tier-one map collect matches hand-written loop shape" {
     try std.testing.expect(try reachableProcShapeFieldTotal(allocator, iter, "box_box_count") >= 1);
 }
 
+// Slice H aliasing guard (refcount-exactness for opportunistic mutation).
+//
+// Slice H turns per-element reads of a loop-carried list into borrows anchored
+// on the loop join parameter, dropping the retain/release pair those reads used
+// to carry. Roc's in-place mutation is refcount-exact: `List.append` mutates
+// its argument in place only when the list is uniquely owned. If the elision
+// ever undercounted a shared list, an append would wrongly see it as unique and
+// mutate shared data. These tests alias one list into two live consumers (one
+// of which would mutate it in place if it looked unique) and assert the naive
+// and optimized lowerings observe identical, unmutated values.
+test "iterdiff: list aliased into an append and a loop stays unmutated across inline modes" {
+    // `base` feeds both an append (a would-be in-place mutation) and a loop that
+    // reads it per element (the Slice H borrow pattern). Because both consumers
+    // are live, `base` is shared, so the append must copy it. The per-element
+    // `dbg x`, the final `dbg base`, and `dbg grown` diverge between modes if the
+    // shared list is ever mutated in place.
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : I64
+        \\main = {
+        \\    base : List(I64)
+        \\    base = [10.I64, 20, 30]
+        \\    grown : List(I64)
+        \\    grown = base.append(40)
+        \\    var $sum = 0.I64
+        \\    for x in base.iter() {
+        \\        dbg x
+        \\        $sum = $sum + x
+        \\    }
+        \\    dbg base
+        \\    dbg grown
+        \\    dbg $sum
+        \\    $sum
+        \\}
+    );
+}
+
+test "iterdiff: loop-carried list appended inside its own loop stays unmutated across inline modes" {
+    // The list is the loop source (carried across the join and read per element
+    // as a Slice H borrow) AND is appended inside the body. It is shared for the
+    // whole loop, so each append must copy it; an in-place mutation of the
+    // carried source would change later iterations and the final `dbg base`.
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : U64
+        \\main = {
+        \\    base : List(I64)
+        \\    base = [1.I64, 2, 3]
+        \\    var $out = []
+        \\    for x in base.iter() {
+        \\        with_x : List(I64)
+        \\        with_x = base.append(x)
+        \\        dbg with_x
+        \\        $out = $out.append(List.len(with_x))
+        \\    }
+        \\    dbg base
+        \\    dbg $out
+        \\    List.len($out)
+        \\}
+    );
+}
+
 test "spec constr keeps a same-binder scalar distinct from a substituted aggregate" {
     // A source pattern binder is reused across every monomorphization of its
     // binding. Here `pair` (a tuple parameter the caller passes a known tuple to,
