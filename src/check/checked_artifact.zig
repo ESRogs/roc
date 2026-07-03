@@ -607,7 +607,8 @@ pub const ProvidedExportTable = struct {
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
-        checked_types: *const CheckedTypePublication,
+        checked_types: *CheckedTypePublication,
+        relation_type_substitution: PlatformAppRelationTypeSubstitution,
         top_level_values: *const TopLevelValueTable,
         published_provides: []const ProvidesEntry,
     ) Allocator.Error!ProvidedExportTable {
@@ -640,12 +641,29 @@ pub const ProvidedExportTable = struct {
                 }
                 unreachable;
             };
-            const checked_type = try checkedTypeIdForRootSource(
+            const source_checked_type = try checkedTypeIdForRootSource(
                 allocator,
                 module,
                 checked_types,
                 .{ .def = def_idx },
             );
+            const checked_type = if (relation_type_substitution.formals.len == 0)
+                source_checked_type
+            else
+                try relation_type_substitution.applyRoot(
+                    allocator,
+                    module,
+                    &checked_types.store,
+                    source_checked_type,
+                );
+            const source_scheme = if (relation_type_substitution.formals.len == 0)
+                top_level.source_scheme
+            else
+                try relation_type_substitution.schemeForRoot(
+                    allocator,
+                    &checked_types.store,
+                    checked_type,
+                );
             switch (top_level.value) {
                 .procedure_binding => |binding| try exports.append(allocator, .{ .procedure = .{
                     .source_name = published.source_name,
@@ -653,7 +671,7 @@ pub const ProvidedExportTable = struct {
                     .def = def_idx,
                     .pattern = top_level.pattern,
                     .checked_type = checked_type,
-                    .source_scheme = top_level.source_scheme,
+                    .source_scheme = source_scheme,
                     .binding = binding,
                 } }),
                 .const_ref => |const_ref| try exports.append(allocator, .{ .data = .{
@@ -662,7 +680,7 @@ pub const ProvidedExportTable = struct {
                     .def = def_idx,
                     .pattern = top_level.pattern,
                     .checked_type = checked_type,
-                    .source_scheme = top_level.source_scheme,
+                    .source_scheme = source_scheme,
                     .const_ref = const_ref,
                 } }),
             }
@@ -13276,6 +13294,30 @@ pub const CheckedProcedureTemplateTable = struct {
         return self.templates[@intFromEnum(id)];
     }
 
+    pub fn applyRelationTypeSubstitution(
+        self: *CheckedProcedureTemplateTable,
+        allocator: Allocator,
+        module: TypedCIR.Module,
+        checked_types: *CheckedTypeStore,
+        relation_type_substitution: PlatformAppRelationTypeSubstitution,
+    ) Allocator.Error!void {
+        if (relation_type_substitution.formals.len == 0) return;
+
+        for (self.templates) |*template| {
+            template.checked_fn_root = try relation_type_substitution.applyRoot(
+                allocator,
+                module,
+                checked_types,
+                template.checked_fn_root,
+            );
+            template.checked_fn_scheme = try relation_type_substitution.schemeForRoot(
+                allocator,
+                checked_types,
+                template.checked_fn_root,
+            );
+        }
+    }
+
     pub fn view(self: *const CheckedProcedureTemplateTable) CheckedProcedureTemplateTableView {
         return .{ .templates = self.templates };
     }
@@ -14463,6 +14505,368 @@ fn platformRequiredPayloadForDeclaration(
     };
 }
 
+const PlatformAppRelationTypeSubstitution = struct {
+    names: ?*const canonical.CanonicalNameStore = null,
+    formals: []const CheckedTypeId = &.{},
+    actuals: []const CheckedTypeId = &.{},
+
+    const empty: PlatformAppRelationTypeSubstitution = .{};
+
+    fn fromRelation(
+        allocator: Allocator,
+        module: TypedCIR.Module,
+        names: *const canonical.CanonicalNameStore,
+        checked_types: *CheckedTypePublication,
+        declarations: *const PlatformRequiredDeclarationTable,
+        relations: *const PlatformRequirementRelationTable,
+    ) Allocator.Error!PlatformAppRelationTypeSubstitution {
+        if (relations.relations.len == 0) return .{ .names = names };
+
+        var collector = PlatformAppRelationTypeSubstitutionCollector.init(allocator, module, names, checked_types);
+        defer collector.deinitScratch();
+
+        for (relations.relations) |relation| {
+            const declaration = declarations.lookupByDeclarationId(relation.declaration) orelse {
+                checkedArtifactInvariant("platform/app type substitution referenced a missing platform requirement declaration", .{});
+            };
+            const platform_root = platformRequiredPayloadForDeclaration(module, checked_types, declaration);
+            try collector.collectPair(platform_root, relation.requested_source_ty_payload);
+            try collector.collectForClauseAliases(declaration);
+        }
+
+        return .{
+            .names = names,
+            .formals = try collector.formals.toOwnedSlice(allocator),
+            .actuals = try collector.actuals.toOwnedSlice(allocator),
+        };
+    }
+
+    fn deinit(self: *PlatformAppRelationTypeSubstitution, allocator: Allocator) void {
+        allocator.free(self.formals);
+        allocator.free(self.actuals);
+        self.* = empty;
+    }
+
+    fn applyRoot(
+        self: PlatformAppRelationTypeSubstitution,
+        allocator: Allocator,
+        _: TypedCIR.Module,
+        checked_types: *CheckedTypeStore,
+        root: CheckedTypeId,
+    ) Allocator.Error!CheckedTypeId {
+        if (self.formals.len == 0) return root;
+
+        var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+        defer active.deinit();
+
+        return try checked_types.cloneCheckedTypeRootSubstituting(
+            allocator,
+            self.names orelse checkedArtifactInvariant("platform/app type substitution missing canonical names", .{}),
+            root,
+            self.formals,
+            self.actuals,
+            &active,
+        );
+    }
+
+    fn schemeForRoot(
+        self: PlatformAppRelationTypeSubstitution,
+        allocator: Allocator,
+        checked_types: *CheckedTypeStore,
+        root: CheckedTypeId,
+    ) Allocator.Error!canonical.CanonicalTypeSchemeKey {
+        _ = self;
+        return try checked_types.ensureSchemeForRoot(allocator, root);
+    }
+};
+
+const PlatformAppRelationTypeSubstitutionPair = struct {
+    platform_root: u32,
+    actual_root: u32,
+};
+
+const PlatformAppRelationTypeSubstitutionCollector = struct {
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *const canonical.CanonicalNameStore,
+    checked_types: *CheckedTypePublication,
+    formals: std.ArrayList(CheckedTypeId),
+    actuals: std.ArrayList(CheckedTypeId),
+    active: std.AutoHashMap(PlatformAppRelationTypeSubstitutionPair, void),
+
+    fn init(
+        allocator: Allocator,
+        module: TypedCIR.Module,
+        names: *const canonical.CanonicalNameStore,
+        checked_types: *CheckedTypePublication,
+    ) PlatformAppRelationTypeSubstitutionCollector {
+        return .{
+            .allocator = allocator,
+            .module = module,
+            .names = names,
+            .checked_types = checked_types,
+            .formals = .empty,
+            .actuals = .empty,
+            .active = std.AutoHashMap(PlatformAppRelationTypeSubstitutionPair, void).init(allocator),
+        };
+    }
+
+    fn deinitScratch(self: *PlatformAppRelationTypeSubstitutionCollector) void {
+        self.active.deinit();
+        self.actuals.deinit(self.allocator);
+        self.formals.deinit(self.allocator);
+    }
+
+    fn collectPair(
+        self: *PlatformAppRelationTypeSubstitutionCollector,
+        platform_root: CheckedTypeId,
+        actual_root: CheckedTypeId,
+    ) Allocator.Error!void {
+        const pair = PlatformAppRelationTypeSubstitutionPair{
+            .platform_root = @intFromEnum(platform_root),
+            .actual_root = @intFromEnum(actual_root),
+        };
+        if (self.active.contains(pair)) return;
+        try self.active.put(pair, {});
+        defer _ = self.active.remove(pair);
+
+        const platform_payload = self.payload(platform_root);
+        if (checkedTypePayloadIsIdentity(platform_payload)) {
+            try self.appendMapping(platform_root, actual_root);
+            return;
+        }
+
+        switch (platform_payload) {
+            .pending => checkedArtifactInvariant("platform/app type substitution reached pending platform payload", .{}),
+            .flex,
+            .rigid,
+            => unreachable,
+            .empty_record,
+            .empty_tag_union,
+            => {},
+            .alias => |alias| try self.collectPair(alias.backing, actualRootSkippingAlias(&self.checked_types.store, actual_root)),
+            .record, .record_unbound => try self.collectRecord(platform_payload, actual_root),
+            .tuple => |platform_items| {
+                const actual_items = switch (self.payload(actualRootSkippingAlias(&self.checked_types.store, actual_root))) {
+                    .tuple => |items| items,
+                    else => checkedArtifactInvariant("platform/app type substitution expected tuple-compatible actual payload", .{}),
+                };
+                if (platform_items.len != actual_items.len) {
+                    checkedArtifactInvariant("platform/app type substitution tuple arity mismatch", .{});
+                }
+                for (platform_items, actual_items) |platform_item, actual_item| {
+                    try self.collectPair(platform_item, actual_item);
+                }
+            },
+            .nominal => |platform_nominal| {
+                const actual_nominal = switch (self.payload(actualRootSkippingAlias(&self.checked_types.store, actual_root))) {
+                    .nominal => |nominal| nominal,
+                    else => {
+                        if (platform_nominal.is_opaque) {
+                            checkedArtifactInvariant("platform/app type substitution expected nominal-compatible actual payload", .{});
+                        }
+                        return try self.collectPair(platform_nominal.backing, actual_root);
+                    },
+                };
+                if (platform_nominal.args.len != actual_nominal.args.len or
+                    platform_nominal.padding_field_types.len != actual_nominal.padding_field_types.len)
+                {
+                    checkedArtifactInvariant("platform/app type substitution nominal arity mismatch", .{});
+                }
+                for (platform_nominal.args, actual_nominal.args) |platform_arg, actual_arg| {
+                    try self.collectPair(platform_arg, actual_arg);
+                }
+                for (platform_nominal.padding_field_types, actual_nominal.padding_field_types) |platform_pad, actual_pad| {
+                    try self.collectPair(platform_pad, actual_pad);
+                }
+            },
+            .function => |platform_fn| {
+                const actual_fn = switch (self.payload(actualRootSkippingAlias(&self.checked_types.store, actual_root))) {
+                    .function => |function| function,
+                    else => checkedArtifactInvariant("platform/app type substitution expected function-compatible actual payload", .{}),
+                };
+                if (platform_fn.args.len != actual_fn.args.len) {
+                    checkedArtifactInvariant("platform/app type substitution function arity mismatch", .{});
+                }
+                for (platform_fn.args, actual_fn.args) |platform_arg, actual_arg| {
+                    try self.collectPair(platform_arg, actual_arg);
+                }
+                try self.collectPair(platform_fn.ret, actual_fn.ret);
+            },
+            .tag_union => |platform_tags| try self.collectTagUnion(platform_tags, actual_root),
+        }
+    }
+
+    fn collectRecord(
+        self: *PlatformAppRelationTypeSubstitutionCollector,
+        platform_payload: CheckedTypePayload,
+        actual_root: CheckedTypeId,
+    ) Allocator.Error!void {
+        const platform_parts = recordParts(platform_payload) orelse {
+            checkedArtifactInvariant("platform/app type substitution expected platform record payload", .{});
+        };
+        const actual_payload = self.payload(actualRootSkippingAlias(&self.checked_types.store, actual_root));
+        const actual_parts = recordParts(actual_payload) orelse {
+            checkedArtifactInvariant("platform/app type substitution expected record-compatible actual payload", .{});
+        };
+
+        const platform_row = try flattenPlatformRequirementRecordRow(
+            self.allocator,
+            &self.checked_types.store,
+            platform_parts.fields,
+            platform_parts.ext,
+        );
+        defer platform_row.deinit(self.allocator);
+        const actual_row = try flattenPlatformRequirementRecordRow(
+            self.allocator,
+            &self.checked_types.store,
+            actual_parts.fields,
+            actual_parts.ext,
+        );
+        defer actual_row.deinit(self.allocator);
+
+        for (platform_row.fields) |platform_field| {
+            const actual_field = findRecordFieldById(actual_row.fields, platform_field.name) orelse {
+                checkedArtifactInvariant("platform/app type substitution missing actual record field", .{});
+            };
+            try self.collectPair(platform_field.ty, actual_field.ty);
+        }
+        if (platform_row.tail) |platform_ext| {
+            const actual_ext = actual_row.tail orelse try self.emptyRecordRoot();
+            try self.collectPair(platform_ext, actual_ext);
+        }
+    }
+
+    fn collectTagUnion(
+        self: *PlatformAppRelationTypeSubstitutionCollector,
+        platform_union: CheckedTagUnionType,
+        actual_root: CheckedTypeId,
+    ) Allocator.Error!void {
+        const actual_payload = self.payload(actualRootSkippingAlias(&self.checked_types.store, actual_root));
+        const actual_union = tagUnionParts(actual_payload) orelse {
+            checkedArtifactInvariant("platform/app type substitution expected tag-compatible actual payload", .{});
+        };
+
+        const platform_row = try flattenPlatformRequirementTagRow(
+            self.allocator,
+            &self.checked_types.store,
+            platform_union.tags,
+            platform_union.ext,
+        );
+        defer platform_row.deinit(self.allocator);
+        const actual_row = try flattenPlatformRequirementTagRow(
+            self.allocator,
+            &self.checked_types.store,
+            actual_union.tags,
+            actual_union.ext,
+        );
+        defer actual_row.deinit(self.allocator);
+
+        for (platform_row.tags) |platform_tag| {
+            const actual_tag = findTagById(actual_row.tags, platform_tag.name) orelse {
+                checkedArtifactInvariant("platform/app type substitution missing actual tag", .{});
+            };
+            const platform_args = platform_tag.argsSlice(&self.checked_types.store);
+            const actual_args = actual_tag.argsSlice(&self.checked_types.store);
+            if (platform_args.len != actual_args.len) {
+                checkedArtifactInvariant("platform/app type substitution tag arity mismatch", .{});
+            }
+            for (platform_args, actual_args) |platform_arg, actual_arg| {
+                try self.collectPair(platform_arg, actual_arg);
+            }
+        }
+        if (platform_row.tail) |platform_ext| {
+            const actual_ext = actual_row.tail orelse try self.emptyTagUnionRoot();
+            try self.collectPair(platform_ext, actual_ext);
+        }
+    }
+
+    fn collectForClauseAliases(
+        self: *PlatformAppRelationTypeSubstitutionCollector,
+        declaration: PlatformRequiredDeclaration,
+    ) Allocator.Error!void {
+        const module_env = self.module.moduleEnvConst();
+        const required_types = self.module.requiresTypes();
+        if (declaration.requires_idx >= required_types.len) {
+            checkedArtifactInvariant("platform/app type substitution alias collection reached missing requirement", .{});
+        }
+        const required_type = required_types[declaration.requires_idx];
+        for (module_env.for_clause_aliases.sliceRange(required_type.type_aliases)) |alias| {
+            const alias_root = self.checked_types.rootForSourceVar(self.module, ModuleEnv.varFrom(alias.alias_stmt_idx)) orelse {
+                checkedArtifactInvariant("platform/app type substitution could not find for-clause alias root", .{});
+            };
+            const alias_payload = self.payload(alias_root);
+            const alias_backing = switch (alias_payload) {
+                .alias => |alias_payload_data| alias_payload_data.backing,
+                else => checkedArtifactInvariant("platform/app type substitution for-clause root was not an alias", .{}),
+            };
+            const actual = self.actualForFormal(alias_backing) orelse continue;
+            try self.appendMapping(alias_root, actual);
+        }
+    }
+
+    fn appendMapping(
+        self: *PlatformAppRelationTypeSubstitutionCollector,
+        formal: CheckedTypeId,
+        actual: CheckedTypeId,
+    ) Allocator.Error!void {
+        if (formal == actual) return;
+        for (self.formals.items, self.actuals.items) |existing_formal, existing_actual| {
+            if (existing_formal != formal) continue;
+            if (existing_actual == actual or checkedTypeRootKeysEqual(&self.checked_types.store, existing_actual, actual)) return;
+            checkedArtifactInvariant("platform/app type substitution found conflicting actuals for one platform root", .{});
+        }
+        try self.formals.append(self.allocator, formal);
+        try self.actuals.append(self.allocator, actual);
+    }
+
+    fn actualForFormal(
+        self: *const PlatformAppRelationTypeSubstitutionCollector,
+        formal: CheckedTypeId,
+    ) ?CheckedTypeId {
+        for (self.formals.items, self.actuals.items) |existing_formal, actual| {
+            if (existing_formal == formal) return actual;
+        }
+        return null;
+    }
+
+    fn payload(
+        self: *const PlatformAppRelationTypeSubstitutionCollector,
+        root: CheckedTypeId,
+    ) CheckedTypePayload {
+        return self.checked_types.store.payload(root);
+    }
+
+    fn emptyRecordRoot(self: *PlatformAppRelationTypeSubstitutionCollector) Allocator.Error!CheckedTypeId {
+        return try self.checked_types.store.appendSyntheticPayloadRoot(self.allocator, self.names, .empty_record);
+    }
+
+    fn emptyTagUnionRoot(self: *PlatformAppRelationTypeSubstitutionCollector) Allocator.Error!CheckedTypeId {
+        return try self.checked_types.store.appendSyntheticPayloadRoot(self.allocator, self.names, .empty_tag_union);
+    }
+};
+
+fn actualRootSkippingAlias(store: *const CheckedTypeStore, root: CheckedTypeId) CheckedTypeId {
+    var current = root;
+    while (true) {
+        switch (store.payload(current)) {
+            .alias => |alias| current = alias.backing,
+            else => return current,
+        }
+    }
+}
+
+fn checkedTypeRootKeysEqual(
+    store: *const CheckedTypeStore,
+    left: CheckedTypeId,
+    right: CheckedTypeId,
+) bool {
+    return canonicalTypeKeyEql(
+        store.roots.items[@intFromEnum(left)].key,
+        store.roots.items[@intFromEnum(right)].key,
+    );
+}
+
 fn importedModuleViewByKey(
     artifacts: []const ImportedModuleView,
     key: CheckedModuleArtifactKey,
@@ -15409,7 +15813,12 @@ const PlatformAppRelationTypeResolver = struct {
                 .value => other_root,
             };
         }
-        return try self.finalize(other_root, context);
+        return switch (context) {
+            .record_tail,
+            .tag_tail,
+            => try self.finalize(other_root, context),
+            .value => other_root,
+        };
     }
 
     fn finalize(
@@ -16363,7 +16772,12 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                 .value => try self.writeSourceType(other_root),
             };
         }
-        return try self.writeFinalize(other_root, context);
+        return switch (context) {
+            .record_tail,
+            .tag_tail,
+            => try self.writeFinalize(other_root, context),
+            .value => try self.writeSourceType(other_root),
+        };
     }
 
     fn writeFinalize(
@@ -19944,6 +20358,55 @@ pub const TopLevelValueTable = struct {
         return self.entries[self.by_def[lo].entry];
     }
 
+    pub fn applyRelationTypeSubstitution(
+        self: *TopLevelValueTable,
+        allocator: Allocator,
+        module: TypedCIR.Module,
+        checked_type_publication: *CheckedTypePublication,
+        procedure_bindings: *TopLevelProcedureBindingTable,
+        callable_eval_templates: *CallableEvalTemplateTable,
+        const_templates: *ConstTemplateTable,
+        relation_type_substitution: PlatformAppRelationTypeSubstitution,
+    ) Allocator.Error!void {
+        if (relation_type_substitution.formals.len == 0) return;
+
+        for (self.entries) |*entry| {
+            const source_root = checked_type_publication.rootForSourceVar(module, module.defType(entry.def)) orelse {
+                checkedArtifactInvariant("top-level relation type substitution could not find source root", .{});
+            };
+            const checked_root = try relation_type_substitution.applyRoot(
+                allocator,
+                module,
+                &checked_type_publication.store,
+                source_root,
+            );
+            const source_scheme = try relation_type_substitution.schemeForRoot(
+                allocator,
+                &checked_type_publication.store,
+                checked_root,
+            );
+            entry.source_scheme = source_scheme;
+
+            switch (entry.value) {
+                .procedure_binding => |binding_ref| {
+                    const binding = &procedure_bindings.bindings[@intFromEnum(binding_ref)];
+                    binding.source_scheme = source_scheme;
+                    switch (binding.body) {
+                        .direct_template => {},
+                        .callable_eval_template => |template_id| {
+                            const template = &callable_eval_templates.templates[@intFromEnum(template_id)];
+                            template.source_scheme = source_scheme;
+                            template.checked_fn_root = checked_root;
+                        },
+                    }
+                },
+                .const_ref => |*const_ref| {
+                    const_ref.* = const_templates.rewriteSourceScheme(const_ref.*, source_scheme);
+                },
+            }
+        }
+    }
+
     pub fn deinit(self: *TopLevelValueTable, allocator: Allocator) void {
         allocator.free(self.by_def);
         allocator.free(self.by_pattern);
@@ -22524,6 +22987,27 @@ pub const ConstTemplateTable = struct {
             .reserved, .eval_template => record.state = .{ .stored_const = template },
             .stored_const => checkedArtifactInvariant("constant template was filled twice", .{}),
         }
+    }
+
+    pub fn rewriteSourceScheme(
+        self: *ConstTemplateTable,
+        ref: ConstRef,
+        source_scheme: canonical.CanonicalTypeSchemeKey,
+    ) ConstRef {
+        const record = self.recordForRef(ref);
+        record.source_scheme = source_scheme;
+        switch (record.state) {
+            .eval_template => |*eval| eval.source_scheme = source_scheme,
+            .reserved,
+            .stored_const,
+            => {},
+        }
+        return .{
+            .artifact = ref.artifact,
+            .owner = ref.owner,
+            .template = ref.template,
+            .source_scheme = source_scheme,
+        };
     }
 
     pub fn get(self: *const ConstTemplateTable, ref: ConstRef) ConstTemplate {
@@ -25267,6 +25751,16 @@ pub fn publishFromTypedModule(
     );
     errdefer platform_required_bindings.deinit(allocator);
 
+    var relation_type_substitution = try PlatformAppRelationTypeSubstitution.fromRelation(
+        allocator,
+        module,
+        &canonical_names,
+        &checked_type_publication,
+        &platform_required_declarations,
+        &platform_requirement_relations,
+    );
+    defer relation_type_substitution.deinit(allocator);
+
     var compile_time_roots = try CompileTimeRootTable.fromModule(
         allocator,
         module,
@@ -25291,6 +25785,12 @@ pub fn publishFromTypedModule(
         checked_types,
         &entry_wrappers,
         &compile_time_roots,
+    );
+    try checked_procedure_templates.applyRelationTypeSubstitution(
+        allocator,
+        module,
+        checked_types,
+        relation_type_substitution,
     );
 
     var checked_const_store = ConstStore.init(allocator);
@@ -25319,6 +25819,15 @@ pub fn publishFromTypedModule(
         &compile_time_roots,
     );
     errdefer top_level_values.deinit(allocator);
+    try top_level_values.applyRelationTypeSubstitution(
+        allocator,
+        module,
+        &checked_type_publication,
+        &top_level_procedure_bindings,
+        &callable_eval_templates,
+        &const_templates,
+        relation_type_substitution,
+    );
 
     var hoisted_constants = try HoistedConstTable.fromRoots(
         allocator,
@@ -25367,6 +25876,7 @@ pub fn publishFromTypedModule(
         allocator,
         module,
         &checked_type_publication,
+        relation_type_substitution,
         &top_level_values,
         provides,
     );
@@ -25789,6 +26299,16 @@ fn expectProvidedExportKind(
     );
     defer platform_required_bindings.deinit(allocator);
 
+    var relation_type_substitution = try PlatformAppRelationTypeSubstitution.fromRelation(
+        allocator,
+        module,
+        &canonical_names,
+        &checked_type_publication,
+        &platform_required_declarations,
+        &platform_requirement_relations,
+    );
+    defer relation_type_substitution.deinit(allocator);
+
     var compile_time_roots = try CompileTimeRootTable.fromModule(
         allocator,
         module,
@@ -25810,6 +26330,12 @@ fn expectProvidedExportKind(
         checked_types,
         &entry_wrappers,
         &compile_time_roots,
+    );
+    try checked_procedure_templates.applyRelationTypeSubstitution(
+        allocator,
+        module,
+        checked_types,
+        relation_type_substitution,
     );
 
     var callable_eval_templates = CallableEvalTemplateTable{};
@@ -25835,6 +26361,15 @@ fn expectProvidedExportKind(
         &compile_time_roots,
     );
     defer top_level_values.deinit(allocator);
+    try top_level_values.applyRelationTypeSubstitution(
+        allocator,
+        module,
+        &checked_type_publication,
+        &top_level_procedure_bindings,
+        &callable_eval_templates,
+        &const_templates,
+        relation_type_substitution,
+    );
 
     var hoisted_constants = try HoistedConstTable.fromRoots(
         allocator,
@@ -25886,6 +26421,7 @@ fn expectProvidedExportKind(
         allocator,
         module,
         &checked_type_publication,
+        relation_type_substitution,
         &top_level_values,
         provides,
     );

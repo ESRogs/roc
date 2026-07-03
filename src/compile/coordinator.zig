@@ -1486,6 +1486,7 @@ pub const Coordinator = struct {
         self: *Coordinator,
         allocator: Allocator,
         imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
+        extra_roots: []const check.CheckedArtifact.ImportedModuleView,
     ) Allocator.Error![]check.CheckedArtifact.ImportedModuleView {
         var views = std.ArrayList(check.CheckedArtifact.ImportedModuleView).empty;
         errdefer views.deinit(allocator);
@@ -1498,6 +1499,9 @@ pub const Coordinator = struct {
 
         for (imported_artifacts) |imported| {
             try pending.append(allocator, imported.view);
+        }
+        for (extra_roots) |view| {
+            try pending.append(allocator, view);
         }
 
         while (pending.pop()) |view| {
@@ -2304,7 +2308,7 @@ pub const Coordinator = struct {
         defer self.gpa.free(imported_envs);
         const imported_artifacts = try self.buildTypecheckImportedArtifacts(pkg, mod, self.gpa);
         defer self.gpa.free(imported_artifacts);
-        const available_artifacts = try self.collectTypecheckAvailableArtifactViews(self.gpa, imported_artifacts);
+        const available_artifacts = try self.collectTypecheckAvailableArtifactViews(self.gpa, imported_artifacts, &.{});
         defer self.gpa.free(available_artifacts);
         const explicit_roots = try buildExplicitRootRequests(mod, self.gpa);
         defer self.gpa.free(explicit_roots);
@@ -3543,23 +3547,30 @@ pub const Coordinator = struct {
         errdefer task_payload_alloc.free(imported_envs);
         const imported_artifacts = try self.buildTypecheckImportedArtifacts(pkg, mod, task_payload_alloc);
         errdefer task_payload_alloc.free(imported_artifacts);
-        var available_artifacts = try self.collectTypecheckAvailableArtifactViews(task_payload_alloc, imported_artifacts);
-        errdefer task_payload_alloc.free(available_artifacts);
+        var platform_requirement_roots_buf: [1]check.CheckedArtifact.ImportedModuleView = undefined;
+        const platform_requirement_roots: []const check.CheckedArtifact.ImportedModuleView = roots: {
+            if (platform_surface == null) break :roots &.{};
+            const platform_root = self.platformRootCandidate() orelse break :roots &.{};
+            const platform_artifact = platform_root.mod.checkedArtifact() orelse break :roots &.{};
+            platform_requirement_roots_buf[0] = check.CheckedArtifact.importedView(platform_artifact);
+            break :roots platform_requirement_roots_buf[0..1];
+        };
+
+        const available_artifacts = try self.collectTypecheckAvailableArtifactViews(
+            task_payload_alloc,
+            imported_artifacts,
+            platform_requirement_roots,
+        );
         if (platform_surface != null) {
-            // Requirement unification copies platform-owned types into the
-            // app's store, so the app's published API can depend on the
-            // platform root's artifact; make it available to publication's
-            // public-API dependency scan.
-            if (self.platformRootCandidate()) |platform_root| {
-                if (platform_root.mod.checkedArtifact()) |platform_artifact| {
-                    const with_platform = try task_payload_alloc.alloc(check.CheckedArtifact.ImportedModuleView, available_artifacts.len + 1);
-                    @memcpy(with_platform[0..available_artifacts.len], available_artifacts);
-                    with_platform[available_artifacts.len] = check.CheckedArtifact.importedView(platform_artifact);
-                    task_payload_alloc.free(available_artifacts);
-                    available_artifacts = with_platform;
+            if (platform_requirement_roots.len == 0) {
+                task_payload_alloc.free(available_artifacts);
+                if (builtin.mode == .Debug) {
+                    std.debug.panic("compile.coordinator missing platform requirement artifact for app typecheck", .{});
                 }
+                unreachable;
             }
         }
+        errdefer task_payload_alloc.free(available_artifacts);
         const explicit_roots = try buildExplicitRootRequests(mod, task_payload_alloc);
         errdefer task_payload_alloc.free(explicit_roots);
 
