@@ -107,7 +107,7 @@ pub fn run(
     var builder = Builder.init(allocator, modules, &program, options);
     defer builder.deinit();
     try builder.initHostedCatalog();
-    try builder.initMethodLookupIndex();
+    try builder.initComponentMethodTargets();
     try builder.loadCandidateSpecializationShards();
 
     for (roots.requests) |request| {
@@ -291,31 +291,6 @@ const MethodDispatch = struct {
     owner: static_dispatch.MethodOwner,
     method: names.MethodNameId,
 };
-
-const MethodLookupIndexEntry = struct {
-    dispatch: MethodDispatch,
-    view: ModuleView,
-    target: static_dispatch.MethodTarget,
-
-    fn lessThan(_: void, lhs: MethodLookupIndexEntry, rhs: MethodLookupIndexEntry) bool {
-        return methodDispatchOrder(lhs.dispatch, rhs.dispatch) == .lt;
-    }
-};
-
-fn assertMethodLookupIndexUnique(entries: []const MethodLookupIndexEntry) void {
-    if (entries.len < 2) return;
-    var index: usize = 1;
-    while (index < entries.len) : (index += 1) {
-        if (methodDispatchOrder(entries[index - 1].dispatch, entries[index].dispatch) != .eq) continue;
-        Common.invariant("checked method registries contain duplicate dispatch targets");
-    }
-}
-
-fn methodDispatchOrder(a: MethodDispatch, b: MethodDispatch) std.math.Order {
-    const owner_order = methodOwnerOrder(a.owner, b.owner);
-    if (owner_order != .eq) return owner_order;
-    return orderEnum(names.MethodNameId, a.method, b.method);
-}
 
 fn methodOwnerOrder(a: static_dispatch.MethodOwner, b: static_dispatch.MethodOwner) std.math.Order {
     const a_tag = methodOwnerTagRank(a);
@@ -681,7 +656,12 @@ const Builder = struct {
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hosted_catalog: []HostedCatalogEntry = &.{},
-    method_lookup_index: []MethodLookupIndexEntry = &.{},
+    /// Exact `(owner, method)` -> target map over every reachable module's
+    /// method registry, for compiler-generated component lookups (structural
+    /// derivation internals, inspect/parser/encode helpers, path synthesis).
+    /// Built once; keys use the same program-name interning as `typeDef`, so
+    /// owners derived from monomorphic type content correlate directly.
+    component_method_targets: std.AutoHashMapUnmanaged(MethodDispatch, MethodLookup) = .{},
     u64_ty: ?Type.TypeId = null,
     bool_ty: ?Type.TypeId = null,
     constrain_depth: usize = 0,
@@ -749,7 +729,7 @@ const Builder = struct {
     }
 
     fn deinit(self: *Builder) void {
-        self.allocator.free(self.method_lookup_index);
+        self.component_method_targets.deinit(self.allocator);
         self.allocator.free(self.hosted_catalog);
         self.hash_defs.deinit();
         self.equality_defs.deinit();
@@ -914,36 +894,40 @@ const Builder = struct {
         return .{ .keys = keys, .symbols = symbols };
     }
 
-    fn initMethodLookupIndex(self: *Builder) Allocator.Error!void {
-        var entries = std.ArrayList(MethodLookupIndexEntry).empty;
-        errdefer entries.deinit(self.allocator);
-
-        try self.appendMethodLookupIndexFromView(&entries, moduleView(self.root_view));
+    fn initComponentMethodTargets(self: *Builder) Allocator.Error!void {
+        try self.appendComponentMethodTargetsFromView(moduleView(self.root_view));
         for (self.modules.imports, 0..) |imported, index| {
             if (self.importModuleAlreadyScanned(imported.key, index)) continue;
-            try self.appendMethodLookupIndexFromView(&entries, moduleView(imported));
+            try self.appendComponentMethodTargetsFromView(moduleView(imported));
         }
         for (self.modules.root.relation_modules, 0..) |relation, index| {
             if (self.relationModuleAlreadyScanned(relation.key, index)) continue;
-            try self.appendMethodLookupIndexFromView(&entries, moduleView(relation));
+            try self.appendComponentMethodTargetsFromView(moduleView(relation));
         }
-
-        std.mem.sort(MethodLookupIndexEntry, entries.items, {}, MethodLookupIndexEntry.lessThan);
-        assertMethodLookupIndexUnique(entries.items);
-
-        self.method_lookup_index = try entries.toOwnedSlice(self.allocator);
     }
 
-    fn appendMethodLookupIndexFromView(self: *Builder, entries: *std.ArrayList(MethodLookupIndexEntry), view: ModuleView) Allocator.Error!void {
+    fn appendComponentMethodTargetsFromView(self: *Builder, view: ModuleView) Allocator.Error!void {
         for (view.method_registry.entries) |entry| {
-            try entries.append(self.allocator, .{
-                .dispatch = .{
-                    .owner = try self.methodOwnerInProgramNames(view, entry.key.owner),
-                    .method = try self.methodName(view, entry.key.method),
-                },
-                .view = view,
-                .target = entry.target,
+            const owner: static_dispatch.MethodOwner = switch (entry.key.owner) {
+                .builtin => |builtin| .{ .builtin = builtin },
+                .source_decl => |decl| .{ .source_decl = .{
+                    .module_name = try self.moduleName(view, decl.module_name),
+                    .statement = decl.statement,
+                } },
+                .nominal => |nominal| .{ .nominal = .{
+                    .module_name = try self.moduleName(view, nominal.module_name),
+                    .type_name = try self.typeName(view, nominal.type_name),
+                    .source_decl = nominal.source_decl,
+                } },
+            };
+            const slot = try self.component_method_targets.getOrPut(self.allocator, .{
+                .owner = owner,
+                .method = try self.methodName(view, entry.key.method),
             });
+            if (slot.found_existing) {
+                Common.invariant("checked method registries contain duplicate dispatch targets");
+            }
+            slot.value_ptr.* = .{ .view = view, .target = entry.target };
         }
     }
 
@@ -981,17 +965,6 @@ const Builder = struct {
 
     fn moduleIdentity(self: *Builder, view: ModuleView, id: names.ModuleIdentityId) Allocator.Error!names.ModuleIdentityId {
         return self.program.names.internModuleIdentity(view.names.moduleIdentityBytes(id));
-    }
-
-    fn methodOwnerInProgramNames(self: *Builder, view: ModuleView, owner: static_dispatch.MethodOwner) Allocator.Error!static_dispatch.MethodOwner {
-        return switch (owner) {
-            .builtin => |builtin| .{ .builtin = builtin },
-            .nominal => |nominal| .{ .nominal = .{
-                .module = try self.moduleIdentity(view, nominal.module),
-                .type_name = try self.typeName(view, nominal.type_name),
-                .source_decl = nominal.source_decl,
-            } },
-        };
     }
 
     fn recordFieldName(self: *Builder, view: ModuleView, id: names.RecordFieldNameId) Allocator.Error!names.RecordFieldNameId {
@@ -2704,25 +2677,7 @@ const Builder = struct {
         method_name: []const u8,
     ) ?MethodLookup {
         const method = self.program.names.lookupMethodName(method_name) orelse return null;
-        return self.lookupMethodTargetInIndex(.{ .owner = owner, .method = method });
-    }
-
-    fn lookupMethodTargetInIndex(
-        self: *Builder,
-        dispatch: MethodDispatch,
-    ) ?MethodLookup {
-        var low: usize = 0;
-        var high: usize = self.method_lookup_index.len;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            const entry = self.method_lookup_index[mid];
-            switch (methodDispatchOrder(entry.dispatch, dispatch)) {
-                .eq => return .{ .view = entry.view, .target = entry.target },
-                .lt => low = mid + 1,
-                .gt => high = mid,
-            }
-        }
-        return null;
+        return self.component_method_targets.get(.{ .owner = owner, .method = method });
     }
 
     fn importModuleAlreadyScanned(self: *Builder, module_id: checked.ModuleId, import_index: usize) bool {
@@ -16378,15 +16333,11 @@ const BodyContext = struct {
         // when the receiver never grounded to a concrete owner and the result mode
         // is not a structural dispatch. That is only reachable inside a bare
         // polymorphic function value never called at a concrete type — e.g.
-        // evaluating `run` itself for `run : a -> a where [a.go : a -> a]`. The
-        // dispatch can never execute (the function is never invoked), so lower it
-        // to a crash rather than failing the invariant. A genuinely reachable
-        // ownerless dispatch is rejected earlier, at check time. The owner is
-        // re-read here because the pre-lowering above may have supplied the
-        // receiver's solved type, and the structural exception reuses the same
-        // `planAllowsStructural` predicate as `dispatchTarget` so structural
-        // equality/hashing/parser/encode dispatches keep their dedicated
-        // structural lowering below.
+        // evaluating `run` itself for `run : a -> a where [a.go : a -> a]`.
+        // Checking classified such dispatches (`unreachable_dispatch`, or a
+        // `checked_error` for reported missing methods); both lower to an
+        // explicit crash. A genuinely reachable ownerless dispatch was
+        // rejected at check time.
         if (self.planUnexecutable(plan)) |reason| {
             const crash_ty = expected_ret_ty orelse plan_ret_ty;
             try self.constrainTypeToMono(checked_ret_ty, crash_ty);
@@ -16398,14 +16349,6 @@ const BodyContext = struct {
                 // anyway (roc run with errors) crashes here.
                 .checked_error => "method dispatch failed to check",
             });
-        }
-        if (self.evidenceResolution(plan, false) == null and
-            methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null and
-            !planAllowsStructural(plan.result_mode))
-        {
-            const crash_ty = expected_ret_ty orelse plan_ret_ty;
-            try self.constrainTypeToMono(checked_ret_ty, crash_ty);
-            return try self.runtimeCrashExpr(crash_ty, "unresolved `where`-clause method dispatch on a polymorphic value");
         }
         const lookup = self.dispatchTarget(plan, dispatcher_ty);
         if (lookup == null) {
@@ -17053,7 +16996,9 @@ const BodyContext = struct {
         // The dispatcher may not be solved yet when this runs for argument
         // evidence; the target then resolves when the expression itself
         // lowers, and the plan's return carries the evidence for now.
-        if (methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null) {
+        if (methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null or
+            self.planUnexecutable(plan) != null)
+        {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
@@ -17118,7 +17063,6 @@ const BodyContext = struct {
             .structural => |kind| return .{ .structural = kind },
             .checked_error => return .checked_error,
             .unreachable_value => return .unreachable_value,
-            .unresolved => return .unavailable,
         }
     }
 
@@ -17160,7 +17104,7 @@ const BodyContext = struct {
                     .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
                 };
             },
-            .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => return .{ .resolved = &.{} },
+            .structural, .checked_error, .unreachable_dispatch => return .{ .resolved = &.{} },
         }
     }
 
@@ -17182,7 +17126,7 @@ const BodyContext = struct {
                     .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
                 };
             },
-            .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => return .{ .resolved = &.{} },
+            .structural, .checked_error, .unreachable_dispatch => return .{ .resolved = &.{} },
         }
     }
 
@@ -17218,10 +17162,6 @@ const BodyContext = struct {
             },
             .structural => return .structural,
             .checked_error, .unreachable_dispatch => return null,
-            .unresolved_checked_plan => {
-                if (count_gaps) self.builder.evidenceGap("plan-unresolved", self.view.names.methodNameText(plan.method));
-                return null;
-            },
         }
     }
 
@@ -17240,7 +17180,7 @@ const BodyContext = struct {
                 .checked_error => .checked_error,
                 .target, .structural, .unavailable => null,
             } else null,
-            .direct, .structural, .unresolved_checked_plan => null,
+            .direct, .structural => null,
         };
     }
 
@@ -17258,25 +17198,14 @@ const BodyContext = struct {
         plan: static_dispatch.StaticDispatchCallPlan,
         dispatcher_ty: Type.TypeId,
     ) ?MethodLookup {
-        if (self.evidenceResolution(plan, true)) |resolution| {
-            // Evidence is authoritative; the derivation comparison below is a
-            // migration audit and is deleted with the derivation path.
-            if (@import("builtin").mode == .Debug) self.debugCompareDerivation(plan, dispatcher_ty, resolution);
-            return switch (resolution) {
-                .target => |lookup| lookup,
-                .structural => null,
-            };
-        }
-
-        // Migration fallback: owner derivation still covers unresolved plans,
-        // unavailable edge evidence, and checked-error sites.
-        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse {
-            if (planAllowsStructural(plan.result_mode)) return null;
-            Common.invariant("dispatch plan had no method owner and no structural equality permission");
-        };
-        return self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse {
-            if (planAllowsStructural(plan.result_mode)) return null;
-            Common.invariant("checked method registry is missing resolved dispatch target");
+        const resolution = self.evidenceResolution(plan, true) orelse
+            Common.invariant("dispatch plan reached monotype lowering without a resolution");
+        // Debug audit: where owner derivation can still resolve the dispatch,
+        // it must agree with the consumed evidence.
+        if (@import("builtin").mode == .Debug) self.debugCompareDerivation(plan, dispatcher_ty, resolution);
+        return switch (resolution) {
+            .target => |lookup| lookup,
+            .structural => null,
         };
     }
 
@@ -17286,12 +17215,7 @@ const BodyContext = struct {
     /// point, not a bug.
     fn debugCompareDerivation(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, dispatcher_ty: Type.TypeId, resolution: EvidenceResolved) void {
         const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse return;
-        const derived = self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse {
-            if (resolution == .target and !planAllowsStructural(plan.result_mode)) {
-                Common.invariant("owner derivation missed a target the dispatch evidence resolved");
-            }
-            return;
-        };
+        const derived = self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse return;
         switch (resolution) {
             .target => |lookup| {
                 if (!std.meta.eql(lookup.target, derived.target)) {
@@ -17302,62 +17226,12 @@ const BodyContext = struct {
         }
     }
 
-    fn debugCompareEvidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, derived: ?MethodLookup) void {
-        switch (plan.resolution) {
-            // Direct plans return before derivation runs.
-            .direct => unreachable,
-            .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse {
-                    self.builder.evidenceGap("dispatch-chain-miss", self.view.names.methodNameText(plan.method));
-                    return;
-                };
-                switch (entry) {
-                    .target => |target| {
-                        const derived_lookup = derived orelse
-                            Common.invariant("dispatch evidence supplied a target but owner derivation chose structural");
-                        if (!std.meta.eql(target.target, derived_lookup.target)) {
-                            Common.invariant("dispatch evidence target disagreed with the owner-derivation target");
-                        }
-                    },
-                    .structural => {
-                        if (derived != null) Common.invariant("dispatch evidence chose structural but owner derivation found a target");
-                    },
-                    .unreachable_value => {
-                        if (derived != null) Common.invariant("dispatch evidence marked the obligation unreachable but owner derivation found a target");
-                    },
-                    .unavailable => self.builder.evidenceGap("dispatch-entry-unavailable", self.view.names.methodNameText(plan.method)),
-                }
-            },
-            .structural => {
-                if (derived != null) Common.invariant("dispatch plan resolved structural but owner derivation found a target");
-            },
-            .checked_error => {},
-            .unreachable_dispatch => {
-                if (derived != null) Common.invariant("dispatch plan classified unreachable but owner derivation found a target");
-            },
-            .unresolved_checked_plan => self.builder.evidenceGap("plan-unresolved", self.view.names.methodNameText(plan.method)),
-        }
-    }
-
-    /// The derived-structural kind a constraint method admits, if any.
     fn structuralKindForMethodText(method_text: []const u8) ?static_dispatch.StructuralKind {
         if (std.mem.eql(u8, method_text, "is_eq")) return .equality;
         if (std.mem.eql(u8, method_text, "to_hash")) return .hash;
         if (std.mem.eql(u8, method_text, "parser_for")) return .parser;
         if (std.mem.eql(u8, method_text, "encode_to")) return .encoder;
         return null;
-    }
-
-    /// Whether a dispatch plan permits structural decomposition (equality or
-    /// hashing) instead of resolving to a concrete method target.
-    fn planAllowsStructural(mode: static_dispatch.StaticDispatchResultMode) bool {
-        return switch (mode) {
-            .equality => |eq| eq.structural_allowed,
-            .hash => |hash| hash.structural_allowed,
-            .parser_for => |parser_for| parser_for.structural_allowed,
-            .encode_to => |encode_to| encode_to.structural_allowed,
-            .value => false,
-        };
     }
 
     fn methodLookupForResolvedTarget(
@@ -22394,7 +22268,6 @@ const BodyContext = struct {
                     }
                 },
                 .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
-                .unresolved_checked_plan => self.builder.evidenceGap("iterator-plan-unresolved", self.view.names.methodNameText(plan.method)),
             }
             const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse
                 Common.invariant("iterator dispatch plan had no method owner");

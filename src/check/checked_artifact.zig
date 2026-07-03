@@ -410,6 +410,9 @@ pub const PublishImportArtifact = struct {
 const CheckedImportViews = struct {
     direct: []const PublishImportArtifact,
     available: []const ImportedModuleView = &.{},
+    /// Platform relation modules: registry-visible for dispatch resolution
+    /// even though they are neither imported nor in `available`.
+    relations: []const ImportedModuleView = &.{},
 };
 
 /// Checked artifacts that must be available to consume this module's public API.
@@ -12787,10 +12790,11 @@ const EvidencePass = struct {
     scope_params: std.AutoHashMap(u32, []EvidenceParam),
     /// Scratch backing for the chain currently being resolved against.
     chain_scratch: std.ArrayList([]const EvidenceParam),
-    /// Obligations the pass could not resolve; these plans keep
-    /// `unresolved_checked_plan` and monotype lowering's owner derivation
-    /// still covers them during the class-by-class migration.
-    unresolved_count: usize = 0,
+    /// Per-plan / per-iterator-plan visited flags: a plan reachable from two
+    /// templates (const body + entry wrapper) resolves once, and the final
+    /// sweep resolves whatever no template reached (chain-free).
+    plan_resolved: []bool = &.{},
+    iterator_plan_resolved: []bool = &.{},
     /// The param chain in scope while resolving a site's evidence entries, so
     /// a fresh var that settled onto an enclosing where-var forwards as
     /// `constraint(depth, k)`. Index 0 is the innermost generalized callable.
@@ -12851,6 +12855,8 @@ const EvidencePass = struct {
     }
 
     fn deinit(self: *EvidencePass) void {
+        self.allocator.free(self.plan_resolved);
+        self.allocator.free(self.iterator_plan_resolved);
         self.value_use_by_node.deinit();
         self.target_by_fn_var.deinit();
         self.source_by_checked_expr.deinit();
@@ -12875,6 +12881,11 @@ const EvidencePass = struct {
     }
 
     fn run(self: *EvidencePass) Allocator.Error!void {
+        self.plan_resolved = try self.allocator.alloc(bool, self.plan_table.plans.len);
+        @memset(self.plan_resolved, false);
+        self.iterator_plan_resolved = try self.allocator.alloc(bool, self.plan_table.iterator_for_plans.len);
+        @memset(self.iterator_plan_resolved, false);
+
         try self.buildIndexes();
 
         var params = std.ArrayListUnmanaged(EvidenceParam).empty;
@@ -12979,10 +12990,16 @@ const EvidencePass = struct {
             try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
         }
 
-        // Any plan the template walk did not reach stays unresolved for the
-        // migration's derivation fallback; count it for the dual-run audit.
-        for (self.plan_table.plans) |plan| {
-            if (plan.resolution == .unresolved_checked_plan) self.unresolved_count += 1;
+        // Plans no template reached (dead code, expressions outside any
+        // template) still leave publication with a definitive resolution:
+        // resolve them chain-free, exactly like root edges.
+        for (0..self.plan_table.plans.len) |raw| {
+            if (self.plan_resolved[raw]) continue;
+            try self.resolvePlan(@enumFromInt(raw), &.{});
+        }
+        for (0..self.plan_table.iterator_for_plans.len) |raw| {
+            if (self.iterator_plan_resolved[raw]) continue;
+            try self.resolveIteratorPlan(@enumFromInt(raw), &.{});
         }
 
         std.mem.sort(static_dispatch.SiteEvidenceEntry, self.site_evidence.items, {}, siteEvidenceLessThan);
@@ -13117,6 +13134,9 @@ const EvidencePass = struct {
         if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.available, owner, method)) |target| {
             return target;
         }
+        if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.relations, owner, method)) |target| {
+            return target;
+        }
         var direct_views_buf: [1]ImportedModuleView = undefined;
         for (self.import_views.direct) |import| {
             direct_views_buf[0] = import.view;
@@ -13141,9 +13161,8 @@ const EvidencePass = struct {
     fn resolvePlan(self: *EvidencePass, plan_id: static_dispatch.StaticDispatchPlanId, chain: []const []const EvidenceParam) Allocator.Error!void {
         const raw = @intFromEnum(plan_id);
         const plan = &self.plan_table.plans[raw];
-        // A plan reachable from two templates (const body + entry wrapper)
-        // resolves once.
-        if (plan.resolution != .unresolved_checked_plan) return;
+        if (self.plan_resolved[raw]) return;
+        self.plan_resolved[raw] = true;
 
         const src = self.build_data.plan_sources[raw];
         const structural_kind: ?static_dispatch.StructuralKind = switch (plan.result_mode) {
@@ -13169,7 +13188,8 @@ const EvidencePass = struct {
     fn resolveIteratorPlan(self: *EvidencePass, plan_id: static_dispatch.IteratorForPlanId, chain: []const []const EvidenceParam) Allocator.Error!void {
         const raw = @intFromEnum(plan_id);
         const plan = &self.plan_table.iterator_for_plans[raw];
-        if (plan.iter.resolution != .unresolved_checked_plan) return;
+        if (self.iterator_plan_resolved[raw]) return;
+        self.iterator_plan_resolved[raw] = true;
 
         const src = self.build_data.iterator_plan_sources[raw];
         self.current_chain = chain;
@@ -13192,10 +13212,9 @@ const EvidencePass = struct {
                 src.next_fn_var,
                 chain,
             )
-        else blk: {
-            self.unresolved_count += 1;
-            break :blk .unresolved_checked_plan;
-        };
+        else
+            // A non-function `iter` callable only occurs on checked errors.
+            .checked_error;
     }
 
     fn iteratorNextDispatcherVar(self: *EvidencePass, iter_fn_var: Var) ?Var {
@@ -13226,18 +13245,15 @@ const EvidencePass = struct {
                         const node = try self.evidenceNodeForTarget(target, constraint_fn_var);
                         return .{ .direct = node };
                     }
-                    // The dispatcher has an owner but this publication's
-                    // registry views missed the method. That is EITHER a type
-                    // the checker chose a derived structural implementation
-                    // for, OR a registry-visibility gap (e.g. platform
-                    // relation modules are not in `available`). Committing to
-                    // `structural` here would contradict monotype's
-                    // program-wide lookup; distinguishing the two needs the
-                    // checker's recorded structural decisions (the eq/hash
-                    // class migration). Until then the plan stays unresolved
-                    // and owner derivation decides.
-                    self.unresolved_count += 1;
-                    return .unresolved_checked_plan;
+                    // The dispatcher has an owner, checking passed, and no
+                    // registry-visible view declares the method: the checker
+                    // discharged the obligation with the derived structural
+                    // implementation. Value dispatches cannot discharge
+                    // structurally, so a miss there is a publication bug
+                    // (every view the checker resolved against is searched
+                    // above).
+                    if (structural_kind) |kind| return .{ .structural = kind };
+                    std.debug.panic("publication could not resolve a checked dispatch target for an owned method", .{});
                 }
                 // No owner head: a genuinely structural shape.
                 if (structural_kind) |kind| return .{ .structural = kind };
@@ -13457,17 +13473,6 @@ const EvidencePass = struct {
                 break :blk .checked_error;
             },
             .unreachable_dispatch => .unreachable_value,
-            .unresolved_checked_plan => blk: {
-                // Migration gap: consumers fall back to owner derivation.
-                self.unresolved_count += 1;
-                if (@import("builtin").mode == .Debug) {
-                    std.log.scoped(.checked_evidence).debug("evidence entry unresolved: method={s} content={s}", .{
-                        self.module.identStoreConst().getText(param.constraint.fn_name),
-                        @tagName(self.types.resolveVar(var_).desc.content),
-                    });
-                }
-                break :blk .unresolved;
-            },
         };
     }
 
@@ -24523,7 +24528,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 11;
+    const serialized_layout_version: u32 = 12;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -26753,7 +26758,7 @@ pub fn publishFromTypedModule(
         &checked_type_publication,
         checked_bodies,
         &method_registry,
-        .{ .direct = inputs.imports, .available = inputs.available_artifacts },
+        .{ .direct = inputs.imports, .available = inputs.available_artifacts, .relations = inputs.relation_artifacts },
         &static_dispatch_plans,
         &checked_procedure_templates,
         &resolved_value_refs,
@@ -27056,10 +27061,42 @@ fn expectProvidedExportKind(
     const empty_callable_eval_templates = CallableEvalTemplateTable{};
     const empty_hoisted_constants = HoistedConstTable{};
     const empty_const_templates = ConstTemplateTable{};
-    const empty_method_registry = static_dispatch.MethodRegistry{};
     const empty_interface_capabilities = ModuleInterfaceCapabilities{};
     var empty_const_store = ConstStore.init(allocator);
     defer empty_const_store.deinit();
+
+    // The module under test dispatches on builtin owners (`value + 1` needs
+    // I64.plus); publication asserts totality, so the builtin projection must
+    // carry its real method registry — built like the real publish path
+    // (bodies, templates, then the registry over them).
+    var builtin_pub_source_nodes = try CheckedSourceNodes.init(allocator, builtin_module);
+    defer builtin_pub_source_nodes.deinit(allocator);
+    var builtin_body_builder = try CheckedBodyStoreBuilder.fromModule(allocator, builtin_module, &builtin_names, &builtin_checked_type_publication, &builtin_pub_source_nodes);
+    defer builtin_body_builder.deinit(allocator);
+    const builtin_bodies = builtin_body_builder.storePtr();
+    var builtin_intrinsic_wrappers = IntrinsicWrapperTable{};
+    defer builtin_intrinsic_wrappers.deinit(allocator);
+    var builtin_templates = try CheckedProcedureTemplateTable.fromModule(
+        allocator,
+        builtin_module,
+        builtin_env.store.sliceDefs(builtin_env.global_value_defs),
+        &builtin_names,
+        artifactRef(builtin_key),
+        &builtin_checked_type_publication,
+        builtin_bodies,
+        &builtin_intrinsic_wrappers,
+    );
+    defer builtin_templates.deinit(allocator);
+    const builtin_template_lookup = builtin_templates.asLookup(builtin_module.moduleIndex());
+    var builtin_method_registry = try static_dispatch.MethodRegistry.fromModule(
+        allocator,
+        builtin_module,
+        &builtin_names,
+        &builtin_template_lookup,
+        &builtin_checked_type_publication,
+        builtin_bodies,
+    );
+    defer builtin_method_registry.deinit(allocator);
 
     const builtin_view = ImportedModuleView{
         .key = builtin_key,
@@ -27089,7 +27126,7 @@ fn expectProvidedExportKind(
         .callable_eval_templates = empty_callable_eval_templates.view(),
         .hoisted_constants = &empty_hoisted_constants,
         .const_templates = &empty_const_templates,
-        .method_registry = &empty_method_registry,
+        .method_registry = &builtin_method_registry,
         .interface_capabilities = &empty_interface_capabilities,
         .const_store = &empty_const_store,
     };
@@ -28460,8 +28497,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x8D, 0x72, 0x5C, 0xF4, 0x9B, 0xC1, 0xDF, 0xD1, 0xD0, 0xC9, 0x0D, 0x8A, 0xD7, 0x93, 0x90, 0x91,
-        0x54, 0x51, 0x6E, 0x18, 0xB0, 0xD9, 0x4F, 0x44, 0x53, 0x9A, 0xEF, 0x4B, 0x5F, 0xEE, 0xF7, 0xAA,
+        0x00, 0x3B, 0xEC, 0x91, 0xA5, 0xDC, 0xE0, 0x34, 0xB3, 0x35, 0xDF, 0x81, 0x03, 0x7E, 0xD5, 0x1D,
+        0xD4, 0xD9, 0xC6, 0x29, 0xD8, 0x55, 0x18, 0x24, 0xBC, 0x48, 0x3D, 0x8E, 0x70, 0x75, 0xE6, 0x99,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

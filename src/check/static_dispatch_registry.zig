@@ -644,10 +644,6 @@ pub const CheckedEvidence = union(enum) {
     /// is always `Err` at this edge). The obligation is vacuous; consuming it
     /// lowers to an unreachable crash, never to a resolved call.
     unreachable_value,
-    /// Publication could not resolve the obligation (a registry-visibility
-    /// gap). Migration state: consumers fall back to owner derivation;
-    /// deleted once every obligation resolves totally.
-    unresolved,
 };
 
 /// Public `EvidenceNode` declaration.
@@ -694,10 +690,6 @@ pub const EvidenceParamRecord = struct {
 
 /// Public `StaticDispatchResolution` declaration.
 pub const StaticDispatchResolution = union(enum) {
-    /// The dispatch target was not published as a concrete procedure target in
-    /// this checked module's static-dispatch inputs. Migration state: this
-    /// variant is deleted once every plan class resolves totally.
-    unresolved_checked_plan,
     /// Checking proved the concrete target (with nested evidence for the
     /// target's own obligations). Later stages must call this target directly
     /// instead of rediscovering it from source or type names.
@@ -726,7 +718,9 @@ pub const StaticDispatchCallPlan = struct {
     /// Range into `StaticDispatchPlanTable.operand_pool` (transform B).
     args: artifact_serialize.Span = .{},
     result_mode: StaticDispatchResultMode,
-    resolution: StaticDispatchResolution,
+    /// Assigned by `resolveTotalDispatchPlans` at publication; the default is
+    /// a construction placeholder the pass overwrites for every plan.
+    resolution: StaticDispatchResolution = .checked_error,
 
     /// The plan's operands within its table's pool.
     pub fn argsSlice(self: StaticDispatchCallPlan, table: *const StaticDispatchPlanTable) []const StaticDispatchOperand {
@@ -754,7 +748,9 @@ pub const IteratorDispatchCall = struct {
     dispatcher_arg_index: u32,
     /// Range into `StaticDispatchPlanTable.iter_operand_pool` (transform B).
     args: artifact_serialize.Span = .{},
-    resolution: StaticDispatchResolution = .unresolved_checked_plan,
+    /// Assigned by `resolveTotalDispatchPlans` at publication; the default is
+    /// a construction placeholder the pass overwrites for every plan.
+    resolution: StaticDispatchResolution = .checked_error,
 
     pub fn argsSlice(self: IteratorDispatchCall, table: *const StaticDispatchPlanTable) []const IteratorDispatchOperand {
         return table.iter_operand_pool[self.args.start .. self.args.start + self.args.len];
@@ -931,7 +927,6 @@ pub const StaticDispatchPlanTable = struct {
                         .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, dispatch_call.constraint_fn_var),
                         .args = ar,
                         .result_mode = try staticDispatchResultModeForCheckedValueCall(allocator, module, checked_types, &constraint_index, dispatch_call.method_name, dispatch_call.constraint_fn_var),
-                        .resolution = .unresolved_checked_plan,
                     });
                     try plan_sources.append(allocator, .{
                         .dispatcher_var = module.exprType(dispatch_call.receiver),
@@ -959,7 +954,6 @@ pub const StaticDispatchPlanTable = struct {
                         .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, constraint_fn_var),
                         .args = ar,
                         .result_mode = .value,
-                        .resolution = .unresolved_checked_plan,
                     });
                     try plan_sources.append(allocator, .{
                         .dispatcher_var = interpolationDispatcherVar(module, expr_idx),
@@ -979,7 +973,6 @@ pub const StaticDispatchPlanTable = struct {
                         .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, dispatch_call.constraint_fn_var),
                         .args = ar,
                         .result_mode = try staticDispatchResultModeForCheckedValueCall(allocator, module, checked_types, &constraint_index, dispatch_call.method_name, dispatch_call.constraint_fn_var),
-                        .resolution = .unresolved_checked_plan,
                     });
                     try plan_sources.append(allocator, .{
                         .dispatcher_var = typeDispatchOwnerVar(module, dispatch_call.type_dispatch_stmt),
@@ -1002,7 +995,6 @@ pub const StaticDispatchPlanTable = struct {
                             .structural_allowed = true,
                             .negated = eq.negated,
                         } },
-                        .resolution = .unresolved_checked_plan,
                     });
                     try plan_sources.append(allocator, .{
                         .dispatcher_var = module.exprType(eq.lhs),
@@ -1064,7 +1056,6 @@ pub const StaticDispatchPlanTable = struct {
                 .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, @enumFromInt(numeral_plan.fn_var)),
                 .args = ar,
                 .result_mode = .value,
-                .resolution = .unresolved_checked_plan,
             });
             try plan_sources.append(allocator, .{
                 .dispatcher_var = @enumFromInt(numeral_plan.target_var),
@@ -1105,7 +1096,6 @@ pub const StaticDispatchPlanTable = struct {
                 .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, @enumFromInt(quote_plan.fn_var)),
                 .args = ar,
                 .result_mode = .value,
-                .resolution = .unresolved_checked_plan,
             });
             try plan_sources.append(allocator, .{
                 .dispatcher_var = @enumFromInt(quote_plan.target_var),
@@ -1736,7 +1726,6 @@ fn testPlan(expr_raw: u32, args_start: u32, args_len: u32) StaticDispatchCallPla
         .callable_ty = @enumFromInt(3),
         .args = .{ .start = args_start, .len = args_len },
         .result_mode = .value,
-        .resolution = .unresolved_checked_plan,
     };
 }
 
