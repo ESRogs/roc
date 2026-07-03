@@ -563,6 +563,7 @@ fn initReportBuilder(self: *TestEnv) Allocator.Error!report_mod.ReportBuilder {
         &.{},
         &self.checker.import_mapping,
         &self.checker.regions,
+        null,
     );
 }
 
