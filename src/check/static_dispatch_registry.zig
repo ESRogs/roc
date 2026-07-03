@@ -615,14 +615,14 @@ pub const StructuralKind = enum(u8) {
 /// `StaticDispatchPlanTable.evidence_nodes`.
 pub const EvidenceNodeId = enum(u32) { _ };
 
-/// Public `EvidenceConstraintRef` declaration.
+/// Public `EvidenceChainIndex` declaration.
 ///
 /// A dispatch obligation forwarded to the enclosing callable's evidence
 /// params: `index` is the canonical evidence-param index (see
 /// `dispatch_evidence.zig`), and `depth` counts enclosing generalized
 /// callables outward from the reference (0 = the innermost generalized
 /// callable the reference appears in).
-pub const EvidenceConstraintRef = struct {
+pub const EvidenceChainIndex = struct {
     depth: u16,
     index: u16,
 };
@@ -636,7 +636,7 @@ pub const EvidenceConstraintRef = struct {
 /// already rejected; consuming it after checking is a compiler bug.
 pub const CheckedEvidence = union(enum) {
     direct: EvidenceNodeId,
-    constraint: EvidenceConstraintRef,
+    constraint: EvidenceChainIndex,
     structural: StructuralKind,
     checked_error,
     /// The edge left this obligation's dispatcher unsolved: no value of that
@@ -696,7 +696,7 @@ pub const StaticDispatchResolution = union(enum) {
     direct: EvidenceNodeId,
     /// The dispatcher is one of the enclosing callable's constrained scheme
     /// vars; each specialization edge supplies the target as evidence.
-    constraint: EvidenceConstraintRef,
+    constraint: EvidenceChainIndex,
     /// The checker chose a compiler-derived structural implementation.
     structural: StructuralKind,
     /// Checking rejected this site; lowering must never consume the plan.

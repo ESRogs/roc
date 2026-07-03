@@ -84,8 +84,8 @@ pub const SpecializationCounters = struct {
     specialization_type_digest_cache_misses: u64 = 0,
     specialization_type_digest_nodes_visited: u64 = 0,
     exact_type_checks: u64 = 0,
-    /// Total-dispatch migration audit: obligations still resolved by owner
-    /// derivation instead of published evidence. Must reach zero before the
+    /// Total-dispatch migration audit: requirements still resolved by owner
+    /// derivation instead of checked evidence. Must reach zero before the
     /// derivation path is deleted.
     evidence_missing: u64 = 0,
 };
@@ -172,8 +172,8 @@ const MethodLookup = struct {
     target: static_dispatch.MethodTarget,
 };
 
-/// One resolved dispatch obligation supplied to a specialization: either a
-/// concrete method target (with the target's own obligations resolved in
+/// One resolved dispatch requirement supplied to a specialization: either a
+/// concrete method target (with the target's own requirements resolved in
 /// `nested`) or a compiler-derived structural implementation. Fully
 /// materialized at the requesting call edge — checked `constraint(k)` refs are
 /// substituted from the requester's own evidence there — so a specialization's
@@ -182,14 +182,14 @@ const MethodLookup = struct {
 const SpecEvidence = union(enum) {
     target: *const SpecEvidenceTarget,
     structural: static_dispatch.StructuralKind,
-    /// The edge left the obligation's dispatcher unsolved: no value of that
+    /// The edge left the requirement's dispatcher unsolved: no value of that
     /// type can ever reach the dispatch, which lowers to an explicit
     /// unreachable crash.
     unreachable_value,
-    /// Checking rejected the edge's obligation (a reported missing method);
+    /// Checking rejected the edge's requirement (a reported missing method);
     /// the dispatch lowers to an explicit crash.
     checked_error,
-    /// Publication left the obligation unresolved (migration gap). Consuming
+    /// Checking left the requirement unresolved (migration gap). Consuming
     /// it falls back to owner derivation until the migration completes.
     unavailable,
 };
@@ -200,7 +200,7 @@ const SpecEvidenceTarget = struct {
     nested: NestedSpecEvidence,
 };
 
-/// A target's own obligations: resolved by checked evidence at publication,
+/// A target's own requirements: resolved by checked evidence in checked module data,
 /// or synthesized lazily at the target's consumption site (compiler-generated
 /// edges have no checked records; the concrete callable type is only known
 /// where the call lowers).
@@ -212,7 +212,7 @@ const NestedSpecEvidence = union(enum) {
 /// The evidence supplied to a callee specialization request.
 const SpecEvidenceVector = union(enum) {
     resolved: []const SpecEvidence,
-    /// Resolve the callee's obligations from its published dispatcher paths
+    /// Resolve the callee's requirements from its checked dispatcher paths
     /// over the concrete callable (compiler-generated edges only).
     synthesize,
 };
@@ -225,7 +225,7 @@ const EvidenceChain = struct {
     vector: []const SpecEvidence = &.{},
     parent: ?*const EvidenceChain = null,
 
-    fn at(self: *const EvidenceChain, ref: static_dispatch.EvidenceConstraintRef) ?SpecEvidence {
+    fn at(self: *const EvidenceChain, ref: static_dispatch.EvidenceChainIndex) ?SpecEvidence {
         var chain: *const EvidenceChain = self;
         var depth = ref.depth;
         while (depth > 0) : (depth -= 1) {
@@ -242,9 +242,12 @@ fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
             .target => |b_target| blk: {
                 if (!std.meta.eql(a_target.target, b_target.target)) break :blk false;
                 switch (a_target.nested) {
-                    .synthesize => break :blk b_target.nested == .synthesize,
+                    // A synthesize marker resolves from the same concrete
+                    // callable this comparison already agrees on, so it is
+                    // compatible with any nested vector for the same target.
+                    .synthesize => break :blk true,
                     .resolved => |a_nested| switch (b_target.nested) {
-                        .synthesize => break :blk false,
+                        .synthesize => break :blk true,
                         .resolved => |b_nested| {
                             if (a_nested.len != b_nested.len) break :blk false;
                             for (a_nested, b_nested) |a_entry, b_entry| {
@@ -357,7 +360,7 @@ const LoweredTemplate = struct {
     solved_fn_ty: Type.TypeId,
     solved_digest: names.TypeDigest,
     status: LoweredTemplateStatus,
-    /// Evidence for the template scheme's dispatch obligations, in canonical
+    /// Evidence for the template scheme's dispatch requirements, in enumeration
     /// evidence-param order, supplied by the first requesting edge. Reused
     /// specializations debug-assert later edges agree (evidence is a function
     /// of the monomorphic type, so agreement is an invariant, not a choice).
@@ -626,7 +629,7 @@ const Builder = struct {
     /// Owns every materialized `SpecEvidence` tree; freed wholesale with the
     /// builder.
     evidence_arena: std.heap.ArenaAllocator,
-    /// Dispatch obligations whose evidence publication could not resolve
+    /// Dispatch requirements whose checked evidence could not resolve
     /// (migration gaps still covered by owner derivation); audited by the
     /// total-dispatch migration before the derivation path is deleted.
     evidence_missing_count: usize = 0,
@@ -722,7 +725,7 @@ const Builder = struct {
         }
     }
 
-    /// Record one dispatch obligation the published evidence could not cover
+    /// Record one dispatch requirement the checked evidence could not cover
     /// (owner derivation resolves it during the migration). The tagged debug
     /// log drives the audit that must reach zero before derivation is deleted.
     fn evidenceGap(self: *Builder, comptime reason: []const u8, context: []const u8) void {
@@ -1476,7 +1479,7 @@ const Builder = struct {
         body_ctx.evidence = .{ .vector = spec_evidence };
         if (spec_evidence.len < template.evidence_params.len) {
             // An entry wrapper's only caller is the root edge itself;
-            // publication resolved that edge's evidence (chain-free: concrete
+            // checking resolved that edge's evidence (chain-free: concrete
             // targets, mono-default owners, structural, vacuous) as site
             // evidence keyed by the root's body expression.
             var filled = false;
@@ -1484,8 +1487,8 @@ const Builder = struct {
                 body_ctx.evidence = .{ .vector = root_evidence };
                 filled = true;
             } else if (template.body != .intrinsic_wrapper) {
-                // Root-edge request scheduled after publication (eval/REPL
-                // entries): resolve the obligations from the template's own
+                // Root-edge request scheduled after checking output was sealed (eval/REPL
+                // entries): resolve the requirements from the template's own
                 // dispatcher paths over the requested callable — the sealed
                 // mono type carries the checker's defaults.
                 const synthesized = try body_ctx.synthesizeParamsEvidence(view, template, lower_fn_ty);
@@ -1500,8 +1503,8 @@ const Builder = struct {
             }
             if (!filled) {
                 // Requesting edges that predate full evidence threading (or
-                // gaps publication counted) leave the vector short; owner
-                // derivation still resolves those obligations during the
+                // counted gaps from checking) leave the vector short; owner
+                // derivation still resolves those requirements during the
                 // migration.
                 const proc_base = view.names.procBase(template_ref.proc_base);
                 const template_name = if (proc_base.export_name) |export_name| view.names.exportNameText(export_name) else "<unnamed>";
@@ -1612,7 +1615,7 @@ const Builder = struct {
             const existing = self.lowered_templates.items[match.index];
             // Evidence is a function of the monomorphic type; two edges
             // requesting the same specialization must agree wherever both
-            // resolved their obligations.
+            // resolved their requirements.
             if (@import("builtin").mode == .Debug and
                 existing.evidence.len == evidence.len and
                 !evidenceVectorsHaveGaps(existing.evidence, evidence) and
@@ -6290,13 +6293,13 @@ const BodyContext = struct {
     /// constants only count as "own" roots for this exact entry, not for every
     /// specialization of the same procedure template.
     current_entry_root: ?checked.ComptimeRootId = null,
-    /// Evidence for the current callable's dispatch obligations (innermost
+    /// Evidence for the current callable's dispatch requirements (innermost
     /// vector plus lexical parents for nested local functions). Body contexts
     /// created for the same specialization (dispatch call contexts, nested
     /// non-generalized closures) share the owning specialization's chain.
     evidence: EvidenceChain = .{},
     /// While restoring a constant's stored value at a use site, the evidence
-    /// vector that use supplied for the constant's own obligations. Closures
+    /// vector that use supplied for the constant's own requirements. Closures
     /// restored from the constant lower their bodies against this chain
     /// (their plans' `constraint(k)` refs index the constant's scheme).
     restore_evidence: EvidenceChain = .{},
@@ -14508,7 +14511,7 @@ const BodyContext = struct {
             Common.invariant("checked direct call target is outside resolved value table");
         }
         // The value use's site evidence resolves the callee scheme's dispatch
-        // obligations at this edge.
+        // requirements at this edge.
         const evidence = try self.evidenceForUseSite(self.view.resolved_refs.records[raw].expr);
         return switch (self.view.resolved_refs.records[raw].ref) {
             .local_proc => |local| .{ .local = try self.fnTemplateForLocalProcWithMono(local, source_fn_ty, source_fn_key, mono_fn_ty, evidence) },
@@ -14845,7 +14848,7 @@ const BodyContext = struct {
         };
     }
 
-    /// Publication-resolved root-edge evidence for a compile-time root's
+    /// Checked root-edge evidence for a compile-time root's
     /// template (site evidence keyed by the root's body expression),
     /// materialized. `template` bounds the expected param count.
     fn rootEdgeEvidenceByExpr(
@@ -14902,7 +14905,7 @@ const BodyContext = struct {
         var body_ctx = try BodyContext.init(self.allocator, self.builder, store_view, eval.entry_template, self.graph, self.draft);
         // The re-lowered constant body's plans index the constant's own
         // scheme; the use edge supplied that vector. Wrapper entries reached
-        // without a use edge (the root drain itself) take publication's
+        // without a use edge (the root drain itself) take checking's
         // root-edge evidence.
         body_ctx.evidence = self.restore_evidence;
         if (self.restore_evidence.vector.len < entry_template.evidence_params.len) {
@@ -17032,14 +17035,14 @@ const BodyContext = struct {
 
     /// Evidence vector for the constrained scheme instantiated at `expr` (a
     /// value use resolved in this context's module), or empty when the use
-    /// carries no obligations.
+    /// carries no requirements.
     fn evidenceForUseSite(self: *BodyContext, expr: checked.CheckedExprId) Allocator.Error![]const SpecEvidence {
         const refs = self.view.static_dispatch_plans.siteEvidence(expr) orelse return &.{};
         return self.materializeEvidence(refs);
     }
 
     /// Evidence vector for a dispatch plan's chosen target (the target's own
-    /// obligations): a direct plan carries it as the evidence node's nested
+    /// requirements): a direct plan carries it as the evidence node's nested
     /// refs; a constraint plan's edge-supplied target carries it materialized.
     fn evidenceForDispatchTarget(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) Allocator.Error!SpecEvidenceVector {
         switch (plan.resolution) {
@@ -17090,8 +17093,8 @@ const BodyContext = struct {
         structural,
     };
 
-    /// The plan's published (or edge-supplied) resolution, if the migration
-    /// has one for it. Null means the derivation fallback still decides
+    /// The plan's checked (or edge-supplied) resolution, if the migration
+    /// has one for it. Null means owner derivation still decides
     /// (unresolved plans, unavailable edge evidence, checked errors).
     fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, count_gaps: bool) ?EvidenceResolved {
         switch (plan.resolution) {
@@ -17122,7 +17125,7 @@ const BodyContext = struct {
 
     /// Whether checking decided this dispatch can never execute: its
     /// dispatcher is a value no edge can supply (unreachable), or checking
-    /// rejected the obligation (a reported missing method). Both lower to an
+    /// rejected the requirement (a reported missing method). Both lower to an
     /// explicit crash.
     fn planUnexecutable(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?UnexecutableDispatch {
         return switch (plan.resolution) {
@@ -17326,7 +17329,7 @@ const BodyContext = struct {
             Common.invariant("checked method registry is missing parser format method");
     }
 
-    /// Resolve a target's obligations from its published dispatcher paths
+    /// Resolve a target's requirements from its checked dispatcher paths
     /// over the concrete monomorphic callable (compiler-generated call edges
     /// only: structural-derivation component calls and builtin helper calls
     /// have no checked instantiation records).
@@ -17340,7 +17343,7 @@ const BodyContext = struct {
         return try self.synthesizeParamsEvidence(lookup.view, template, callable_mono_ty);
     }
 
-    /// Resolve a template's obligations from its published dispatcher paths
+    /// Resolve a template's requirements from its checked dispatcher paths
     /// over the concrete monomorphic callable.
     fn synthesizeParamsEvidence(
         self: *BodyContext,
@@ -17370,8 +17373,8 @@ const BodyContext = struct {
         return out;
     }
 
-    /// One synthesized obligation on a concrete component type: its method
-    /// target (whose own obligations synthesize at their consumption sites),
+    /// One synthesized requirement on a concrete component type: its method
+    /// target (whose own requirements synthesize at their consumption sites),
     /// the structural implementation for ownerless shapes, or unreachable for
     /// components no value inhabits.
     fn synthesizeComponentEvidence(
@@ -17394,9 +17397,9 @@ const BodyContext = struct {
         return .unreachable_value;
     }
 
-    /// Walk a published dispatcher path over a concrete monomorphic type.
+    /// Walk a checked dispatcher path over a concrete monomorphic type.
     /// Null when the mono shape diverges from the checked scheme's (e.g. an
-    /// erased row) — the obligation then stays a counted gap.
+    /// erased row) — the requirement then stays a counted gap.
     fn walkEvidencePath(
         self: *BodyContext,
         view: ModuleView,
@@ -17503,7 +17506,7 @@ const BodyContext = struct {
                 const evidence = switch (evidence_vector) {
                     .resolved => |resolved| resolved,
                     // Compiler-generated edge: resolve the target's
-                    // obligations from its published dispatcher paths over
+                    // requirements from its checked dispatcher paths over
                     // the concrete callable.
                     .synthesize => try self.synthesizeTargetEvidence(lookup, procedure.template, callable_mono_ty),
                 };
@@ -17520,7 +17523,7 @@ const BodyContext = struct {
                 self.requireLocalMethodTargetInCurrentView(lookup);
                 const evidence = switch (evidence_vector) {
                     .resolved => |resolved| resolved,
-                    // Local targets publish no template params to synthesize
+                    // Local targets carry no template params to synthesize
                     // from; their uses carry checked records instead.
                     .synthesize => &.{},
                 };
@@ -22198,8 +22201,8 @@ const BodyContext = struct {
             Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
         }
         const lookup: MethodLookup = blk: {
-            // Consume the published (or edge-supplied) resolution; owner
-            // derivation remains the migration fallback and its comparison
+            // Consume the checked (or edge-supplied) resolution; owner
+            // owner derivation still covers migration leftovers and its comparison
             // audit.
             switch (plan.resolution) {
                 .direct => |node_id| {

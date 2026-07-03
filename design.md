@@ -2846,7 +2846,8 @@ lowering. Every dispatch site leaves checking with an explicit resolution on
 its plan:
 
 - `direct(evidence_node)` — checking proved the concrete target. The evidence
-  node names the target and carries evidence for the target's own obligations
+  node names the target and carries evidence for the target's own
+  requirements
   (its nested `where`-clause constraints), recursively.
 - `constraint(depth, k)` — the dispatcher is the k-th evidence param of the
   d-th enclosing generalized callable. Each specialization edge supplies the
@@ -2864,8 +2865,8 @@ Nothing else exists. Monotype lowering never derives a method owner from type
 content, never searches a registry by method name, and never intersects
 constraints to guess a target.
 
-**Evidence params.** Every type scheme with dispatch obligations has one
-canonical, order-deterministic list of (dispatcher var, constraint) pairs —
+**Evidence params.** Every type scheme with dispatch requirements has one
+deterministic ordered list of (dispatcher var, constraint) pairs —
 its evidence params — enumerated purely from the scheme's type structure
 (depth-first: function args then return, type arguments then backing, row
 fields and tags then extension, constraints emitted at each var's first
@@ -2877,7 +2878,7 @@ scheme.
 
 **Edges supply evidence.** Checking persists, for every instantiation of a
 constrained scheme, the (pristine var, fresh var) pairs of its constrained
-vars. Publication resolves each instantiation edge's obligations — against the
+vars. Checking resolves each instantiation edge's requirements — against the
 enclosing callable's own evidence params (producing `constraint(k)` again),
 against concrete types (producing `direct` targets through exact registry
 lookups), through the monomorphic default rule, or structurally — and stores
@@ -2890,22 +2891,22 @@ functions by `depth`).
 **The default rule.** A constrained var no edge can pin follows exactly the
 rule Monotype uses to materialize unresolved variables: numeral literals and
 defaultable arithmetic operators default to `Dec`, quote and interpolation
-literals default to `Str`, and every obligation on such a var resolves against
-the default owner during checking. Structural-capable obligations on other
+literals default to `Str`, and every requirement on such a var resolves against
+the default owner during checking. Structural-capable requirements on other
 unpinnable vars resolve structurally; the rest are statically unreachable.
 
 **Compiler-generated edges.** Structural derivations and builtin helpers call
 methods on component types with no checked instantiation record. For these,
-each published evidence param also carries the semantic PATH from its scheme's
+each checked evidence param also carries the label-addressed PATH from its scheme's
 callable to the dispatcher's first occurrence (argument positions, type
 arguments, row labels — labels rather than positions, because Monotype sorts
-rows). Monotype resolves such a target's obligations by walking those paths
+rows). Monotype resolves such a target's requirements by walking those paths
 over the concrete monomorphic callable at the consumption site, recursively:
 component owners resolve through exact registry lookups, ownerless shapes take
 the structural implementations.
 
 Exact registry lookups — `(MethodOwner, MethodNameId)` — happen during
-checking and publication, and during path synthesis for compiler-generated
+checking, and during path synthesis for compiler-generated
 edges. The registry only ever answers exact lookups after the owner is known
 from checked type content; no stage asks "which owners could match this
 constraint?".

@@ -12795,6 +12795,9 @@ const EvidencePass = struct {
     /// sweep resolves whatever no template reached (chain-free).
     plan_resolved: []bool = &.{},
     iterator_plan_resolved: []bool = &.{},
+    /// Shared-var use sites deferred during template walks (their chains did
+    /// not bind every obligation); the final sweep re-emits leftovers.
+    deferred_use_sites: std.ArrayListUnmanaged(struct { source_node: u32, site_key: u32 }) = .empty,
     /// The param chain in scope while resolving a site's evidence entries, so
     /// a fresh var that settled onto an enclosing where-var forwards as
     /// `constraint(depth, k)`. Index 0 is the innermost generalized callable.
@@ -12857,6 +12860,7 @@ const EvidencePass = struct {
     fn deinit(self: *EvidencePass) void {
         self.allocator.free(self.plan_resolved);
         self.allocator.free(self.iterator_plan_resolved);
+        self.deferred_use_sites.deinit(self.allocator);
         self.value_use_by_node.deinit();
         self.target_by_fn_var.deinit();
         self.source_by_checked_expr.deinit();
@@ -12949,13 +12953,13 @@ const EvidencePass = struct {
             const plan_refs = self.plan_table.template_refs[plan_start .. plan_start + template.static_dispatch_plans.len];
             for (plan_refs, 0..) |plan_id, i| {
                 const chain = try self.chainFor(self.template_iterator_refs.plan_scopes[plan_start + i], params.items);
-                try self.resolvePlan(plan_id, chain);
+                try self.resolvePlan(plan_id, chain, false);
             }
 
             const iter_span = self.template_iterator_refs.spans[template_index];
             for (self.template_iterator_refs.pool[iter_span.start .. iter_span.start + iter_span.len], 0..) |iter_plan_id, i| {
                 const chain = try self.chainFor(self.template_iterator_refs.iterator_scopes[iter_span.start + i], params.items);
-                try self.resolveIteratorPlan(iter_plan_id, chain);
+                try self.resolveIteratorPlan(iter_plan_id, chain, false);
             }
 
             const value_ref_start = template.resolved_value_refs.start;
@@ -12983,11 +12987,24 @@ const EvidencePass = struct {
             defer entries.deinit(self.allocator);
             try entries.ensureTotalCapacity(self.allocator, params.items.len);
             for (params.items) |param| {
-                entries.appendAssumeCapacity(try self.evidenceForVar(param, param.dispatcher_var, param.constraint.fn_var));
+                entries.appendAssumeCapacity((try self.evidenceForVar(param, param.dispatcher_var, param.constraint.fn_var, true)).?);
             }
             const span = try self.appendEvidenceRefs(entries.items);
             try self.site_seen.put(site_key, {});
             try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
+        }
+
+        // Shared-var use sites no template's chain fully bound: emit their
+        // evidence chain-free (concrete targets, defaults, structural,
+        // vacuous). A site an intervening walk already emitted (overlapping
+        // spans) is skipped by `site_seen`.
+        {
+            var i: usize = 0;
+            while (i < self.deferred_use_sites.items.len) : (i += 1) {
+                const deferred = self.deferred_use_sites.items[i];
+                if (self.site_seen.contains(deferred.site_key)) continue;
+                try self.emitRecursiveUseEvidence(deferred.source_node, deferred.site_key, &.{}, true);
+            }
         }
 
         // Plans no template reached (dead code, expressions outside any
@@ -12995,11 +13012,11 @@ const EvidencePass = struct {
         // resolve them chain-free, exactly like root edges.
         for (0..self.plan_table.plans.len) |raw| {
             if (self.plan_resolved[raw]) continue;
-            try self.resolvePlan(@enumFromInt(raw), &.{});
+            try self.resolvePlan(@enumFromInt(raw), &.{}, true);
         }
         for (0..self.plan_table.iterator_for_plans.len) |raw| {
             if (self.iterator_plan_resolved[raw]) continue;
-            try self.resolveIteratorPlan(@enumFromInt(raw), &.{});
+            try self.resolveIteratorPlan(@enumFromInt(raw), &.{}, true);
         }
 
         std.mem.sort(static_dispatch.SiteEvidenceEntry, self.site_evidence.items, {}, siteEvidenceLessThan);
@@ -13065,22 +13082,15 @@ const EvidencePass = struct {
                     .s_decl => |decl| decl,
                     else => continue,
                 };
-                switch (self.module.expr(decl.expr).data) {
-                    // Lambda-form local procs are evidence scopes (the
-                    // collector pushes them); value-form decls resolve through
-                    // use records instead.
-                    .e_lambda, .e_closure => continue,
-                    else => {},
-                }
-                const pattern_var = ModuleEnv.varFrom(decl.pattern);
-                if (self.types.resolveVar(pattern_var).desc.rank != .generalized) continue;
-                scheme_params.clearRetainingCapacity();
-                try self.enumerateParams(pattern_var, &scheme_params);
-                for (scheme_params.items) |param| {
-                    const root = self.types.resolveVar(param.dispatcher_var).var_;
-                    const entry = try self.local_value_scheme_by_var.getOrPut(@intFromEnum(root));
-                    if (!entry.found_existing) entry.value_ptr.* = @intFromEnum(decl.pattern);
-                }
+                try self.mapValueSchemeParams(decl.pattern, decl.expr, &scheme_params);
+            }
+            // Top-level generalized VALUE defs (e.g. an `if` choosing between
+            // closures) lower inline at their single use type exactly like
+            // local value decls; their body plans resolve through use records
+            // the same way.
+            for (global_value_defs) |def_idx| {
+                const def = module_env.store.getDef(def_idx);
+                try self.mapValueSchemeParams(def.pattern, def.expr, &scheme_params);
             }
         }
     }
@@ -13116,7 +13126,7 @@ const EvidencePass = struct {
 
     /// The canonical `(depth, index)` of `dispatcher_root`'s `method`
     /// obligation in the chain, searching innermost-out.
-    fn chainParamIndex(self: *EvidencePass, chain: []const []const EvidenceParam, dispatcher_root: Var, method: canonical.MethodNameId) Allocator.Error!?static_dispatch.EvidenceConstraintRef {
+    fn chainParamIndex(self: *EvidencePass, chain: []const []const EvidenceParam, dispatcher_root: Var, method: canonical.MethodNameId) Allocator.Error!?static_dispatch.EvidenceChainIndex {
         for (chain, 0..) |params, depth| {
             if (try self.paramIndexFor(params, dispatcher_root, method)) |k| {
                 return .{ .depth = @intCast(depth), .index = @intCast(k) };
@@ -13147,6 +13157,30 @@ const EvidencePass = struct {
         return null;
     }
 
+    /// Map a generalized VALUE decl's scheme param roots to its pattern for
+    /// use-record obligation resolution (lambda-form decls are evidence
+    /// scopes instead).
+    fn mapValueSchemeParams(
+        self: *EvidencePass,
+        pattern: CIR.Pattern.Idx,
+        expr: CIR.Expr.Idx,
+        scheme_params: *std.ArrayListUnmanaged(EvidenceParam),
+    ) Allocator.Error!void {
+        switch (self.module.expr(expr).data) {
+            .e_lambda, .e_closure => return,
+            else => {},
+        }
+        const pattern_var = ModuleEnv.varFrom(pattern);
+        if (self.types.resolveVar(pattern_var).desc.rank != .generalized) return;
+        scheme_params.clearRetainingCapacity();
+        try self.enumerateParams(pattern_var, scheme_params);
+        for (scheme_params.items) |param| {
+            const root = self.types.resolveVar(param.dispatcher_var).var_;
+            const entry = try self.local_value_scheme_by_var.getOrPut(@intFromEnum(root));
+            if (!entry.found_existing) entry.value_ptr.* = @intFromEnum(pattern);
+        }
+    }
+
     /// The canonical param index of `dispatcher_root`'s `method` obligation.
     fn paramIndexFor(self: *EvidencePass, params: []const EvidenceParam, dispatcher_root: Var, method: canonical.MethodNameId) Allocator.Error!?u32 {
         const idents = self.module.identStoreConst();
@@ -13158,11 +13192,10 @@ const EvidencePass = struct {
         return null;
     }
 
-    fn resolvePlan(self: *EvidencePass, plan_id: static_dispatch.StaticDispatchPlanId, chain: []const []const EvidenceParam) Allocator.Error!void {
+    fn resolvePlan(self: *EvidencePass, plan_id: static_dispatch.StaticDispatchPlanId, chain: []const []const EvidenceParam, commit_unpinned: bool) Allocator.Error!void {
         const raw = @intFromEnum(plan_id);
         const plan = &self.plan_table.plans[raw];
         if (self.plan_resolved[raw]) return;
-        self.plan_resolved[raw] = true;
 
         const src = self.build_data.plan_sources[raw];
         const structural_kind: ?static_dispatch.StructuralKind = switch (plan.result_mode) {
@@ -13176,45 +13209,49 @@ const EvidencePass = struct {
         // where-vars against the same chain.
         self.current_chain = chain;
         defer self.current_chain = &.{};
-        plan.resolution = try self.resolveObligation(
+        plan.resolution = (try self.resolveObligation(
             src.dispatcher_var,
             plan.method,
             structural_kind,
             src.constraint_fn_var,
             chain,
-        );
+            commit_unpinned,
+        )) orelse return;
+        self.plan_resolved[raw] = true;
     }
 
-    fn resolveIteratorPlan(self: *EvidencePass, plan_id: static_dispatch.IteratorForPlanId, chain: []const []const EvidenceParam) Allocator.Error!void {
+    fn resolveIteratorPlan(self: *EvidencePass, plan_id: static_dispatch.IteratorForPlanId, chain: []const []const EvidenceParam, commit_unpinned: bool) Allocator.Error!void {
         const raw = @intFromEnum(plan_id);
         const plan = &self.plan_table.iterator_for_plans[raw];
         if (self.iterator_plan_resolved[raw]) return;
-        self.iterator_plan_resolved[raw] = true;
 
         const src = self.build_data.iterator_plan_sources[raw];
         self.current_chain = chain;
         defer self.current_chain = &.{};
-        plan.iter.resolution = try self.resolveObligation(
+        plan.iter.resolution = (try self.resolveObligation(
             src.iter_dispatcher_var,
             plan.iter.method,
             null,
             src.iter_fn_var,
             chain,
-        );
+            commit_unpinned,
+        )) orelse return;
         // The iterator type is the `iter` callable's return: dispatch `next`
         // on it.
         const next_dispatcher = self.iteratorNextDispatcherVar(src.iter_fn_var);
         plan.next.resolution = if (next_dispatcher) |dispatcher_var|
-            try self.resolveObligation(
+            (try self.resolveObligation(
                 dispatcher_var,
                 plan.next.method,
                 null,
                 src.next_fn_var,
                 chain,
-            )
+                commit_unpinned,
+            )) orelse return
         else
             // A non-function `iter` callable only occurs on checked errors.
             .checked_error;
+        self.iterator_plan_resolved[raw] = true;
     }
 
     fn iteratorNextDispatcherVar(self: *EvidencePass, iter_fn_var: Var) ?Var {
@@ -13226,6 +13263,11 @@ const EvidencePass = struct {
     /// Resolve one dispatch obligation: `method` dispatched on
     /// `dispatcher_var`, with `constraint_fn_var` keying the discharge record
     /// that carries the chosen target's own nested obligations.
+    /// Resolve one dispatch obligation. With `commit_unpinned = false`
+    /// (template walks), an obligation the given chain does not bind returns
+    /// null so a template whose scheme DOES bind it (template plan-ref spans
+    /// can overlap) or the final chain-free sweep resolves it instead. With
+    /// `commit_unpinned = true` the result is total.
     fn resolveObligation(
         self: *EvidencePass,
         dispatcher_var: Var,
@@ -13233,12 +13275,33 @@ const EvidencePass = struct {
         structural_kind: ?static_dispatch.StructuralKind,
         constraint_fn_var: ?Var,
         chain: []const []const EvidenceParam,
-    ) Allocator.Error!static_dispatch.StaticDispatchResolution {
+        commit_unpinned: bool,
+    ) Allocator.Error!?static_dispatch.StaticDispatchResolution {
         const resolved = self.types.resolveVar(dispatcher_var);
+
+        // A generalized VALUE decl's scheme param may LOOK concrete here:
+        // compile-time finalization defaults the pristine var (e.g. to Dec)
+        // after uses were instantiated. The uses are the truth — they carry
+        // the type each inline lowering actually runs at — so resolve through
+        // a representative use record before trusting the var's content.
+        if (self.local_value_scheme_by_var.get(@intFromEnum(resolved.var_))) |pattern_raw| {
+            if (self.value_use_record_by_pattern.get(pattern_raw)) |record_idx| {
+                const module_env = self.module.moduleEnvConst();
+                const record = module_env.scheme_instantiations.items.items[record_idx];
+                const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+                if (self.pairForResolved(pairs, resolved.var_)) |fresh| {
+                    if (self.types.resolveVar(fresh).var_ != resolved.var_) {
+                        const fresh_fn: ?Var = if (constraint_fn_var) |fn_var| self.pairForResolved(pairs, self.types.resolveVar(fn_var).var_) else null;
+                        return self.resolveObligation(fresh, method, structural_kind, fresh_fn orelse constraint_fn_var, chain, true);
+                    }
+                }
+            }
+        }
+
         switch (resolved.desc.content) {
             .err => return .checked_error,
-            .flex => |flex| return self.resolveVarObligation(resolved.var_, flex.constraints, method, structural_kind, chain),
-            .rigid => |rigid| return self.resolveVarObligation(resolved.var_, rigid.constraints, method, structural_kind, chain),
+            .flex => |flex| return self.resolveVarObligation(resolved.var_, flex.constraints, method, structural_kind, chain, commit_unpinned),
+            .rigid => |rigid| return self.resolveVarObligation(resolved.var_, rigid.constraints, method, structural_kind, chain, commit_unpinned),
             .alias, .structure => {
                 if (self.methodOwnerForSourceContent(resolved.var_)) |owner| {
                     if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
@@ -13271,10 +13334,16 @@ const EvidencePass = struct {
         method: canonical.MethodNameId,
         structural_kind: ?static_dispatch.StructuralKind,
         chain: []const []const EvidenceParam,
-    ) Allocator.Error!static_dispatch.StaticDispatchResolution {
+        commit_unpinned: bool,
+    ) Allocator.Error!?static_dispatch.StaticDispatchResolution {
         if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
             return .{ .constraint = ref };
         }
+
+        // Not bound by this chain. During template walks another template's
+        // scheme may bind it (plan-ref spans can overlap); only the final
+        // sweep commits unpinned classifications.
+        if (!commit_unpinned) return null;
 
         // Not an evidence param of any enclosing callable, so no edge pins it
         // and monotype materializes it by `numericDefaultPhaseForConstraints`
@@ -13282,7 +13351,6 @@ const EvidencePass = struct {
         // type variables (Dec for numerals and defaultable arithmetic
         // operators, Str for quotes and interpolations). Every obligation on
         // the var resolves against that default owner now.
-        const constraint_slice = self.types.sliceStaticDispatchConstraints(constraints);
         if (numericDefaultPhaseForConstraints(self.module, constraints)) |phase| {
             const owner: static_dispatch.MethodOwner = switch (phase) {
                 .mono_specialization => .{ .builtin = .dec },
@@ -13294,27 +13362,6 @@ const EvidencePass = struct {
             if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
                 const node = try self.evidenceNodeForTarget(target, null);
                 return .{ .direct = node };
-            }
-        }
-
-        // A generalized local VALUE decl lowers inline at the single type its
-        // uses unify to; resolve the obligation through a representative use
-        // instantiation.
-        if (self.local_value_scheme_by_var.get(@intFromEnum(dispatcher_root))) |pattern_raw| {
-            if (self.value_use_record_by_pattern.get(pattern_raw)) |record_idx| {
-                const module_env = self.module.moduleEnvConst();
-                const record = module_env.scheme_instantiations.items.items[record_idx];
-                const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
-                if (pairFor(pairs, dispatcher_root)) |fresh| {
-                    var fresh_fn: ?Var = null;
-                    const idents = self.module.identStoreConst();
-                    for (constraint_slice) |constraint| {
-                        if (try self.names.internMethodIdent(idents, constraint.fn_name) != method) continue;
-                        fresh_fn = pairFor(pairs, self.types.resolveVar(constraint.fn_var).var_);
-                        break;
-                    }
-                    return self.resolveObligation(fresh, method, structural_kind, fresh_fn, chain);
-                }
             }
         }
 
@@ -13418,7 +13465,7 @@ const EvidencePass = struct {
         try entries.ensureTotalCapacity(self.allocator, params.items.len);
 
         for (params.items) |param| {
-            entries.appendAssumeCapacity(try self.evidenceForRecordParam(record, pairs, param));
+            entries.appendAssumeCapacity(try self.evidenceForRecordParam(pairs, param));
         }
 
         return self.appendEvidenceRefs(entries.items);
@@ -13426,20 +13473,18 @@ const EvidencePass = struct {
 
     fn evidenceForRecordParam(
         self: *EvidencePass,
-        record: ModuleEnv.SchemeInstantiationRecord,
         pairs: []const ModuleEnv.SchemeInstantiationPair,
         param: EvidenceParam,
     ) Allocator.Error!static_dispatch.CheckedEvidence {
-        _ = record;
         const dispatcher_root = self.types.resolveVar(param.dispatcher_var).var_;
-        const fresh_dispatcher = pairFor(pairs, dispatcher_root) orelse {
+        const fresh_dispatcher = self.pairForResolved(pairs, dispatcher_root) orelse {
             // The scheme var was not copied at this instantiation (it was
             // already monomorphic there); resolve the pristine var directly.
-            return self.evidenceForVar(param, param.dispatcher_var, null);
+            return (try self.evidenceForVar(param, param.dispatcher_var, null, true)).?;
         };
         const fn_root = self.types.resolveVar(param.constraint.fn_var).var_;
-        const fresh_fn = pairFor(pairs, fn_root);
-        return self.evidenceForVar(param, fresh_dispatcher, fresh_fn);
+        const fresh_fn = self.pairForResolved(pairs, fn_root);
+        return (try self.evidenceForVar(param, fresh_dispatcher, fresh_fn, true)).?;
     }
 
     /// Resolve one obligation of an instantiated scheme: the fresh dispatcher
@@ -13453,12 +13498,13 @@ const EvidencePass = struct {
         param: EvidenceParam,
         var_: Var,
         fresh_fn_var: ?Var,
-    ) Allocator.Error!static_dispatch.CheckedEvidence {
+        commit_unpinned: bool,
+    ) Allocator.Error!?static_dispatch.CheckedEvidence {
         const idents = self.module.identStoreConst();
         const method = try self.names.internMethodIdent(idents, param.constraint.fn_name);
         const structural_kind = self.structuralKindForMethodIdent(param.constraint.fn_name);
 
-        const resolution = try self.resolveObligation(var_, method, structural_kind, fresh_fn_var, self.current_chain);
+        const resolution = (try self.resolveObligation(var_, method, structural_kind, fresh_fn_var, self.current_chain, commit_unpinned)) orelse return null;
         return switch (resolution) {
             .direct => |node| .{ .direct = node },
             .constraint => |ref| .{ .constraint = ref },
@@ -13517,10 +13563,14 @@ const EvidencePass = struct {
         // generic def is checked against the shared pre-generalization vars,
         // so its obligations forward to the enclosing template's own params
         // by var identity.
-        try self.emitRecursiveUseEvidence(source_node, site_key, chain);
+        try self.emitRecursiveUseEvidence(source_node, site_key, chain, false);
     }
 
-    fn emitRecursiveUseEvidence(self: *EvidencePass, source_node: u32, site_key: u32, chain: []const []const EvidenceParam) Allocator.Error!void {
+    /// Emit evidence for a shared-var (recursive/SCC) use. With
+    /// `commit_unpinned = false`, a site whose obligations this chain does
+    /// not fully bind is skipped so a template whose scheme binds them (spans
+    /// can overlap) or the deferred-site sweep emits it instead.
+    fn emitRecursiveUseEvidence(self: *EvidencePass, source_node: u32, site_key: u32, chain: []const []const EvidenceParam, commit_unpinned: bool) Allocator.Error!void {
         if (self.module.nodeTag(@enumFromInt(source_node)) != .expr_var) return;
         const lookup = self.module.expr(@enumFromInt(source_node)).data.e_lookup_local;
         const callee_def = self.def_by_pattern.get(@intFromEnum(lookup.pattern_idx)) orelse return;
@@ -13540,12 +13590,16 @@ const EvidencePass = struct {
             const method = try self.names.internMethodIdent(idents, callee_param.constraint.fn_name);
             if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
                 entries.appendAssumeCapacity(.{ .constraint = ref });
-            } else {
+            } else if (try self.evidenceForVar(callee_param, callee_param.dispatcher_var, callee_param.constraint.fn_var, commit_unpinned)) |evidence| {
                 // The use shares the definition's vars (no instantiation
                 // record), so the obligation resolves exactly like a plan on
                 // those vars: concrete targets, defaulting, structural, or
                 // vacuous classification.
-                entries.appendAssumeCapacity(try self.evidenceForVar(callee_param, callee_param.dispatcher_var, callee_param.constraint.fn_var));
+                entries.appendAssumeCapacity(evidence);
+            } else {
+                // Not bound by this chain: defer the whole site.
+                try self.deferred_use_sites.append(self.allocator, .{ .source_node = source_node, .site_key = site_key });
+                return;
             }
         }
 
@@ -13554,9 +13608,11 @@ const EvidencePass = struct {
         try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
     }
 
-    fn pairFor(pairs: []const ModuleEnv.SchemeInstantiationPair, old_root: Var) ?Var {
+    /// `pairFor`, but comparing RESOLVED roots on both sides: finalization
+    /// after record time can move the pristine var's root.
+    fn pairForResolved(self: *EvidencePass, pairs: []const ModuleEnv.SchemeInstantiationPair, old_root: Var) ?Var {
         for (pairs) |pair| {
-            if (pair.old_var == @intFromEnum(old_root)) return @enumFromInt(pair.fresh_var);
+            if (self.types.resolveVar(@enumFromInt(pair.old_var)).var_ == old_root) return @enumFromInt(pair.fresh_var);
         }
         return null;
     }
