@@ -599,14 +599,96 @@ pub const StaticDispatchOperand = union(enum) {
     generated_quote: CheckedStringLiteralId,
 };
 
+/// Public `StructuralKind` declaration.
+///
+/// The compiler-derived structural implementations the checker can choose for
+/// a dispatch instead of a method target.
+pub const StructuralKind = enum(u8) {
+    equality,
+    hash,
+    parser,
+    encoder,
+};
+
+/// Public `EvidenceNodeId` declaration. Index into
+/// `StaticDispatchPlanTable.evidence_nodes`.
+pub const EvidenceNodeId = enum(u32) { _ };
+
+/// Public `EvidenceConstraintRef` declaration.
+///
+/// A dispatch obligation forwarded to the enclosing callable's evidence
+/// params: `index` is the canonical evidence-param index (see
+/// `dispatch_evidence.zig`), and `depth` counts enclosing generalized
+/// callables outward from the reference (0 = the innermost generalized
+/// callable the reference appears in).
+pub const EvidenceConstraintRef = struct {
+    depth: u16,
+    index: u16,
+};
+
+/// Public `CheckedEvidence` declaration.
+///
+/// How one dispatch obligation was satisfied: with a concrete target (plus
+/// nested evidence for the target's own obligations), by forwarding to the
+/// enclosing callable's evidence params, or with a compiler-derived structural
+/// implementation. `checked_error` marks an obligation at a site checking
+/// already rejected; consuming it after checking is a compiler bug.
+pub const CheckedEvidence = union(enum) {
+    direct: EvidenceNodeId,
+    constraint: EvidenceConstraintRef,
+    structural: StructuralKind,
+    checked_error,
+};
+
+/// Public `EvidenceNode` declaration.
+///
+/// A concrete method target together with evidence for the target's own
+/// evidence params (in the target scheme's canonical order); `nested` is a
+/// range into `StaticDispatchPlanTable.evidence_refs`.
+pub const EvidenceNode = struct {
+    target: MethodTarget,
+    nested: artifact_serialize.Span = .{},
+};
+
+/// Public `SiteEvidenceEntry` declaration.
+///
+/// Evidence for one instantiation site (keyed by the checked expression of the
+/// use), covering the instantiated scheme's evidence params in canonical
+/// order: a range into `StaticDispatchPlanTable.evidence_refs`. Sorted by key
+/// for binary search (transform D).
+pub const SiteEvidenceEntry = extern struct {
+    /// `@intFromEnum` of the site's `CheckedExprId`.
+    key: u32,
+    start: u32,
+    len: u32,
+};
+
+/// Public `EvidenceParamRecord` declaration.
+///
+/// One published evidence param of a procedure template's scheme, in canonical
+/// order (see `dispatch_evidence.zig`). Consumers index these by position;
+/// the method name is carried for debug verification.
+pub const EvidenceParamRecord = struct {
+    method: canonical.MethodNameId,
+};
+
 /// Public `StaticDispatchResolution` declaration.
 pub const StaticDispatchResolution = union(enum) {
     /// The dispatch target was not published as a concrete procedure target in
-    /// this checked module's static-dispatch inputs.
+    /// this checked module's static-dispatch inputs. Migration state: this
+    /// variant is deleted once every plan class resolves totally.
     unresolved_checked_plan,
-    /// Checking proved the concrete target. Later stages must call this target
-    /// directly instead of rediscovering it from source or type names.
-    resolved_target: MethodTarget,
+    /// Checking proved the concrete target (with nested evidence for the
+    /// target's own obligations). Later stages must call this target directly
+    /// instead of rediscovering it from source or type names.
+    direct: EvidenceNodeId,
+    /// The dispatcher is one of the enclosing callable's constrained scheme
+    /// vars; each specialization edge supplies the target as evidence.
+    constraint: EvidenceConstraintRef,
+    /// The checker chose a compiler-derived structural implementation.
+    structural: StructuralKind,
+    /// Checking rejected this site; lowering must never consume the plan.
+    checked_error,
 };
 
 /// Public `StaticDispatchCallPlan` declaration.
@@ -647,6 +729,7 @@ pub const IteratorDispatchCall = struct {
     dispatcher_arg_index: u32,
     /// Range into `StaticDispatchPlanTable.iter_operand_pool` (transform B).
     args: artifact_serialize.Span = .{},
+    resolution: StaticDispatchResolution = .unresolved_checked_plan,
 
     pub fn argsSlice(self: IteratorDispatchCall, table: *const StaticDispatchPlanTable) []const IteratorDispatchOperand {
         return table.iter_operand_pool[self.args.start .. self.args.start + self.args.len];
@@ -721,6 +804,12 @@ pub const StaticDispatchPlanTable = struct {
     operand_pool: []const StaticDispatchOperand = &.{},
     /// Shared flat pool of iterator-plan operands.
     iter_operand_pool: []const IteratorDispatchOperand = &.{},
+    /// Concrete dispatch targets with nested evidence (`EvidenceNodeId`s).
+    evidence_nodes: []EvidenceNode = &.{},
+    /// Flat pool of evidence: node `nested` ranges and site-evidence ranges.
+    evidence_refs: []CheckedEvidence = &.{},
+    /// Checked-expr-keyed evidence for instantiation sites, sorted by key.
+    site_evidence: []SiteEvidenceEntry = &.{},
 
     pub const Serialized = extern struct {
         plans: SerializedSlice(StaticDispatchCallPlan) = .{},
@@ -732,11 +821,14 @@ pub const StaticDispatchPlanTable = struct {
         template_refs: SerializedSlice(StaticDispatchPlanId) = .{},
         operand_pool: SerializedSlice(StaticDispatchOperand) = .{},
         iter_operand_pool: SerializedSlice(IteratorDispatchOperand) = .{},
+        evidence_nodes: SerializedSlice(EvidenceNode) = .{},
+        evidence_refs: SerializedSlice(CheckedEvidence) = .{},
+        site_evidence: SerializedSlice(SiteEvidenceEntry) = .{},
 
         comptime {
-            // 9 side lists → 9 base-pointer fixups on deserialize, never a
+            // 12 side lists → 12 base-pointer fixups on deserialize, never a
             // function of how many plans/operands the table holds.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 9);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 12);
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(StaticDispatchPlanTable, @This());
@@ -750,11 +842,14 @@ pub const StaticDispatchPlanTable = struct {
         names: *canonical.CanonicalNameStore,
         checked_types: anytype,
         checked_bodies: anytype,
-        local_method_registry: *const MethodRegistry,
-        imported_views: anytype,
+        build_data: *PlanTableBuildData,
     ) Allocator.Error!StaticDispatchPlanTable {
         var plans = std.ArrayList(StaticDispatchCallPlan).empty;
         errdefer plans.deinit(allocator);
+        var plan_sources = std.ArrayList(PlanSource).empty;
+        errdefer plan_sources.deinit(allocator);
+        var iterator_plan_sources = std.ArrayList(IteratorPlanSource).empty;
+        errdefer iterator_plan_sources.deinit(allocator);
         // Operand side-pools; per-plan operand slices are flattened into these.
         var operand_pool = std.ArrayList(StaticDispatchOperand).empty;
         errdefer operand_pool.deinit(allocator);
@@ -803,7 +898,7 @@ pub const StaticDispatchPlanTable = struct {
                     }
                     const ar = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, args);
 
-                    const plan = StaticDispatchCallPlan{
+                    try plans.append(allocator, .{
                         .expr = checked_expr,
                         .method = try names.internMethodIdent(idents, dispatch_call.method_name),
                         .dispatcher = .{ .arg = 0 },
@@ -812,8 +907,11 @@ pub const StaticDispatchPlanTable = struct {
                         .args = ar,
                         .result_mode = try staticDispatchResultModeForCheckedValueCall(allocator, module, checked_types, &constraint_index, dispatch_call.method_name, dispatch_call.constraint_fn_var),
                         .resolution = .unresolved_checked_plan,
-                    };
-                    try plans.append(allocator, resolveStaticDispatchPlan(names, checked_types, local_method_registry, imported_views, plan));
+                    });
+                    try plan_sources.append(allocator, .{
+                        .dispatcher_var = module.exprType(dispatch_call.receiver),
+                        .constraint_fn_var = dispatch_call.constraint_fn_var,
+                    });
                 },
                 .e_interpolation => |interpolation| {
                     const checked_interpolation = switch (checked_expr_data) {
@@ -828,7 +926,7 @@ pub const StaticDispatchPlanTable = struct {
                     const constraint_fn_var = interpolation.constraint_fn_var orelse unreachable;
                     const ar = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, args);
 
-                    const plan = StaticDispatchCallPlan{
+                    try plans.append(allocator, .{
                         .expr = checked_expr,
                         .method = from_interpolation,
                         .dispatcher = .type_only,
@@ -837,15 +935,18 @@ pub const StaticDispatchPlanTable = struct {
                         .args = ar,
                         .result_mode = .value,
                         .resolution = .unresolved_checked_plan,
-                    };
-                    try plans.append(allocator, resolveStaticDispatchPlan(names, checked_types, local_method_registry, imported_views, plan));
+                    });
+                    try plan_sources.append(allocator, .{
+                        .dispatcher_var = interpolationDispatcherVar(module, expr_idx),
+                        .constraint_fn_var = constraint_fn_var,
+                    });
                 },
                 .e_type_dispatch_call => |dispatch_call| {
                     const args = try staticDispatchOperandsForSlice(allocator, checked_bodies, module.sliceExpr(dispatch_call.args));
                     defer allocator.free(args);
                     const ar = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, args);
 
-                    const plan = StaticDispatchCallPlan{
+                    try plans.append(allocator, .{
                         .expr = checked_expr,
                         .method = try names.internMethodIdent(idents, dispatch_call.method_name),
                         .dispatcher = .type_only,
@@ -854,15 +955,18 @@ pub const StaticDispatchPlanTable = struct {
                         .args = ar,
                         .result_mode = try staticDispatchResultModeForCheckedValueCall(allocator, module, checked_types, &constraint_index, dispatch_call.method_name, dispatch_call.constraint_fn_var),
                         .resolution = .unresolved_checked_plan,
-                    };
-                    try plans.append(allocator, resolveStaticDispatchPlan(names, checked_types, local_method_registry, imported_views, plan));
+                    });
+                    try plan_sources.append(allocator, .{
+                        .dispatcher_var = typeDispatchOwnerVar(module, dispatch_call.type_dispatch_stmt),
+                        .constraint_fn_var = dispatch_call.constraint_fn_var,
+                    });
                 },
                 .e_method_eq => |eq| {
                     const args = try staticDispatchOperandsForSlice(allocator, checked_bodies, &.{ eq.lhs, eq.rhs });
                     defer allocator.free(args);
                     const ar = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, args);
 
-                    const plan = StaticDispatchCallPlan{
+                    try plans.append(allocator, .{
                         .expr = checked_expr,
                         .method = try names.internMethodIdent(idents, module.commonIdents().is_eq),
                         .dispatcher = .{ .arg = 0 },
@@ -874,8 +978,11 @@ pub const StaticDispatchPlanTable = struct {
                             .negated = eq.negated,
                         } },
                         .resolution = .unresolved_checked_plan,
-                    };
-                    try plans.append(allocator, resolveStaticDispatchPlan(names, checked_types, local_method_registry, imported_views, plan));
+                    });
+                    try plan_sources.append(allocator, .{
+                        .dispatcher_var = module.exprType(eq.lhs),
+                        .constraint_fn_var = eq.constraint_fn_var,
+                    });
                 },
                 else => unreachable,
             }
@@ -924,7 +1031,7 @@ pub const StaticDispatchPlanTable = struct {
             const ar = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, &args);
 
             const plan_id: StaticDispatchPlanId = @enumFromInt(@as(u32, @intCast(plans.items.len)));
-            const plan = StaticDispatchCallPlan{
+            try plans.append(allocator, .{
                 .expr = checked_expr,
                 .method = try names.internMethodName("from_numeral"),
                 .dispatcher = .type_only,
@@ -933,8 +1040,11 @@ pub const StaticDispatchPlanTable = struct {
                 .args = ar,
                 .result_mode = .value,
                 .resolution = .unresolved_checked_plan,
-            };
-            try plans.append(allocator, resolveStaticDispatchPlan(names, checked_types, local_method_registry, imported_views, plan));
+            });
+            try plan_sources.append(allocator, .{
+                .dispatcher_var = @enumFromInt(numeral_plan.target_var),
+                .constraint_fn_var = @enumFromInt(numeral_plan.fn_var),
+            });
             try numeral_by_node.put(allocator, node, plan_id);
         }
 
@@ -962,7 +1072,7 @@ pub const StaticDispatchPlanTable = struct {
             const ar = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, &args);
 
             const plan_id: StaticDispatchPlanId = @enumFromInt(@as(u32, @intCast(plans.items.len)));
-            const plan = StaticDispatchCallPlan{
+            try plans.append(allocator, .{
                 .expr = checked_expr,
                 .method = try names.internMethodName("from_quote"),
                 .dispatcher = .type_only,
@@ -971,8 +1081,11 @@ pub const StaticDispatchPlanTable = struct {
                 .args = ar,
                 .result_mode = .value,
                 .resolution = .unresolved_checked_plan,
-            };
-            try plans.append(allocator, resolveStaticDispatchPlan(names, checked_types, local_method_registry, imported_views, plan));
+            });
+            try plan_sources.append(allocator, .{
+                .dispatcher_var = @enumFromInt(quote_plan.target_var),
+                .constraint_fn_var = @enumFromInt(quote_plan.fn_var),
+            });
             try quote_by_node.put(allocator, node, plan_id);
         }
 
@@ -1024,6 +1137,11 @@ pub const StaticDispatchPlanTable = struct {
                     .iterator_ty = iterator_ty,
                     .step_ty = step_ty,
                 });
+                try iterator_plan_sources.append(allocator, .{
+                    .iter_dispatcher_var = module.exprType(iterable_idx),
+                    .iter_fn_var = @enumFromInt(for_plan.iter_fn_var),
+                    .next_fn_var = @enumFromInt(for_plan.next_fn_var),
+                });
             }
             try iterator_for_by_node.put(allocator, for_node_idx, iterator_for_id);
         }
@@ -1042,6 +1160,11 @@ pub const StaticDispatchPlanTable = struct {
         numeral_by_node.deinit(allocator);
         quote_by_node.deinit(allocator);
         iterator_for_by_node.deinit(allocator);
+
+        build_data.* = .{
+            .plan_sources = try plan_sources.toOwnedSlice(allocator),
+            .iterator_plan_sources = try iterator_plan_sources.toOwnedSlice(allocator),
+        };
 
         return .{
             .plans = try plans.toOwnedSlice(allocator),
@@ -1071,6 +1194,24 @@ pub const StaticDispatchPlanTable = struct {
         return if (lookupPlanKV(self.iterator_for_by_node, @intFromEnum(node))) |v| @enumFromInt(v) else null;
     }
 
+    pub fn evidenceNode(self: *const StaticDispatchPlanTable, id: EvidenceNodeId) EvidenceNode {
+        return self.evidence_nodes[@intFromEnum(id)];
+    }
+
+    /// The evidence node's nested evidence, in the target scheme's canonical
+    /// evidence-param order.
+    pub fn nestedEvidence(self: *const StaticDispatchPlanTable, node: EvidenceNode) []const CheckedEvidence {
+        return self.evidence_refs[node.nested.start .. node.nested.start + node.nested.len];
+    }
+
+    /// Evidence for the scheme instantiated at `expr` (a value use of a
+    /// constrained definition), in the callee scheme's canonical
+    /// evidence-param order; null when the use needed no evidence.
+    pub fn siteEvidence(self: *const StaticDispatchPlanTable, expr: CheckedExprId) ?[]const CheckedEvidence {
+        const found = artifact_serialize.binarySearchByKey(SiteEvidenceEntry, u32, self.site_evidence, @intFromEnum(expr), siteEvidenceOrder) orelse return null;
+        return self.evidence_refs[found.start .. found.start + found.len];
+    }
+
     /// Build-time-only teardown: frees the heap-owned slices. A frozen
     /// (deserialized) table's slices alias the artifact's single backing buffer and are
     /// NEVER freed here — the artifact's `deinitInternal` frees the buffer wholesale and
@@ -1087,6 +1228,44 @@ pub const StaticDispatchPlanTable = struct {
         allocator.free(self.iterator_for_plans);
         allocator.free(@constCast(self.operand_pool));
         allocator.free(@constCast(self.iter_operand_pool));
+        allocator.free(self.evidence_nodes);
+        allocator.free(self.evidence_refs);
+        allocator.free(self.site_evidence);
+        self.* = .{};
+    }
+};
+
+fn siteEvidenceOrder(e: SiteEvidenceEntry, key: u32) std.math.Order {
+    return std.math.order(e.key, key);
+}
+
+/// Build-time-only side data recorded by `StaticDispatchPlanTable.fromModule`
+/// so the total-resolution pass (`dispatch_evidence.zig`) can resolve each
+/// plan from the checker type store: the source dispatcher var and the source
+/// constraint fn var (the discharge-record key). Parallel to `plans`; never
+/// serialized.
+pub const PlanSource = struct {
+    dispatcher_var: Var,
+    constraint_fn_var: ?Var,
+};
+
+/// Build-time-only side data for iterator plans, parallel to
+/// `iterator_for_plans`.
+pub const IteratorPlanSource = struct {
+    iter_dispatcher_var: Var,
+    iter_fn_var: Var,
+    next_fn_var: Var,
+};
+
+/// Build-time-only outputs of `StaticDispatchPlanTable.fromModule` consumed by
+/// the total-resolution pass.
+pub const PlanTableBuildData = struct {
+    plan_sources: []PlanSource = &.{},
+    iterator_plan_sources: []IteratorPlanSource = &.{},
+
+    pub fn deinit(self: *PlanTableBuildData, allocator: Allocator) void {
+        allocator.free(self.plan_sources);
+        allocator.free(self.iterator_plan_sources);
         self.* = .{};
     }
 };
@@ -1271,25 +1450,9 @@ fn checkedTypeIsBuiltinBool(checked_types: anytype, ty: CheckedTypeId) bool {
     };
 }
 
-fn resolveStaticDispatchPlan(
-    names: *canonical.CanonicalNameStore,
-    checked_types: anytype,
-    local_method_registry: *const MethodRegistry,
-    imported_views: anytype,
-    plan: StaticDispatchCallPlan,
-) StaticDispatchCallPlan {
-    const owner = methodOwnerForCheckedType(checked_types, plan.dispatcher_ty) orelse return plan;
-    const target = lookupCheckedMethodTarget(names, local_method_registry, imported_views, owner, plan.method) orelse {
-        if (plan.result_mode == .equality and plan.result_mode.equality.structural_allowed) return plan;
-        return plan;
-    };
-
-    var resolved = plan;
-    resolved.resolution = .{ .resolved_target = target };
-    return resolved;
-}
-
-fn methodOwnerForCheckedType(checked_types: anytype, ty: CheckedTypeId) ?MethodOwner {
+/// Public `methodOwnerForCheckedType` declaration: the method owner of a
+/// published checked type, walking alias chains transparently.
+pub fn methodOwnerForCheckedType(checked_types: anytype, ty: CheckedTypeId) ?MethodOwner {
     var current = ty;
     // Aliases are transparent for static dispatch: an alias's method owner is its
     // backing's owner. Walk the (finite) alias chain so an alias-over-nominal,
@@ -1335,7 +1498,9 @@ fn methodOwnerForCheckedPayload(payload: anytype) ?MethodOwner {
     };
 }
 
-fn builtinOwnerForCheckedBuiltin(builtin: anytype) BuiltinOwner {
+/// Public `builtinOwnerForCheckedBuiltin` declaration: the registry owner key
+/// for a checked builtin nominal.
+pub fn builtinOwnerForCheckedBuiltin(builtin: anytype) BuiltinOwner {
     return switch (builtin) {
         .bool => .bool,
         .str => .str,
@@ -1366,7 +1531,9 @@ fn builtinOwnerForCheckedBuiltin(builtin: anytype) BuiltinOwner {
     };
 }
 
-fn lookupCheckedMethodTarget(
+/// Public `lookupCheckedMethodTarget` declaration: exact registry lookup in
+/// the local registry, then the imported views.
+pub fn lookupCheckedMethodTarget(
     names: *canonical.CanonicalNameStore,
     local_method_registry: *const MethodRegistry,
     imported_views: anytype,
@@ -1437,6 +1604,21 @@ fn interpolationDispatcherTypeId(
     return switch (suffix_target.target()) {
         .local => |stmt_idx| checkedTypeIdForVar(allocator, module, checked_types, ModuleEnv.varFrom(stmt_idx)),
         .invalid => checkedTypeIdForVar(allocator, module, checked_types, module.exprType(expr_idx)),
+        .builtin, .external => if (@import("builtin").mode == .Debug) {
+            std.debug.panic("checked static dispatch invariant violated: interpolation suffix target was not published as a local type", .{});
+        } else unreachable,
+    };
+}
+
+/// Source-var mirror of `interpolationDispatcherTypeId`, for the plan-source
+/// side data the total-resolution pass consumes.
+fn interpolationDispatcherVar(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) Var {
+    const suffix_target = module.moduleEnvConst().numericSuffixTargetForNode(ModuleEnv.nodeIdxFrom(expr_idx)) orelse
+        return module.exprType(expr_idx);
+
+    return switch (suffix_target.target()) {
+        .local => |stmt_idx| ModuleEnv.varFrom(stmt_idx),
+        .invalid => module.exprType(expr_idx),
         .builtin, .external => if (@import("builtin").mode == .Debug) {
             std.debug.panic("checked static dispatch invariant violated: interpolation suffix target was not published as a local type", .{});
         } else unreachable,
@@ -1539,7 +1721,7 @@ test "StaticDispatchPlanTable: relocates with a constant number of fixups, opera
     // The fixup count is fixed by the number of serialized base pointers, never
     // by how much data each pool holds. The two tables below differ in operand
     // count by three orders of magnitude yet relocate identically.
-    comptime std.debug.assert(@typeInfo(StaticDispatchPlanTable.Serialized).@"struct".fields.len == 9);
+    comptime std.debug.assert(@typeInfo(StaticDispatchPlanTable.Serialized).@"struct".fields.len == 12);
 
     inline for (.{ @as(u32, 4), @as(u32, 4000) }) |operand_count| {
         const operands = try gpa.alloc(StaticDispatchOperand, operand_count);

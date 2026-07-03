@@ -14,6 +14,7 @@ const types = @import("types");
 const TypedCIR = @import("typed_cir.zig");
 const checked_ids = @import("checked_ids.zig");
 const static_dispatch = @import("static_dispatch_registry.zig");
+const dispatch_evidence = @import("dispatch_evidence.zig");
 const canonical = @import("canonical_names.zig");
 const canonical_type_keys = @import("canonical_type_keys.zig");
 const hoist_roots = @import("hoist_roots.zig");
@@ -12576,6 +12577,21 @@ fn isLocalProcExpr(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) bool {
     };
 }
 
+/// Build-time-only per-template iterator-for plan refs collected by
+/// `sealCheckedProcedureTemplateRefs` for the total-resolution pass; never
+/// serialized (mono looks iterator plans up by node).
+const TemplateIteratorRefs = struct {
+    /// Parallel to `templates.templates`; each span indexes `pool`.
+    spans: []artifact_serialize.Span = &.{},
+    pool: []static_dispatch.IteratorForPlanId = &.{},
+
+    fn deinit(self: *TemplateIteratorRefs, allocator: Allocator) void {
+        allocator.free(self.spans);
+        allocator.free(self.pool);
+        self.* = .{};
+    }
+};
+
 fn sealCheckedProcedureTemplateRefs(
     allocator: Allocator,
     checked_bodies: *const CheckedBodyStore,
@@ -12583,6 +12599,7 @@ fn sealCheckedProcedureTemplateRefs(
     templates: *CheckedProcedureTemplateTable,
     static_dispatch_plans: *static_dispatch.StaticDispatchPlanTable,
     resolved_value_refs: *ResolvedValueRefTable,
+    template_iterator_refs: *TemplateIteratorRefs,
 ) Allocator.Error!void {
     var collector = CheckedTemplateRefCollector.init(allocator, checked_bodies, static_dispatch_plans);
     defer collector.deinit();
@@ -12595,8 +12612,12 @@ fn sealCheckedProcedureTemplateRefs(
     errdefer value_ref_pool.deinit(allocator);
     var dispatch_ref_pool = std.ArrayList(static_dispatch.StaticDispatchPlanId).empty;
     errdefer dispatch_ref_pool.deinit(allocator);
+    var iterator_ref_pool = std.ArrayList(static_dispatch.IteratorForPlanId).empty;
+    errdefer iterator_ref_pool.deinit(allocator);
+    const iterator_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.len);
+    errdefer allocator.free(iterator_spans);
 
-    for (templates.templates) |*template| {
+    for (templates.templates, 0..) |*template, template_index| {
         collector.clear();
 
         switch (template.body) {
@@ -12613,10 +12634,655 @@ fn sealCheckedProcedureTemplateRefs(
 
         template.resolved_value_refs = try artifact_serialize.appendSpan(ResolvedValueRefTableRef, ResolvedValueRefId, &value_ref_pool, allocator, collector.value_refs.items);
         template.static_dispatch_plans = try artifact_serialize.appendSpan(@TypeOf(template.static_dispatch_plans), static_dispatch.StaticDispatchPlanId, &dispatch_ref_pool, allocator, collector.dispatch_refs.items);
+        iterator_spans[template_index] = try artifact_serialize.appendSpan(artifact_serialize.Span, static_dispatch.IteratorForPlanId, &iterator_ref_pool, allocator, collector.iterator_refs.items);
     }
 
     resolved_value_refs.template_refs = try value_ref_pool.toOwnedSlice(allocator);
     static_dispatch_plans.template_refs = try dispatch_ref_pool.toOwnedSlice(allocator);
+    template_iterator_refs.* = .{
+        .spans = iterator_spans,
+        .pool = try iterator_ref_pool.toOwnedSlice(allocator),
+    };
+}
+
+/// Resolve every static-dispatch plan and instantiation-site obligation to an
+/// explicit `direct` / `constraint(k)` / `structural` / `checked_error`
+/// resolution, and publish each template's evidence params
+/// (projects/big/total-dispatch-plans.md).
+///
+/// Runs after `sealCheckedProcedureTemplateRefs` so plans and value refs are
+/// grouped per template: `constraint(k)` indexes the enclosing template's
+/// canonical evidence-param list. Concrete dispatchers resolve through the
+/// checked registry exactly as the pre-total inline resolution did; where-var
+/// dispatchers resolve to their param index; evidence for call edges comes
+/// from the checker's persisted `SchemeInstantiationRecord`s, whose fresh vars
+/// are resolved against the settled type store.
+const EvidencePass = struct {
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *canonical.CanonicalNameStore,
+    checked_types: *const CheckedTypePublication,
+    checked_bodies: *const CheckedBodyStore,
+    local_method_registry: *const static_dispatch.MethodRegistry,
+    import_views: CheckedImportViews,
+    plan_table: *static_dispatch.StaticDispatchPlanTable,
+    templates: *CheckedProcedureTemplateTable,
+    resolved_value_refs: *const ResolvedValueRefTable,
+    build_data: *const static_dispatch.PlanTableBuildData,
+    template_iterator_refs: *const TemplateIteratorRefs,
+
+    types: *const types.Store,
+
+    /// value_use record index by source node.
+    value_use_by_node: std.AutoHashMap(u32, u32),
+    /// dispatch_target record index by the discharged constraint's raw fn var.
+    target_by_fn_var: std.AutoHashMap(u32, u32),
+    /// Source node by checked expr (reverse of `exprIdForSource`).
+    source_by_checked_expr: std.AutoHashMap(u32, u32),
+    /// Top-level def by its pattern (for self/SCC-recursive lookups that were
+    /// checked without instantiation).
+    def_by_pattern: std.AutoHashMap(u32, CIR.Def.Idx),
+    /// Memoized evidence node per dispatch_target record.
+    node_by_record: std.AutoHashMap(u32, static_dispatch.EvidenceNodeId),
+    record_in_progress: std.AutoHashMap(u32, void),
+    /// Site-evidence dedupe (a checked expr can be reachable from two
+    /// templates, e.g. a const body and its entry wrapper).
+    site_seen: std.AutoHashMap(u32, void),
+
+    evidence_nodes: std.ArrayList(static_dispatch.EvidenceNode),
+    evidence_refs: std.ArrayList(static_dispatch.CheckedEvidence),
+    site_evidence: std.ArrayList(static_dispatch.SiteEvidenceEntry),
+    evidence_params_pool: std.ArrayList(static_dispatch.EvidenceParamRecord),
+
+    enum_scratch: dispatch_evidence.Scratch,
+    /// Obligations the pass could not resolve; these plans keep
+    /// `unresolved_checked_plan` and monotype lowering's owner derivation
+    /// still covers them during the class-by-class migration.
+    unresolved_count: usize = 0,
+    /// The enclosing template's params while resolving a site's evidence
+    /// entries, so a fresh var that settled onto an enclosing where-var
+    /// forwards as `constraint(k)`.
+    current_site_params: []const EvidenceParam = &.{},
+
+    const EvidenceParam = dispatch_evidence.EvidenceParam;
+
+    fn init(
+        allocator: Allocator,
+        module: TypedCIR.Module,
+        names: *canonical.CanonicalNameStore,
+        checked_types: *const CheckedTypePublication,
+        checked_bodies: *const CheckedBodyStore,
+        local_method_registry: *const static_dispatch.MethodRegistry,
+        import_views: CheckedImportViews,
+        plan_table: *static_dispatch.StaticDispatchPlanTable,
+        templates: *CheckedProcedureTemplateTable,
+        resolved_value_refs: *const ResolvedValueRefTable,
+        build_data: *const static_dispatch.PlanTableBuildData,
+        template_iterator_refs: *const TemplateIteratorRefs,
+    ) EvidencePass {
+        return .{
+            .allocator = allocator,
+            .module = module,
+            .names = names,
+            .checked_types = checked_types,
+            .checked_bodies = checked_bodies,
+            .local_method_registry = local_method_registry,
+            .import_views = import_views,
+            .plan_table = plan_table,
+            .templates = templates,
+            .resolved_value_refs = resolved_value_refs,
+            .build_data = build_data,
+            .template_iterator_refs = template_iterator_refs,
+            .types = module.typeStoreConst(),
+            .value_use_by_node = std.AutoHashMap(u32, u32).init(allocator),
+            .target_by_fn_var = std.AutoHashMap(u32, u32).init(allocator),
+            .source_by_checked_expr = std.AutoHashMap(u32, u32).init(allocator),
+            .def_by_pattern = std.AutoHashMap(u32, CIR.Def.Idx).init(allocator),
+            .node_by_record = std.AutoHashMap(u32, static_dispatch.EvidenceNodeId).init(allocator),
+            .record_in_progress = std.AutoHashMap(u32, void).init(allocator),
+            .site_seen = std.AutoHashMap(u32, void).init(allocator),
+            .evidence_nodes = .empty,
+            .evidence_refs = .empty,
+            .site_evidence = .empty,
+            .evidence_params_pool = .empty,
+            .enum_scratch = .{},
+        };
+    }
+
+    fn deinit(self: *EvidencePass) void {
+        self.value_use_by_node.deinit();
+        self.target_by_fn_var.deinit();
+        self.source_by_checked_expr.deinit();
+        self.def_by_pattern.deinit();
+        self.node_by_record.deinit();
+        self.record_in_progress.deinit();
+        self.site_seen.deinit();
+        self.evidence_nodes.deinit(self.allocator);
+        self.evidence_refs.deinit(self.allocator);
+        self.site_evidence.deinit(self.allocator);
+        self.evidence_params_pool.deinit(self.allocator);
+        self.enum_scratch.deinit(self.allocator);
+    }
+
+    fn run(self: *EvidencePass) Allocator.Error!void {
+        try self.buildIndexes();
+
+        var params = std.ArrayListUnmanaged(EvidenceParam).empty;
+        defer params.deinit(self.allocator);
+
+        // by_def maps source defs to templates; entry wrappers and intrinsic
+        // wrappers have no scheme of their own (empty params).
+        var template_defs = std.AutoHashMap(u32, CIR.Def.Idx).init(self.allocator);
+        defer template_defs.deinit();
+        for (self.templates.by_def) |entry| {
+            try template_defs.put(@intFromEnum(entry.template.template), entry.def);
+        }
+
+        for (self.templates.templates, 0..) |*template, template_index| {
+            params.clearRetainingCapacity();
+            if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
+                try self.enumerateParams(ModuleEnv.varFrom(def_idx), &params);
+            }
+
+            // Publish the template's evidence params in canonical order.
+            const idents = self.module.identStoreConst();
+            const pool_start: u32 = @intCast(self.evidence_params_pool.items.len);
+            for (params.items) |param| {
+                try self.evidence_params_pool.append(self.allocator, .{
+                    .method = try self.names.internMethodIdent(idents, param.constraint.fn_name),
+                });
+            }
+            template.evidence_params = .{ .start = pool_start, .len = @intCast(params.items.len) };
+
+            const plan_refs = self.plan_table.template_refs[template.static_dispatch_plans.start .. template.static_dispatch_plans.start + template.static_dispatch_plans.len];
+            for (plan_refs) |plan_id| {
+                try self.resolvePlan(plan_id, params.items);
+            }
+
+            const iter_span = self.template_iterator_refs.spans[template_index];
+            for (self.template_iterator_refs.pool[iter_span.start .. iter_span.start + iter_span.len]) |iter_plan_id| {
+                try self.resolveIteratorPlan(iter_plan_id, params.items);
+            }
+
+            const value_refs = self.resolved_value_refs.template_refs[template.resolved_value_refs.start .. template.resolved_value_refs.start + template.resolved_value_refs.len];
+            for (value_refs) |ref_id| {
+                try self.emitSiteEvidence(ref_id, params.items);
+            }
+        }
+
+        // Any plan the template walk did not reach stays unresolved for the
+        // migration's derivation fallback; count it for the dual-run audit.
+        for (self.plan_table.plans) |plan| {
+            if (plan.resolution == .unresolved_checked_plan) self.unresolved_count += 1;
+        }
+
+        std.mem.sort(static_dispatch.SiteEvidenceEntry, self.site_evidence.items, {}, siteEvidenceLessThan);
+
+        self.plan_table.evidence_nodes = try self.evidence_nodes.toOwnedSlice(self.allocator);
+        self.plan_table.evidence_refs = try self.evidence_refs.toOwnedSlice(self.allocator);
+        self.plan_table.site_evidence = try self.site_evidence.toOwnedSlice(self.allocator);
+        self.templates.evidence_params_pool = try self.evidence_params_pool.toOwnedSlice(self.allocator);
+    }
+
+    fn buildIndexes(self: *EvidencePass) Allocator.Error!void {
+        const module_env = self.module.moduleEnvConst();
+        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
+            switch (@as(ModuleEnv.SchemeInstantiationRecord.Slot, @enumFromInt(record.slot_kind))) {
+                .value_use => {
+                    // Re-checks can record the same instantiation twice; keep
+                    // the first.
+                    const entry = try self.value_use_by_node.getOrPut(record.node_idx);
+                    if (!entry.found_existing) entry.value_ptr.* = @intCast(i);
+                },
+                .dispatch_target => {
+                    // Key by the settled union-find root so a query through
+                    // any var unified with the discharged constraint's fn var
+                    // finds the record.
+                    const root = self.types.resolveVar(@enumFromInt(record.slot_data)).var_;
+                    const entry = try self.target_by_fn_var.getOrPut(@intFromEnum(root));
+                    if (!entry.found_existing) entry.value_ptr.* = @intCast(i);
+                },
+            }
+        }
+
+        var raw_node: u32 = 0;
+        while (raw_node < self.module.nodeCount()) : (raw_node += 1) {
+            if (!isExprNodeTag(self.module.nodeTag(@enumFromInt(raw_node)))) continue;
+            const checked = self.checked_bodies.exprIdForSource(@enumFromInt(raw_node)) orelse continue;
+            try self.source_by_checked_expr.put(@intFromEnum(checked), raw_node);
+        }
+
+        const global_value_defs = module_env.store.sliceDefs(module_env.global_value_defs);
+        for (global_value_defs) |def_idx| {
+            const def = module_env.store.getDef(def_idx);
+            try self.def_by_pattern.put(@intFromEnum(def.pattern), def_idx);
+        }
+    }
+
+    fn enumerateParams(self: *EvidencePass, root: Var, out: *std.ArrayListUnmanaged(EvidenceParam)) Allocator.Error!void {
+        try dispatch_evidence.enumerateEvidenceParams(self.allocator, self.types, root, &self.enum_scratch, out);
+    }
+
+    /// The canonical param index of `dispatcher_root`'s `method` obligation.
+    fn paramIndexFor(self: *EvidencePass, params: []const EvidenceParam, dispatcher_root: Var, method: canonical.MethodNameId) Allocator.Error!?u32 {
+        const idents = self.module.identStoreConst();
+        for (params, 0..) |param, k| {
+            if (self.types.resolveVar(param.dispatcher_var).var_ != dispatcher_root) continue;
+            if (try self.names.internMethodIdent(idents, param.constraint.fn_name) != method) continue;
+            return @intCast(k);
+        }
+        return null;
+    }
+
+    fn resolvePlan(self: *EvidencePass, plan_id: static_dispatch.StaticDispatchPlanId, params: []const EvidenceParam) Allocator.Error!void {
+        const raw = @intFromEnum(plan_id);
+        const plan = &self.plan_table.plans[raw];
+        // A plan reachable from two templates (const body + entry wrapper)
+        // resolves once.
+        if (plan.resolution != .unresolved_checked_plan) return;
+
+        const src = self.build_data.plan_sources[raw];
+        const structural_kind: ?static_dispatch.StructuralKind = switch (plan.result_mode) {
+            .value => null,
+            .equality => |eq| if (eq.structural_allowed) .equality else null,
+            .hash => |hash| if (hash.structural_allowed) .hash else null,
+            .parser_for => |parser_for| if (parser_for.structural_allowed) .parser else null,
+            .encode_to => |encode_to| if (encode_to.structural_allowed) .encoder else null,
+        };
+        // Nested evidence built for this plan's target forwards enclosing
+        // where-vars against the same template params.
+        self.current_site_params = params;
+        defer self.current_site_params = &.{};
+        plan.resolution = try self.resolveObligation(
+            src.dispatcher_var,
+            plan.method,
+            structural_kind,
+            src.constraint_fn_var,
+            params,
+        );
+    }
+
+    fn resolveIteratorPlan(self: *EvidencePass, plan_id: static_dispatch.IteratorForPlanId, params: []const EvidenceParam) Allocator.Error!void {
+        const raw = @intFromEnum(plan_id);
+        const plan = &self.plan_table.iterator_for_plans[raw];
+        if (plan.iter.resolution != .unresolved_checked_plan) return;
+
+        const src = self.build_data.iterator_plan_sources[raw];
+        self.current_site_params = params;
+        defer self.current_site_params = &.{};
+        plan.iter.resolution = try self.resolveObligation(
+            src.iter_dispatcher_var,
+            plan.iter.method,
+            null,
+            src.iter_fn_var,
+            params,
+        );
+        // The iterator type is the `iter` callable's return: dispatch `next`
+        // on it.
+        const next_dispatcher = self.iteratorNextDispatcherVar(src.iter_fn_var);
+        plan.next.resolution = if (next_dispatcher) |dispatcher_var|
+            try self.resolveObligation(
+                dispatcher_var,
+                plan.next.method,
+                null,
+                src.next_fn_var,
+                params,
+            )
+        else blk: {
+            self.unresolved_count += 1;
+            break :blk .unresolved_checked_plan;
+        };
+    }
+
+    fn iteratorNextDispatcherVar(self: *EvidencePass, iter_fn_var: Var) ?Var {
+        const resolved = self.types.resolveVar(iter_fn_var);
+        const func = resolved.desc.content.unwrapFunc() orelse return null;
+        return func.ret;
+    }
+
+    /// Resolve one dispatch obligation: `method` dispatched on
+    /// `dispatcher_var`, with `constraint_fn_var` keying the discharge record
+    /// that carries the chosen target's own nested obligations.
+    fn resolveObligation(
+        self: *EvidencePass,
+        dispatcher_var: Var,
+        method: canonical.MethodNameId,
+        structural_kind: ?static_dispatch.StructuralKind,
+        constraint_fn_var: ?Var,
+        params: []const EvidenceParam,
+    ) Allocator.Error!static_dispatch.StaticDispatchResolution {
+        const resolved = self.types.resolveVar(dispatcher_var);
+        switch (resolved.desc.content) {
+            .err => return .checked_error,
+            .flex => |flex| return self.resolveVarObligation(resolved.var_, flex.constraints, method, structural_kind, params),
+            .rigid => |rigid| return self.resolveVarObligation(resolved.var_, rigid.constraints, method, structural_kind, params),
+            .alias, .structure => {
+                if (self.methodOwnerForSourceContent(resolved.var_)) |owner| {
+                    if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.available, owner, method)) |target| {
+                        const node = try self.evidenceNodeForTarget(target, constraint_fn_var);
+                        return .{ .direct = node };
+                    }
+                }
+                if (structural_kind) |kind| return .{ .structural = kind };
+                // Checking already reported the missing method; the site is
+                // erroneous.
+                return .checked_error;
+            },
+        }
+    }
+
+    fn resolveVarObligation(
+        self: *EvidencePass,
+        dispatcher_root: Var,
+        constraints: types.StaticDispatchConstraint.SafeList.Range,
+        method: canonical.MethodNameId,
+        structural_kind: ?static_dispatch.StructuralKind,
+        params: []const EvidenceParam,
+    ) Allocator.Error!static_dispatch.StaticDispatchResolution {
+        _ = structural_kind;
+        if (try self.paramIndexFor(params, dispatcher_root, method)) |k| {
+            return .{ .constraint = .{ .depth = 0, .index = @intCast(k) } };
+        }
+
+        // Not an evidence param of the enclosing template. A var whose
+        // obligations all come from literal conversions defaults at
+        // monomorphic specialization (Dec for numerals, Str for quotes and
+        // interpolations); resolve the plan to that default's method now.
+        const constraint_slice = self.types.sliceStaticDispatchConstraints(constraints);
+        var all_literal = constraint_slice.len > 0;
+        for (constraint_slice) |constraint| {
+            if (constraint.origin.literalKind() == null) all_literal = false;
+        }
+        if (all_literal) {
+            if (self.literalDefaultTarget(constraint_slice[0], method)) |target| {
+                const node = try self.evidenceNodeForTarget(target, null);
+                return .{ .direct = node };
+            }
+        }
+
+        // Constrained vars of a generalized local function (or another scope
+        // this pass does not model yet) stay unresolved; monotype owner
+        // derivation covers them until the class migration completes.
+        self.unresolved_count += 1;
+        return .unresolved_checked_plan;
+    }
+
+    fn literalDefaultTarget(
+        self: *EvidencePass,
+        constraint: types.StaticDispatchConstraint,
+        method: canonical.MethodNameId,
+    ) ?static_dispatch.MethodTarget {
+        const kind = constraint.origin.literalKind() orelse return null;
+        const owner: static_dispatch.MethodOwner = switch (kind) {
+            .numeral => .{ .builtin = .dec },
+            .quote, .interpolation => .{ .builtin = .str },
+        };
+        return static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.available, owner, method);
+    }
+
+    /// The method owner of a settled source var, walking alias content
+    /// transparently (mirrors `methodOwnerForCheckedType` on published types).
+    fn methodOwnerForSourceContent(self: *EvidencePass, var_: Var) ?static_dispatch.MethodOwner {
+        var current = var_;
+        var remaining: u64 = self.types.len();
+        while (true) {
+            const resolved = self.types.resolveVar(current);
+            switch (resolved.desc.content) {
+                .alias => |alias| {
+                    if (remaining == 0) {
+                        checkedArtifactInvariant("checked evidence source alias chain was cyclic", .{});
+                    }
+                    remaining -= 1;
+                    current = self.types.getAliasBackingVar(alias);
+                },
+                .structure => |flat_type| switch (flat_type) {
+                    .nominal_type => |nominal| {
+                        if (categorizeBuiltinNominal(self.module, self.import_views, nominal)) |builtin_nominal| {
+                            return .{ .builtin = static_dispatch.builtinOwnerForCheckedBuiltin(builtin_nominal) };
+                        }
+                        const idents = self.module.identStoreConst();
+                        const module_name = self.names.internModuleIdent(idents, nominal.origin_module) catch return null;
+                        if (nominal.sourceDeclOptional()) |source_decl| {
+                            return .{ .source_decl = .{
+                                .module_name = module_name,
+                                .statement = source_decl,
+                            } };
+                        }
+                        const type_name = self.names.internTypeIdent(idents, nominal.ident.ident_idx) catch return null;
+                        return .{ .nominal = .{
+                            .module_name = module_name,
+                            .type_name = type_name,
+                            .source_decl = null,
+                        } };
+                    },
+                    else => return null,
+                },
+                else => return null,
+            }
+        }
+    }
+
+    /// Build (memoized) the evidence node for `target`, with nested evidence
+    /// from the discharge record keyed by `constraint_fn_var`.
+    fn evidenceNodeForTarget(
+        self: *EvidencePass,
+        target: static_dispatch.MethodTarget,
+        constraint_fn_var: ?Var,
+    ) Allocator.Error!static_dispatch.EvidenceNodeId {
+        const record_idx: ?u32 = if (constraint_fn_var) |fn_var|
+            self.target_by_fn_var.get(@intFromEnum(self.types.resolveVar(fn_var).var_))
+        else
+            null;
+
+        if (record_idx) |idx| {
+            if (self.node_by_record.get(idx)) |memoized| return memoized;
+            if ((try self.record_in_progress.getOrPut(idx)).found_existing) {
+                checkedArtifactInvariant("checked dispatch evidence chain was cyclic", .{});
+            }
+            defer _ = self.record_in_progress.remove(idx);
+
+            const nested = try self.evidenceRefsForRecord(idx);
+            const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
+            try self.evidence_nodes.append(self.allocator, .{ .target = target, .nested = nested });
+            try self.node_by_record.put(idx, node_id);
+            return node_id;
+        }
+
+        // Monomorphic target (or a discharge this pass has no record for —
+        // e.g. a recursion-cycle placeholder): no nested obligations.
+        const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
+        try self.evidence_nodes.append(self.allocator, .{ .target = target });
+        return node_id;
+    }
+
+    /// Resolve one instantiation record's obligations (in the scheme's
+    /// canonical order) into a contiguous `evidence_refs` range.
+    fn evidenceRefsForRecord(self: *EvidencePass, record_idx: u32) Allocator.Error!artifact_serialize.Span {
+        const module_env = self.module.moduleEnvConst();
+        const record = module_env.scheme_instantiations.items.items[record_idx];
+        const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+
+        var params = std.ArrayListUnmanaged(EvidenceParam).empty;
+        defer params.deinit(self.allocator);
+        try self.enumerateParams(@enumFromInt(record.scheme_root), &params);
+
+        var entries = std.ArrayListUnmanaged(static_dispatch.CheckedEvidence).empty;
+        defer entries.deinit(self.allocator);
+        try entries.ensureTotalCapacity(self.allocator, params.items.len);
+
+        for (params.items) |param| {
+            entries.appendAssumeCapacity(try self.evidenceForRecordParam(record, pairs, param));
+        }
+
+        return self.appendEvidenceRefs(entries.items);
+    }
+
+    fn evidenceForRecordParam(
+        self: *EvidencePass,
+        record: ModuleEnv.SchemeInstantiationRecord,
+        pairs: []const ModuleEnv.SchemeInstantiationPair,
+        param: EvidenceParam,
+    ) Allocator.Error!static_dispatch.CheckedEvidence {
+        _ = record;
+        const dispatcher_root = self.types.resolveVar(param.dispatcher_var).var_;
+        const fresh_dispatcher = pairFor(pairs, dispatcher_root) orelse {
+            // The scheme var was not copied at this instantiation (it was
+            // already monomorphic there); resolve the pristine var directly.
+            return self.evidenceForVar(param, param.dispatcher_var, null);
+        };
+        const fn_root = self.types.resolveVar(param.constraint.fn_var).var_;
+        const fresh_fn = pairFor(pairs, fn_root);
+        return self.evidenceForVar(param, fresh_dispatcher, fresh_fn);
+    }
+
+    /// Resolve one obligation of an instantiated scheme: the fresh dispatcher
+    /// var either settled to a concrete type (direct or structural evidence),
+    /// or is one of the *enclosing* callable's params (forwarded). The
+    /// enclosing params here are the ones of the template whose body contains
+    /// the instantiation site; the caller of `siteEvidence`/nested-node
+    /// construction passes them contextually via `current_site_params`.
+    fn evidenceForVar(
+        self: *EvidencePass,
+        param: EvidenceParam,
+        var_: Var,
+        fresh_fn_var: ?Var,
+    ) Allocator.Error!static_dispatch.CheckedEvidence {
+        const idents = self.module.identStoreConst();
+        const method = try self.names.internMethodIdent(idents, param.constraint.fn_name);
+        const structural_kind = self.structuralKindForMethodIdent(param.constraint.fn_name);
+
+        const resolution = try self.resolveObligation(var_, method, structural_kind, fresh_fn_var, self.current_site_params);
+        return switch (resolution) {
+            .direct => |node| .{ .direct = node },
+            .constraint => |ref| .{ .constraint = ref },
+            .structural => |kind| .{ .structural = kind },
+            .checked_error => .checked_error,
+            .unresolved_checked_plan => blk: {
+                // Track alongside plan-level gaps; consumers treat missing
+                // evidence like a checked error until the migration finishes.
+                self.unresolved_count += 1;
+                break :blk .checked_error;
+            },
+        };
+    }
+
+    /// The derived-structural kind a constraint method admits, if any.
+    fn structuralKindForMethodIdent(self: *EvidencePass, fn_name: anytype) ?static_dispatch.StructuralKind {
+        const common = self.module.commonIdents();
+        if (fn_name.eql(common.is_eq)) return .equality;
+        if (fn_name.eql(common.to_hash)) return .hash;
+        if (fn_name.eql(common.parser_for)) return .parser;
+        if (fn_name.eql(common.encode_to)) return .encoder;
+        return null;
+    }
+
+    fn appendEvidenceRefs(self: *EvidencePass, entries: []const static_dispatch.CheckedEvidence) Allocator.Error!artifact_serialize.Span {
+        const start: u32 = @intCast(self.evidence_refs.items.len);
+        try self.evidence_refs.appendSlice(self.allocator, entries);
+        return .{ .start = start, .len = @intCast(entries.len) };
+    }
+
+    /// Publish site evidence for one value reference within the current
+    /// template: how each of the referenced scheme's obligations was
+    /// satisfied at that use.
+    fn emitSiteEvidence(self: *EvidencePass, ref_id: ResolvedValueRefId, params: []const EvidenceParam) Allocator.Error!void {
+        const rec = self.resolved_value_refs.records[@intFromEnum(ref_id)];
+        const site_key = @intFromEnum(rec.expr);
+        if (self.site_seen.contains(site_key)) return;
+
+        const source_node = self.source_by_checked_expr.get(site_key) orelse return;
+
+        self.current_site_params = params;
+        defer self.current_site_params = &.{};
+
+        if (self.value_use_by_node.get(source_node)) |record_idx| {
+            const span = try self.evidenceRefsForRecord(record_idx);
+            if (span.len == 0) return;
+            try self.site_seen.put(site_key, {});
+            try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
+            return;
+        }
+
+        // No instantiation record: a self- or SCC-recursive use of a local
+        // generic def is checked against the shared pre-generalization vars,
+        // so its obligations forward to the enclosing template's own params
+        // by var identity.
+        try self.emitRecursiveUseEvidence(source_node, site_key, params);
+    }
+
+    fn emitRecursiveUseEvidence(self: *EvidencePass, source_node: u32, site_key: u32, params: []const EvidenceParam) Allocator.Error!void {
+        if (self.module.nodeTag(@enumFromInt(source_node)) != .expr_var) return;
+        const lookup = self.module.expr(@enumFromInt(source_node)).data.e_lookup_local;
+        const callee_def = self.def_by_pattern.get(@intFromEnum(lookup.pattern_idx)) orelse return;
+
+        var callee_params = std.ArrayListUnmanaged(EvidenceParam).empty;
+        defer callee_params.deinit(self.allocator);
+        try self.enumerateParams(ModuleEnv.varFrom(callee_def), &callee_params);
+        if (callee_params.items.len == 0) return;
+
+        var entries = std.ArrayListUnmanaged(static_dispatch.CheckedEvidence).empty;
+        defer entries.deinit(self.allocator);
+        try entries.ensureTotalCapacity(self.allocator, callee_params.items.len);
+
+        const idents = self.module.identStoreConst();
+        for (callee_params.items) |callee_param| {
+            const dispatcher_root = self.types.resolveVar(callee_param.dispatcher_var).var_;
+            const method = try self.names.internMethodIdent(idents, callee_param.constraint.fn_name);
+            if (try self.paramIndexFor(params, dispatcher_root, method)) |k| {
+                entries.appendAssumeCapacity(.{ .constraint = .{ .depth = 0, .index = @intCast(k) } });
+            } else {
+                self.unresolved_count += 1;
+                entries.appendAssumeCapacity(.checked_error);
+            }
+        }
+
+        const span = try self.appendEvidenceRefs(entries.items);
+        try self.site_seen.put(site_key, {});
+        try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
+    }
+
+    fn pairFor(pairs: []const ModuleEnv.SchemeInstantiationPair, old_root: Var) ?Var {
+        for (pairs) |pair| {
+            if (pair.old_var == @intFromEnum(old_root)) return @enumFromInt(pair.fresh_var);
+        }
+        return null;
+    }
+};
+
+fn siteEvidenceLessThan(_: void, a: static_dispatch.SiteEvidenceEntry, b: static_dispatch.SiteEvidenceEntry) bool {
+    return a.key < b.key;
+}
+
+fn resolveTotalDispatchPlans(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *canonical.CanonicalNameStore,
+    checked_types: *const CheckedTypePublication,
+    checked_bodies: *const CheckedBodyStore,
+    local_method_registry: *const static_dispatch.MethodRegistry,
+    import_views: CheckedImportViews,
+    plan_table: *static_dispatch.StaticDispatchPlanTable,
+    templates: *CheckedProcedureTemplateTable,
+    resolved_value_refs: *const ResolvedValueRefTable,
+    build_data: *const static_dispatch.PlanTableBuildData,
+    template_iterator_refs: *const TemplateIteratorRefs,
+) Allocator.Error!void {
+    var pass = EvidencePass.init(
+        allocator,
+        module,
+        names,
+        checked_types,
+        checked_bodies,
+        local_method_registry,
+        import_views,
+        plan_table,
+        templates,
+        resolved_value_refs,
+        build_data,
+        template_iterator_refs,
+    );
+    defer pass.deinit();
+    try pass.run();
 }
 
 fn sealConstEvalTemplatesForRoots(
@@ -12675,6 +13341,7 @@ const CheckedTemplateRefCollector = struct {
     static_dispatch_plans: *const static_dispatch.StaticDispatchPlanTable,
     value_refs: std.ArrayList(ResolvedValueRefId),
     dispatch_refs: std.ArrayList(static_dispatch.StaticDispatchPlanId),
+    iterator_refs: std.ArrayList(static_dispatch.IteratorForPlanId),
     visited_exprs: std.AutoHashMap(CheckedExprId, void),
     visited_patterns: std.AutoHashMap(CheckedPatternId, void),
     visited_statements: std.AutoHashMap(CheckedStatementId, void),
@@ -12690,6 +13357,7 @@ const CheckedTemplateRefCollector = struct {
             .static_dispatch_plans = static_dispatch_plans,
             .value_refs = .empty,
             .dispatch_refs = .empty,
+            .iterator_refs = .empty,
             .visited_exprs = std.AutoHashMap(CheckedExprId, void).init(allocator),
             .visited_patterns = std.AutoHashMap(CheckedPatternId, void).init(allocator),
             .visited_statements = std.AutoHashMap(CheckedStatementId, void).init(allocator),
@@ -12701,12 +13369,14 @@ const CheckedTemplateRefCollector = struct {
         self.visited_patterns.deinit();
         self.visited_exprs.deinit();
         self.dispatch_refs.deinit(self.allocator);
+        self.iterator_refs.deinit(self.allocator);
         self.value_refs.deinit(self.allocator);
     }
 
     fn clear(self: *CheckedTemplateRefCollector) void {
         self.value_refs.clearRetainingCapacity();
         self.dispatch_refs.clearRetainingCapacity();
+        self.iterator_refs.clearRetainingCapacity();
         self.visited_exprs.clearRetainingCapacity();
         self.visited_patterns.clearRetainingCapacity();
         self.visited_statements.clearRetainingCapacity();
@@ -12890,6 +13560,7 @@ const CheckedTemplateRefCollector = struct {
         if (raw >= self.static_dispatch_plans.iterator_for_plans.len) {
             checkedArtifactInvariant("checked template iterator-for plan id was outside the plan table", .{});
         }
+        try self.iterator_refs.append(self.allocator, plan_id);
         const plan = self.static_dispatch_plans.iterator_for_plans[raw];
         try self.collectIteratorDispatchCall(plan.iter);
         try self.collectIteratorDispatchCall(plan.next);
@@ -13142,16 +13813,23 @@ pub const CheckedProcedureTemplate = struct {
     top_level_value_uses: TopLevelUseSummaryRef,
     nested_proc_sites: NestedProcSiteTableRef,
     target: ProcTarget,
+    /// The scheme's dispatch obligations in canonical order (a range into
+    /// `CheckedProcedureTemplateTable.evidence_params_pool`). Every
+    /// specialization of this template receives one evidence entry per param.
+    evidence_params: artifact_serialize.Span = .{},
 };
 
 /// Public `CheckedProcedureTemplateTable` declaration.
 pub const CheckedProcedureTemplateTable = struct {
     templates: []CheckedProcedureTemplate = &.{},
     by_def: []static_dispatch.ProcedureTemplateLookupEntry = &.{},
+    /// Flat pool backing each template's `evidence_params` span.
+    evidence_params_pool: []static_dispatch.EvidenceParamRecord = &.{},
 
     pub const Serialized = extern struct {
         templates: SerializedSlice(CheckedProcedureTemplate) = .{},
         by_def: SerializedSlice(static_dispatch.ProcedureTemplateLookupEntry) = .{},
+        evidence_params_pool: SerializedSlice(static_dispatch.EvidenceParamRecord) = .{},
         const Serde = artifact_serialize.SliceStoreSerde(CheckedProcedureTemplateTable, @This());
         pub const serialize = Serde.serialize;
         pub const deserialize = Serde.deserialize;
@@ -13354,7 +14032,13 @@ pub const CheckedProcedureTemplateTable = struct {
     pub fn deinit(self: *CheckedProcedureTemplateTable, allocator: Allocator) void {
         allocator.free(self.by_def);
         allocator.free(self.templates);
+        allocator.free(self.evidence_params_pool);
         self.* = .{};
+    }
+
+    /// The template's evidence params, in canonical order.
+    pub fn evidenceParams(self: *const CheckedProcedureTemplateTable, template: *const CheckedProcedureTemplate) []const static_dispatch.EvidenceParamRecord {
+        return self.evidence_params_pool[template.evidence_params.start .. template.evidence_params.start + template.evidence_params.len];
     }
 };
 
@@ -23322,7 +24006,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 184);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 188);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -23462,7 +24146,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 7;
+    const serialized_layout_version: u32 = 8;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -25543,14 +26227,15 @@ pub fn publishFromTypedModule(
     var method_registry = try static_dispatch.MethodRegistry.fromModule(allocator, module, &canonical_names, &template_lookup, &checked_type_publication, checked_bodies);
     errdefer method_registry.deinit(allocator);
 
+    var plan_build_data = static_dispatch.PlanTableBuildData{};
+    errdefer plan_build_data.deinit(allocator);
     var static_dispatch_plans = try static_dispatch.StaticDispatchPlanTable.fromModule(
         allocator,
         module,
         &canonical_names,
         &checked_type_publication,
         checked_bodies,
-        &method_registry,
-        inputs.available_artifacts,
+        &plan_build_data,
     );
     errdefer static_dispatch_plans.deinit(allocator);
     checked_bodies.attachStaticDispatchPlans(&static_dispatch_plans);
@@ -25671,6 +26356,8 @@ pub fn publishFromTypedModule(
         inputs.relation_artifacts,
     );
 
+    var template_iterator_refs = TemplateIteratorRefs{};
+    errdefer template_iterator_refs.deinit(allocator);
     try sealCheckedProcedureTemplateRefs(
         allocator,
         checked_bodies,
@@ -25678,7 +26365,25 @@ pub fn publishFromTypedModule(
         &checked_procedure_templates,
         &static_dispatch_plans,
         &resolved_value_refs,
+        &template_iterator_refs,
     );
+
+    try resolveTotalDispatchPlans(
+        allocator,
+        module,
+        &canonical_names,
+        &checked_type_publication,
+        checked_bodies,
+        &method_registry,
+        .{ .direct = inputs.imports, .available = inputs.available_artifacts },
+        &static_dispatch_plans,
+        &checked_procedure_templates,
+        &resolved_value_refs,
+        &plan_build_data,
+        &template_iterator_refs,
+    );
+    template_iterator_refs.deinit(allocator);
+    plan_build_data.deinit(allocator);
 
     var provided_exports = try ProvidedExportTable.fromModule(
         allocator,
@@ -26069,14 +26774,15 @@ fn expectProvidedExportKind(
     var method_registry = try static_dispatch.MethodRegistry.fromModule(allocator, module, &canonical_names, &template_lookup, &checked_type_publication, checked_bodies);
     defer method_registry.deinit(allocator);
 
+    var plan_build_data = static_dispatch.PlanTableBuildData{};
+    defer plan_build_data.deinit(allocator);
     var static_dispatch_plans = try static_dispatch.StaticDispatchPlanTable.fromModule(
         allocator,
         module,
         &canonical_names,
         &checked_type_publication,
         checked_bodies,
-        &method_registry,
-        &.{},
+        &plan_build_data,
     );
     defer static_dispatch_plans.deinit(allocator);
     checked_bodies.attachStaticDispatchPlans(&static_dispatch_plans);
@@ -26194,6 +26900,8 @@ fn expectProvidedExportKind(
         &.{},
     );
 
+    var template_iterator_refs = TemplateIteratorRefs{};
+    defer template_iterator_refs.deinit(allocator);
     try sealCheckedProcedureTemplateRefs(
         allocator,
         checked_bodies,
@@ -26201,6 +26909,22 @@ fn expectProvidedExportKind(
         &checked_procedure_templates,
         &static_dispatch_plans,
         &resolved_value_refs,
+        &template_iterator_refs,
+    );
+
+    try resolveTotalDispatchPlans(
+        allocator,
+        module,
+        &canonical_names,
+        &checked_type_publication,
+        checked_bodies,
+        &method_registry,
+        .{ .direct = &builtin_imports, .available = &.{} },
+        &static_dispatch_plans,
+        &checked_procedure_templates,
+        &resolved_value_refs,
+        &plan_build_data,
+        &template_iterator_refs,
     );
 
     var provided_exports = try ProvidedExportTable.fromModule(
@@ -27353,8 +28077,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xA3, 0x20, 0xAD, 0x3D, 0xFB, 0x97, 0x4B, 0x2A, 0x7A, 0x02, 0xE0, 0x5B, 0x55, 0x1A, 0x72, 0x65,
-        0x37, 0xB4, 0xA9, 0xBE, 0xB4, 0x6F, 0x33, 0xA1, 0x11, 0xE3, 0x81, 0xEA, 0x0A, 0x72, 0x66, 0x04,
+        0x3A, 0xB7, 0x61, 0x32, 0x4C, 0x83, 0x50, 0x8F, 0x70, 0x41, 0xC8, 0xD9, 0x2E, 0x4F, 0x6E, 0x6A,
+        0xE3, 0x05, 0xBA, 0xC6, 0xE9, 0xDB, 0x6A, 0xBE, 0x00, 0x6B, 0x43, 0xD2, 0x1B, 0xB5, 0x49, 0xE9,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

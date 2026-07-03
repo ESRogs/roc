@@ -167,6 +167,76 @@ const MethodLookup = struct {
     target: static_dispatch.MethodTarget,
 };
 
+/// One resolved dispatch obligation supplied to a specialization: either a
+/// concrete method target (with the target's own obligations resolved in
+/// `nested`) or a compiler-derived structural implementation. Fully
+/// materialized at the requesting call edge — checked `constraint(k)` refs are
+/// substituted from the requester's own evidence there — so a specialization's
+/// vector is self-contained (dictionary passing evaluated at compile time;
+/// projects/big/total-dispatch-plans.md).
+const SpecEvidence = union(enum) {
+    target: *const SpecEvidenceTarget,
+    structural: static_dispatch.StructuralKind,
+    /// The edge's obligation was rejected during checking, or publication left
+    /// it unresolved (migration gap). Consuming it falls back to owner
+    /// derivation until the class-by-class migration completes.
+    unavailable,
+};
+
+const SpecEvidenceTarget = struct {
+    view: ModuleView,
+    target: static_dispatch.MethodTarget,
+    nested: []const SpecEvidence,
+};
+
+/// The evidence vectors in scope while lowering a body: the innermost
+/// generalized callable's vector plus its lexical parents (nested local
+/// functions see their own vector at depth 0 and enclosing callables' vectors
+/// at higher depths, like compile-time captures).
+const EvidenceChain = struct {
+    vector: []const SpecEvidence = &.{},
+    parent: ?*const EvidenceChain = null,
+
+    fn at(self: *const EvidenceChain, ref: static_dispatch.EvidenceConstraintRef) ?SpecEvidence {
+        var chain: *const EvidenceChain = self;
+        var depth = ref.depth;
+        while (depth > 0) : (depth -= 1) {
+            chain = chain.parent orelse return null;
+        }
+        if (ref.index >= chain.vector.len) return null;
+        return chain.vector[ref.index];
+    }
+};
+
+fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
+    return switch (a) {
+        .target => |a_target| switch (b) {
+            .target => |b_target| blk: {
+                if (!std.meta.eql(a_target.target, b_target.target)) break :blk false;
+                if (a_target.nested.len != b_target.nested.len) break :blk false;
+                for (a_target.nested, b_target.nested) |a_nested, b_nested| {
+                    if (!specEvidenceEql(a_nested, b_nested)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+        .structural => |a_kind| switch (b) {
+            .structural => |b_kind| a_kind == b_kind,
+            else => false,
+        },
+        .unavailable => b == .unavailable,
+    };
+}
+
+fn specEvidenceVectorEql(a: []const SpecEvidence, b: []const SpecEvidence) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |a_entry, b_entry| {
+        if (!specEvidenceEql(a_entry, b_entry)) return false;
+    }
+    return true;
+}
+
 const MethodDispatch = struct {
     owner: static_dispatch.MethodOwner,
     method: names.MethodNameId,
@@ -309,6 +379,11 @@ const LoweredTemplate = struct {
     solved_fn_ty: Type.TypeId,
     solved_digest: names.TypeDigest,
     status: LoweredTemplateStatus,
+    /// Evidence for the template scheme's dispatch obligations, in canonical
+    /// evidence-param order, supplied by the first requesting edge. Reused
+    /// specializations debug-assert later edges agree (evidence is a function
+    /// of the monomorphic type, so agreement is an invariant, not a choice).
+    evidence: []const SpecEvidence = &.{},
 };
 
 const LoweredNestedStatus = enum {
@@ -565,6 +640,13 @@ const Builder = struct {
     /// when its types are final and specialization keys are stable.
     active_graph: ?*InstGraph = null,
     final_body_output_allowance: FinalBodyOutputCounts = .{},
+    /// Owns every materialized `SpecEvidence` tree; freed wholesale with the
+    /// builder.
+    evidence_arena: std.heap.ArenaAllocator,
+    /// Dispatch obligations whose evidence publication could not resolve
+    /// (migration gaps still covered by owner derivation); audited by the
+    /// total-dispatch migration before the derivation path is deleted.
+    evidence_missing_count: usize = 0,
 
     fn init(allocator: Allocator, modules: Common.CheckedModules, program: *Ast.Program, options: Options) Builder {
         return .{
@@ -592,6 +674,7 @@ const Builder = struct {
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
+            .evidence_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -641,6 +724,7 @@ const Builder = struct {
         self.spec_store.deinit();
         self.unsolved_monos.deinit();
         self.type_cache.deinit();
+        self.evidence_arena.deinit();
     }
 
     fn count(self: *Builder, comptime field: []const u8) void {
@@ -6156,6 +6240,11 @@ const BodyContext = struct {
     /// constants only count as "own" roots for this exact entry, not for every
     /// specialization of the same procedure template.
     current_entry_root: ?checked.ComptimeRootId = null,
+    /// Evidence for the current callable's dispatch obligations (innermost
+    /// vector plus lexical parents for nested local functions). Body contexts
+    /// created for the same specialization (dispatch call contexts, nested
+    /// non-generalized closures) share the owning specialization's chain.
+    evidence: EvidenceChain = .{},
 
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
@@ -6911,6 +7000,7 @@ const BodyContext = struct {
         copy_type_cells: bool,
     ) Allocator.Error!BodyContext {
         var child = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        child.evidence = self.evidence;
         errdefer child.deinit();
         child.owner_context_fn_key = self.owner_context_fn_key;
         child.current_fn_key = current_fn_key;
@@ -7841,6 +7931,7 @@ const BodyContext = struct {
             return try self.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
         }
         var source_ctx = try BodyContext.init(self.allocator, self.builder, source.view, self.owner_template, self.graph, self.draft);
+        source_ctx.evidence = self.evidence;
         defer source_ctx.deinit();
         source_ctx.owner_context_fn_key = self.owner_context_fn_key;
         source_ctx.current_fn_key = self.current_fn_key;
@@ -8844,6 +8935,7 @@ const BodyContext = struct {
         );
 
         var body_ctx = try BodyContext.init(self.allocator, self.builder, view, wrapper.template, self.graph, self.draft);
+        body_ctx.evidence = self.evidence;
         defer body_ctx.deinit();
         const root_fn_key = Ast.fnTemplateDigest(wrapper_template, &self.builder.program.types, &self.builder.program.names);
         body_ctx.owner_context_fn_key = root_fn_key;
@@ -13780,6 +13872,7 @@ const BodyContext = struct {
 
         if (call.direct_target) |target| {
             var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+            call_ctx.evidence = self.evidence;
             defer call_ctx.deinit();
             call_ctx.owner_context_fn_key = self.owner_context_fn_key;
             call_ctx.current_fn_key = self.current_fn_key;
@@ -13808,6 +13901,7 @@ const BodyContext = struct {
 
         const fn_ty = (try self.indirectCalleeMonoType(call.func, call.args, expected_ret_ty)) orelse fn_ty: {
             var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+            call_ctx.evidence = self.evidence;
             defer call_ctx.deinit();
             call_ctx.owner_context_fn_key = self.owner_context_fn_key;
             call_ctx.current_fn_key = self.current_fn_key;
@@ -14316,6 +14410,7 @@ const BodyContext = struct {
             }
 
             var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+            call_ctx.evidence = self.evidence;
             defer call_ctx.deinit();
             call_ctx.owner_context_fn_key = self.owner_context_fn_key;
             call_ctx.current_fn_key = self.current_fn_key;
@@ -14327,6 +14422,7 @@ const BodyContext = struct {
         }
 
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
         call_ctx.current_fn_key = self.current_fn_key;
@@ -14701,6 +14797,7 @@ const BodyContext = struct {
         );
 
         var body_ctx = try BodyContext.init(self.allocator, self.builder, store_view, eval.entry_template, self.graph, self.draft);
+        body_ctx.evidence = self.evidence;
         defer body_ctx.deinit();
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
@@ -14917,6 +15014,7 @@ const BodyContext = struct {
             .nested => {
                 const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
                 var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
+                fn_ctx.evidence = self.evidence;
                 defer fn_ctx.deinit();
                 return try self.builder.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def), template);
             },
@@ -14934,6 +15032,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
+        fn_ctx.evidence = self.evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, ty);
@@ -15053,6 +15152,7 @@ const BodyContext = struct {
         const fn_view = self.builder.moduleForDigest(names.procTemplateModuleDigest(runtime.owner));
 
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, runtime.owner, self.graph, self.draft);
+        fn_ctx.evidence = self.evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
 
@@ -15145,6 +15245,7 @@ const BodyContext = struct {
         const fn_view = self.builder.moduleForDigest(names.procTemplateModuleDigest(runtime.owner));
 
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, runtime.owner, self.graph, self.draft);
+        fn_ctx.evidence = self.evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
 
@@ -16000,6 +16101,7 @@ const BodyContext = struct {
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
 
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
         call_ctx.current_fn_key = self.current_fn_key;
@@ -16080,7 +16182,7 @@ const BodyContext = struct {
         // `planAllowsStructural` predicate as `dispatchTarget` so structural
         // equality/hashing/parser/encode dispatches keep their dedicated
         // structural lowering below.
-        if (plan.resolution == .unresolved_checked_plan and
+        if (plan.resolution != .direct and
             methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null and
             !planAllowsStructural(plan.result_mode))
         {
@@ -16177,6 +16279,7 @@ const BodyContext = struct {
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
 
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
         call_ctx.current_fn_key = self.current_fn_key;
@@ -16715,6 +16818,7 @@ const BodyContext = struct {
         const plan = self.view.static_dispatch_plans.plans[@intFromEnum(plan_id)];
 
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
         call_ctx.current_fn_key = self.current_fn_key;
@@ -16774,8 +16878,11 @@ const BodyContext = struct {
         dispatcher_ty: Type.TypeId,
     ) ?MethodLookup {
         switch (plan.resolution) {
-            .resolved_target => |target| return self.methodLookupForResolvedTarget(target),
-            .unresolved_checked_plan => {},
+            .direct => |node_id| return self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target),
+            // The evidence-based resolutions are consumed per plan class as
+            // the total-dispatch migration lands; until then the owner
+            // derivation below still resolves them.
+            .constraint, .structural, .checked_error, .unresolved_checked_plan => {},
         }
 
         const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse {
@@ -21609,6 +21716,7 @@ const BodyContext = struct {
         if (plan.dispatcher_arg_index >= plan_args.len) Common.invariant("iterator dispatch plan dispatcher argument index was outside the argument span");
 
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
         call_ctx.current_fn_key = self.current_fn_key;
