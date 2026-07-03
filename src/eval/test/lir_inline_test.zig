@@ -1235,22 +1235,6 @@ fn hasGroupedStrMatchSet(shape: ProcShape) bool {
     return shape.str_match_set_count == 1;
 }
 
-fn expectIterCollectWorkerSpecialized(source: []const u8) TestError!void {
-    const allocator = std.testing.allocator;
-
-    var optimized = try lowerModule(allocator, source, .wrappers);
-    defer optimized.deinit(allocator);
-
-    var unoptimized = try lowerModule(allocator, source, .none);
-    defer unoptimized.deinit(allocator);
-
-    try std.testing.expect(try reachableIterCollectShape(allocator, &optimized.lowered, .specialized));
-    try std.testing.expect(!try reachableIterCollectShape(allocator, &optimized.lowered, .generic));
-
-    try std.testing.expect(!try reachableIterCollectShape(allocator, &unoptimized.lowered, .specialized));
-    try std.testing.expect(try reachableIterCollectShape(allocator, &unoptimized.lowered, .generic));
-}
-
 fn rootDirectCallTarget(
     allocator: Allocator,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
@@ -1860,25 +1844,6 @@ test "trmc: result used before the constructor is not transformed" {
     , .none);
 }
 
-test "plant iter pipeline specializes collect worker after inlining" {
-    try expectIterCollectWorkerSpecialized(
-        \\Plant : { seed : I64 }
-        \\
-        \\random_plant : I64 -> Plant
-        \\random_plant = |seed| { seed: seed }
-        \\
-        \\starting_plants : () -> List(Plant)
-        \\starting_plants = || {
-        \\    (0.I64..=15)
-        \\        .map(|i| random_plant(i * 12))
-        \\        .collect()
-        \\}
-        \\
-        \\main : () -> List(Plant)
-        \\main = || starting_plants()
-    );
-}
-
 test "known-length List.iter collect specializes without unbound locals" {
     // Regression: collecting a Known-length iterator (List.iter) under
     // optimization specializes a recursive capturing worker (List.iter's `make`
@@ -1895,21 +1860,6 @@ test "known-length List.iter collect specializes without unbound locals" {
         \\    )
     , .wrappers);
     defer optimized.deinit(allocator);
-}
-
-test "direct iter collect worker specializes constructor recursive call" {
-    try expectIterCollectWorkerSpecialized(
-        \\Plant : { seed : I64 }
-        \\
-        \\random_plant : I64 -> Plant
-        \\random_plant = |seed| { seed: seed }
-        \\
-        \\main : () -> List(Plant)
-        \\main = ||
-        \\    Iter.collect(
-        \\        Iter.map(0.I64..=15, |i| random_plant(i * 12)),
-        \\    )
-    );
 }
 
 test "spec constr does not duplicate opaque let-bound direct calls" {

@@ -357,11 +357,21 @@ const PendingLet = struct {
 };
 
 const LoopPattern = struct {
-    values: []const Shape,
-    /// Per-slot record of back edges that could not supply the slot's shape
-    /// leaves during a split attempt. The attempt's owner reads these after
-    /// cloning the body, carries the marked slots whole, and retries.
-    slot_failed: []bool,
+    /// The entry shape of each carried slot, split into leaves the back edges
+    /// supply. A back edge that cannot supply one leaf demotes that leaf (not
+    /// the whole slot) to `.any` in place, keeping its sibling leaves split.
+    values: []Shape,
+    /// Set by any back edge that demoted a leaf during a split attempt. The
+    /// attempt's owner reads this after cloning the body, discards the clone,
+    /// and retries with the demoted leaves carried as runtime scalars.
+    any_demoted: bool,
+};
+
+/// The result of supplying one loop slot's leaves from a back edge: the
+/// (possibly demoted) shape and whether any leaf demoted to `.any`.
+const SuppliedSlot = struct {
+    shape: Shape,
+    demoted: bool,
 };
 
 const ActiveCallable = struct {
@@ -2577,9 +2587,12 @@ const Cloner = struct {
         // the source expressions do not show. So the split is decided by
         // attempt: substitute each carried slot with its entry shape's leaves,
         // clone the body, and let every back edge either supply the leaves or
-        // mark its slot. Marked slots degrade to whole values, the failed
-        // clone is discarded, and the attempt repeats. Each retry erases at
-        // least one constructor slot, so attempts are bounded by slot count.
+        // demote the specific leaves it cannot supply. A demoted leaf becomes a
+        // runtime scalar over its finite value set (e.g. an entry-known tag a
+        // back edge flips to a sibling tag) while its sibling leaves stay split.
+        // The failed clone is discarded and the attempt repeats. Each retry
+        // erases at least one constructor leaf, so attempts are bounded by the
+        // leaf count.
         while (has_constructor) {
             var new_params = std.ArrayList(Ast.TypedLocal).empty;
             defer new_params.deinit(self.pass.allocator);
@@ -2594,15 +2607,11 @@ const Cloner = struct {
                 try self.appendExprsFromValue(shape, value, &new_initials);
             }
 
-            const slot_failed = try self.pass.arena.allocator().alloc(bool, shapes.len);
-            @memset(slot_failed, false);
-            try self.loop_stack.append(self.pass.allocator, .{ .values = shapes, .slot_failed = slot_failed });
+            try self.loop_stack.append(self.pass.allocator, .{ .values = shapes, .any_demoted = false });
             const body = try self.cloneExpr(loop.body);
             const frame = self.loop_stack.pop() orelse Common.invariant("loop stack underflow after split attempt");
 
-            var any_failed = false;
-            for (frame.slot_failed) |failed| any_failed = any_failed or failed;
-            if (!any_failed) {
+            if (!frame.any_demoted) {
                 return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
                     .params = try self.pass.program.addTypedLocalSpan(new_params.items),
                     .initial_values = try self.pass.program.addExprSpan(new_initials.items),
@@ -2611,24 +2620,21 @@ const Cloner = struct {
             }
 
             self.restore(split_start);
+            // Back edges demoted their unsupplied leaves in place. Any slot that
+            // still carries constructor structure is worth another split attempt.
             has_constructor = false;
-            for (shapes, frame.slot_failed) |*shape, failed| {
-                if (failed) shape.* = .{ .any = shapeType(shape.*) };
-                switch (shape.*) {
-                    .any => {},
-                    else => has_constructor = true,
-                }
-            }
+            for (shapes) |shape| switch (shape) {
+                .any => {},
+                else => has_constructor = true,
+            };
         }
 
         const whole_shapes = try self.pass.arena.allocator().alloc(Shape, params.len);
         for (params, 0..) |param, index| whole_shapes[index] = .{ .any = param.ty };
-        const whole_failed = try self.pass.arena.allocator().alloc(bool, params.len);
-        @memset(whole_failed, false);
 
         const initial_span = try self.valuesToExprSpan(values);
         for (params) |param| try self.shadowLocal(param.local);
-        try self.loop_stack.append(self.pass.allocator, .{ .values = whole_shapes, .slot_failed = whole_failed });
+        try self.loop_stack.append(self.pass.allocator, .{ .values = whole_shapes, .any_demoted = false });
         const body = try self.cloneExpr(loop.body);
         const popped = self.loop_stack.pop() orelse Common.invariant("loop stack underflow after whole-state body clone");
         _ = popped;
@@ -2760,18 +2766,16 @@ const Cloner = struct {
 
         for (loop.values, source_values, 0..) |shape, value_expr, slot_index| {
             const value = try self.cloneExprValue(value_expr);
-            if (!shapeMatchesValue(self.pass.program, shape, value)) {
-                if (!try self.appendFieldReadExprsFromValue(shape, value, &new_values)) {
-                    // This back edge cannot supply the slot's entry-shape
-                    // leaves; mark the slot so the split attempt carries it
-                    // whole. The value emitted here is part of a clone the
-                    // attempt discards.
-                    self.loop_stack.items[frame_count - 1].slot_failed[slot_index] = true;
-                    try new_values.append(self.pass.allocator, try self.materialize(value));
-                }
-                continue;
+            const supplied = try self.supplyLoopSlotLeaves(shape, value, &new_values);
+            if (supplied.demoted) {
+                // This back edge could not supply some of the slot's entry-shape
+                // leaves. Record the per-leaf demotion so the split attempt
+                // carries those leaves as runtime scalars while their siblings
+                // stay split; the values emitted here belong to a clone the
+                // attempt discards and retries.
+                self.loop_stack.items[frame_count - 1].values[slot_index] = supplied.shape;
+                self.loop_stack.items[frame_count - 1].any_demoted = true;
             }
-            try self.appendExprsFromValue(shape, value, &new_values);
         }
 
         return .{ .continue_ = .{
@@ -2930,57 +2934,170 @@ const Cloner = struct {
         }
     }
 
-    fn appendFieldReadExprsFromValue(
+    /// Supply a loop slot's entry-shape leaves from a back edge's value,
+    /// appending one expr per leaf to `out` in the order `valueFromShapeArgs`
+    /// created the leaf params. Where the value structurally matches the shape,
+    /// the split leaves are emitted directly (or read from an opaque expr via
+    /// field access). Where a sub-path of the value cannot supply the shape's
+    /// leaves — a back edge flipping an entry-known tag to a sibling tag, or a
+    /// value that is not the shape's constructor — that sub-path demotes to
+    /// `.any` and its whole value materializes as one runtime scalar over its
+    /// finite value set, while its sibling leaves stay split. The returned
+    /// shape carries the demotions; `demoted` is set when any leaf demoted.
+    fn supplyLoopSlotLeaves(
         self: *Cloner,
         shape: Shape,
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
-    ) Common.LowerError!bool {
+    ) Common.LowerError!SuppliedSlot {
         if (shapeMatchesValue(self.pass.program, shape, value)) {
             try self.appendExprsFromValue(shape, value, out);
-            return true;
+            return .{ .shape = shape, .demoted = false };
         }
 
         switch (shape) {
             .any => {
                 try out.append(self.pass.allocator, try self.materialize(value));
-                return true;
+                return .{ .shape = shape, .demoted = false };
+            },
+            .tag => |tag| {
+                const value_tag = switch (value) {
+                    .tag => |value_tag| value_tag,
+                    else => return try self.demoteLoopSlotLeaf(tag.ty, value, out),
+                };
+                if (value_tag.name != tag.name or
+                    !sameType(self.pass.program, tag.ty, value_tag.ty) or
+                    value_tag.payloads.len != tag.payloads.len)
+                {
+                    return try self.demoteLoopSlotLeaf(tag.ty, value, out);
+                }
+                const payloads = try self.pass.arena.allocator().alloc(Shape, tag.payloads.len);
+                var demoted = false;
+                for (tag.payloads, value_tag.payloads, 0..) |payload_shape, payload_value, index| {
+                    const supplied = try self.supplyLoopSlotLeaves(payload_shape, payload_value, out);
+                    payloads[index] = supplied.shape;
+                    demoted = demoted or supplied.demoted;
+                }
+                return .{ .shape = .{ .tag = .{ .ty = tag.ty, .name = tag.name, .payloads = payloads } }, .demoted = demoted };
             },
             .record => |record| {
-                const receiver = switch (value) {
-                    .expr => |expr| expr,
-                    else => return false,
-                };
-                if (!canReadFieldsFromExpr(self.pass.program, receiver)) return false;
-                for (record.fields) |field| {
-                    const field_expr = try self.addExpr(.{ .ty = shapeType(field.shape), .data = .{ .field_access = .{
-                        .receiver = receiver,
-                        .field = field.name,
-                    } } });
-                    if (!try self.appendFieldReadExprsFromValue(field.shape, .{ .expr = field_expr }, out)) return false;
+                switch (value) {
+                    .record => |value_record| {
+                        if (sameType(self.pass.program, record.ty, value_record.ty) and
+                            value_record.fields.len == record.fields.len)
+                        {
+                            const fields = try self.pass.arena.allocator().alloc(FieldShape, record.fields.len);
+                            var demoted = false;
+                            for (record.fields, value_record.fields, 0..) |field_shape, field_value, index| {
+                                if (field_shape.name != field_value.name) return try self.demoteLoopSlotLeaf(record.ty, value, out);
+                                const supplied = try self.supplyLoopSlotLeaves(field_shape.shape, field_value.value, out);
+                                fields[index] = .{ .name = field_shape.name, .shape = supplied.shape };
+                                demoted = demoted or supplied.demoted;
+                            }
+                            return .{ .shape = .{ .record = .{ .ty = record.ty, .fields = fields } }, .demoted = demoted };
+                        }
+                    },
+                    .expr => |receiver| {
+                        if (canReadFieldsFromExpr(self.pass.program, receiver)) {
+                            const fields = try self.pass.arena.allocator().alloc(FieldShape, record.fields.len);
+                            var demoted = false;
+                            for (record.fields, 0..) |field_shape, index| {
+                                const field_expr = try self.addExpr(.{ .ty = shapeType(field_shape.shape), .data = .{ .field_access = .{
+                                    .receiver = receiver,
+                                    .field = field_shape.name,
+                                } } });
+                                const supplied = try self.supplyLoopSlotLeaves(field_shape.shape, .{ .expr = field_expr }, out);
+                                fields[index] = .{ .name = field_shape.name, .shape = supplied.shape };
+                                demoted = demoted or supplied.demoted;
+                            }
+                            return .{ .shape = .{ .record = .{ .ty = record.ty, .fields = fields } }, .demoted = demoted };
+                        }
+                    },
+                    else => {},
                 }
-                return true;
+                return try self.demoteLoopSlotLeaf(record.ty, value, out);
             },
             .tuple => |tuple| {
-                const receiver = switch (value) {
-                    .expr => |expr| expr,
-                    else => return false,
-                };
-                if (!canReadFieldsFromExpr(self.pass.program, receiver)) return false;
-                for (tuple.items, 0..) |item, index| {
-                    const item_expr = try self.addExpr(.{ .ty = shapeType(item), .data = .{ .tuple_access = .{
-                        .tuple = receiver,
-                        .elem_index = @as(u32, @intCast(index)),
-                    } } });
-                    if (!try self.appendFieldReadExprsFromValue(item, .{ .expr = item_expr }, out)) return false;
+                switch (value) {
+                    .tuple => |value_tuple| {
+                        if (sameType(self.pass.program, tuple.ty, value_tuple.ty) and
+                            value_tuple.items.len == tuple.items.len)
+                        {
+                            const items = try self.pass.arena.allocator().alloc(Shape, tuple.items.len);
+                            var demoted = false;
+                            for (tuple.items, value_tuple.items, 0..) |item_shape, item_value, index| {
+                                const supplied = try self.supplyLoopSlotLeaves(item_shape, item_value, out);
+                                items[index] = supplied.shape;
+                                demoted = demoted or supplied.demoted;
+                            }
+                            return .{ .shape = .{ .tuple = .{ .ty = tuple.ty, .items = items } }, .demoted = demoted };
+                        }
+                    },
+                    .expr => |receiver| {
+                        if (canReadFieldsFromExpr(self.pass.program, receiver)) {
+                            const items = try self.pass.arena.allocator().alloc(Shape, tuple.items.len);
+                            var demoted = false;
+                            for (tuple.items, 0..) |item_shape, index| {
+                                const item_expr = try self.addExpr(.{ .ty = shapeType(item_shape), .data = .{ .tuple_access = .{
+                                    .tuple = receiver,
+                                    .elem_index = @as(u32, @intCast(index)),
+                                } } });
+                                const supplied = try self.supplyLoopSlotLeaves(item_shape, .{ .expr = item_expr }, out);
+                                items[index] = supplied.shape;
+                                demoted = demoted or supplied.demoted;
+                            }
+                            return .{ .shape = .{ .tuple = .{ .ty = tuple.ty, .items = items } }, .demoted = demoted };
+                        }
+                    },
+                    else => {},
                 }
-                return true;
+                return try self.demoteLoopSlotLeaf(tuple.ty, value, out);
             },
-            .tag,
-            .nominal,
-            .callable,
-            => return false,
+            .nominal => |nominal| {
+                switch (value) {
+                    .nominal => |value_nominal| {
+                        if (sameType(self.pass.program, nominal.ty, value_nominal.ty)) {
+                            const supplied = try self.supplyLoopSlotLeaves(nominal.backing.*, value_nominal.backing.*, out);
+                            const backing = try self.pass.arena.allocator().create(Shape);
+                            backing.* = supplied.shape;
+                            return .{ .shape = .{ .nominal = .{ .ty = nominal.ty, .backing = backing } }, .demoted = supplied.demoted };
+                        }
+                    },
+                    else => {},
+                }
+                return try self.demoteLoopSlotLeaf(nominal.ty, value, out);
+            },
+            .callable => |callable| {
+                const value_callable = switch (value) {
+                    .callable => |value_callable| value_callable,
+                    else => return try self.demoteLoopSlotLeaf(callable.ty, value, out),
+                };
+                if (!sameType(self.pass.program, callable.ty, value_callable.ty) or
+                    !callableTargetMatches(self.pass.program, callable.fn_id, value_callable.fn_id) or
+                    value_callable.captures.len != callable.captures.len)
+                {
+                    return try self.demoteLoopSlotLeaf(callable.ty, value, out);
+                }
+                const captures = try self.pass.arena.allocator().alloc(Shape, callable.captures.len);
+                var demoted = false;
+                for (callable.captures, value_callable.captures, 0..) |capture_shape, capture_value, index| {
+                    const supplied = try self.supplyLoopSlotLeaves(capture_shape, capture_value, out);
+                    captures[index] = supplied.shape;
+                    demoted = demoted or supplied.demoted;
+                }
+                return .{ .shape = .{ .callable = .{ .ty = callable.ty, .fn_id = callable.fn_id, .captures = captures } }, .demoted = demoted };
+            },
         }
+    }
+
+    fn demoteLoopSlotLeaf(
+        self: *Cloner,
+        ty: Type.TypeId,
+        value: Value,
+        out: *std.ArrayList(Ast.ExprId),
+    ) Common.LowerError!SuppliedSlot {
+        try out.append(self.pass.allocator, try self.materialize(value));
+        return .{ .shape = .{ .any = ty }, .demoted = true };
     }
 
     fn cloneFieldAccess(self: *Cloner, ty: Type.TypeId, field: anytype) Common.LowerError!Ast.ExprId {
