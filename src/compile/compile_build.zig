@@ -752,12 +752,12 @@ pub const BuildEnv = struct {
         // Also queue the platform's root module if this is an app
         // The platform's root module contains the `requires` clause which must be compiled
         // for type checking against the app's exports
-        const root_is_app = root_pkg.kind == .app or root_pkg.kind == .default_app;
         var pf_it = self.packages.iterator();
         while (pf_it.next()) |pf_entry| {
             const pf_pkg = pf_entry.value_ptr.*;
             if (pf_pkg.kind == .platform) {
                 if (coord.getPackage(pf_entry.key_ptr.*)) |platform_coord_pkg| {
+                    coord.markPlatformPackage(platform_coord_pkg.name);
                     const plat_module_name = PackageEnv.moduleNameFromPath(pf_pkg.root_file);
                     const plat_root_id = try platform_coord_pkg.ensureModule(self.gpa, plat_module_name, pf_pkg.root_file);
                     if (platform_coord_pkg.modules.items[plat_root_id].phase == .Parse) {
@@ -770,9 +770,6 @@ pub const BuildEnv = struct {
                         if (comptime trace_build) {
                             std.debug.print("[BUILD] Queued platform root module: {s} in package {s}\n", .{ plat_module_name, pf_entry.key_ptr.* });
                         }
-                    }
-                    if (root_is_app) {
-                        try coord.setPlatformRequirementDependency(coord_pkg, platform_coord_pkg, plat_root_id);
                     }
                 }
             }
@@ -972,6 +969,7 @@ pub const BuildEnv = struct {
                     .Parse, .Parsing => .Parse,
                     .Canonicalize => .Canonicalize,
                     .WaitingOnImports => .WaitingOnImports,
+                    .WaitingOnPlatformRequirements => .WaitingOnImports,
                     .TypeCheck => .TypeCheck,
                     .Done => .Done,
                 };

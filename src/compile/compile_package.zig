@@ -352,11 +352,19 @@ pub const TypeCheckOutput = struct {
     }
 };
 
+/// Owned output from checking a platform's requires surface.
+pub const PlatformRequirementsCheckOutput = struct {
+    checker: Check,
+
+    pub fn deinit(self: *PlatformRequirementsCheckOutput) void {
+        self.checker.deinit();
+    }
+};
+
 /// Public `ArtifactPublicationInputs` declaration.
 pub const ArtifactPublicationInputs = struct {
     available_artifacts: []const CheckedArtifact.ImportedModuleView = &.{},
     relation_artifacts: []const CheckedArtifact.ImportedModuleView = &.{},
-    platform_requirement_artifact: ?CheckedArtifact.ImportedModuleView = null,
     platform_requirement_context: ?CheckedArtifact.PlatformRequirementContextKey = null,
     platform_app_relation: ?CheckedArtifact.PlatformAppRelation = null,
     explicit_roots: []const CheckedArtifact.ExplicitRootRequestInput = &.{},
@@ -473,7 +481,6 @@ fn buildCheckOwnerEnvs(
     imported_envs: []const *ModuleEnv,
     imported_artifacts: []const CheckedArtifact.PublishImportArtifact,
     available_artifacts: []const CheckedArtifact.ImportedModuleView,
-    platform_requirement_artifact: ?CheckedArtifact.ImportedModuleView,
 ) Allocator.Error![]const *const ModuleEnv {
     var owner_envs = std.ArrayList(*const ModuleEnv).empty;
     errdefer owner_envs.deinit(allocator);
@@ -492,16 +499,6 @@ fn buildCheckOwnerEnvs(
             available_artifacts,
             &seen_public_dependencies,
             imported_artifact.view,
-        );
-    }
-    if (platform_requirement_artifact) |platform| {
-        try appendCheckOwnerEnvIfMissing(allocator, &owner_envs, platform.module_env);
-        try appendCheckOwnerEnvPublicDependencies(
-            allocator,
-            &owner_envs,
-            available_artifacts,
-            &seen_public_dependencies,
-            platform,
         );
     }
 
@@ -1775,7 +1772,7 @@ pub const PackageEnv = struct {
         imported_envs: []const *ModuleEnv,
         imported_artifacts: []const CheckedArtifact.PublishImportArtifact,
         available_artifacts: []const CheckedArtifact.ImportedModuleView,
-        platform_requirement_artifact: ?CheckedArtifact.ImportedModuleView,
+        platform_requirements: ?Check.PlatformRequirementInput,
         platform_requirement_context: ?CheckedArtifact.PlatformRequirementContextKey,
         explicit_roots: []const CheckedArtifact.ExplicitRootRequestInput,
         ctfe_options: eval.CompileTimeFinalization.Options,
@@ -1795,7 +1792,7 @@ pub const PackageEnv = struct {
         var module_envs_map = std.AutoHashMap(base.Ident.Idx, Can.AutoImportedType).init(check_alloc);
         errdefer module_envs_map.deinit();
 
-        const owner_envs = try buildCheckOwnerEnvs(check_alloc, imported_envs, imported_artifacts, available_artifacts, platform_requirement_artifact);
+        const owner_envs = try buildCheckOwnerEnvs(check_alloc, imported_envs, imported_artifacts, available_artifacts);
         defer check_alloc.free(owner_envs);
 
         var checker = try Check.initWithOwnerModules(
@@ -1808,14 +1805,15 @@ pub const PackageEnv = struct {
             &env.store.regions,
             module_builtin_ctx,
         );
+        checker.platform_requirements = platform_requirements;
         checker.fixupTypeWriter();
         errdefer checker.deinit();
 
-        if (platform_requirement_artifact) |platform| {
-            try checker.checkFileWithPlatformRequirements(.{ .module_env = platform.module_env });
-        } else {
-            try checker.checkFile();
-        }
+        // For app modules with platform requirements, defer finalizing numeric defaults
+        // until after platform requirements are checked, so numeric literals can be
+        // constrained by platform types (e.g., I64) before defaulting to Dec.
+        // TODO: re-enable defer_numeric_defaults once ModuleEnv has the field
+        try checker.checkFile();
 
         module_envs_map.deinit();
 
@@ -1849,7 +1847,6 @@ pub const PackageEnv = struct {
             imported_envs,
             imported_artifacts,
             .{
-                .platform_requirement_artifact = platform_requirement_artifact,
                 .platform_requirement_context = platform_requirement_context,
                 .platform_app_relation = null,
                 .explicit_roots = explicit_roots,
@@ -1930,7 +1927,6 @@ pub const PackageEnv = struct {
                 .imports = imported_artifacts,
                 .available_artifacts = publication.available_artifacts,
                 .relation_artifacts = publication.relation_artifacts,
-                .platform_requirement_artifact = publication.platform_requirement_artifact,
                 .platform_requirement_context = publication.platform_requirement_context,
                 .platform_app_relation = publication.platform_app_relation,
                 .explicit_roots = publication.explicit_roots,
@@ -2040,6 +2036,7 @@ pub const PackageEnv = struct {
             imported_envs.items,
             &typecheck_output.checker.import_mapping,
             &typecheck_output.checker.regions,
+            null,
         );
         defer rb.deinit();
         for (typecheck_output.checker.problems.problems.items) |prob| {
@@ -2090,6 +2087,16 @@ pub const PackageEnv = struct {
             entry.value_ptr.* = {};
 
             try views.append(self.gpa, view);
+
+            for (view.direct_import_artifact_keys) |dependency_key| {
+                const dependency = self.availableArtifactViewByKey(imported_artifacts, dependency_key) orelse {
+                    if (builtin.mode == .Debug) {
+                        std.debug.panic("compile.PackageEnv missing direct dependency checked artifact", .{});
+                    }
+                    unreachable;
+                };
+                try pending.append(self.gpa, dependency);
+            }
 
             for (view.public_api_dependencies.type_owner_artifacts) |dependency_key| {
                 const dependency = self.availableArtifactViewByKey(imported_artifacts, dependency_key) orelse {
