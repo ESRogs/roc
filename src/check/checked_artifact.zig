@@ -22056,6 +22056,27 @@ fn collectPublicApiDependencies(
         );
     }
 
+    // Platform requirement signatures are public API too: requirement
+    // unification copies them into each app's store, so nominals they mention
+    // (e.g. a hosted-interface type from a sibling module) must be reachable
+    // through this artifact's type-owner dependencies (issue 9911).
+    for (module.requiresTypes()) |required_type| {
+        const root = checked_type_publication.rootForSourceVar(module, ModuleEnv.varFrom(required_type.type_anno)) orelse continue;
+        try appendPublicApiTypeDependencies(
+            allocator,
+            names,
+            module_identity,
+            artifact_key,
+            checked_types,
+            root,
+            &active_types,
+            imports,
+            available_artifacts,
+            &keys,
+            &type_owner_keys,
+        );
+    }
+
     try appendExposedTypeDeclarationPublicApiDependencies(
         allocator,
         module,
@@ -28113,6 +28134,9 @@ test "transform-A stores: serialize/deserialize round-trip preserves every slice
     try expectAllSliceStoreRoundTrips(PublicApiDependencies);
     try expectAllSliceStoreRoundTrips(CheckedProcedureTemplateTable);
     try expectAllSliceStoreRoundTrips(static_dispatch.MethodRegistry);
+    // Total-dispatch plans: resolutions, evidence nodes/refs, site evidence,
+    // and iterator plans must survive artifact caching byte-exactly.
+    try expectAllSliceStoreRoundTrips(static_dispatch.StaticDispatchPlanTable);
     try expectAllSliceStoreRoundTrips(NestedProcSiteTable); // transform-B: now POD after side-list conversion
     try expectAllSliceStoreRoundTrips(ModuleInterfaceCapabilities); // transform-B: args moved to shared pool
     try expectAllSliceStoreRoundTrips(HostedProcTable); // transform-B: order_key moved to byte pool
