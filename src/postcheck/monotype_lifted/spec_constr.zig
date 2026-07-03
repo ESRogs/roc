@@ -1578,6 +1578,10 @@ const Cloner = struct {
                 } };
             },
             .let_ => |let_| return try self.cloneLetValue(let_),
+            .block => |block| {
+                if (try self.cloneBlockValue(block)) |value| return value;
+                return .{ .expr = try self.cloneExprPlain(expr_id) };
+            },
             .field_access => |field| {
                 const receiver = try self.cloneExprValue(field.receiver);
                 if (fieldFromValue(receiver, field.field)) |value| return value;
@@ -1619,7 +1623,14 @@ const Cloner = struct {
                 if (call.is_cold) return .{ .expr = try self.cloneExprPlain(expr_id) };
                 if (!self.inline_direct_calls) return .{ .expr = try self.cloneExprPlain(expr_id) };
                 const has_known_shape_arg = try self.directCallHasKnownShapeArg(call.args);
-                if (self.inline_direct_requires_known_arg and !has_known_shape_arg) {
+                // A direct call carries its callee's captures by the callee's
+                // own capture locals: the residual call imports those locals
+                // into the enclosing function. In a context where a capture
+                // operand has been substituted away from the callee's local,
+                // that import would name a local the context does not have,
+                // so the call cannot stay residual and must inline.
+                const captures_foreign = self.callCapturesAreForeign(call.captures);
+                if (self.inline_direct_requires_known_arg and !has_known_shape_arg and !captures_foreign) {
                     return .{ .expr = try self.cloneExprPlain(expr_id) };
                 }
                 const callee = Ast.localDirectCallee(call) orelse return .{ .expr = try self.cloneExprPlain(expr_id) };
@@ -1637,6 +1648,20 @@ const Cloner = struct {
     fn directCallHasKnownShapeArg(self: *Cloner, args_span: Ast.Span(Ast.ExprId)) Allocator.Error!bool {
         for (self.pass.program.exprSpan(args_span)) |arg| {
             if (try self.exprHasKnownShape(arg)) return true;
+        }
+        return false;
+    }
+
+    /// Whether any capture operand of a direct call would clone to something
+    /// other than the callee's own capture local — i.e. the call sits in a
+    /// context where the captured bindings have been substituted.
+    fn callCapturesAreForeign(self: *Cloner, captures_span: Ast.Span(Ast.ExprId)) bool {
+        for (self.pass.program.exprSpan(captures_span)) |capture_expr| {
+            const local = localExpr(self.pass.program, capture_expr) orelse return true;
+            if (self.subst.contains(local)) return true;
+            if (self.binderIdentityOf(local)) |identity| {
+                if (self.binder_subst.contains(identity)) return true;
+            }
         }
         return false;
     }
@@ -1862,12 +1887,57 @@ const Cloner = struct {
             return rest;
         }
         self.restore(change_start);
+        if (try self.bindPatToPendingReusableValue(let_.bind, let_.value, false, value)) {
+            const rest = try self.cloneExprValue(let_.rest);
+            self.restore(change_start);
+            return rest;
+        }
         return .{ .expr = try self.addExpr(.{ .ty = self.pass.program.exprs.items[@intFromEnum(let_.rest)].ty, .data = .{ .let_ = .{
             .bind = try self.clonePat(let_.bind),
             .value = value_expr,
             .rest = try self.cloneExpr(let_.rest),
             .comptime_site = let_.comptime_site,
         } } }) };
+    }
+
+    /// Dissolve a binding by naming its value's opaque leaves as pending
+    /// bindings: the value keeps its structure, uses substitute leaf
+    /// references, and the pending bindings are emitted where the stack next
+    /// flushes, still dominating every use. Sound only when every named leaf
+    /// is an effect-free computation created before any effect in its region,
+    /// and the value does not reference its own binder. Returns false with
+    /// all speculative work undone.
+    fn bindPatToPendingReusableValue(
+        self: *Cloner,
+        pat_id: Ast.PatId,
+        source_value: Ast.ExprId,
+        recursive: bool,
+        value: Value,
+    ) Common.LowerError!bool {
+        const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
+        const self_referential = switch (pat.data) {
+            .bind => |local| localUseCountInExpr(self.pass.program, local, source_value) != 0,
+            else => recursive,
+        };
+        if (self_referential) return false;
+        if (self.effect_marks != self.region_entry_marks) return false;
+
+        const pending_before = self.pending.items.len;
+        const change_before = self.changes.items.len;
+        const reusable = try self.makeReusableForMatch(value);
+        for (self.pending.items[pending_before..]) |pend| {
+            if (!exprHasNoObservableEffect(self.pass.program, pend.value)) {
+                self.restore(change_before);
+                self.pending.shrinkRetainingCapacity(pending_before);
+                return false;
+            }
+        }
+        if (!try self.bindPatToReusableValue(pat_id, reusable)) {
+            self.restore(change_before);
+            self.pending.shrinkRetainingCapacity(pending_before);
+            return false;
+        }
+        return true;
     }
 
     fn cloneLet(self: *Cloner, let_: anytype) Common.LowerError!Ast.ExprData {
@@ -2109,6 +2179,52 @@ const Cloner = struct {
         _ = self.binder_subst.remove(identity);
     }
 
+
+    /// A block whose statements all dissolve — each binds a substitutable
+    /// value, or names an effect-free computation that becomes a pending
+    /// binding — is transparent to value flow: its result keeps the final
+    /// expression's structure. A statement that must stay a statement (an
+    /// effect, a runtime destructure, control flow) pins the block, which
+    /// then materializes as written. Returns null on a pinned block with all
+    /// speculative work undone.
+    fn cloneBlockValue(self: *Cloner, block: anytype) Common.LowerError!?Value {
+        const change_start = self.changes.items.len;
+        const pending_entry = self.pending.items.len;
+
+        const source = try self.pass.allocator.dupe(Ast.StmtId, self.pass.program.stmtSpan(block.statements));
+        defer self.pass.allocator.free(source);
+
+        for (source) |stmt_id| {
+            const stmt = self.pass.program.stmts.items[@intFromEnum(stmt_id)];
+            const let_ = switch (stmt) {
+                .let_ => |let_| let_,
+                // A discarded effect-free expression performs no observable
+                // work, so the statement dissolves with the block.
+                .expr => |stmt_expr| {
+                    if (exprHasNoObservableEffect(self.pass.program, stmt_expr)) continue;
+                    self.restore(change_start);
+                    self.pending.shrinkRetainingCapacity(pending_entry);
+                    return null;
+                },
+                else => {
+                    self.restore(change_start);
+                    self.pending.shrinkRetainingCapacity(pending_entry);
+                    return null;
+                },
+            };
+            const value = try self.cloneExprValue(let_.value);
+            if (try self.bindPatToReusableValue(let_.pat, value)) continue;
+            if (!try self.bindPatToPendingReusableValue(let_.pat, let_.value, let_.recursive, value)) {
+                self.restore(change_start);
+                self.pending.shrinkRetainingCapacity(pending_entry);
+                return null;
+            }
+        }
+
+        const final = try self.cloneExprValue(block.final_expr);
+        self.restore(change_start);
+        return final;
+    }
 
     fn cloneBlock(self: *Cloner, ty: Type.TypeId, block: anytype) Common.LowerError!Ast.ExprId {
         const change_start = self.changes.items.len;
