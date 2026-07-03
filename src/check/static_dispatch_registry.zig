@@ -13,6 +13,7 @@ const canonical = @import("canonical_names.zig");
 const checked_ids = @import("checked_ids.zig");
 const collections = @import("collections");
 const artifact_serialize = @import("artifact_serialize.zig");
+const dispatch_evidence = @import("dispatch_evidence.zig");
 const SerializedSlice = artifact_serialize.SerializedSlice;
 const CompactWriter = collections.CompactWriter;
 
@@ -668,13 +669,23 @@ pub const SiteEvidenceEntry = extern struct {
     len: u32,
 };
 
+/// Public `EvidencePathStep` declaration: one semantic step from a type to a
+/// component, in the artifact's canonical names (`data` is a positional index,
+/// a `canonical.RecordFieldLabelId`, or a `canonical.TagNameId` per kind).
+pub const EvidencePathStep = dispatch_evidence.PathStep;
+
 /// Public `EvidenceParamRecord` declaration.
 ///
 /// One published evidence param of a procedure template's scheme, in canonical
-/// order (see `dispatch_evidence.zig`). Consumers index these by position;
-/// the method name is carried for debug verification.
+/// order (see `dispatch_evidence.zig`). Consumers index these by position; the
+/// method name identifies the obligation, and `path` locates the dispatcher
+/// within the scheme's callable so compiler-generated call edges (which have
+/// no checked instantiation records) can resolve the obligation from the
+/// concrete monomorphic callable. An empty path means the dispatcher is only
+/// reachable through a constraint's fn type.
 pub const EvidenceParamRecord = struct {
     method: canonical.MethodNameId,
+    path: artifact_serialize.Span = .{},
 };
 
 /// Public `StaticDispatchResolution` declaration.

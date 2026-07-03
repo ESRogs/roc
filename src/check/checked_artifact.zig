@@ -12779,6 +12779,7 @@ const EvidencePass = struct {
     evidence_refs: std.ArrayList(static_dispatch.CheckedEvidence),
     site_evidence: std.ArrayList(static_dispatch.SiteEvidenceEntry),
     evidence_params_pool: std.ArrayList(static_dispatch.EvidenceParamRecord),
+    evidence_param_paths: std.ArrayList(static_dispatch.EvidencePathStep),
 
     enum_scratch: dispatch_evidence.Scratch,
     /// Canonical evidence params per collected local-function scope,
@@ -12842,6 +12843,7 @@ const EvidencePass = struct {
             .evidence_refs = .empty,
             .site_evidence = .empty,
             .evidence_params_pool = .empty,
+            .evidence_param_paths = .empty,
             .enum_scratch = .{},
             .scope_params = std.AutoHashMap(u32, []EvidenceParam).init(allocator),
             .chain_scratch = .empty,
@@ -12862,6 +12864,7 @@ const EvidencePass = struct {
         self.evidence_refs.deinit(self.allocator);
         self.site_evidence.deinit(self.allocator);
         self.evidence_params_pool.deinit(self.allocator);
+        self.evidence_param_paths.deinit(self.allocator);
         self.enum_scratch.deinit(self.allocator);
         var scope_lists = self.scope_params.valueIterator();
         while (scope_lists.next()) |list| {
@@ -12907,12 +12910,24 @@ const EvidencePass = struct {
                 .checked_body, .intrinsic_wrapper => {},
             }
 
-            // Publish the template's evidence params in canonical order.
+            // Publish the template's evidence params in canonical order,
+            // converting each dispatcher path's row labels to canonical ids.
             const idents = self.module.identStoreConst();
             const pool_start: u32 = @intCast(self.evidence_params_pool.items.len);
             for (params.items) |param| {
+                const path_start: u32 = @intCast(self.evidence_param_paths.items.len);
+                for (param.path) |path_step| {
+                    var converted = path_step;
+                    switch (path_step.stepKind()) {
+                        .record_field => converted.data = @intFromEnum(try self.names.internRecordFieldIdent(idents, @bitCast(path_step.data))),
+                        .tag_payload_tag => converted.data = @intFromEnum(try self.names.internTagIdent(idents, @bitCast(path_step.data))),
+                        else => {},
+                    }
+                    try self.evidence_param_paths.append(self.allocator, converted);
+                }
                 try self.evidence_params_pool.append(self.allocator, .{
                     .method = try self.names.internMethodIdent(idents, param.constraint.fn_name),
+                    .path = .{ .start = path_start, .len = @intCast(param.path.len) },
                 });
             }
             template.evidence_params = .{ .start = pool_start, .len = @intCast(params.items.len) };
@@ -12950,6 +12965,7 @@ const EvidencePass = struct {
         self.plan_table.evidence_refs = try self.evidence_refs.toOwnedSlice(self.allocator);
         self.plan_table.site_evidence = try self.site_evidence.toOwnedSlice(self.allocator);
         self.templates.evidence_params_pool = try self.evidence_params_pool.toOwnedSlice(self.allocator);
+        self.templates.evidence_param_paths = try self.evidence_param_paths.toOwnedSlice(self.allocator);
     }
 
     fn buildIndexes(self: *EvidencePass) Allocator.Error!void {
@@ -14148,11 +14164,14 @@ pub const CheckedProcedureTemplateTable = struct {
     by_def: []static_dispatch.ProcedureTemplateLookupEntry = &.{},
     /// Flat pool backing each template's `evidence_params` span.
     evidence_params_pool: []static_dispatch.EvidenceParamRecord = &.{},
+    /// Flat pool backing each evidence param's `path` span.
+    evidence_param_paths: []static_dispatch.EvidencePathStep = &.{},
 
     pub const Serialized = extern struct {
         templates: SerializedSlice(CheckedProcedureTemplate) = .{},
         by_def: SerializedSlice(static_dispatch.ProcedureTemplateLookupEntry) = .{},
         evidence_params_pool: SerializedSlice(static_dispatch.EvidenceParamRecord) = .{},
+        evidence_param_paths: SerializedSlice(static_dispatch.EvidencePathStep) = .{},
         const Serde = artifact_serialize.SliceStoreSerde(CheckedProcedureTemplateTable, @This());
         pub const serialize = Serde.serialize;
         pub const deserialize = Serde.deserialize;
@@ -14356,12 +14375,19 @@ pub const CheckedProcedureTemplateTable = struct {
         allocator.free(self.by_def);
         allocator.free(self.templates);
         allocator.free(self.evidence_params_pool);
+        allocator.free(self.evidence_param_paths);
         self.* = .{};
     }
 
     /// The template's evidence params, in canonical order.
     pub fn evidenceParams(self: *const CheckedProcedureTemplateTable, template: *const CheckedProcedureTemplate) []const static_dispatch.EvidenceParamRecord {
         return self.evidence_params_pool[template.evidence_params.start .. template.evidence_params.start + template.evidence_params.len];
+    }
+
+    /// The param's dispatcher path over the scheme callable (empty =
+    /// pathless).
+    pub fn evidenceParamPath(self: *const CheckedProcedureTemplateTable, param: static_dispatch.EvidenceParamRecord) []const static_dispatch.EvidencePathStep {
+        return self.evidence_param_paths[param.path.start .. param.path.start + param.path.len];
     }
 };
 
@@ -24329,7 +24355,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 188);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 189);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -24469,7 +24495,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 9;
+    const serialized_layout_version: u32 = 10;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -28406,8 +28432,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x21, 0xAE, 0x8F, 0x13, 0x9F, 0x41, 0x29, 0xCD, 0x94, 0xD1, 0x6E, 0x17, 0x0A, 0x79, 0x3C, 0xC5,
-        0x21, 0xEA, 0xAC, 0x53, 0x0D, 0xA0, 0x4E, 0x6A, 0x5E, 0xAB, 0x02, 0x4D, 0x16, 0x3D, 0x23, 0x4A,
+        0xBC, 0xA1, 0xEE, 0x5A, 0x0B, 0xC2, 0xE9, 0xA0, 0x2C, 0x80, 0x4E, 0xFC, 0xF2, 0xD6, 0xF2, 0x7D,
+        0x23, 0x7D, 0xF6, 0xE3, 0x53, 0xAB, 0xB2, 0x0C, 0x0D, 0x60, 0xA6, 0x7F, 0x8A, 0x52, 0x0D, 0x87,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
