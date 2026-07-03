@@ -1521,6 +1521,48 @@ pub const Coordinator = struct {
         return try views.toOwnedSlice(allocator);
     }
 
+    fn extendTypecheckAvailableArtifactViews(
+        self: *Coordinator,
+        allocator: Allocator,
+        existing_views: []const check.CheckedArtifact.ImportedModuleView,
+        root: check.CheckedArtifact.ImportedModuleView,
+    ) Allocator.Error![]check.CheckedArtifact.ImportedModuleView {
+        var views = std.ArrayList(check.CheckedArtifact.ImportedModuleView).empty;
+        errdefer views.deinit(allocator);
+        try views.appendSlice(allocator, existing_views);
+
+        var pending = std.ArrayList(check.CheckedArtifact.ImportedModuleView).empty;
+        defer pending.deinit(allocator);
+
+        var seen = std.AutoHashMap(check.CheckedArtifact.CheckedModuleArtifactKey, void).init(allocator);
+        defer seen.deinit();
+
+        for (existing_views) |view| {
+            try seen.put(view.key, {});
+        }
+
+        try pending.append(allocator, root);
+        while (pending.pop()) |view| {
+            const entry = try seen.getOrPut(view.key);
+            if (entry.found_existing) continue;
+            entry.value_ptr.* = {};
+
+            try views.append(allocator, view);
+
+            for (view.public_api_dependencies.type_owner_artifacts) |dependency_key| {
+                const artifact = self.checkedArtifactByKey(dependency_key) orelse {
+                    if (builtin.mode == .Debug) {
+                        std.debug.panic("compile.coordinator missing type-owner dependency checked artifact", .{});
+                    }
+                    unreachable;
+                };
+                try pending.append(allocator, check.CheckedArtifact.importedView(artifact));
+            }
+        }
+
+        return try views.toOwnedSlice(allocator);
+    }
+
     fn rootRelationContainsArtifact(
         root_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
         key: check.CheckedArtifact.CheckedModuleArtifactKey,
@@ -3552,9 +3594,11 @@ pub const Coordinator = struct {
             // public-API dependency scan.
             if (self.platformRootCandidate()) |platform_root| {
                 if (platform_root.mod.checkedArtifact()) |platform_artifact| {
-                    const with_platform = try task_payload_alloc.alloc(check.CheckedArtifact.ImportedModuleView, available_artifacts.len + 1);
-                    @memcpy(with_platform[0..available_artifacts.len], available_artifacts);
-                    with_platform[available_artifacts.len] = check.CheckedArtifact.importedView(platform_artifact);
+                    const with_platform = try self.extendTypecheckAvailableArtifactViews(
+                        task_payload_alloc,
+                        available_artifacts,
+                        check.CheckedArtifact.importedView(platform_artifact),
+                    );
                     task_payload_alloc.free(available_artifacts);
                     available_artifacts = with_platform;
                 }

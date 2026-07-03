@@ -269,37 +269,45 @@ fn populateAnchorMap(
 ) Allocator.Error!void {
     for (entries) |entry| {
         const local_name = moduleRelativeEntryName(module_name, entry.name);
-        const entry_rel_path = if (parent_rel_path.len == 0)
+        const is_collapsed_module_root = parent_rel_path.len == 0 and
+            entry.kind != .value and
+            std.mem.eql(u8, local_name, module_name);
+
+        const entry_rel_path = if (is_collapsed_module_root)
+            ""
+        else if (parent_rel_path.len == 0)
             try arena.dupe(u8, local_name)
         else
             try std.fmt.allocPrint(arena, "{s}.{s}", .{ parent_rel_path, local_name });
 
-        // For value entries, the final dotted segment is the value's own name
-        // (e.g. `default` in `Builtin.Num.U8.default`) — exclude it so we only
-        // map type-like prefixes (`Num`, `Num.U8`).
-        var rel_end: usize = entry_rel_path.len;
-        if (entry.kind == .value) {
-            const last_dot = std.mem.findScalarLast(u8, entry_rel_path, '.') orelse {
-                try populateAnchorMap(map, gpa, arena, module_name, entry.children, entry_rel_path);
-                continue;
-            };
-            rel_end = last_dot;
-        }
-
-        // Walk each `.`-separated prefix of the relative path.
-        var seg_start: usize = 0;
-        while (seg_start < rel_end) {
-            const next_dot = std.mem.findScalarPos(u8, entry_rel_path[0..rel_end], seg_start, '.');
-            const seg_end = next_dot orelse rel_end;
-            const short_name = entry_rel_path[seg_start..seg_end];
-            const prefix_path = entry_rel_path[0..seg_end];
-
-            const result = try map.getOrPut(gpa, short_name);
-            if (!result.found_existing) {
-                result.value_ptr.* = prefix_path;
+        if (!is_collapsed_module_root) {
+            // For value entries, the final dotted segment is the value's own name
+            // (e.g. `default` in `Builtin.Num.U8.default`) — exclude it so we only
+            // map type-like prefixes (`Num`, `Num.U8`).
+            var rel_end: usize = entry_rel_path.len;
+            if (entry.kind == .value) {
+                const last_dot = std.mem.findScalarLast(u8, entry_rel_path, '.') orelse {
+                    try populateAnchorMap(map, gpa, arena, module_name, entry.children, entry_rel_path);
+                    continue;
+                };
+                rel_end = last_dot;
             }
 
-            seg_start = if (next_dot) |d| d + 1 else rel_end;
+            // Walk each `.`-separated prefix of the relative path.
+            var seg_start: usize = 0;
+            while (seg_start < rel_end) {
+                const next_dot = std.mem.findScalarPos(u8, entry_rel_path[0..rel_end], seg_start, '.');
+                const seg_end = next_dot orelse rel_end;
+                const short_name = entry_rel_path[seg_start..seg_end];
+                const prefix_path = entry_rel_path[0..seg_end];
+
+                const result = try map.getOrPut(gpa, short_name);
+                if (!result.found_existing) {
+                    result.value_ptr.* = prefix_path;
+                }
+
+                seg_start = if (next_dot) |d| d + 1 else rel_end;
+            }
         }
 
         try populateAnchorMap(map, gpa, arena, module_name, entry.children, entry_rel_path);
@@ -1514,9 +1522,71 @@ fn isIdentCont(c: u8) bool {
     return isIdentStart(c) or (c >= '0' and c <= '9');
 }
 
+const BuiltinDocHead = struct {
+    head: []const u8,
+    anchor_head: []const u8,
+};
+
+const builtin_doc_heads = [_]BuiltinDocHead{
+    .{ .head = "Encoding", .anchor_head = "Encoding" },
+    .{ .head = "FieldName", .anchor_head = "Encoding.FieldName" },
+    .{ .head = "FieldNames", .anchor_head = "Encoding.FieldName.FieldNames" },
+    .{ .head = "ParseTagUnionSpec", .anchor_head = "Encoding.ParseTagUnionSpec" },
+    .{ .head = "JsonState", .anchor_head = "Encoding.JsonState" },
+    .{ .head = "JsonEncodeState", .anchor_head = "Encoding.JsonEncodeState" },
+    .{ .head = "JsonEncoding", .anchor_head = "Encoding.JsonEncoding" },
+    .{ .head = "HttpHeaderState", .anchor_head = "Encoding.HttpHeaderState" },
+    .{ .head = "HttpHeaderEncoding", .anchor_head = "Encoding.HttpHeaderEncoding" },
+    .{ .head = "Json", .anchor_head = "Encoding.Json" },
+    .{ .head = "HttpHeader", .anchor_head = "Encoding.HttpHeader" },
+    .{ .head = "Str", .anchor_head = "Str" },
+    .{ .head = "Utf8Problem", .anchor_head = "Str.Utf8Problem" },
+    .{ .head = "Hasher", .anchor_head = "Hasher" },
+    .{ .head = "Crypto", .anchor_head = "Crypto" },
+    .{ .head = "DigestBytesErr", .anchor_head = "Crypto.DigestBytesErr" },
+    .{ .head = "DigestHexErr", .anchor_head = "Crypto.DigestHexErr" },
+    .{ .head = "SHA256", .anchor_head = "Crypto.SHA256" },
+    .{ .head = "BLAKE3", .anchor_head = "Crypto.BLAKE3" },
+    .{ .head = "Iter", .anchor_head = "Iter" },
+    .{ .head = "Stream", .anchor_head = "Stream" },
+    .{ .head = "List", .anchor_head = "List" },
+    .{ .head = "Bool", .anchor_head = "Bool" },
+    .{ .head = "Box", .anchor_head = "Box" },
+    .{ .head = "Try", .anchor_head = "Try" },
+    .{ .head = "Dict", .anchor_head = "Dict" },
+    .{ .head = "HashMap", .anchor_head = "Dict.HashMap" },
+    .{ .head = "DictBucket", .anchor_head = "Dict.DictBucket" },
+    .{ .head = "DictData", .anchor_head = "Dict.DictData" },
+    .{ .head = "DictMetadata", .anchor_head = "Dict.DictMetadata" },
+    .{ .head = "Set", .anchor_head = "Set" },
+    .{ .head = "Num", .anchor_head = "Num" },
+    .{ .head = "Numeral", .anchor_head = "Num.Numeral" },
+    .{ .head = "U8", .anchor_head = "Num.U8" },
+    .{ .head = "I8", .anchor_head = "Num.I8" },
+    .{ .head = "U16", .anchor_head = "Num.U16" },
+    .{ .head = "I16", .anchor_head = "Num.I16" },
+    .{ .head = "U32", .anchor_head = "Num.U32" },
+    .{ .head = "I32", .anchor_head = "Num.I32" },
+    .{ .head = "U64", .anchor_head = "Num.U64" },
+    .{ .head = "I64", .anchor_head = "Num.I64" },
+    .{ .head = "U128", .anchor_head = "Num.U128" },
+    .{ .head = "I128", .anchor_head = "Num.I128" },
+    .{ .head = "Dec", .anchor_head = "Num.Dec" },
+    .{ .head = "F32", .anchor_head = "Num.F32" },
+    .{ .head = "F64", .anchor_head = "Num.F64" },
+};
+
+fn builtinDocAnchorHead(head: []const u8) ?[]const u8 {
+    for (builtin_doc_heads) |entry| {
+        if (std.mem.eql(u8, head, entry.head)) return entry.anchor_head;
+    }
+    return null;
+}
+
 /// Writes the href for a shorthand doc reference like `Str` or `Str.reserve`.
 /// If the label's first segment names a known module, the link points at that
-/// module's page; otherwise it falls back to an anchor on the current page.
+/// module's page. Otherwise, the label resolves to an existing anchor in the
+/// current module or to the published Builtin docs.
 ///
 /// As a side effect, when the resolved fragment (`#…`) does not correspond
 /// to any `id="…"` in the rendered site, the reference is reported via
@@ -1581,24 +1651,60 @@ fn writeDocRefHref(w: Writer, ctx: *const RenderContext, label: []const u8, brac
         return;
     }
 
-    // Not a known module — treat as a reference relative to the current
-    // module. Entry ids are `<module>.<label>`. Substitute the first segment
-    // through the anchor map so a label like `U8` resolves to `Num.U8` and
-    // `U8.default` resolves to `Num.U8.default`.
+    if (ctx.current_module) |cur| {
+        const tail = if (first_dot) |d| label[d..] else "";
+
+        if (ctx.lookupAnchorHead(head)) |resolved_head| {
+            anchor_len = 0;
+            anchor_overflow = false;
+            append(&anchor_buf, &anchor_len, &anchor_overflow, cur);
+            append(&anchor_buf, &anchor_len, &anchor_overflow, ".");
+            append(&anchor_buf, &anchor_len, &anchor_overflow, resolved_head);
+            append(&anchor_buf, &anchor_len, &anchor_overflow, tail);
+
+            try w.writeAll("#");
+            try writeHtmlEscaped(w, cur);
+            try w.writeAll(".");
+            try writeHtmlEscaped(w, resolved_head);
+            try writeHtmlEscaped(w, tail);
+            try validateAnchor(ctx, label, anchor_buf[0..anchor_len], anchor_overflow, bracket_offset);
+            return;
+        }
+
+        anchor_len = 0;
+        anchor_overflow = false;
+        append(&anchor_buf, &anchor_len, &anchor_overflow, cur);
+        append(&anchor_buf, &anchor_len, &anchor_overflow, ".");
+        append(&anchor_buf, &anchor_len, &anchor_overflow, label);
+        if (!anchor_overflow and ctx.all_anchors.contains(anchor_buf[0..anchor_len])) {
+            try w.writeAll("#");
+            try writeHtmlEscaped(w, anchor_buf[0..anchor_len]);
+            return;
+        }
+    }
+
+    if (!ctx.documenting_builtin) {
+        if (builtinDocAnchorHead(head)) |builtin_anchor_head| {
+            try w.writeAll(builtins_docs_url_prefix);
+            try writeHtmlEscaped(w, builtin_anchor_head);
+            if (first_dot) |d| {
+                try writeHtmlEscaped(w, label[d..]);
+            }
+            return;
+        }
+    }
+
     try w.writeAll("#");
+    anchor_len = 0;
+    anchor_overflow = false;
     if (ctx.current_module) |cur| {
         try writeHtmlEscaped(w, cur);
         try w.writeAll(".");
         append(&anchor_buf, &anchor_len, &anchor_overflow, cur);
         append(&anchor_buf, &anchor_len, &anchor_overflow, ".");
     }
-    const resolved_head = ctx.lookupAnchorHead(head) orelse head;
-    try writeHtmlEscaped(w, resolved_head);
-    append(&anchor_buf, &anchor_len, &anchor_overflow, resolved_head);
-    if (first_dot) |d| {
-        try writeHtmlEscaped(w, label[d..]);
-        append(&anchor_buf, &anchor_len, &anchor_overflow, label[d..]);
-    }
+    try writeHtmlEscaped(w, label);
+    append(&anchor_buf, &anchor_len, &anchor_overflow, label);
     try validateAnchor(ctx, label, anchor_buf[0..anchor_len], anchor_overflow, bracket_offset);
 }
 

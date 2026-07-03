@@ -607,7 +607,10 @@ pub const ProvidedExportTable = struct {
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
-        checked_types: *const CheckedTypePublication,
+        names: *const canonical.CanonicalNameStore,
+        checked_types: *CheckedTypePublication,
+        platform_required_declarations: *const PlatformRequiredDeclarationTable,
+        platform_requirement_relations: *const PlatformRequirementRelationTable,
         top_level_values: *const TopLevelValueTable,
         published_provides: []const ProvidesEntry,
     ) Allocator.Error!ProvidedExportTable {
@@ -646,13 +649,22 @@ pub const ProvidedExportTable = struct {
                 checked_types,
                 .{ .def = def_idx },
             );
+            const resolved_checked_type = try relationResolvedProvidedExportType(
+                allocator,
+                module,
+                names,
+                checked_types,
+                platform_required_declarations,
+                platform_requirement_relations,
+                checked_type,
+            );
             switch (top_level.value) {
                 .procedure_binding => |binding| try exports.append(allocator, .{ .procedure = .{
                     .source_name = published.source_name,
                     .ffi_symbol = published.ffi_symbol,
                     .def = def_idx,
                     .pattern = top_level.pattern,
-                    .checked_type = checked_type,
+                    .checked_type = resolved_checked_type,
                     .source_scheme = top_level.source_scheme,
                     .binding = binding,
                 } }),
@@ -661,7 +673,7 @@ pub const ProvidedExportTable = struct {
                     .ffi_symbol = published.ffi_symbol,
                     .def = def_idx,
                     .pattern = top_level.pattern,
-                    .checked_type = checked_type,
+                    .checked_type = resolved_checked_type,
                     .source_scheme = top_level.source_scheme,
                     .const_ref = const_ref,
                 } }),
@@ -676,6 +688,242 @@ pub const ProvidedExportTable = struct {
         self.* = .{};
     }
 };
+
+fn relationResolvedProvidedExportType(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *const canonical.CanonicalNameStore,
+    checked_types: *CheckedTypePublication,
+    platform_required_declarations: *const PlatformRequiredDeclarationTable,
+    platform_requirement_relations: *const PlatformRequirementRelationTable,
+    checked_type: CheckedTypeId,
+) Allocator.Error!CheckedTypeId {
+    if (platform_requirement_relations.relations.len == 0) return checked_type;
+
+    var formals = std.ArrayList(CheckedTypeId).empty;
+    defer formals.deinit(allocator);
+    var actuals = std.ArrayList(CheckedTypeId).empty;
+    defer actuals.deinit(allocator);
+    var relation_active = std.AutoHashMap(PlatformRelationTypePair, void).init(allocator);
+    defer relation_active.deinit();
+
+    for (platform_requirement_relations.relations) |relation| {
+        const declaration = platform_required_declarations.lookupByDeclarationId(relation.declaration) orelse {
+            checkedArtifactInvariant("platform/app relation referenced a missing platform requirement declaration", .{});
+        };
+        try appendPlatformRelationTypeSubstitutions(
+            allocator,
+            &checked_types.store,
+            platformRequiredPayloadForDeclaration(module, checked_types, declaration),
+            relation.requested_source_ty_payload,
+            &formals,
+            &actuals,
+            &relation_active,
+        );
+
+        const declaration_scheme = checked_types.store.schemeForKey(declaration.declared_source_ty) orelse {
+            checkedArtifactInvariant("platform requirement declaration has no published source type scheme", .{});
+        };
+        try appendPlatformRelationTypeSubstitutions(
+            allocator,
+            &checked_types.store,
+            declaration_scheme.root,
+            relation.requested_source_ty_payload,
+            &formals,
+            &actuals,
+            &relation_active,
+        );
+
+        if (checked_types.store.rootForKey(relation.declared_source_ty)) |declared_root| {
+            try appendPlatformRelationTypeSubstitutions(
+                allocator,
+                &checked_types.store,
+                declared_root,
+                relation.requested_source_ty_payload,
+                &formals,
+                &actuals,
+                &relation_active,
+            );
+        }
+    }
+
+    var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+    defer active.deinit();
+    const resolved = try checked_types.store.cloneCheckedTypeRootSubstituting(
+        allocator,
+        names,
+        checked_type,
+        formals.items,
+        actuals.items,
+        &active,
+    );
+    return resolved;
+}
+
+const PlatformRelationTypePair = struct {
+    platform: u32,
+    resolved: u32,
+};
+
+fn appendPlatformRelationTypeSubstitutions(
+    allocator: Allocator,
+    store: *const CheckedTypeStore,
+    platform_root: CheckedTypeId,
+    resolved_root: CheckedTypeId,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRelationTypePair, void),
+) Allocator.Error!void {
+    try appendPlatformRelationTypeSubstitution(allocator, formals, actuals, platform_root, resolved_root);
+
+    const pair = PlatformRelationTypePair{
+        .platform = @intFromEnum(platform_root),
+        .resolved = @intFromEnum(resolved_root),
+    };
+    if (active.contains(pair)) return;
+    try active.put(pair, {});
+    defer _ = active.remove(pair);
+
+    const platform_payload = store.payload(platform_root);
+    const resolved_payload = store.payload(resolved_root);
+
+    switch (platform_payload) {
+        .pending => checkedArtifactInvariant("platform relation type substitution reached pending platform payload", .{}),
+        .flex,
+        .rigid,
+        .empty_record,
+        .empty_tag_union,
+        => return,
+        .alias => |platform_alias| {
+            switch (resolved_payload) {
+                .alias => |resolved_alias| {
+                    try appendPlatformRelationTypeSubstitutions(allocator, store, platform_alias.backing, resolved_alias.backing, formals, actuals, active);
+                    try appendPlatformRelationTypeSliceSubstitutions(allocator, store, platform_alias.args, resolved_alias.args, formals, actuals, active);
+                },
+                else => try appendPlatformRelationTypeSubstitutions(allocator, store, platform_alias.backing, resolved_root, formals, actuals, active),
+            }
+        },
+        .function => |platform_fn| {
+            const resolved_fn = switch (resolved_payload) {
+                .function => |function| function,
+                else => checkedArtifactInvariant("platform relation type substitution expected resolved function payload", .{}),
+            };
+            try appendPlatformRelationTypeSliceSubstitutions(allocator, store, platform_fn.args, resolved_fn.args, formals, actuals, active);
+            try appendPlatformRelationTypeSubstitutions(allocator, store, platform_fn.ret, resolved_fn.ret, formals, actuals, active);
+        },
+        .tuple => |platform_items| {
+            const resolved_items = switch (resolved_payload) {
+                .tuple => |items| items,
+                else => checkedArtifactInvariant("platform relation type substitution expected resolved tuple payload", .{}),
+            };
+            try appendPlatformRelationTypeSliceSubstitutions(allocator, store, platform_items, resolved_items, formals, actuals, active);
+        },
+        .record, .record_unbound => {
+            const platform_record = recordParts(platform_payload) orelse unreachable;
+            const resolved_record = recordParts(resolved_payload) orelse
+                checkedArtifactInvariant("platform relation type substitution expected resolved record payload", .{});
+            try appendPlatformRelationRecordSubstitutions(allocator, store, platform_record.fields, resolved_record.fields, formals, actuals, active);
+            if (platform_record.ext) |platform_ext| {
+                if (resolved_record.ext) |resolved_ext| {
+                    try appendPlatformRelationTypeSubstitutions(allocator, store, platform_ext, resolved_ext, formals, actuals, active);
+                }
+            }
+        },
+        .tag_union => |platform_union| {
+            const resolved_union = tagUnionParts(resolved_payload) orelse
+                checkedArtifactInvariant("platform relation type substitution expected resolved tag-union payload", .{});
+            try appendPlatformRelationTagSubstitutions(allocator, store, platform_union.tags, resolved_union.tags, formals, actuals, active);
+            if (resolved_union.ext) |resolved_ext| {
+                try appendPlatformRelationTypeSubstitutions(allocator, store, platform_union.ext, resolved_ext, formals, actuals, active);
+            }
+        },
+        .nominal => |platform_nominal| {
+            switch (resolved_payload) {
+                .nominal => |resolved_nominal| {
+                    try appendPlatformRelationTypeSubstitutions(allocator, store, platform_nominal.backing, resolved_nominal.backing, formals, actuals, active);
+                    try appendPlatformRelationTypeSliceSubstitutions(allocator, store, platform_nominal.args, resolved_nominal.args, formals, actuals, active);
+                    try appendPlatformRelationTypeSliceSubstitutions(allocator, store, platform_nominal.padding_field_types, resolved_nominal.padding_field_types, formals, actuals, active);
+                },
+                else => if (!platform_nominal.is_opaque) {
+                    try appendPlatformRelationTypeSubstitutions(allocator, store, platform_nominal.backing, resolved_root, formals, actuals, active);
+                },
+            }
+        },
+    }
+}
+
+fn appendPlatformRelationTypeSubstitution(
+    allocator: Allocator,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    formal: CheckedTypeId,
+    actual: CheckedTypeId,
+) Allocator.Error!void {
+    for (formals.items, actuals.items) |existing_formal, existing_actual| {
+        if (existing_formal != formal) continue;
+        if (existing_actual != actual) {
+            checkedArtifactInvariant("platform relation type substitution assigned incompatible resolved roots", .{});
+        }
+        return;
+    }
+    try formals.append(allocator, formal);
+    try actuals.append(allocator, actual);
+}
+
+fn appendPlatformRelationTypeSliceSubstitutions(
+    allocator: Allocator,
+    store: *const CheckedTypeStore,
+    platform_roots: []const CheckedTypeId,
+    resolved_roots: []const CheckedTypeId,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRelationTypePair, void),
+) Allocator.Error!void {
+    if (platform_roots.len != resolved_roots.len) {
+        checkedArtifactInvariant("platform relation type substitution arity mismatch", .{});
+    }
+    for (platform_roots, resolved_roots) |platform_root, resolved_root| {
+        try appendPlatformRelationTypeSubstitutions(allocator, store, platform_root, resolved_root, formals, actuals, active);
+    }
+}
+
+fn appendPlatformRelationRecordSubstitutions(
+    allocator: Allocator,
+    store: *const CheckedTypeStore,
+    platform_fields: []const CheckedRecordField,
+    resolved_fields: []const CheckedRecordField,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRelationTypePair, void),
+) Allocator.Error!void {
+    for (platform_fields) |platform_field| {
+        const resolved_field = findRecordFieldById(resolved_fields, platform_field.name) orelse continue;
+        try appendPlatformRelationTypeSubstitutions(allocator, store, platform_field.ty, resolved_field.ty, formals, actuals, active);
+    }
+}
+
+fn appendPlatformRelationTagSubstitutions(
+    allocator: Allocator,
+    store: *const CheckedTypeStore,
+    platform_tags: []const CheckedTag,
+    resolved_tags: []const CheckedTag,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRelationTypePair, void),
+) Allocator.Error!void {
+    for (platform_tags) |platform_tag| {
+        const resolved_tag = findTagById(resolved_tags, platform_tag.name) orelse continue;
+        try appendPlatformRelationTypeSliceSubstitutions(
+            allocator,
+            store,
+            platform_tag.argsSlice(store),
+            resolved_tag.argsSlice(store),
+            formals,
+            actuals,
+            active,
+        );
+    }
+}
 
 /// Public `RootRequestKind` declaration.
 pub const RootRequestKind = enum(u8) {
@@ -20726,6 +20974,21 @@ fn collectPublicApiDependencies(
         &type_owner_keys,
     );
 
+    try appendPlatformRequiredDeclarationPublicApiDependencies(
+        allocator,
+        module,
+        names,
+        module_identity,
+        artifact_key,
+        checked_type_publication,
+        checked_types,
+        imports,
+        available_artifacts,
+        &active_types,
+        &keys,
+        &type_owner_keys,
+    );
+
     var closure_dependencies = PublicApiClosureDependencyCollector.init(
         allocator,
         artifact_key,
@@ -20807,6 +21070,40 @@ fn appendExposedTypeDeclarationPublicApiDependencies(
             },
             else => {},
         }
+    }
+}
+
+fn appendPlatformRequiredDeclarationPublicApiDependencies(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *const canonical.CanonicalNameStore,
+    module_identity: ModuleIdentity,
+    artifact_key: CheckedModuleArtifactKey,
+    checked_type_publication: *const CheckedTypePublication,
+    checked_types: *const CheckedTypeStore,
+    imports: []const PublishImportArtifact,
+    available_artifacts: []const ImportedModuleView,
+    active_types: *std.AutoHashMap(CheckedTypeId, void),
+    keys: *ArtifactKeyAccumulator,
+    type_owner_keys: *ArtifactKeyAccumulator,
+) Allocator.Error!void {
+    for (module.requiresTypes()) |required_type| {
+        const root = checked_type_publication.rootForSourceVar(module, ModuleEnv.varFrom(required_type.type_anno)) orelse {
+            checkedArtifactInvariant("platform required declaration type root was not published", .{});
+        };
+        try appendPublicApiTypeDependencies(
+            allocator,
+            names,
+            module_identity,
+            artifact_key,
+            checked_types,
+            root,
+            active_types,
+            imports,
+            available_artifacts,
+            keys,
+            type_owner_keys,
+        );
     }
 }
 
@@ -25366,7 +25663,10 @@ pub fn publishFromTypedModule(
     var provided_exports = try ProvidedExportTable.fromModule(
         allocator,
         module,
+        &canonical_names,
         &checked_type_publication,
+        &platform_required_declarations,
+        &platform_requirement_relations,
         &top_level_values,
         provides,
     );
@@ -25885,7 +26185,10 @@ fn expectProvidedExportKind(
     var provided_exports = try ProvidedExportTable.fromModule(
         allocator,
         module,
+        &canonical_names,
         &checked_type_publication,
+        &platform_required_declarations,
+        &platform_requirement_relations,
         &top_level_values,
         provides,
     );
