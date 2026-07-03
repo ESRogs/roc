@@ -18,7 +18,7 @@ const recursive_data_tests = @import("eval_recursive_data_tests.zig");
 /// Every value-producing test is observed solely through `Str.inspect(...)`.
 const core_tests = [_]TestCase{
     // Frontend problems
-    .{ .name = "problem: undefined variable", .source = "undefinedVar", .expected = .{ .problem = {} } },
+    .{ .name = "problem: name not in scope", .source = "undefinedVar", .expected = .{ .problem = {} } },
     .{ .name = "problem: dec plus int type mismatch", .source = "1.0.Dec + 2.I64", .expected = .{ .problem = {} } },
     .{ .name = "problem: dec minus int type mismatch", .source = "1.0.Dec - 2.I64", .expected = .{ .problem = {} } },
     .{ .name = "problem: dec times int type mismatch", .source = "1.0.Dec * 2.I64", .expected = .{ .problem = {} } },
