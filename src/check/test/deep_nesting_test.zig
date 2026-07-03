@@ -65,7 +65,7 @@ const NESTING_DEPTH: usize = 4_000;
 
 /// Build `main! = |_args| { { { ... { 0 } ... } } }` nested `depth` deep, purely
 /// via nested blocks (the final_expr spine the checker walks iteratively).
-fn nestedBlocks(gpa: std.mem.Allocator, depth: usize) ![]u8 {
+fn nestedBlocks(gpa: std.mem.Allocator, depth: usize) std.mem.Allocator.Error![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(gpa);
     try buf.appendSlice(gpa, "main! = |_args| {\n");
@@ -116,7 +116,7 @@ const STMT_NESTING_DEPTH: usize = 150;
 /// is the next nested block, with the binding referenced as the block's final
 /// expression. This exercises the recursive `checkBlockStatements` path (contrast
 /// `nestedBlocks`, which nests purely via the iterative `final_expr` spine).
-fn stmtNestedBlocks(gpa: std.mem.Allocator, depth: usize) ![]u8 {
+fn stmtNestedBlocks(gpa: std.mem.Allocator, depth: usize) (std.mem.Allocator.Error || std.fmt.BufPrintError)![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(gpa);
     var numbuf: [24]u8 = undefined;
@@ -170,7 +170,7 @@ const BINOP_CHAIN_DEPTH: usize = 150;
 
 /// Build `main! = |_args| 1 + 1 + 1 + ... ` with `depth` additions — a single
 /// left-associative binop chain `depth` operators deep.
-fn binopChain(gpa: std.mem.Allocator, depth: usize) ![]u8 {
+fn binopChain(gpa: std.mem.Allocator, depth: usize) std.mem.Allocator.Error![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(gpa);
     try buf.appendSlice(gpa, "main! = |_args| 1");
