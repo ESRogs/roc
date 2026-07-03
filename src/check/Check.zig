@@ -15081,8 +15081,8 @@ fn checkCallExprPostArgs(
 
     const call_arg_expr_idxs = self.cir.store.sliceExpr(call.args);
 
-    // Reconstruct `did_err`: the func-side flag from `call_after_func`, OR'd with
-    // each arg's error content (re-resolved now that every arg is checked).
+    // Start with the func-side flag from `call_after_func`, then OR in each
+    // arg's error content now that every arg is checked.
     var did_err = func_did_err;
     for (call_arg_expr_idxs) |call_arg_idx| {
         did_err = did_err or (self.types.resolveVar(ModuleEnv.varFrom(call_arg_idx)).desc.content == .err);
