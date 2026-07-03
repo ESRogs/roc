@@ -186,9 +186,11 @@ const SpecEvidence = union(enum) {
     /// type can ever reach the dispatch, which lowers to an explicit
     /// unreachable crash.
     unreachable_value,
-    /// The edge's obligation was rejected during checking, or publication left
-    /// it unresolved (migration gap). Consuming it falls back to owner
-    /// derivation until the class-by-class migration completes.
+    /// Checking rejected the edge's obligation (a reported missing method);
+    /// the dispatch lowers to an explicit crash.
+    checked_error,
+    /// Publication left the obligation unresolved (migration gap). Consuming
+    /// it falls back to owner derivation until the migration completes.
     unavailable,
 };
 
@@ -260,6 +262,7 @@ fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
             else => false,
         },
         .unreachable_value => b == .unreachable_value,
+        .checked_error => b == .checked_error,
         .unavailable => b == .unavailable,
     };
 }
@@ -1554,6 +1557,9 @@ const Builder = struct {
             var short = template.evidence_params.len - spec_evidence.len;
             while (short > 0) : (short -= 1) {
                 self.evidenceGap("spec-vector-short", template_name);
+                if (@import("builtin").mode == .Debug) {
+                    std.log.scoped(.monotype).debug("  in module: {s}", .{view.module_env.module_name});
+                }
             }
         }
         body_ctx.source_region_override = source_region_override;
@@ -16311,13 +16317,17 @@ const BodyContext = struct {
         // `planAllowsStructural` predicate as `dispatchTarget` so structural
         // equality/hashing/parser/encode dispatches keep their dedicated
         // structural lowering below.
-        if (self.planIsUnreachable(plan)) {
-            // Checking marked this dispatch statically unreachable: its
-            // dispatcher is a value no specialization edge can supply, so the
-            // dispatch can never execute.
+        if (self.planUnexecutable(plan)) |reason| {
             const crash_ty = expected_ret_ty orelse plan_ret_ty;
             try self.constrainTypeToMono(checked_ret_ty, crash_ty);
-            return try self.runtimeCrashExpr(crash_ty, "dispatch on a value that can never exist");
+            return try self.runtimeCrashExpr(crash_ty, switch (reason) {
+                // The dispatcher is a value no specialization edge can supply,
+                // so the dispatch can never execute.
+                .unreachable_value => "dispatch on a value that can never exist",
+                // Checking reported the missing method; executing the site
+                // anyway (roc run with errors) crashes here.
+                .checked_error => "method dispatch failed to check",
+            });
         }
         if (self.evidenceResolution(plan, false) == null and
             methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null and
@@ -17036,8 +17046,9 @@ const BodyContext = struct {
                 return entry;
             },
             .structural => |kind| return .{ .structural = kind },
-            .checked_error => return .unavailable,
+            .checked_error => return .checked_error,
             .unreachable_value => return .unreachable_value,
+            .unresolved => return .unavailable,
         }
     }
 
@@ -17076,7 +17087,7 @@ const BodyContext = struct {
                         .resolved => |nested| .{ .resolved = nested },
                         .synthesize => .synthesize,
                     },
-                    .structural, .unreachable_value, .unavailable => .{ .resolved = &.{} },
+                    .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
                 };
             },
             .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => return .{ .resolved = &.{} },
@@ -17098,7 +17109,7 @@ const BodyContext = struct {
                         .resolved => |nested| .{ .resolved = nested },
                         .synthesize => .synthesize,
                     },
-                    .structural, .unreachable_value, .unavailable => .{ .resolved = &.{} },
+                    .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
                 };
             },
             .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => return .{ .resolved = &.{} },
@@ -17126,8 +17137,9 @@ const BodyContext = struct {
                 return switch (entry) {
                     .target => |target| .{ .target = .{ .view = target.view, .target = target.target } },
                     .structural => .structural,
-                    // Unreachable dispatches crash before target resolution.
-                    .unreachable_value => null,
+                    // Unreachable and checked-error dispatches crash before
+                    // target resolution.
+                    .unreachable_value, .checked_error => null,
                     .unavailable => blk: {
                         if (count_gaps) self.builder.evidenceGap("dispatch-entry-unavailable", self.view.names.methodNameText(plan.method));
                         break :blk null;
@@ -17143,13 +17155,22 @@ const BodyContext = struct {
         }
     }
 
-    /// Whether checking decided this dispatch can never execute (its
-    /// dispatcher is a value no edge can supply): lowers to an explicit crash.
-    fn planIsUnreachable(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) bool {
+    const UnexecutableDispatch = enum { unreachable_value, checked_error };
+
+    /// Whether checking decided this dispatch can never execute: its
+    /// dispatcher is a value no edge can supply (unreachable), or checking
+    /// rejected the obligation (a reported missing method). Both lower to an
+    /// explicit crash.
+    fn planUnexecutable(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?UnexecutableDispatch {
         return switch (plan.resolution) {
-            .unreachable_dispatch => true,
-            .constraint => |constraint_ref| if (self.evidence.at(constraint_ref)) |entry| entry == .unreachable_value else false,
-            .direct, .structural, .checked_error, .unresolved_checked_plan => false,
+            .unreachable_dispatch => .unreachable_value,
+            .checked_error => .checked_error,
+            .constraint => |constraint_ref| if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
+                .unreachable_value => .unreachable_value,
+                .checked_error => .checked_error,
+                .target, .structural, .unavailable => null,
+            } else null,
+            .direct, .structural, .unresolved_checked_plan => null,
         };
     }
 
@@ -22285,7 +22306,7 @@ const BodyContext = struct {
                             if (@import("builtin").mode == .Debug) self.debugCompareIteratorDerivation(dispatcher_ty, plan.method, consumed);
                             break :blk consumed;
                         },
-                        .structural, .unreachable_value => Common.invariant("iterator dispatch evidence was not a callable target"),
+                        .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
                         .unavailable => self.builder.evidenceGap("iterator-entry-unavailable", self.view.names.methodNameText(plan.method)),
                     } else {
                         self.builder.evidenceGap("iterator-chain-miss", self.view.names.methodNameText(plan.method));

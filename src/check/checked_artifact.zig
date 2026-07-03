@@ -13432,8 +13432,7 @@ const EvidencePass = struct {
             },
             .unreachable_dispatch => .unreachable_value,
             .unresolved_checked_plan => blk: {
-                // Track alongside plan-level gaps; consumers treat missing
-                // evidence like a checked error until the migration finishes.
+                // Migration gap: consumers fall back to owner derivation.
                 self.unresolved_count += 1;
                 if (@import("builtin").mode == .Debug) {
                     std.log.scoped(.checked_evidence).debug("evidence entry unresolved: method={s} content={s}", .{
@@ -13441,7 +13440,7 @@ const EvidencePass = struct {
                         @tagName(self.types.resolveVar(var_).desc.content),
                     });
                 }
-                break :blk .checked_error;
+                break :blk .unresolved;
             },
         };
     }
@@ -13511,8 +13510,11 @@ const EvidencePass = struct {
             if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
                 entries.appendAssumeCapacity(.{ .constraint = ref });
             } else {
-                self.unresolved_count += 1;
-                entries.appendAssumeCapacity(.checked_error);
+                // The use shares the definition's vars (no instantiation
+                // record), so the obligation resolves exactly like a plan on
+                // those vars: concrete targets, defaulting, structural, or
+                // vacuous classification.
+                entries.appendAssumeCapacity(try self.evidenceForVar(callee_param, callee_param.dispatcher_var, callee_param.constraint.fn_var));
             }
         }
 
@@ -24495,7 +24497,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 10;
+    const serialized_layout_version: u32 = 11;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -28432,8 +28434,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xBC, 0xA1, 0xEE, 0x5A, 0x0B, 0xC2, 0xE9, 0xA0, 0x2C, 0x80, 0x4E, 0xFC, 0xF2, 0xD6, 0xF2, 0x7D,
-        0x23, 0x7D, 0xF6, 0xE3, 0x53, 0xAB, 0xB2, 0x0C, 0x0D, 0x60, 0xA6, 0x7F, 0x8A, 0x52, 0x0D, 0x87,
+        0x8D, 0x72, 0x5C, 0xF4, 0x9B, 0xC1, 0xDF, 0xD1, 0xD0, 0xC9, 0x0D, 0x8A, 0xD7, 0x93, 0x90, 0x91,
+        0x54, 0x51, 0x6E, 0x18, 0xB0, 0xD9, 0x4F, 0x44, 0x53, 0x9A, 0xEF, 0x4B, 0x5F, 0xEE, 0xF7, 0xAA,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

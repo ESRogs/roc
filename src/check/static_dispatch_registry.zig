@@ -644,6 +644,10 @@ pub const CheckedEvidence = union(enum) {
     /// is always `Err` at this edge). The obligation is vacuous; consuming it
     /// lowers to an unreachable crash, never to a resolved call.
     unreachable_value,
+    /// Publication could not resolve the obligation (a registry-visibility
+    /// gap). Migration state: consumers fall back to owner derivation;
+    /// deleted once every obligation resolves totally.
+    unresolved,
 };
 
 /// Public `EvidenceNode` declaration.

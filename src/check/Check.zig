@@ -342,6 +342,13 @@ has_can_diagnostics: bool,
 /// non-literal/non-`is_eq` dispatch constraint, and does not resolve into the
 /// pinnable set can never be pinned, so its dispatch is reported as ambiguous.
 instantiation_dispatchers: std.ArrayListUnmanaged(InstantiationDispatcher),
+/// How many `instantiation_dispatchers` the end-of-check sweep has already
+/// enqueued for validation. Discharging one instantiated constraint can
+/// instantiate further constrained schemes (a generic method target with its
+/// own where clauses); the sweep loops from this cursor until no new
+/// dispatchers appear, so nested obligations are validated to a fixpoint
+/// (issue 9892's inner `a.decode` on a concrete type).
+instantiation_dispatchers_checked: usize = 0,
 /// The expression currently being checked (`checkExpr` sets this on entry and
 /// restores it on exit). When `instantiateVarHelp` records an
 /// `InstantiationDispatcher`, it stamps this expression onto it, so the
@@ -6836,29 +6843,41 @@ fn checkInstantiatedStaticDispatchConstraints(
     env: *Env,
     is_numeric_default_pass: bool,
 ) std.mem.Allocator.Error!void {
-    if (self.instantiation_dispatchers.items.len == 0) return;
+    // Discharging an instantiated constraint can instantiate the chosen
+    // method target's own scheme, appending new dispatchers; loop to a
+    // fixpoint so nested obligations are validated too. The per-round cursor
+    // keeps each dispatcher enqueued exactly once, and the round cap bounds
+    // adversarial chains (each round performs real unification work, so real
+    // programs converge in a handful of rounds).
+    var rounds: u32 = 64;
+    while (rounds > 0) : (rounds -= 1) {
+        const start = self.instantiation_dispatchers_checked;
+        const end = self.instantiation_dispatchers.items.len;
+        if (start >= end) return;
+        self.instantiation_dispatchers_checked = end;
 
-    const deferred_top = env.deferred_static_dispatch_constraints.items.items.len;
-    for (self.instantiation_dispatchers.items) |dispatcher| {
-        if (dispatcher.constraints.len() == 0) continue;
-        var has_where_constraint = false;
-        for (self.types.sliceStaticDispatchConstraints(dispatcher.constraints)) |constraint| {
-            if (constraint.origin == .where_clause) {
-                has_where_constraint = true;
-                break;
+        const deferred_top = env.deferred_static_dispatch_constraints.items.items.len;
+        for (self.instantiation_dispatchers.items[start..end]) |dispatcher| {
+            if (dispatcher.constraints.len() == 0) continue;
+            var has_where_constraint = false;
+            for (self.types.sliceStaticDispatchConstraints(dispatcher.constraints)) |constraint| {
+                if (constraint.origin == .where_clause) {
+                    has_where_constraint = true;
+                    break;
+                }
             }
+            if (!has_where_constraint) continue;
+
+            _ = try env.deferred_static_dispatch_constraints.append(self.gpa, .{
+                .var_ = dispatcher.dispatcher_var,
+                .constraints = dispatcher.constraints,
+            });
         }
-        if (!has_where_constraint) continue;
+        if (env.deferred_static_dispatch_constraints.items.items.len == deferred_top) continue;
 
-        _ = try env.deferred_static_dispatch_constraints.append(self.gpa, .{
-            .var_ = dispatcher.dispatcher_var,
-            .constraints = dispatcher.constraints,
-        });
+        try self.checkStaticDispatchConstraints(env, is_numeric_default_pass);
+        try self.checkAllConstraints(env);
     }
-    if (env.deferred_static_dispatch_constraints.items.items.len == deferred_top) return;
-
-    try self.checkStaticDispatchConstraints(env, is_numeric_default_pass);
-    try self.checkAllConstraints(env);
 }
 
 /// Detect ambiguous static dispatch: a static-dispatch-constrained type variable
