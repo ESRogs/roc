@@ -402,6 +402,11 @@ const Pass = struct {
     /// rest carry effects. Functions created during specialization are past
     /// the end of this table and count as effectful.
     fn_effect_free: []bool,
+    /// Per source function: whether the branch-append peel rewrote its body
+    /// before specialization. A peeled body iterates the shared base directly,
+    /// so it no longer reads as branch-chosen, but its base loop still needs the
+    /// whole-body scalarizing clone.
+    peeled: []bool,
 
     fn init(allocator: Allocator, program: *Ast.Program) Allocator.Error!Pass {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -443,6 +448,10 @@ const Pass = struct {
             }
         }
 
+        const peeled = try allocator.alloc(bool, program.fns.items.len);
+        errdefer allocator.free(peeled);
+        @memset(peeled, false);
+
         return .{
             .allocator = allocator,
             .arena = arena,
@@ -450,11 +459,13 @@ const Pass = struct {
             .plans = plans,
             .symbols = .{ .next = program.next_symbol },
             .fn_effect_free = fn_effect_free,
+            .peeled = peeled,
         };
     }
 
     fn deinit(self: *Pass) void {
         self.allocator.free(self.fn_effect_free);
+        self.allocator.free(self.peeled);
         for (self.plans) |*plan| plan.deinit(self.allocator);
         self.allocator.free(self.plans);
         self.arena.deinit();
@@ -463,6 +474,11 @@ const Pass = struct {
     fn run(self: *Pass) Common.LowerError!void {
         const original_fn_count = self.plans.len;
 
+        // The append peel runs first, while an append chain's arms are still
+        // separate `append` calls over their shared base. Specialization would
+        // otherwise collapse a multi-append arm into one specialized adapter
+        // worker the peel could not unwrap.
+        try self.peelBranchAppendLoops(original_fn_count);
         try self.collectArgUses(original_fn_count);
         try self.collectCallPatterns(original_fn_count);
         try self.reserveSpecIds();
@@ -472,6 +488,24 @@ const Pass = struct {
         try Lift.recomputeCaptures(self.allocator, self.program);
 
         self.program.next_symbol = self.symbols.next;
+    }
+
+    /// Rewrite each branch-chosen `append`-loop function into a base loop plus a
+    /// branch-dispatched tail, before specialization can collapse its arms.
+    /// Records which functions were rewritten so their base loops still get the
+    /// whole-body scalarizing clone later.
+    fn peelBranchAppendLoops(self: *Pass, original_fn_count: usize) Common.LowerError!void {
+        for (0..original_fn_count) |index| {
+            const body = switch (self.program.fns.items[index].body) {
+                .roc => |body| body,
+                .hosted => continue,
+            };
+            if (!try self.bodyHasBranchChosenIterLoop(body)) continue;
+            if (try self.peelBranchAppendBody(body)) |peeled| {
+                self.program.fns.items[index].body = .{ .roc = peeled };
+                self.peeled[index] = true;
+            }
+        }
     }
 
     fn copyProcDebugName(self: *Pass, source_symbol: Common.Symbol, target_symbol: Common.Symbol) Allocator.Error!void {
@@ -1008,9 +1042,10 @@ const Pass = struct {
             // sunk loop over its own source. Cloning the whole body also carries
             // any owned-construction loop it holds, so those are not collected
             // separately for it.
-            if (try self.bodyHasBranchChosenIterLoop(body)) {
-                const peeled = try self.peelBranchAppendBody(body);
-                try self.cloneFnBodyInPlace(fn_id, peeled orelse body);
+            // A peeled body iterates the shared base directly; scalarize its base
+            // loop with the same whole-body clone the branch-chosen shape uses.
+            if (self.peeled[index] or try self.bodyHasBranchChosenIterLoop(body)) {
+                try self.cloneFnBodyInPlace(fn_id, body);
                 continue;
             }
 
@@ -1166,10 +1201,13 @@ const Pass = struct {
         };
     }
 
-    /// The canonical desugared `for`-loop over an iterator: a two-slot loop
-    /// (iterator state, one carried accumulator) whose body pulls the next item
-    /// and dispatches on the pull result. Recognized structurally so the peel
-    /// can factor the shared base iteration out of a branch-chosen source.
+    /// The canonical desugared `for`-loop over an iterator: an iterator slot
+    /// plus zero or one carried accumulator, whose body pulls the next item and
+    /// dispatches on the pull result. Recognized structurally so the peel can
+    /// factor the shared base iteration out of a branch-chosen source. A
+    /// zero-carry loop is a side-effecting drive (optionally with an early
+    /// `return`, e.g. a short-circuit search); a one-carry loop is a fold whose
+    /// per-element result is the accumulator value the `One` arm continues with.
     const CanonicalForLoop = struct {
         /// The local fed to the iterator constructor in the iterator slot's
         /// initial value — the branch-bound source the loop consumes.
@@ -1177,16 +1215,19 @@ const Pass = struct {
         /// The whole iterator-slot initial expression (a construction over
         /// `source_local`), reused to rebuild the base iteration.
         iter_init: Ast.ExprId,
-        /// The accumulator slot's initial value.
-        carry_init: Ast.ExprId,
-        /// The accumulator loop parameter.
+        /// Number of carried accumulators (0 or 1).
+        carry_count: usize,
+        /// The accumulator loop parameter (valid when `carry_count == 1`).
         carry_param: Ast.LocalId,
-        /// The accumulator loop parameter's type.
+        /// The accumulator loop parameter's type (valid when `carry_count == 1`).
         carry_ty: Type.TypeId,
+        /// The type each per-element application produces: the accumulator type
+        /// for a fold, or a zero-sized unit for a side-effecting drive.
+        value_ty: Type.TypeId,
         /// The `One(...)` payload's item pattern — bound to each pulled element.
         item_pat: Ast.PatId,
         /// The `One(...)` arm body, ending in a `continue` whose accumulator
-        /// value is the per-element result.
+        /// value (when carried) is the per-element result.
         one_body: Ast.ExprId,
         /// The local bound by the `One(...)` payload's `rest` field.
         rest_local: Ast.LocalId,
@@ -1211,37 +1252,66 @@ const Pass = struct {
         const body_expr = self.program.exprs.items[@intFromEnum(body)];
         const block = switch (body_expr.data) {
             .block => |b| b,
-            else => return null,
+            else => {
+                return null;
+            },
         };
         const stmts = try self.allocator.dupe(Ast.StmtId, self.program.stmtSpan(block.statements));
         defer self.allocator.free(stmts);
 
-        // The loop must be bound by a statement whose result flows straight to
-        // the block's final expression, so the tail can take the loop's place.
-        const result_local = localExpr(self.program, block.final_expr) orelse return null;
-
+        // Locate the driving loop: a statement whose value/expression is a loop.
+        // A one-carry loop that binds its result (a fold) rebinds that result
+        // through the tail; a zero-carry loop driven for effect (a search) runs
+        // the tail as an effect after it.
         var loop_stmt_index: ?usize = null;
         var loop_expr_id: Ast.ExprId = undefined;
+        var result_local: ?Ast.LocalId = null;
         for (stmts, 0..) |stmt_id, index| {
-            const let_ = switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
-                .let_ => |l| l,
+            switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+                .let_ => |let_| {
+                    if (self.program.exprs.items[@intFromEnum(let_.value)].data != .loop_) continue;
+                    result_local = switch (self.program.pats.items[@intFromEnum(let_.pat)].data) {
+                        .bind => |local| local,
+                        else => continue,
+                    };
+                    loop_stmt_index = index;
+                    loop_expr_id = let_.value;
+                },
+                .expr => |e| {
+                    if (self.program.exprs.items[@intFromEnum(e)].data != .loop_) continue;
+                    result_local = null;
+                    loop_stmt_index = index;
+                    loop_expr_id = e;
+                },
                 else => continue,
-            };
-            const bound = switch (self.program.pats.items[@intFromEnum(let_.pat)].data) {
-                .bind => |local| local,
-                else => continue,
-            };
-            if (bound != result_local) continue;
-            if (self.program.exprs.items[@intFromEnum(let_.value)].data != .loop_) continue;
-            loop_stmt_index = index;
-            loop_expr_id = let_.value;
-            break;
+            }
+            if (loop_stmt_index != null) break;
         }
-        const li = loop_stmt_index orelse return null;
-        if (localUseCountInExpr(self.program, result_local, body) != 1) return null;
+        const li = loop_stmt_index orelse {
+            return null;
+        };
 
-        const canonical = (try self.matchCanonicalForLoop(loop_expr_id)) orelse return null;
-        if (localUseCountInExpr(self.program, canonical.source_local, body) != 1) return null;
+        const canonical = (try self.matchCanonicalForLoop(loop_expr_id)) orelse {
+            return null;
+        };
+        if (localUseCountInExpr(self.program, canonical.source_local, body) != 1) {
+            return null;
+        }
+        // A fold's result feeds the block's final expression directly, so the
+        // rebuilt fold value can take its place.
+        if (canonical.carry_count == 1) {
+            const rl = result_local orelse {
+                return null;
+            };
+            if (localExpr(self.program, block.final_expr) != rl) {
+                return null;
+            }
+            if (localUseCountInExpr(self.program, rl, body) != 1) {
+                return null;
+            }
+        } else if (result_local != null) {
+            return null;
+        }
 
         // Find the branch that binds the source, and confirm its arms share one
         // base source reached by unwrapping append adapter state.
@@ -1259,35 +1329,61 @@ const Pass = struct {
             if (bound != canonical.source_local) continue;
             switch (self.program.exprs.items[@intFromEnum(let_.value)].data) {
                 .if_, .match_ => {},
-                else => return null,
+                else => {
+                    return null;
+                },
             }
             collision_stmt_index = index;
             branch_expr_id = let_.value;
             break;
         }
-        const ci = collision_stmt_index orelse return null;
+        const ci = collision_stmt_index orelse {
+            return null;
+        };
 
-        const base_local = (try self.sharedArmBase(branch_expr_id)) orelse return null;
-
-        // Build the tail dispatch: the branch structure, each arm's body
-        // replaced by the accumulator folded over that arm's appended items.
-        const tail = (try self.buildTailDispatch(branch_expr_id, result_local, base_local, canonical)) orelse return null;
+        const base_local = (try self.sharedArmBase(branch_expr_id)) orelse {
+            return null;
+        };
 
         // Rebuild the loop so its iterator slot iterates the shared base.
-        const new_loop = (try self.rebuildLoopOverBase(loop_expr_id, base_local, canonical)) orelse return null;
+        const new_loop = (try self.rebuildLoopOverBase(loop_expr_id, base_local, canonical)) orelse {
+            return null;
+        };
+
+        // A fold threads the base loop's result into the tail; a search runs the
+        // tail for effect only.
+        var carry_start: ?Ast.ExprId = null;
+        var base_loop_stmt: Ast.StmtId = undefined;
+        var result_stmt: ?Ast.StmtId = null;
+        if (canonical.carry_count == 1) {
+            const temp = try self.program.addLocal(self.symbols.fresh(), canonical.carry_ty);
+            const temp_bind = try self.program.addPat(.{ .ty = canonical.carry_ty, .data = .{ .bind = temp } });
+            base_loop_stmt = try self.program.addStmt(.{ .let_ = .{ .pat = temp_bind, .value = new_loop } });
+            carry_start = try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .local = temp } });
+        } else {
+            base_loop_stmt = try self.program.addStmt(.{ .expr = new_loop });
+        }
+
+        // The tail replays the branch structure, each arm's body replaced by the
+        // per-element computation run over that arm's appended items.
+        const tail = (try self.buildTailDispatch(branch_expr_id, base_local, carry_start, canonical)) orelse {
+            return null;
+        };
+
+        if (canonical.carry_count == 1) {
+            const result_let = self.program.stmts.items[@intFromEnum(stmts[li])].let_;
+            result_stmt = try self.program.addStmt(.{ .let_ = .{ .pat = result_let.pat, .value = tail } });
+        } else {
+            result_stmt = try self.program.addStmt(.{ .expr = tail });
+        }
 
         var new_stmts = std.ArrayList(Ast.StmtId).empty;
         defer new_stmts.deinit(self.allocator);
         for (stmts, 0..) |stmt_id, index| {
             if (index == ci) continue; // the branch binding is replayed as the tail
             if (index == li) {
-                const loop_let = self.program.stmts.items[@intFromEnum(stmt_id)].let_;
-                try new_stmts.append(self.allocator, try self.program.addStmt(.{ .let_ = .{
-                    .pat = loop_let.pat,
-                    .value = new_loop,
-                    .recursive = loop_let.recursive,
-                    .comptime_site = loop_let.comptime_site,
-                } }));
+                try new_stmts.append(self.allocator, base_loop_stmt);
+                try new_stmts.append(self.allocator, result_stmt.?);
                 continue;
             }
             try new_stmts.append(self.allocator, stmt_id);
@@ -1295,7 +1391,7 @@ const Pass = struct {
 
         return try self.program.addExpr(.{ .ty = body_expr.ty, .data = .{ .block = .{
             .statements = try self.program.addStmtSpan(new_stmts.items),
-            .final_expr = tail,
+            .final_expr = block.final_expr,
         } } });
     }
 
@@ -1343,10 +1439,12 @@ const Pass = struct {
         const loop = self.program.exprs.items[@intFromEnum(loop_expr_id)].data.loop_;
         const params = self.program.typedLocalSpan(loop.params);
         const initials = self.program.exprSpan(loop.initial_values);
-        if (params.len != 2 or initials.len != 2) return null;
+        // Slot 0 is the iterator; at most one accumulator follows it.
+        if (params.len < 1 or params.len > 2 or params.len != initials.len) return null;
+        const carry_count = params.len - 1;
 
         const iter_param = params[0].local;
-        const carry_param = params[1].local;
+        const carry_param = if (carry_count == 1) params[1].local else undefined;
 
         // The iterator slot's initial constructs the iterator from one source
         // local — the branch-bound value.
@@ -1375,13 +1473,18 @@ const Pass = struct {
             };
             const payloads = self.program.patSpan(tag.payloads);
             if (payloads.len == 0) {
-                // Exhausted arm: breaks with the accumulator unchanged.
+                // Exhausted arm: breaks, carrying the accumulator unchanged.
                 const broke = self.stripArmBlock(branch.body);
                 const break_val = switch (self.program.exprs.items[@intFromEnum(broke)].data) {
-                    .break_ => |maybe| maybe orelse return null,
+                    .break_ => |maybe| maybe,
                     else => return null,
                 };
-                if (localExpr(self.program, break_val) != carry_param) return null;
+                if (carry_count == 0) {
+                    if (break_val != null) return null;
+                } else {
+                    const bv = break_val orelse return null;
+                    if (localExpr(self.program, bv) != carry_param) return null;
+                }
                 continue;
             }
             if (payloads.len != 1) return null;
@@ -1390,12 +1493,12 @@ const Pass = struct {
                 else => return null,
             };
             const cont = (self.tailContinueValues(branch.body)) orelse return null;
-            if (cont.len != 2) return null;
+            if (cont.len != params.len) return null;
             const cont_rest = localExpr(self.program, cont[0]) orelse return null;
 
             if (record_fields.len == 1) {
                 // Skip arm: advances the iterator, accumulator unchanged.
-                if (localExpr(self.program, cont[1]) != carry_param) return null;
+                if (carry_count == 1 and localExpr(self.program, cont[1]) != carry_param) return null;
                 const only = record_fields[0];
                 if (self.bindLocalOf(only.pattern) != cont_rest) return null;
                 continue;
@@ -1422,12 +1525,21 @@ const Pass = struct {
         }
 
         const ip = item_pat orelse return null;
+        const carry_ty = if (carry_count == 1) params[1].ty else undefined;
+        // A fold produces the accumulator type; a side-effecting drive produces
+        // the loop's own (unit) result type. Reuse an existing type id — the
+        // Monotype type store is frozen during this pass.
+        const value_ty = if (carry_count == 1)
+            carry_ty
+        else
+            self.program.exprs.items[@intFromEnum(loop_expr_id)].ty;
         return .{
             .source_local = source_local,
             .iter_init = initials[0],
-            .carry_init = initials[1],
+            .carry_count = carry_count,
             .carry_param = carry_param,
-            .carry_ty = params[1].ty,
+            .carry_ty = carry_ty,
+            .value_ty = value_ty,
             .item_pat = ip,
             .one_body = one_body,
             .rest_local = rest_local,
@@ -1641,22 +1753,27 @@ const Pass = struct {
             .is_cold = iter_call.is_cold,
         } } });
 
-        const new_initials = try self.program.addExprSpan(&.{ new_iter_init, canonical.carry_init });
+        // Keep every accumulator slot's initial value; only the iterator slot
+        // changes to iterate the shared base.
+        const initials = try self.allocator.dupe(Ast.ExprId, self.program.exprSpan(loop.initial_values));
+        defer self.allocator.free(initials);
+        initials[0] = new_iter_init;
         return try self.program.addExpr(.{ .ty = loop_expr.ty, .data = .{ .loop_ = .{
             .params = loop.params,
-            .initial_values = new_initials,
+            .initial_values = try self.program.addExprSpan(initials),
             .body = loop.body,
         } } });
     }
 
     /// Build the branch-dispatched tail: the source branch's structure, each
-    /// arm's body replaced by the accumulator folded over that arm's appended
-    /// items in yield order.
+    /// arm's body replaced by the per-element computation run over that arm's
+    /// appended items in yield order. `carry_start` is the base loop's
+    /// accumulator result for a fold, or null for a side-effecting drive.
     fn buildTailDispatch(
         self: *Pass,
         branch_expr_id: Ast.ExprId,
-        result_local: Ast.LocalId,
         base_local: Ast.LocalId,
+        carry_start: ?Ast.ExprId,
         canonical: CanonicalForLoop,
     ) Common.LowerError!?Ast.ExprId {
         const expr = self.program.exprs.items[@intFromEnum(branch_expr_id)];
@@ -1667,11 +1784,11 @@ const Pass = struct {
                 var rewritten = try self.allocator.alloc(Ast.IfBranch, branches.len);
                 defer self.allocator.free(rewritten);
                 for (branches, 0..) |br, index| {
-                    const arm = (try self.buildArmFold(br.body, result_local, base_local, canonical)) orelse return null;
+                    const arm = (try self.buildArmTail(br.body, base_local, carry_start, canonical)) orelse return null;
                     rewritten[index] = .{ .cond = br.cond, .body = arm };
                 }
-                const final_else = (try self.buildArmFold(if_.final_else, result_local, base_local, canonical)) orelse return null;
-                return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .if_ = .{
+                const final_else = (try self.buildArmTail(if_.final_else, base_local, carry_start, canonical)) orelse return null;
+                return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .{ .if_ = .{
                     .branches = try self.program.addIfBranchSpan(rewritten),
                     .final_else = final_else,
                 } } });
@@ -1682,10 +1799,10 @@ const Pass = struct {
                 var rewritten = try self.allocator.alloc(Ast.Branch, branches.len);
                 defer self.allocator.free(rewritten);
                 for (branches, 0..) |br, index| {
-                    const arm = (try self.buildArmFold(br.body, result_local, base_local, canonical)) orelse return null;
+                    const arm = (try self.buildArmTail(br.body, base_local, carry_start, canonical)) orelse return null;
                     rewritten[index] = .{ .pat = br.pat, .guard = br.guard, .body = arm };
                 }
-                return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .match_ = .{
+                return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .{ .match_ = .{
                     .scrutinee = match.scrutinee,
                     .branches = try self.program.addBranchSpan(rewritten),
                     .comptime_site = match.comptime_site,
@@ -1695,53 +1812,62 @@ const Pass = struct {
         }
     }
 
-    /// Fold the loop's per-element computation over one arm's appended items,
-    /// starting from the loop result, threading each intermediate accumulator
-    /// through a fresh binding.
-    fn buildArmFold(
+    /// Run the loop's per-element computation over one arm's appended items in
+    /// yield order. For a fold, thread each intermediate accumulator through a
+    /// fresh binding starting from `carry_start`; for a drive, sequence the
+    /// per-item effects. An arm that appends nothing yields the incoming
+    /// accumulator (fold) or a no-op (drive).
+    fn buildArmTail(
         self: *Pass,
         arm: Ast.ExprId,
-        result_local: Ast.LocalId,
         base_local: Ast.LocalId,
+        carry_start: ?Ast.ExprId,
         canonical: CanonicalForLoop,
     ) Common.LowerError!?Ast.ExprId {
         const chain = (try self.reduceArmChain(arm)) orelse return null;
         defer self.allocator.free(chain.items);
         if (chain.base != base_local) return null;
 
-        var carry_ref = try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .local = result_local } });
-        if (chain.items.len == 0) return carry_ref;
+        if (chain.items.len == 0) {
+            if (canonical.carry_count == 1) {
+                const start = carry_start orelse return null;
+                return start;
+            }
+            return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .unit });
+        }
 
+        var carry_ref = carry_start;
         var stmts = std.ArrayList(Ast.StmtId).empty;
         defer stmts.deinit(self.allocator);
         for (chain.items, 0..) |item, index| {
             const step = (try self.buildBodyApplication(carry_ref, item, canonical)) orelse return null;
             if (index + 1 == chain.items.len) {
                 if (stmts.items.len == 0) return step;
-                return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .block = .{
+                return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .{ .block = .{
                     .statements = try self.program.addStmtSpan(stmts.items),
                     .final_expr = step,
                 } } });
             }
-            const fresh = try self.program.addLocal(self.symbols.fresh(), canonical.carry_ty);
-            const bind = try self.program.addPat(.{ .ty = canonical.carry_ty, .data = .{ .bind = fresh } });
-            try stmts.append(self.allocator, try self.program.addStmt(.{ .let_ = .{
-                .pat = bind,
-                .value = step,
-            } }));
-            carry_ref = try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .local = fresh } });
+            if (canonical.carry_count == 1) {
+                const fresh = try self.program.addLocal(self.symbols.fresh(), canonical.carry_ty);
+                const bind = try self.program.addPat(.{ .ty = canonical.carry_ty, .data = .{ .bind = fresh } });
+                try stmts.append(self.allocator, try self.program.addStmt(.{ .let_ = .{ .pat = bind, .value = step } }));
+                carry_ref = try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .local = fresh } });
+            } else {
+                try stmts.append(self.allocator, try self.program.addStmt(.{ .expr = step }));
+            }
         }
         unreachable;
     }
 
     /// One application of the loop body: bind the item pattern to an appended
-    /// item and the accumulator parameter to the incoming accumulator, then run
-    /// the per-element computation to its accumulator result. Every bound local
-    /// is renamed fresh so the tail's applications and the base loop stay
-    /// independent.
+    /// item (and, for a fold, the accumulator parameter to the incoming
+    /// accumulator), then run the per-element computation to its result. Every
+    /// bound local is renamed fresh so the tail's applications and the base loop
+    /// stay independent.
     fn buildBodyApplication(
         self: *Pass,
-        carry_expr: Ast.ExprId,
+        carry_expr: ?Ast.ExprId,
         item_expr: Ast.ExprId,
         canonical: CanonicalForLoop,
     ) Common.LowerError!?Ast.ExprId {
@@ -1752,34 +1878,49 @@ const Pass = struct {
         // slot: the rest binding must be read only by the continue we drop.
         if (localUseCountInExpr(self.program, canonical.rest_local, canonical.one_body) != 1) return null;
 
+        var stmts = std.ArrayList(Ast.StmtId).empty;
+        defer stmts.deinit(self.allocator);
+
         const item_pat = (try self.clonePatFresh(canonical.item_pat, &renames)) orelse return null;
-        const carry_local = try self.program.addLocal(self.symbols.fresh(), canonical.carry_ty);
-        try renames.put(canonical.carry_param, carry_local);
-        const carry_bind = try self.program.addPat(.{ .ty = canonical.carry_ty, .data = .{ .bind = carry_local } });
+        try stmts.append(self.allocator, try self.program.addStmt(.{ .let_ = .{ .pat = item_pat, .value = item_expr } }));
 
-        const body = (try self.cloneNewCarry(canonical.one_body, &renames)) orelse return null;
+        if (canonical.carry_count == 1) {
+            const carry = carry_expr orelse return null;
+            const carry_local = try self.program.addLocal(self.symbols.fresh(), canonical.carry_ty);
+            try renames.put(canonical.carry_param, carry_local);
+            const carry_bind = try self.program.addPat(.{ .ty = canonical.carry_ty, .data = .{ .bind = carry_local } });
+            try stmts.append(self.allocator, try self.program.addStmt(.{ .let_ = .{ .pat = carry_bind, .value = carry } }));
+        }
 
-        var stmts = [_]Ast.StmtId{
-            try self.program.addStmt(.{ .let_ = .{ .pat = item_pat, .value = item_expr } }),
-            try self.program.addStmt(.{ .let_ = .{ .pat = carry_bind, .value = carry_expr } }),
-        };
-        return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .block = .{
-            .statements = try self.program.addStmtSpan(&stmts),
+        const body = (try self.cloneNewCarry(canonical.one_body, &renames, canonical)) orelse return null;
+
+        return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .{ .block = .{
+            .statements = try self.program.addStmtSpan(stmts.items),
             .final_expr = body,
         } } });
     }
 
     /// Deep-clone a loop-body arm with all bound locals renamed fresh,
-    /// replacing the tail `continue` with its accumulator value. Returns null
-    /// for any construct outside the pure per-element computation set (a nested
-    /// loop, an early `break`/`return`, a lambda), keeping the peel from
-    /// reconstructing a shape it cannot fold.
-    fn cloneNewCarry(self: *Pass, expr_id: Ast.ExprId, renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.ExprId {
+    /// replacing the tail `continue` with its per-element result: the
+    /// accumulator value for a fold, or a unit for a side-effecting drive.
+    /// Early `return`s are preserved (they exit the enclosing function the same
+    /// way in the peeled tail). Returns null for constructs outside the
+    /// foldable set (a nested loop, a `break`, a lambda), keeping the peel from
+    /// reconstructing a shape it cannot replay.
+    fn cloneNewCarry(
+        self: *Pass,
+        expr_id: Ast.ExprId,
+        renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId),
+        canonical: CanonicalForLoop,
+    ) Common.LowerError!?Ast.ExprId {
         const expr = self.program.exprs.items[@intFromEnum(expr_id)];
         switch (expr.data) {
             .continue_ => |cont| {
                 const values = self.program.exprSpan(cont.values);
-                if (values.len != 2) return null;
+                if (values.len != canonical.carry_count + 1) return null;
+                if (canonical.carry_count == 0) {
+                    return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .unit });
+                }
                 return try self.cloneExprFresh(values[1], renames);
             },
             .block => |block| {
@@ -1791,8 +1932,8 @@ const Pass = struct {
                     const cloned = (try self.cloneStmtFresh(stmt_id, renames)) orelse return null;
                     try stmts.append(self.allocator, cloned);
                 }
-                const final = (try self.cloneNewCarry(block.final_expr, renames)) orelse return null;
-                return try self.program.addExpr(.{ .ty = expr.ty, .data = .{ .block = .{
+                const final = (try self.cloneNewCarry(block.final_expr, renames, canonical)) orelse return null;
+                return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .{ .block = .{
                     .statements = try self.program.addStmtSpan(stmts.items),
                     .final_expr = final,
                 } } });
@@ -1804,11 +1945,11 @@ const Pass = struct {
                 defer self.allocator.free(rewritten);
                 for (branches, 0..) |br, index| {
                     const cond = (try self.cloneExprFresh(br.cond, renames)) orelse return null;
-                    const arm = (try self.cloneNewCarry(br.body, renames)) orelse return null;
+                    const arm = (try self.cloneNewCarry(br.body, renames, canonical)) orelse return null;
                     rewritten[index] = .{ .cond = cond, .body = arm };
                 }
-                const final_else = (try self.cloneNewCarry(if_.final_else, renames)) orelse return null;
-                return try self.program.addExpr(.{ .ty = expr.ty, .data = .{ .if_ = .{
+                const final_else = (try self.cloneNewCarry(if_.final_else, renames, canonical)) orelse return null;
+                return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .{ .if_ = .{
                     .branches = try self.program.addIfBranchSpan(rewritten),
                     .final_else = final_else,
                 } } });
@@ -1822,10 +1963,10 @@ const Pass = struct {
                 for (branches, 0..) |br, index| {
                     if (br.guard != null) return null;
                     const pat = (try self.clonePatFresh(br.pat, renames)) orelse return null;
-                    const arm = (try self.cloneNewCarry(br.body, renames)) orelse return null;
+                    const arm = (try self.cloneNewCarry(br.body, renames, canonical)) orelse return null;
                     rewritten[index] = .{ .pat = pat, .guard = null, .body = arm };
                 }
-                return try self.program.addExpr(.{ .ty = expr.ty, .data = .{ .match_ = .{
+                return try self.program.addExpr(.{ .ty = canonical.value_ty, .data = .{ .match_ = .{
                     .scrutinee = scrutinee,
                     .branches = try self.program.addBranchSpan(rewritten),
                     .comptime_site = match.comptime_site,
@@ -1972,6 +2113,14 @@ const Pass = struct {
                     .comptime_site = match.comptime_site,
                 } };
             },
+            // An early return exits the enclosing function; it is preserved
+            // verbatim in the peeled tail, where it fires only after the base
+            // iteration completes without returning — the same order the
+            // unfused loop would return in.
+            .return_ => |ret| .{ .return_ = .{
+                .value = (try self.cloneExprFresh(ret.value, renames)) orelse return null,
+                .target = ret.target,
+            } },
             else => return null,
         };
         return try self.program.addExpr(.{ .ty = expr.ty, .data = data });

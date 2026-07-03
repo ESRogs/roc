@@ -4630,6 +4630,55 @@ test "iterdiff: if-chosen iterator chains consumed by one loop agree across inli
     );
 }
 
+test "iterdiff: branch-chosen append search with early return agrees across inline modes" {
+    // Rocci's `on_screen_collided!` shape: a zero-accumulator `for` over a
+    // branch-chosen append chain that returns early on the first match. The
+    // branch-append peel factors the shared base iteration out and replays the
+    // per-element check over each arm's appended items; the returned first-match
+    // element pins the exact pull order (base elements, then appended items in
+    // append order, with the early return short-circuiting). Both lowerings must
+    // return the same element for every `(selector, target)` probe.
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\find : U64, I64 -> I64
+        \\find = |selector, target| {
+        \\    base = [10.I64, 20, 30].iter()
+        \\    chosen =
+        \\        if selector == 2 {
+        \\            base.append(40).append(50)
+        \\        } else if selector == 1 {
+        \\            base.append(60)
+        \\        } else {
+        \\            base
+        \\        }
+        \\    for x in chosen {
+        \\        if x >= target {
+        \\            return x
+        \\        }
+        \\    }
+        \\    -1
+        \\}
+        \\
+        \\main : I64
+        \\main = {
+        \\    a = find(2, 35)
+        \\    b = find(2, 45)
+        \\    c = find(2, 100)
+        \\    d = find(1, 55)
+        \\    e = find(0, 5)
+        \\    f = find(0, 100)
+        \\    dbg a
+        \\    dbg b
+        \\    dbg c
+        \\    dbg d
+        \\    dbg e
+        \\    dbg f
+        \\    a + b + c + d + e + f
+        \\}
+    );
+}
+
 test "iterdiff: set materialized mid-pipeline then iterated agrees across inline modes" {
     // Design invariant 4: constructing a Set from the elements really runs, so
     // its deduplication happens exactly where written; the pipeline then keeps
