@@ -659,7 +659,7 @@ pub const ProvidedExportTable = struct {
             const source_scheme = if (relation_type_substitution.formals.len == 0)
                 top_level.source_scheme
             else
-                try relation_type_substitution.schemeForRoot(
+                try PlatformAppRelationTypeSubstitution.schemeForRoot(
                     allocator,
                     &checked_types.store,
                     checked_type,
@@ -13310,7 +13310,7 @@ pub const CheckedProcedureTemplateTable = struct {
                 checked_types,
                 template.checked_fn_root,
             );
-            template.checked_fn_scheme = try relation_type_substitution.schemeForRoot(
+            template.checked_fn_scheme = try PlatformAppRelationTypeSubstitution.schemeForRoot(
                 allocator,
                 checked_types,
                 template.checked_fn_root,
@@ -14570,12 +14570,10 @@ const PlatformAppRelationTypeSubstitution = struct {
     }
 
     fn schemeForRoot(
-        self: PlatformAppRelationTypeSubstitution,
         allocator: Allocator,
         checked_types: *CheckedTypeStore,
         root: CheckedTypeId,
     ) Allocator.Error!canonical.CanonicalTypeSchemeKey {
-        _ = self;
         return try checked_types.ensureSchemeForRoot(allocator, root);
     }
 };
@@ -20380,7 +20378,7 @@ pub const TopLevelValueTable = struct {
                 &checked_type_publication.store,
                 source_root,
             );
-            const source_scheme = try relation_type_substitution.schemeForRoot(
+            const source_scheme = try PlatformAppRelationTypeSubstitution.schemeForRoot(
                 allocator,
                 &checked_type_publication.store,
                 checked_root,
