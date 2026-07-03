@@ -16286,7 +16286,15 @@ const BodyContext = struct {
         // `planAllowsStructural` predicate as `dispatchTarget` so structural
         // equality/hashing/parser/encode dispatches keep their dedicated
         // structural lowering below.
-        if (plan.resolution != .direct and
+        if (self.planIsUnreachable(plan)) {
+            // Checking marked this dispatch statically unreachable: its
+            // dispatcher is a value no specialization edge can supply, so the
+            // dispatch can never execute.
+            const crash_ty = expected_ret_ty orelse plan_ret_ty;
+            try self.constrainTypeToMono(checked_ret_ty, crash_ty);
+            return try self.runtimeCrashExpr(crash_ty, "dispatch on a value that can never exist");
+        }
+        if (self.evidenceResolution(plan, false) == null and
             methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null and
             !planAllowsStructural(plan.result_mode))
         {
@@ -17066,38 +17074,112 @@ const BodyContext = struct {
         }
     }
 
+    /// A consumed evidence resolution: a concrete target or the checker's
+    /// structural decision.
+    const EvidenceResolved = union(enum) {
+        target: MethodLookup,
+        structural,
+    };
+
+    /// The plan's published (or edge-supplied) resolution, if the migration
+    /// has one for it. Null means the derivation fallback still decides
+    /// (unresolved plans, unavailable edge evidence, checked errors).
+    fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, count_gaps: bool) ?EvidenceResolved {
+        switch (plan.resolution) {
+            .direct => |node_id| return .{ .target = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target) },
+            .constraint => |constraint_ref| {
+                const entry = self.evidence.at(constraint_ref) orelse {
+                    if (count_gaps) self.builder.evidenceGap("dispatch-chain-miss", self.view.names.methodNameText(plan.method));
+                    return null;
+                };
+                return switch (entry) {
+                    .target => |target| .{ .target = .{ .view = target.view, .target = target.target } },
+                    .structural => .structural,
+                    // Unreachable dispatches crash before target resolution.
+                    .unreachable_value => null,
+                    .unavailable => blk: {
+                        if (count_gaps) self.builder.evidenceGap("dispatch-entry-unavailable", self.view.names.methodNameText(plan.method));
+                        break :blk null;
+                    },
+                };
+            },
+            .structural => return .structural,
+            .checked_error, .unreachable_dispatch => return null,
+            .unresolved_checked_plan => {
+                if (count_gaps) self.builder.evidenceGap("plan-unresolved", self.view.names.methodNameText(plan.method));
+                return null;
+            },
+        }
+    }
+
+    /// Whether checking decided this dispatch can never execute (its
+    /// dispatcher is a value no edge can supply): lowers to an explicit crash.
+    fn planIsUnreachable(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) bool {
+        return switch (plan.resolution) {
+            .unreachable_dispatch => true,
+            .constraint => |constraint_ref| if (self.evidence.at(constraint_ref)) |entry| entry == .unreachable_value else false,
+            .direct, .structural, .checked_error, .unresolved_checked_plan => false,
+        };
+    }
+
+    /// Iterator-call twin of `debugCompareDerivation`.
+    fn debugCompareIteratorDerivation(self: *BodyContext, dispatcher_ty: Type.TypeId, method: names.MethodNameId, consumed: MethodLookup) void {
+        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse return;
+        const derived = self.builder.lookupMethodTarget(owner, self.view, method) orelse return;
+        if (!std.meta.eql(consumed.target, derived.target)) {
+            Common.invariant("iterator dispatch evidence target disagreed with the owner-derivation target");
+        }
+    }
+
     fn dispatchTarget(
         self: *BodyContext,
         plan: static_dispatch.StaticDispatchCallPlan,
         dispatcher_ty: Type.TypeId,
     ) ?MethodLookup {
-        switch (plan.resolution) {
-            .direct => |node_id| return self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target),
-            // The evidence-based resolutions are consumed per plan class as
-            // the total-dispatch migration lands; until then the owner
-            // derivation below still resolves them, and the debug dual-run
-            // asserts the two agree.
-            .constraint, .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => {},
+        if (self.evidenceResolution(plan, true)) |resolution| {
+            // Evidence is authoritative; the derivation comparison below is a
+            // migration audit and is deleted with the derivation path.
+            if (@import("builtin").mode == .Debug) self.debugCompareDerivation(plan, dispatcher_ty, resolution);
+            return switch (resolution) {
+                .target => |lookup| lookup,
+                .structural => null,
+            };
         }
 
-        const derived: ?MethodLookup = blk: {
-            const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse {
-                if (planAllowsStructural(plan.result_mode)) break :blk null;
-                Common.invariant("dispatch plan had no method owner and no structural equality permission");
-            };
-            break :blk self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse {
-                if (planAllowsStructural(plan.result_mode)) break :blk null;
-                Common.invariant("checked method registry is missing resolved dispatch target");
-            };
+        // Migration fallback: owner derivation still covers unresolved plans,
+        // unavailable edge evidence, and checked-error sites.
+        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse {
+            if (planAllowsStructural(plan.result_mode)) return null;
+            Common.invariant("dispatch plan had no method owner and no structural equality permission");
         };
-        if (@import("builtin").mode == .Debug) self.debugCompareEvidenceResolution(plan, derived);
-        return derived;
+        return self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse {
+            if (planAllowsStructural(plan.result_mode)) return null;
+            Common.invariant("checked method registry is missing resolved dispatch target");
+        };
     }
 
-    /// Dual-run audit for the total-dispatch migration: wherever publication
-    /// resolved a plan, the evidence-based resolution must agree with the
-    /// owner-derivation result it is about to replace. Divergence is a
-    /// compiler bug.
+    /// Migration audit: where owner derivation can still resolve the dispatch,
+    /// it must agree with the consumed evidence. Derivation being blind (no
+    /// owner, or registry miss) while evidence resolves is the migration's
+    /// point, not a bug.
+    fn debugCompareDerivation(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, dispatcher_ty: Type.TypeId, resolution: EvidenceResolved) void {
+        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse return;
+        const derived = self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse {
+            if (resolution == .target and !planAllowsStructural(plan.result_mode)) {
+                Common.invariant("owner derivation missed a target the dispatch evidence resolved");
+            }
+            return;
+        };
+        switch (resolution) {
+            .target => |lookup| {
+                if (!std.meta.eql(lookup.target, derived.target)) {
+                    Common.invariant("dispatch evidence target disagreed with the owner-derivation target");
+                }
+            },
+            .structural => Common.invariant("dispatch evidence chose structural but owner derivation found a target"),
+        }
+    }
+
     fn debugCompareEvidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, derived: ?MethodLookup) void {
         switch (plan.resolution) {
             // Direct plans return before derivation runs.
@@ -21980,10 +22062,37 @@ const BodyContext = struct {
         if (!self.sameType(dispatcher_ty, actual_dispatcher_ty)) {
             Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
         }
-        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse
-            Common.invariant("iterator dispatch plan had no method owner");
-        const lookup = self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse
-            Common.invariant("checked iterator dispatch method registry is missing resolved target");
+        const lookup: MethodLookup = blk: {
+            // Consume the published (or edge-supplied) resolution; owner
+            // derivation remains the migration fallback and its comparison
+            // audit.
+            switch (plan.resolution) {
+                .direct => |node_id| {
+                    const consumed = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target);
+                    if (@import("builtin").mode == .Debug) self.debugCompareIteratorDerivation(dispatcher_ty, plan.method, consumed);
+                    break :blk consumed;
+                },
+                .constraint => |constraint_ref| {
+                    if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
+                        .target => |target| {
+                            const consumed: MethodLookup = .{ .view = target.view, .target = target.target };
+                            if (@import("builtin").mode == .Debug) self.debugCompareIteratorDerivation(dispatcher_ty, plan.method, consumed);
+                            break :blk consumed;
+                        },
+                        .structural, .unreachable_value => Common.invariant("iterator dispatch evidence was not a callable target"),
+                        .unavailable => self.builder.evidenceGap("iterator-entry-unavailable", self.view.names.methodNameText(plan.method)),
+                    } else {
+                        self.builder.evidenceGap("iterator-chain-miss", self.view.names.methodNameText(plan.method));
+                    }
+                },
+                .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
+                .unresolved_checked_plan => self.builder.evidenceGap("iterator-plan-unresolved", self.view.names.methodNameText(plan.method)),
+            }
+            const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse
+                Common.invariant("iterator dispatch plan had no method owner");
+            break :blk self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse
+                Common.invariant("checked iterator dispatch method registry is missing resolved target");
+        };
 
         const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, &call_ctx, plan.callable_ty, expected_ret_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
