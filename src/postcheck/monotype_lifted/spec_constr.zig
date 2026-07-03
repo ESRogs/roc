@@ -967,32 +967,214 @@ const Pass = struct {
 
     /// A `for` over a statically known source lowers to a loop carried directly
     /// in its enclosing function; it never becomes a call-pattern worker, so
-    /// nothing else scalarizes it. Clone each such loop through the value pass
-    /// in place so its loop-carried iterator construction inlines and its state
-    /// splits into scalars — the same transformation a specialized collect
-    /// worker receives. Only the loop expression is cloned, not its enclosing
-    /// let bindings, so a pipeline built and named before the loop (a
-    /// branch-chosen or `append`-style iterator whose construction the loop only
-    /// consumes) stays a residual value and is not force-inlined here.
+    /// nothing else scalarizes it. Two source shapes are handled here.
+    ///
+    /// A loop over an owned construction (`for x in [1, 2, 3].iter()`) has its
+    /// loop expression cloned through the value pass in place, so its
+    /// loop-carried iterator construction inlines and its state splits into
+    /// scalars — the same transformation a specialized collect worker receives.
+    ///
+    /// A loop over an iterator named by an enclosing `if`/`match` binding (`for x
+    /// in collision_points`, where `collision_points` chose between `base` and
+    /// `base.append(..)`) has the whole enclosing body cloned instead, so the
+    /// value pass sinks the loop into each branch — where that branch's iterator
+    /// constructor is known — and scalarizes each sunk loop over its own source.
     ///
     /// Only original function bodies are scanned. A specialized worker's loop
-    /// already passed through loop-state cloning while the worker was written,
-    /// and its body may carry a known upstream pipeline substituted in place; a
-    /// second in-place clone would force-inline that pipeline, which the
-    /// branch-join value tracking does not yet support.
+    /// already passed through loop-state cloning while the worker was written.
     fn scalarizeIteratorLoops(self: *Pass, original_fn_count: usize) Common.LowerError!void {
-        var loops = std.ArrayList(Ast.ExprId).empty;
-        defer loops.deinit(self.allocator);
-
-        for (self.program.fns.items[0..original_fn_count]) |fn_| {
-            const body = switch (fn_.body) {
+        for (0..original_fn_count) |index| {
+            const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
+            const body = switch (self.program.fns.items[index].body) {
                 .roc => |body| body,
                 .hosted => continue,
             };
-            try self.collectIteratorLoops(body, &loops);
-        }
 
-        for (loops.items) |loop_id| try self.cloneLoopInPlace(loop_id);
+            // A `for` over a branch-chosen or `append`-style iterator reads its
+            // source through a local the enclosing scope bound to an `if`/`match`.
+            // Cloning only the loop leaves that construction a residual value; the
+            // whole body must clone so the value pass sinks the loop into each
+            // branch (where the branch's constructor is known) and scalarizes each
+            // sunk loop over its own source. Cloning the whole body also carries
+            // any owned-construction loop it holds, so those are not collected
+            // separately for it.
+            if (try self.bodyHasBranchChosenIterLoop(body)) {
+                try self.cloneFnBodyInPlace(fn_id, body);
+                continue;
+            }
+
+            var loops = std.ArrayList(Ast.ExprId).empty;
+            defer loops.deinit(self.allocator);
+            try self.collectIteratorLoops(body, &loops);
+            for (loops.items) |loop_id| try self.cloneLoopInPlace(loop_id);
+        }
+    }
+
+    /// Whether a function body holds a `for` loop over an iterator named by an
+    /// enclosing `if`/`match` binding — the branch-chosen (tier-two) shape. The
+    /// loop's first carried value is an identity-style construction over a single
+    /// local, and that local is bound in scope to a branch expression whose arms
+    /// are the differently-shaped iterators the loop must specialize over.
+    fn bodyHasBranchChosenIterLoop(self: *Pass, body: Ast.ExprId) Allocator.Error!bool {
+        var branch_bound = std.AutoHashMap(Ast.LocalId, void).init(self.allocator);
+        defer branch_bound.deinit();
+        try self.collectBranchBoundLocals(body, &branch_bound);
+        if (branch_bound.count() == 0) return false;
+        return self.loopConsumesBranchBoundLocal(body, &branch_bound);
+    }
+
+    /// Record every local bound (in a block statement or a `let` expression) to
+    /// an `if`/`match` whose branches build iterator values — the sources a
+    /// branch-chosen `for` loop consumes.
+    fn collectBranchBoundLocals(
+        self: *Pass,
+        expr_id: Ast.ExprId,
+        out: *std.AutoHashMap(Ast.LocalId, void),
+    ) Allocator.Error!void {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .let_ => |let_| {
+                try self.noteBranchBoundBinding(let_.bind, let_.value, out);
+                try self.collectBranchBoundLocals(let_.value, out);
+                try self.collectBranchBoundLocals(let_.rest, out);
+            },
+            .block => |block| {
+                for (self.program.stmtSpan(block.statements)) |stmt_id| {
+                    switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+                        .let_ => |let_| {
+                            try self.noteBranchBoundBinding(let_.pat, let_.value, out);
+                            try self.collectBranchBoundLocals(let_.value, out);
+                        },
+                        .expr, .expect, .dbg => |value| try self.collectBranchBoundLocals(value, out),
+                        .return_ => |ret| try self.collectBranchBoundLocals(ret.value, out),
+                        else => {},
+                    }
+                }
+                try self.collectBranchBoundLocals(block.final_expr, out);
+            },
+            .loop_ => |loop| {
+                for (self.program.exprSpan(loop.initial_values)) |v| try self.collectBranchBoundLocals(v, out);
+                try self.collectBranchBoundLocals(loop.body, out);
+            },
+            .if_ => |if_| {
+                for (self.program.ifBranchSpan(if_.branches)) |br| try self.collectBranchBoundLocals(br.body, out);
+                try self.collectBranchBoundLocals(if_.final_else, out);
+            },
+            .match_ => |match| {
+                for (self.program.branchSpan(match.branches)) |br| try self.collectBranchBoundLocals(br.body, out);
+            },
+            .nominal, .dbg, .expect => |child| try self.collectBranchBoundLocals(child, out),
+            .return_ => |ret| try self.collectBranchBoundLocals(ret.value, out),
+            .comptime_branch_taken => |taken| try self.collectBranchBoundLocals(taken.body, out),
+            else => {},
+        }
+    }
+
+    fn noteBranchBoundBinding(
+        self: *Pass,
+        pat_id: Ast.PatId,
+        value_id: Ast.ExprId,
+        out: *std.AutoHashMap(Ast.LocalId, void),
+    ) Allocator.Error!void {
+        const local = switch (self.program.pats.items[@intFromEnum(pat_id)].data) {
+            .bind => |local| local,
+            else => return,
+        };
+        switch (self.program.exprs.items[@intFromEnum(value_id)].data) {
+            .if_, .match_ => try out.put(local, {}),
+            else => {},
+        }
+    }
+
+    /// Whether some loop's first carried value is an identity-style construction
+    /// over one of the branch-bound locals.
+    fn loopConsumesBranchBoundLocal(
+        self: *Pass,
+        expr_id: Ast.ExprId,
+        set: *std.AutoHashMap(Ast.LocalId, void),
+    ) Allocator.Error!bool {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .loop_ => |loop| {
+                const initials = self.program.exprSpan(loop.initial_values);
+                if (initials.len != 0 and self.loopInitialConsumesLocal(initials[0], set)) return true;
+                return self.loopConsumesBranchBoundLocal(loop.body, set);
+            },
+            .let_ => |let_| {
+                return (try self.loopConsumesBranchBoundLocal(let_.value, set)) or
+                    (try self.loopConsumesBranchBoundLocal(let_.rest, set));
+            },
+            .block => |block| {
+                for (self.program.stmtSpan(block.statements)) |stmt_id| {
+                    const found = switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+                        .let_ => |let_| try self.loopConsumesBranchBoundLocal(let_.value, set),
+                        .expr, .expect, .dbg => |value| try self.loopConsumesBranchBoundLocal(value, set),
+                        .return_ => |ret| try self.loopConsumesBranchBoundLocal(ret.value, set),
+                        else => false,
+                    };
+                    if (found) return true;
+                }
+                return self.loopConsumesBranchBoundLocal(block.final_expr, set);
+            },
+            .if_ => |if_| {
+                for (self.program.ifBranchSpan(if_.branches)) |br| {
+                    if (try self.loopConsumesBranchBoundLocal(br.body, set)) return true;
+                }
+                return self.loopConsumesBranchBoundLocal(if_.final_else, set);
+            },
+            .match_ => |match| {
+                for (self.program.branchSpan(match.branches)) |br| {
+                    if (try self.loopConsumesBranchBoundLocal(br.body, set)) return true;
+                }
+                return false;
+            },
+            .nominal, .dbg, .expect => |child| return self.loopConsumesBranchBoundLocal(child, set),
+            .return_ => |ret| return self.loopConsumesBranchBoundLocal(ret.value, set),
+            .comptime_branch_taken => |taken| return self.loopConsumesBranchBoundLocal(taken.body, set),
+            else => return false,
+        }
+    }
+
+    /// Whether a loop's first initial is a single-local direct-call construction
+    /// (`Iter.iter(named)`) over a branch-bound local.
+    fn loopInitialConsumesLocal(
+        self: *Pass,
+        expr_id: Ast.ExprId,
+        set: *std.AutoHashMap(Ast.LocalId, void),
+    ) bool {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        if (expr.data != .call_proc) return false;
+        const call = expr.data.call_proc;
+        if (Ast.localDirectCallee(call) == null) return false;
+        const args = self.program.exprSpan(call.args);
+        if (args.len != 1) return false;
+        const arg = self.program.exprs.items[@intFromEnum(args[0])];
+        return switch (arg.data) {
+            .local => |local| set.contains(local),
+            else => false,
+        };
+    }
+
+    /// Clone a whole function body through the value pass and replace it. The
+    /// value pass inlines the branch-chosen iterator's construction into each
+    /// branch, sinks the consuming loop into those branches, and scalarizes each
+    /// sunk loop's carried state.
+    fn cloneFnBodyInPlace(self: *Pass, fn_id: Ast.FnId, body: Ast.ExprId) Common.LowerError!void {
+        var cloner = Cloner.initForRewrite(self);
+        defer cloner.deinit();
+        // The branch-chosen iterator's construction chain (its source `List.iter`,
+        // each `append`/`map` adapter) spans separate `let` bindings. Its leaf
+        // source is a list value the known-shape gate does not count, so the
+        // source construction would stay residual and the branch would never
+        // become a known value the loop can sink into. Counting a list source as
+        // a known-shape argument exposes that construction — enough for the branch
+        // to sink and each sunk loop to scalarize — without force-inlining the
+        // arbitrary user calls whose over-inlining breaks known-match collapse.
+        cloner.inline_direct_requires_known_arg = true;
+        cloner.inline_list_source_construction = true;
+        cloner.force_loop_initial_inline = true;
+        const cloned = try cloner.cloneExpr(body);
+        self.program.fns.items[@intFromEnum(fn_id)].body = .{ .roc = cloned };
     }
 
     /// Collect the outermost loops whose first carried value is built by a
@@ -1047,10 +1229,10 @@ const Pass = struct {
     /// Whether a loop's first carried value is an iterator built directly over a
     /// source the loop owns — a construction call (`List.iter`, a range) whose
     /// arguments are all built inline rather than named locals. A `for` over a
-    /// pipeline named beforehand (`for x in some_iter`, `for x in
-    /// branch_chosen`) reads its source through a local, so it does not qualify:
-    /// force-inlining its `iter` dispatch would expand that upstream pipeline,
-    /// which the branch-join/`append` value tracking cannot yet fuse.
+    /// pipeline named beforehand (`for x in some_iter`) reads its source through
+    /// a local, so it does not qualify here; a branch-chosen source instead
+    /// routes through the whole-body clone, which sinks the loop into each
+    /// branch where the source construction is inline.
     fn loopInitialIsOwnedConstruction(self: *Pass, expr_id: Ast.ExprId) bool {
         const expr = self.program.exprs.items[@intFromEnum(expr_id)];
         if (expr.data != .call_proc) return false;
@@ -1497,6 +1679,12 @@ const Cloner = struct {
     /// named upstream pipeline stays a residual value rather than being expanded
     /// here (which the branch-join/`append` value tracking is not yet ready for).
     force_loop_initial_inline: bool = false,
+    /// When set, a `list` (or `str`) source expression counts as a known-shape
+    /// argument, so a direct construction over it (`List.iter(list)`) inlines
+    /// even under the known-shape gate. Set only for a branch-chosen loop's
+    /// whole-body clone, where the iterator source must inline for the branch to
+    /// become a known value the loop can sink into.
+    inline_list_source_construction: bool = false,
     current_loc: SourceLoc,
     current_region: Region,
 
@@ -1837,6 +2025,7 @@ const Cloner = struct {
             .nominal,
             .fn_ref,
             => (try self.pass.constructorShape(expr_id)) != null,
+            .list, .str_lit => self.inline_list_source_construction,
             .field_access => |field| blk: {
                 const receiver_local = localExpr(self.pass.program, field.receiver) orelse break :blk false;
                 const receiver = self.subst.get(receiver_local) orelse break :blk false;
@@ -2832,6 +3021,22 @@ const Cloner = struct {
     }
 
     fn simplifyKnownMatchValue(self: *Cloner, scrutinee: Value, branches_span: Ast.Span(Ast.Branch)) Common.LowerError!?Value {
+        return self.selectKnownMatchValue(scrutinee, branches_span, false);
+    }
+
+    /// Collapse a match whose scrutinee is a known constructor to the selected
+    /// branch's body. `decline_on_no_match` distinguishes the two callers: the
+    /// direct known-match collapse proves exhaustiveness (a known constructor
+    /// always selects a branch), so a miss is an invariant; case-of-case
+    /// distribution instead *offers* a value that a branch may not structurally
+    /// cover (an opaque tag payload the selection cannot verify), so it declines
+    /// and leaves the match materialized.
+    fn selectKnownMatchValue(
+        self: *Cloner,
+        scrutinee: Value,
+        branches_span: Ast.Span(Ast.Branch),
+        decline_on_no_match: bool,
+    ) Common.LowerError!?Value {
         if (scrutinee == .expr) return null;
         for (self.pass.program.branchSpan(branches_span)) |branch| {
             const match_change_start = self.changes.items.len;
@@ -2850,6 +3055,7 @@ const Cloner = struct {
             self.restore(change_start);
             return try self.resolvePending(pending_start, body);
         }
+        if (decline_on_no_match) return null;
         Common.invariant("known constructor match had no matching branch");
     }
 
@@ -3328,7 +3534,7 @@ const Cloner = struct {
         inner_value: Value,
         outer_branches_span: Ast.Span(Ast.Branch),
     ) Common.LowerError!?Value {
-        if (try self.simplifyKnownMatchValue(inner_value, outer_branches_span)) |value| return value;
+        if (try self.selectKnownMatchValue(inner_value, outer_branches_span, true)) |value| return value;
         return switch (inner_value) {
             .expr => |expr| try self.cloneCaseOfCaseValue(ty, expr, outer_branches_span),
             else => null,
