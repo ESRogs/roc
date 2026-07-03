@@ -458,6 +458,7 @@ const Pass = struct {
         try self.reserveSpecIds();
         try self.createSpecializations(original_fn_count);
         try self.rewriteExistingCalls();
+        try self.scalarizeIteratorLoops(original_fn_count);
         try Lift.recomputeCaptures(self.allocator, self.program);
 
         self.program.next_symbol = self.symbols.next;
@@ -964,6 +965,115 @@ const Pass = struct {
         }
     }
 
+    /// A `for` over a statically known source lowers to a loop carried directly
+    /// in its enclosing function; it never becomes a call-pattern worker, so
+    /// nothing else scalarizes it. Clone each such loop through the value pass
+    /// in place so its loop-carried iterator construction inlines and its state
+    /// splits into scalars — the same transformation a specialized collect
+    /// worker receives. Only the loop expression is cloned, not its enclosing
+    /// let bindings, so a pipeline built and named before the loop (a
+    /// branch-chosen or `append`-style iterator whose construction the loop only
+    /// consumes) stays a residual value and is not force-inlined here.
+    ///
+    /// Only original function bodies are scanned. A specialized worker's loop
+    /// already passed through loop-state cloning while the worker was written,
+    /// and its body may carry a known upstream pipeline substituted in place; a
+    /// second in-place clone would force-inline that pipeline, which the
+    /// branch-join value tracking does not yet support.
+    fn scalarizeIteratorLoops(self: *Pass, original_fn_count: usize) Common.LowerError!void {
+        var loops = std.ArrayList(Ast.ExprId).empty;
+        defer loops.deinit(self.allocator);
+
+        for (self.program.fns.items[0..original_fn_count]) |fn_| {
+            const body = switch (fn_.body) {
+                .roc => |body| body,
+                .hosted => continue,
+            };
+            try self.collectIteratorLoops(body, &loops);
+        }
+
+        for (loops.items) |loop_id| try self.cloneLoopInPlace(loop_id);
+    }
+
+    /// Collect the outermost loops whose first carried value is built by a
+    /// direct call — the shape a `for` over an iterator lowers to. A nested loop
+    /// is left to the clone of its enclosing loop, and a plain counting loop
+    /// (scalars initialized by literals) does not qualify.
+    fn collectIteratorLoops(self: *Pass, expr_id: Ast.ExprId, out: *std.ArrayList(Ast.ExprId)) Allocator.Error!void {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .loop_ => |loop| {
+                const initials = self.program.exprSpan(loop.initial_values);
+                if (initials.len != 0 and self.loopInitialIsOwnedConstruction(initials[0])) {
+                    try out.append(self.allocator, expr_id);
+                    return;
+                }
+                try self.collectIteratorLoops(loop.body, out);
+            },
+            .let_ => |let_| {
+                try self.collectIteratorLoops(let_.value, out);
+                try self.collectIteratorLoops(let_.rest, out);
+            },
+            .block => |block| {
+                for (self.program.stmtSpan(block.statements)) |stmt_id| {
+                    switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+                        .let_ => |let_| try self.collectIteratorLoops(let_.value, out),
+                        .expr, .expect, .dbg => |value| try self.collectIteratorLoops(value, out),
+                        .return_ => |ret| try self.collectIteratorLoops(ret.value, out),
+                        else => {},
+                    }
+                }
+                try self.collectIteratorLoops(block.final_expr, out);
+            },
+            .match_ => |match| {
+                try self.collectIteratorLoops(match.scrutinee, out);
+                for (self.program.branchSpan(match.branches)) |branch| {
+                    try self.collectIteratorLoops(branch.body, out);
+                }
+            },
+            .if_ => |if_| {
+                for (self.program.ifBranchSpan(if_.branches)) |if_branch| {
+                    try self.collectIteratorLoops(if_branch.body, out);
+                }
+                try self.collectIteratorLoops(if_.final_else, out);
+            },
+            .nominal, .dbg, .expect => |child| try self.collectIteratorLoops(child, out),
+            .return_ => |ret| try self.collectIteratorLoops(ret.value, out),
+            .comptime_branch_taken => |taken| try self.collectIteratorLoops(taken.body, out),
+            else => {},
+        }
+    }
+
+    /// Whether a loop's first carried value is an iterator built directly over a
+    /// source the loop owns — a construction call (`List.iter`, a range) whose
+    /// arguments are all built inline rather than named locals. A `for` over a
+    /// pipeline named beforehand (`for x in some_iter`, `for x in
+    /// branch_chosen`) reads its source through a local, so it does not qualify:
+    /// force-inlining its `iter` dispatch would expand that upstream pipeline,
+    /// which the branch-join/`append` value tracking cannot yet fuse.
+    fn loopInitialIsOwnedConstruction(self: *Pass, expr_id: Ast.ExprId) bool {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        if (expr.data != .call_proc) return false;
+        const call = expr.data.call_proc;
+        if (Ast.localDirectCallee(call) == null) return false;
+        for (self.program.exprSpan(call.args)) |arg| {
+            if (self.program.exprs.items[@intFromEnum(arg)].data == .local) return false;
+        }
+        return true;
+    }
+
+    /// Clone one loop through the value pass and overwrite the original in
+    /// place. Free locals the loop reads (its enclosing bindings) resolve to
+    /// themselves, so only the loop-carried iterator construction inlines.
+    fn cloneLoopInPlace(self: *Pass, loop_id: Ast.ExprId) Common.LowerError!void {
+        var cloner = Cloner.initForRewrite(self);
+        defer cloner.deinit();
+        cloner.inline_direct_requires_known_arg = true;
+        cloner.force_loop_initial_inline = true;
+        const cloned = try cloner.cloneExpr(loop_id);
+        self.program.exprs.items[@intFromEnum(loop_id)].data = self.program.exprs.items[@intFromEnum(cloned)].data;
+    }
+
     fn rewriteCallsInExpr(self: *Pass, expr_id: Ast.ExprId, done: []bool) Allocator.Error!void {
         const index = @intFromEnum(expr_id);
         if (done[index]) return;
@@ -1380,6 +1490,13 @@ const Cloner = struct {
     region_entry_marks: usize,
     inline_direct_calls: bool,
     inline_direct_requires_known_arg: bool,
+    /// When set, a loop's initial values inline their construction call even
+    /// without a known-shape argument, exposing an iterator constructor whose
+    /// arguments (a source list, a range bound) are opaque scalars. Only set for
+    /// an in-place loop clone, where the surrounding bindings are absent, so a
+    /// named upstream pipeline stays a residual value rather than being expanded
+    /// here (which the branch-join/`append` value tracking is not yet ready for).
+    force_loop_initial_inline: bool = false,
     current_loc: SourceLoc,
     current_region: Region,
 
@@ -2232,6 +2349,16 @@ const Cloner = struct {
         defer self.pass.allocator.free(values);
         const shapes = try self.pass.arena.allocator().alloc(Shape, initial_values.len);
         var has_constructor = false;
+        // A loop-carried value that begins as an iterator construction only
+        // reveals its constructor shape after that construction inlines. An
+        // adapter constructor (e.g. `List.iter(list)`, `Iter.map(inner, f)`)
+        // returns a record whose leaves the split threads as scalars, but its
+        // arguments (the source list, the inner iterator) need not themselves
+        // be known shapes. So expose the initial value's constructor by
+        // inlining its construction call regardless of argument shape; the
+        // per-argument known-shape gate governs only residual body calls.
+        const saved_requires_known_arg = self.inline_direct_requires_known_arg;
+        if (self.force_loop_initial_inline) self.inline_direct_requires_known_arg = false;
         for (initial_values, 0..) |initial, index| {
             values[index] = try self.cloneExprValue(initial);
             if (try self.pass.shapeFromValue(values[index])) |shape| {
@@ -2241,6 +2368,7 @@ const Cloner = struct {
                 shapes[index] = .{ .any = valueType(self.pass.program, values[index]) };
             }
         }
+        self.inline_direct_requires_known_arg = saved_requires_known_arg;
 
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
