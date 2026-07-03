@@ -369,6 +369,18 @@ const ActiveCallable = struct {
     specialized: Ast.FnId,
 };
 
+/// A function currently being inlined, with the number of known-constructor
+/// nodes carried by the call's arguments and captures. A same-function call
+/// nested inside its own inlining may re-enter only when its known-constructor
+/// arguments are strictly smaller, which is what lets an adapter's step inline
+/// `Iter.next` on its own inner iterator (one adapter layer smaller) while
+/// still terminating: the measure strictly decreases and the base iterator's
+/// step calls no further `next`.
+const InlineFrame = struct {
+    fn_id: Ast.FnId,
+    known_size: usize,
+};
+
 const Pass = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -907,10 +919,10 @@ const Pass = struct {
         var cloner = Cloner.init(self, source_fn_id, spec.pattern);
         defer cloner.deinit();
 
-        try cloner.inline_stack.append(self.allocator, source_fn_id);
+        try cloner.inline_stack.append(self.allocator, .{ .fn_id = source_fn_id, .known_size = 0 });
         defer {
             const popped = cloner.inline_stack.pop() orelse Common.invariant("call-pattern inline stack underflow while writing specialization");
-            if (popped != source_fn_id) Common.invariant("call-pattern inline stack was corrupted while writing specialization");
+            if (popped.fn_id != source_fn_id) Common.invariant("call-pattern inline stack was corrupted while writing specialization");
         }
 
         const args = try cloner.buildArgs();
@@ -1352,7 +1364,7 @@ const Cloner = struct {
     subst: std.AutoHashMap(Ast.LocalId, Value),
     binder_subst: std.AutoHashMap(BinderIdentity, Value),
     changes: std.ArrayList(BindingChange),
-    inline_stack: std.ArrayList(Ast.FnId),
+    inline_stack: std.ArrayList(InlineFrame),
     callable_stack: std.ArrayList(ActiveCallable),
     loop_stack: std.ArrayList(LoopPattern),
     /// Bindings created while producing a structured value, not yet emitted.
@@ -2847,6 +2859,73 @@ const Cloner = struct {
         return try self.makeReusableForMatch(value);
     }
 
+    /// Count the constructor nodes (tag, record, tuple, nominal, callable) in a
+    /// known value, treating opaque `expr` leaves as zero. This is the measure
+    /// the inline recursion guard shrinks: a call re-entering a function already
+    /// on the inline stack is admitted only when its known-constructor arguments
+    /// are strictly smaller, so inlining an adapter step's `Iter.next` on its
+    /// inner iterator (one layer smaller) makes progress and terminates.
+    fn knownConstructorSize(self: *Cloner, value: Value) usize {
+        return switch (value) {
+            .expr => 0,
+            .tag => |tag| blk: {
+                var count: usize = 1;
+                for (tag.payloads) |payload| count += self.knownConstructorSize(payload);
+                break :blk count;
+            },
+            .record => |record| blk: {
+                var count: usize = 1;
+                for (record.fields) |field| count += self.knownConstructorSize(field.value);
+                break :blk count;
+            },
+            .tuple => |tuple| blk: {
+                var count: usize = 1;
+                for (tuple.items) |item| count += self.knownConstructorSize(item);
+                break :blk count;
+            },
+            .nominal => |nominal| 1 + self.knownConstructorSize(nominal.backing.*),
+            .callable => |callable| blk: {
+                var count: usize = 1;
+                for (callable.captures) |capture| count += self.knownConstructorSize(capture);
+                break :blk count;
+            },
+        };
+    }
+
+    /// Resolve an expression to its known value through the current
+    /// substitution environment without emitting anything. Used only to measure
+    /// a call's known-constructor size for the inline recursion guard; returns
+    /// null when the expression carries no known constructor here.
+    fn peekKnownValue(self: *Cloner, expr_id: Ast.ExprId) ?Value {
+        const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
+        return switch (expr.data) {
+            .local => |local| blk: {
+                if (self.subst.get(local)) |value| break :blk value;
+                if (self.binderIdentityOf(local)) |identity| {
+                    if (self.binder_subst.get(identity)) |value| break :blk value;
+                }
+                break :blk null;
+            },
+            .field_access => |field| blk: {
+                const receiver = self.peekKnownValue(field.receiver) orelse break :blk null;
+                break :blk fieldFromValue(receiver, field.field);
+            },
+            .tuple_access => |access| blk: {
+                const receiver = self.peekKnownValue(access.tuple) orelse break :blk null;
+                break :blk itemFromValue(receiver, access.elem_index);
+            },
+            else => null,
+        };
+    }
+
+    fn argsKnownConstructorSize(self: *Cloner, span: Ast.Span(Ast.ExprId)) usize {
+        var total: usize = 0;
+        for (self.pass.program.exprSpan(span)) |arg| {
+            if (self.peekKnownValue(arg)) |value| total += self.knownConstructorSize(value);
+        }
+        return total;
+    }
+
     fn unsafeLeafCount(self: *Cloner, value: Value) usize {
         return switch (value) {
             .expr => |expr| if (self.exprCanSubstitute(expr)) 0 else 1,
@@ -3134,8 +3213,12 @@ const Cloner = struct {
         callable: CallableValue,
         args_span: Ast.Span(Ast.ExprId),
     ) Common.LowerError!Value {
+        var callable_call_size: usize = 0;
+        for (callable.captures) |capture| callable_call_size += self.knownConstructorSize(capture);
+        callable_call_size += self.argsKnownConstructorSize(args_span);
         for (self.inline_stack.items) |active| {
-            if (active == callable.fn_id) {
+            if (active.fn_id != callable.fn_id) continue;
+            if (callable_call_size == 0 or callable_call_size >= active.known_size) {
                 return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
                     .callee = try self.materialize(.{ .callable = callable }),
                     .args = try self.cloneExprSpan(args_span),
@@ -3197,10 +3280,10 @@ const Cloner = struct {
             prepared_args[index] = try self.valueForInlineLocal(source_arg.local, arg_value, body, unsafe_count);
         }
 
-        try self.inline_stack.append(self.pass.allocator, callable.fn_id);
+        try self.inline_stack.append(self.pass.allocator, .{ .fn_id = callable.fn_id, .known_size = callable_call_size });
         defer {
             const popped = self.inline_stack.pop() orelse Common.invariant("call-pattern inline stack underflow");
-            if (popped != callable.fn_id) Common.invariant("call-pattern inline stack was corrupted");
+            if (popped.fn_id != callable.fn_id) Common.invariant("call-pattern inline stack was corrupted");
         }
 
         for (source_args, prepared_args) |source_arg, arg_value| {
@@ -3217,8 +3300,12 @@ const Cloner = struct {
         captures_span: Ast.Span(Ast.ExprId),
         original_expr: Ast.ExprId,
     ) Common.LowerError!Value {
+        const direct_call_size = self.argsKnownConstructorSize(args_span) + self.argsKnownConstructorSize(captures_span);
         for (self.inline_stack.items) |active| {
-            if (active == callee) return .{ .expr = try self.cloneExprPlain(original_expr) };
+            if (active.fn_id != callee) continue;
+            if (direct_call_size == 0 or direct_call_size >= active.known_size) {
+                return .{ .expr = try self.cloneExprPlain(original_expr) };
+            }
         }
 
         const source_fn = self.pass.program.fns.items[@intFromEnum(callee)];
@@ -3275,10 +3362,10 @@ const Cloner = struct {
             prepared_args[index] = try self.valueForInlineLocal(source_arg.local, arg_value, body, unsafe_count);
         }
 
-        try self.inline_stack.append(self.pass.allocator, callee);
+        try self.inline_stack.append(self.pass.allocator, .{ .fn_id = callee, .known_size = direct_call_size });
         defer {
             const popped = self.inline_stack.pop() orelse Common.invariant("call-pattern inline stack underflow");
-            if (popped != callee) Common.invariant("call-pattern inline stack was corrupted");
+            if (popped.fn_id != callee) Common.invariant("call-pattern inline stack was corrupted");
         }
 
         for (captures, prepared_captures) |capture, capture_value| {
