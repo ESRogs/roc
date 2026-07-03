@@ -91,6 +91,9 @@ type_id_to_zig = |type_table, duplicate_tag_names, type_id| {
 	type_repr_to_zig(type_table, duplicate_tag_names, type_id, TypeTable.get(table, type_id))
 }
 
+is_opaque_box_zig_type : Str -> Bool
+is_opaque_box_zig_type = |zig_type| zig_type == "void" or zig_type == "*anyopaque" or zig_type == "RocBox"
+
 ## Render one `extern struct` field declaration for a record field. Unnamed
 ## nominal-record padding fields become fixed-size byte arrays (`[size]u8`);
 ## named fields use their resolved Zig type.
@@ -122,8 +125,8 @@ type_repr_to_zig = |type_table, duplicate_tag_names, type_id, type_repr| {
 				RocUnknown(_) => "RocBox"
 				_ => {
 					inner_zig = type_id_to_zig(type_table, duplicate_tag_names, inner_id)
-					if inner_zig == "*anyopaque" {
-						"*anyopaque"
+					if is_opaque_box_zig_type(inner_zig) {
+						"RocBox"
 					} else {
 						"*${inner_zig}"
 					}
@@ -1036,7 +1039,7 @@ decref_stmt_for_repr = |type_table, duplicate_tag_names, type_id, type_repr, exp
 				RocFunction(_) => "    decrefErasedCallable(${expr}, roc_host);\n"
 				_ => {
 					inner_zig = type_id_to_zig(type_table, duplicate_tag_names, inner_id)
-					if inner_zig == "*anyopaque" {
+					if is_opaque_box_zig_type(inner_zig) {
 						"    decrefBox(@ptrCast(${expr}), roc_host);\n"
 					} else if is_type_refcounted(type_table, inner_id) {
 						"    decrefBoxWith(@ptrCast(${expr}), @alignOf(${inner_zig}), true, &${box_payload_decref_name(inner_id)}, roc_host);\n"
@@ -1229,7 +1232,7 @@ generate_box_payload_decref_helpers = |type_table, duplicate_tag_names| {
 						RocFunction(_) => {}
 						_ => {
 							inner_zig = type_id_to_zig(type_table, duplicate_tag_names, inner_id)
-							if inner_zig != "*anyopaque" and is_type_refcounted(type_table, inner_id) {
+							if !is_opaque_box_zig_type(inner_zig) and is_type_refcounted(type_table, inner_id) {
 								stmt = decref_stmt_for_type_id(type_table, duplicate_tag_names, inner_id, "payload.*")
 								$helpers = Str.concat(
 									$helpers,
