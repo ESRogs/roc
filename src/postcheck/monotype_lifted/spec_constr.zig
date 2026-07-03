@@ -1009,7 +1009,8 @@ const Pass = struct {
             // any owned-construction loop it holds, so those are not collected
             // separately for it.
             if (try self.bodyHasBranchChosenIterLoop(body)) {
-                try self.cloneFnBodyInPlace(fn_id, body);
+                const peeled = try self.peelBranchAppendBody(body);
+                try self.cloneFnBodyInPlace(fn_id, peeled orelse body);
                 continue;
             }
 
@@ -1163,6 +1164,903 @@ const Pass = struct {
             .local => |local| set.contains(local),
             else => false,
         };
+    }
+
+    /// The canonical desugared `for`-loop over an iterator: a two-slot loop
+    /// (iterator state, one carried accumulator) whose body pulls the next item
+    /// and dispatches on the pull result. Recognized structurally so the peel
+    /// can factor the shared base iteration out of a branch-chosen source.
+    const CanonicalForLoop = struct {
+        /// The local fed to the iterator constructor in the iterator slot's
+        /// initial value — the branch-bound source the loop consumes.
+        source_local: Ast.LocalId,
+        /// The whole iterator-slot initial expression (a construction over
+        /// `source_local`), reused to rebuild the base iteration.
+        iter_init: Ast.ExprId,
+        /// The accumulator slot's initial value.
+        carry_init: Ast.ExprId,
+        /// The accumulator loop parameter.
+        carry_param: Ast.LocalId,
+        /// The accumulator loop parameter's type.
+        carry_ty: Type.TypeId,
+        /// The `One(...)` payload's item pattern — bound to each pulled element.
+        item_pat: Ast.PatId,
+        /// The `One(...)` arm body, ending in a `continue` whose accumulator
+        /// value is the per-element result.
+        one_body: Ast.ExprId,
+        /// The local bound by the `One(...)` payload's `rest` field.
+        rest_local: Ast.LocalId,
+    };
+
+    /// A branch arm's iterator source reduced to a shared base plus the finite
+    /// items an `append` chain adds after it, in yield order.
+    const ArmChain = struct {
+        base: Ast.LocalId,
+        items: []Ast.ExprId,
+    };
+
+    /// Rewrite a `for` over a branch-chosen `append`-style iterator into one
+    /// loop over the shared base source followed by a branch-dispatched tail
+    /// that replays the loop body for each appended item. The base loop is
+    /// scalarized by the whole-body clone that runs afterward; the tail folds
+    /// the same per-element computation over the taken arm's appended items, in
+    /// exactly the unfused pull order (base elements, then appended items in arm
+    /// order). Returns null (keeping the per-branch split) for any shape it
+    /// cannot faithfully reconstruct.
+    fn peelBranchAppendBody(self: *Pass, body: Ast.ExprId) Common.LowerError!?Ast.ExprId {
+        const body_expr = self.program.exprs.items[@intFromEnum(body)];
+        const block = switch (body_expr.data) {
+            .block => |b| b,
+            else => return null,
+        };
+        const stmts = try self.allocator.dupe(Ast.StmtId, self.program.stmtSpan(block.statements));
+        defer self.allocator.free(stmts);
+
+        // The loop must be bound by a statement whose result flows straight to
+        // the block's final expression, so the tail can take the loop's place.
+        const result_local = localExpr(self.program, block.final_expr) orelse return null;
+
+        var loop_stmt_index: ?usize = null;
+        var loop_expr_id: Ast.ExprId = undefined;
+        for (stmts, 0..) |stmt_id, index| {
+            const let_ = switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+                .let_ => |l| l,
+                else => continue,
+            };
+            const bound = switch (self.program.pats.items[@intFromEnum(let_.pat)].data) {
+                .bind => |local| local,
+                else => continue,
+            };
+            if (bound != result_local) continue;
+            if (self.program.exprs.items[@intFromEnum(let_.value)].data != .loop_) continue;
+            loop_stmt_index = index;
+            loop_expr_id = let_.value;
+            break;
+        }
+        const li = loop_stmt_index orelse return null;
+        if (localUseCountInExpr(self.program, result_local, body) != 1) return null;
+
+        const canonical = (try self.matchCanonicalForLoop(loop_expr_id)) orelse return null;
+        if (localUseCountInExpr(self.program, canonical.source_local, body) != 1) return null;
+
+        // Find the branch that binds the source, and confirm its arms share one
+        // base source reached by unwrapping append adapter state.
+        var collision_stmt_index: ?usize = null;
+        var branch_expr_id: Ast.ExprId = undefined;
+        for (stmts, 0..) |stmt_id, index| {
+            const let_ = switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+                .let_ => |l| l,
+                else => continue,
+            };
+            const bound = switch (self.program.pats.items[@intFromEnum(let_.pat)].data) {
+                .bind => |local| local,
+                else => continue,
+            };
+            if (bound != canonical.source_local) continue;
+            switch (self.program.exprs.items[@intFromEnum(let_.value)].data) {
+                .if_, .match_ => {},
+                else => return null,
+            }
+            collision_stmt_index = index;
+            branch_expr_id = let_.value;
+            break;
+        }
+        const ci = collision_stmt_index orelse return null;
+
+        const base_local = (try self.sharedArmBase(branch_expr_id)) orelse return null;
+
+        // Build the tail dispatch: the branch structure, each arm's body
+        // replaced by the accumulator folded over that arm's appended items.
+        const tail = (try self.buildTailDispatch(branch_expr_id, result_local, base_local, canonical)) orelse return null;
+
+        // Rebuild the loop so its iterator slot iterates the shared base.
+        const new_loop = (try self.rebuildLoopOverBase(loop_expr_id, base_local, canonical)) orelse return null;
+
+        var new_stmts = std.ArrayList(Ast.StmtId).empty;
+        defer new_stmts.deinit(self.allocator);
+        for (stmts, 0..) |stmt_id, index| {
+            if (index == ci) continue; // the branch binding is replayed as the tail
+            if (index == li) {
+                const loop_let = self.program.stmts.items[@intFromEnum(stmt_id)].let_;
+                try new_stmts.append(self.allocator, try self.program.addStmt(.{ .let_ = .{
+                    .pat = loop_let.pat,
+                    .value = new_loop,
+                    .recursive = loop_let.recursive,
+                    .comptime_site = loop_let.comptime_site,
+                } }));
+                continue;
+            }
+            try new_stmts.append(self.allocator, stmt_id);
+        }
+
+        return try self.program.addExpr(.{ .ty = body_expr.ty, .data = .{ .block = .{
+            .statements = try self.program.addStmtSpan(new_stmts.items),
+            .final_expr = tail,
+        } } });
+    }
+
+    fn stripArmBlock(self: *Pass, expr_id: Ast.ExprId) Ast.ExprId {
+        var current = expr_id;
+        while (true) {
+            const expr = self.program.exprs.items[@intFromEnum(current)];
+            switch (expr.data) {
+                .block => |block| {
+                    if (self.program.stmtSpan(block.statements).len != 0) return current;
+                    current = block.final_expr;
+                },
+                else => return current,
+            }
+        }
+    }
+
+    /// Unwrap to a block's final expression regardless of intervening
+    /// statements. Used only to classify a function's shape, never to move
+    /// code, so discarding the statements is sound here.
+    fn blockFinal(self: *Pass, expr_id: Ast.ExprId) Ast.ExprId {
+        var current = expr_id;
+        while (true) {
+            const expr = self.program.exprs.items[@intFromEnum(current)];
+            switch (expr.data) {
+                .block => |block| current = block.final_expr,
+                else => return current,
+            }
+        }
+    }
+
+    const DirectCall = struct { fn_id: Ast.FnId, args: []const Ast.ExprId };
+
+    fn asDirectCall(self: *Pass, expr_id: Ast.ExprId) ?DirectCall {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        if (expr.data != .call_proc) return null;
+        const call = expr.data.call_proc;
+        const fn_id = Ast.localDirectCallee(call) orelse return null;
+        return .{ .fn_id = fn_id, .args = self.program.exprSpan(call.args) };
+    }
+
+    /// Match the canonical desugared `for` loop shape, extracting the pieces the
+    /// peel threads. Returns null for any other loop.
+    fn matchCanonicalForLoop(self: *Pass, loop_expr_id: Ast.ExprId) Common.LowerError!?CanonicalForLoop {
+        const loop = self.program.exprs.items[@intFromEnum(loop_expr_id)].data.loop_;
+        const params = self.program.typedLocalSpan(loop.params);
+        const initials = self.program.exprSpan(loop.initial_values);
+        if (params.len != 2 or initials.len != 2) return null;
+
+        const iter_param = params[0].local;
+        const carry_param = params[1].local;
+
+        // The iterator slot's initial constructs the iterator from one source
+        // local — the branch-bound value.
+        const iter_call = self.asDirectCall(initials[0]) orelse return null;
+        if (iter_call.args.len != 1) return null;
+        const source_local = localExpr(self.program, iter_call.args[0]) orelse return null;
+
+        const match_expr = self.program.exprs.items[@intFromEnum(self.stripArmBlock(loop.body))];
+        if (match_expr.data != .match_) return null;
+        const match = match_expr.data.match_;
+
+        // The scrutinee pulls the next item from the iterator slot.
+        const next_call = self.asDirectCall(match.scrutinee) orelse return null;
+        if (next_call.args.len != 1) return null;
+        if (localExpr(self.program, next_call.args[0]) != iter_param) return null;
+
+        var item_pat: ?Ast.PatId = null;
+        var one_body: Ast.ExprId = undefined;
+        var rest_local: Ast.LocalId = undefined;
+        for (self.program.branchSpan(match.branches)) |branch| {
+            if (branch.guard != null) return null;
+            const pat = self.program.pats.items[@intFromEnum(branch.pat)];
+            const tag = switch (pat.data) {
+                .tag => |t| t,
+                else => return null,
+            };
+            const payloads = self.program.patSpan(tag.payloads);
+            if (payloads.len == 0) {
+                // Exhausted arm: breaks with the accumulator unchanged.
+                const broke = self.stripArmBlock(branch.body);
+                const break_val = switch (self.program.exprs.items[@intFromEnum(broke)].data) {
+                    .break_ => |maybe| maybe orelse return null,
+                    else => return null,
+                };
+                if (localExpr(self.program, break_val) != carry_param) return null;
+                continue;
+            }
+            if (payloads.len != 1) return null;
+            const record_fields = switch (self.program.pats.items[@intFromEnum(payloads[0])].data) {
+                .record => |fields| self.program.recordDestructSpan(fields),
+                else => return null,
+            };
+            const cont = (self.tailContinueValues(branch.body)) orelse return null;
+            if (cont.len != 2) return null;
+            const cont_rest = localExpr(self.program, cont[0]) orelse return null;
+
+            if (record_fields.len == 1) {
+                // Skip arm: advances the iterator, accumulator unchanged.
+                if (localExpr(self.program, cont[1]) != carry_param) return null;
+                const only = record_fields[0];
+                if (self.bindLocalOf(only.pattern) != cont_rest) return null;
+                continue;
+            }
+            if (record_fields.len != 2) return null;
+            // One arm: yields an item and advances; its continue carries the
+            // per-element accumulator result.
+            var this_item_pat: ?Ast.PatId = null;
+            var found_rest = false;
+            for (record_fields) |field| {
+                if (self.bindLocalOf(field.pattern)) |bound| {
+                    if (bound == cont_rest) {
+                        found_rest = true;
+                        continue;
+                    }
+                }
+                if (this_item_pat != null) return null;
+                this_item_pat = field.pattern;
+            }
+            if (!found_rest or this_item_pat == null) return null;
+            item_pat = this_item_pat;
+            one_body = branch.body;
+            rest_local = cont_rest;
+        }
+
+        const ip = item_pat orelse return null;
+        return .{
+            .source_local = source_local,
+            .iter_init = initials[0],
+            .carry_init = initials[1],
+            .carry_param = carry_param,
+            .carry_ty = params[1].ty,
+            .item_pat = ip,
+            .one_body = one_body,
+            .rest_local = rest_local,
+        };
+    }
+
+    fn bindLocalOf(self: *Pass, pat_id: Ast.PatId) ?Ast.LocalId {
+        return switch (self.program.pats.items[@intFromEnum(pat_id)].data) {
+            .bind => |local| local,
+            else => null,
+        };
+    }
+
+    /// The values of the `continue` at the tail position of a loop-body arm,
+    /// or null when the arm's tail is not a plain `continue`.
+    fn tailContinueValues(self: *Pass, expr_id: Ast.ExprId) ?[]const Ast.ExprId {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        return switch (expr.data) {
+            .continue_ => |cont| self.program.exprSpan(cont.values),
+            .block => |block| self.tailContinueValues(block.final_expr),
+            else => null,
+        };
+    }
+
+    /// The shared base local every arm of the source branch reduces to, or null
+    /// when the arms do not share one base under append unwrapping.
+    fn sharedArmBase(self: *Pass, branch_expr_id: Ast.ExprId) Common.LowerError!?Ast.LocalId {
+        const expr = self.program.exprs.items[@intFromEnum(branch_expr_id)];
+        var base: ?Ast.LocalId = null;
+        switch (expr.data) {
+            .if_ => |if_| {
+                for (self.program.ifBranchSpan(if_.branches)) |br| {
+                    if (!try self.armBaseMatches(br.body, &base)) return null;
+                }
+                if (!try self.armBaseMatches(if_.final_else, &base)) return null;
+            },
+            .match_ => |match| {
+                for (self.program.branchSpan(match.branches)) |br| {
+                    if (br.guard != null) return null;
+                    if (!try self.armBaseMatches(br.body, &base)) return null;
+                }
+            },
+            else => return null,
+        }
+        return base;
+    }
+
+    fn armBaseMatches(self: *Pass, arm: Ast.ExprId, base: *?Ast.LocalId) Common.LowerError!bool {
+        const chain = (try self.reduceArmChain(arm)) orelse return false;
+        defer self.allocator.free(chain.items);
+        if (base.*) |existing| {
+            if (existing != chain.base) return false;
+        } else {
+            base.* = chain.base;
+        }
+        return true;
+    }
+
+    /// Reduce a branch arm's iterator source to its base local and the finite
+    /// list of items appended after it, in yield order. Caller owns the items.
+    fn reduceArmChain(self: *Pass, arm: Ast.ExprId) Common.LowerError!?ArmChain {
+        const stripped = self.stripArmBlock(arm);
+        if (localExpr(self.program, stripped)) |local| {
+            return .{ .base = local, .items = try self.allocator.alloc(Ast.ExprId, 0) };
+        }
+        const call = self.asDirectCall(stripped) orelse return null;
+        if (call.args.len != 2) return null;
+        if (!self.fnIsSuffixAppend(call.fn_id)) return null;
+        const item = call.args[1];
+        const inner = (try self.reduceArmChain(call.args[0])) orelse return null;
+        defer self.allocator.free(inner.items);
+        const items = try self.allocator.alloc(Ast.ExprId, inner.items.len + 1);
+        @memcpy(items[0..inner.items.len], inner.items);
+        items[inner.items.len] = item;
+        return .{ .base = inner.base, .items = items };
+    }
+
+    /// Whether a two-argument function is a suffix `append` adapter: it builds
+    /// an iterator whose step, when its inner iterator is exhausted, yields one
+    /// held item and then finishes. Detected by that step's structure — the
+    /// exhausted arm of a pull over the inner iterator producing a held value —
+    /// not by the function's name.
+    fn fnIsSuffixAppend(self: *Pass, fn_id: Ast.FnId) bool {
+        const raw = @intFromEnum(fn_id);
+        if (raw >= self.program.fns.items.len) return false;
+        const fn_ = self.program.fns.items[raw];
+        if (self.program.typedLocalSpan(fn_.args).len != 2) return false;
+        const body = switch (fn_.body) {
+            .roc => |b| b,
+            .hosted => return false,
+        };
+        // The body constructs the adapter through a `make`-style helper.
+        const make_call = self.asDirectCall(self.blockFinal(body)) orelse return false;
+        const make_raw = @intFromEnum(make_call.fn_id);
+        if (make_raw >= self.program.fns.items.len) return false;
+        const make_body = switch (self.program.fns.items[make_raw].body) {
+            .roc => |b| b,
+            .hosted => return false,
+        };
+        // The helper builds the iterator record with a step callable; find that
+        // step function reference among its arguments.
+        const record_call = self.asDirectCall(self.blockFinal(make_body)) orelse return false;
+        var step_fn: ?Ast.FnId = null;
+        for (record_call.args) |arg| {
+            switch (self.program.exprs.items[@intFromEnum(arg)].data) {
+                .fn_ref => |fn_ref| step_fn = fn_ref.fn_id,
+                else => {},
+            }
+        }
+        const step = step_fn orelse return false;
+        return self.stepYieldsHeldItemWhenExhausted(step);
+    }
+
+    /// Whether a step function's pull over its inner iterator has an exhausted
+    /// arm (a nullary-tag pattern) that yields a held item — the structural
+    /// signature of a suffix append, distinguishing it from prepend (item
+    /// yielded immediately) or map (item transformed from the inner element).
+    fn stepYieldsHeldItemWhenExhausted(self: *Pass, fn_id: Ast.FnId) bool {
+        const raw = @intFromEnum(fn_id);
+        if (raw >= self.program.fns.items.len) return false;
+        const body = switch (self.program.fns.items[raw].body) {
+            .roc => |b| b,
+            .hosted => return false,
+        };
+        return self.exprHasExhaustedYield(body, 0);
+    }
+
+    fn exprHasExhaustedYield(self: *Pass, expr_id: Ast.ExprId, depth: usize) bool {
+        if (depth > 64) return false;
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .match_ => |match| {
+                // A pull over the inner iterator: a match with a nullary-tag
+                // (exhausted) arm yielding a held item.
+                if (self.asDirectCall(match.scrutinee) != null) {
+                    for (self.program.branchSpan(match.branches)) |branch| {
+                        const tag = switch (self.program.pats.items[@intFromEnum(branch.pat)].data) {
+                            .tag => |t| t,
+                            else => continue,
+                        };
+                        if (self.program.patSpan(tag.payloads).len != 0) continue;
+                        if (self.armYieldsHeldItem(branch.body)) return true;
+                    }
+                }
+                if (self.exprHasExhaustedYield(match.scrutinee, depth + 1)) return true;
+                for (self.program.branchSpan(match.branches)) |branch| {
+                    if (self.exprHasExhaustedYield(branch.body, depth + 1)) return true;
+                }
+                return false;
+            },
+            .if_ => |if_| {
+                for (self.program.ifBranchSpan(if_.branches)) |br| {
+                    if (self.exprHasExhaustedYield(br.body, depth + 1)) return true;
+                }
+                return self.exprHasExhaustedYield(if_.final_else, depth + 1);
+            },
+            .block => |block| {
+                for (self.program.stmtSpan(block.statements)) |stmt_id| {
+                    switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+                        .let_ => |let_| if (self.exprHasExhaustedYield(let_.value, depth + 1)) return true,
+                        else => {},
+                    }
+                }
+                return self.exprHasExhaustedYield(block.final_expr, depth + 1);
+            },
+            .let_ => |let_| return self.exprHasExhaustedYield(let_.value, depth + 1) or
+                self.exprHasExhaustedYield(let_.rest, depth + 1),
+            else => return false,
+        }
+    }
+
+    /// Whether an exhausted-arm body yields a `One`-style item whose held value
+    /// is a plain (captured) local — the appended item.
+    fn armYieldsHeldItem(self: *Pass, expr_id: Ast.ExprId) bool {
+        const yielded = self.stripArmBlock(expr_id);
+        const tag = switch (self.program.exprs.items[@intFromEnum(yielded)].data) {
+            .tag => |t| t,
+            else => return false,
+        };
+        const payloads = self.program.exprSpan(tag.payloads);
+        if (payloads.len != 1) return false;
+        const fields = switch (self.program.exprs.items[@intFromEnum(payloads[0])].data) {
+            .record => |f| self.program.fieldExprSpan(f),
+            else => return false,
+        };
+        for (fields) |field| {
+            if (localExpr(self.program, field.value) != null) return true;
+        }
+        return false;
+    }
+
+    /// Rebuild the loop so its iterator slot iterates the shared base, keeping
+    /// the accumulator slot and body unchanged.
+    fn rebuildLoopOverBase(
+        self: *Pass,
+        loop_expr_id: Ast.ExprId,
+        base_local: Ast.LocalId,
+        canonical: CanonicalForLoop,
+    ) Common.LowerError!?Ast.ExprId {
+        const loop_expr = self.program.exprs.items[@intFromEnum(loop_expr_id)];
+        const loop = loop_expr.data.loop_;
+        const iter_call_expr = self.program.exprs.items[@intFromEnum(canonical.iter_init)];
+        const iter_call = iter_call_expr.data.call_proc;
+
+        const base_ty = self.program.locals.items[@intFromEnum(base_local)].ty;
+        const base_ref = try self.program.addExpr(.{ .ty = base_ty, .data = .{ .local = base_local } });
+        const new_iter_init = try self.program.addExpr(.{ .ty = iter_call_expr.ty, .data = .{ .call_proc = .{
+            .callee = iter_call.callee,
+            .args = try self.program.addExprSpan(&.{base_ref}),
+            .captures = iter_call.captures,
+            .is_cold = iter_call.is_cold,
+        } } });
+
+        const new_initials = try self.program.addExprSpan(&.{ new_iter_init, canonical.carry_init });
+        return try self.program.addExpr(.{ .ty = loop_expr.ty, .data = .{ .loop_ = .{
+            .params = loop.params,
+            .initial_values = new_initials,
+            .body = loop.body,
+        } } });
+    }
+
+    /// Build the branch-dispatched tail: the source branch's structure, each
+    /// arm's body replaced by the accumulator folded over that arm's appended
+    /// items in yield order.
+    fn buildTailDispatch(
+        self: *Pass,
+        branch_expr_id: Ast.ExprId,
+        result_local: Ast.LocalId,
+        base_local: Ast.LocalId,
+        canonical: CanonicalForLoop,
+    ) Common.LowerError!?Ast.ExprId {
+        const expr = self.program.exprs.items[@intFromEnum(branch_expr_id)];
+        switch (expr.data) {
+            .if_ => |if_| {
+                const branches = try self.allocator.dupe(Ast.IfBranch, self.program.ifBranchSpan(if_.branches));
+                defer self.allocator.free(branches);
+                var rewritten = try self.allocator.alloc(Ast.IfBranch, branches.len);
+                defer self.allocator.free(rewritten);
+                for (branches, 0..) |br, index| {
+                    const arm = (try self.buildArmFold(br.body, result_local, base_local, canonical)) orelse return null;
+                    rewritten[index] = .{ .cond = br.cond, .body = arm };
+                }
+                const final_else = (try self.buildArmFold(if_.final_else, result_local, base_local, canonical)) orelse return null;
+                return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .if_ = .{
+                    .branches = try self.program.addIfBranchSpan(rewritten),
+                    .final_else = final_else,
+                } } });
+            },
+            .match_ => |match| {
+                const branches = try self.allocator.dupe(Ast.Branch, self.program.branchSpan(match.branches));
+                defer self.allocator.free(branches);
+                var rewritten = try self.allocator.alloc(Ast.Branch, branches.len);
+                defer self.allocator.free(rewritten);
+                for (branches, 0..) |br, index| {
+                    const arm = (try self.buildArmFold(br.body, result_local, base_local, canonical)) orelse return null;
+                    rewritten[index] = .{ .pat = br.pat, .guard = br.guard, .body = arm };
+                }
+                return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .match_ = .{
+                    .scrutinee = match.scrutinee,
+                    .branches = try self.program.addBranchSpan(rewritten),
+                    .comptime_site = match.comptime_site,
+                } } });
+            },
+            else => return null,
+        }
+    }
+
+    /// Fold the loop's per-element computation over one arm's appended items,
+    /// starting from the loop result, threading each intermediate accumulator
+    /// through a fresh binding.
+    fn buildArmFold(
+        self: *Pass,
+        arm: Ast.ExprId,
+        result_local: Ast.LocalId,
+        base_local: Ast.LocalId,
+        canonical: CanonicalForLoop,
+    ) Common.LowerError!?Ast.ExprId {
+        const chain = (try self.reduceArmChain(arm)) orelse return null;
+        defer self.allocator.free(chain.items);
+        if (chain.base != base_local) return null;
+
+        var carry_ref = try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .local = result_local } });
+        if (chain.items.len == 0) return carry_ref;
+
+        var stmts = std.ArrayList(Ast.StmtId).empty;
+        defer stmts.deinit(self.allocator);
+        for (chain.items, 0..) |item, index| {
+            const step = (try self.buildBodyApplication(carry_ref, item, canonical)) orelse return null;
+            if (index + 1 == chain.items.len) {
+                if (stmts.items.len == 0) return step;
+                return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .block = .{
+                    .statements = try self.program.addStmtSpan(stmts.items),
+                    .final_expr = step,
+                } } });
+            }
+            const fresh = try self.program.addLocal(self.symbols.fresh(), canonical.carry_ty);
+            const bind = try self.program.addPat(.{ .ty = canonical.carry_ty, .data = .{ .bind = fresh } });
+            try stmts.append(self.allocator, try self.program.addStmt(.{ .let_ = .{
+                .pat = bind,
+                .value = step,
+            } }));
+            carry_ref = try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .local = fresh } });
+        }
+        unreachable;
+    }
+
+    /// One application of the loop body: bind the item pattern to an appended
+    /// item and the accumulator parameter to the incoming accumulator, then run
+    /// the per-element computation to its accumulator result. Every bound local
+    /// is renamed fresh so the tail's applications and the base loop stay
+    /// independent.
+    fn buildBodyApplication(
+        self: *Pass,
+        carry_expr: Ast.ExprId,
+        item_expr: Ast.ExprId,
+        canonical: CanonicalForLoop,
+    ) Common.LowerError!?Ast.ExprId {
+        var renames = std.AutoHashMap(Ast.LocalId, Ast.LocalId).init(self.allocator);
+        defer renames.deinit();
+
+        // Guard against the accumulator flowing through the dropped iterator
+        // slot: the rest binding must be read only by the continue we drop.
+        if (localUseCountInExpr(self.program, canonical.rest_local, canonical.one_body) != 1) return null;
+
+        const item_pat = (try self.clonePatFresh(canonical.item_pat, &renames)) orelse return null;
+        const carry_local = try self.program.addLocal(self.symbols.fresh(), canonical.carry_ty);
+        try renames.put(canonical.carry_param, carry_local);
+        const carry_bind = try self.program.addPat(.{ .ty = canonical.carry_ty, .data = .{ .bind = carry_local } });
+
+        const body = (try self.cloneNewCarry(canonical.one_body, &renames)) orelse return null;
+
+        var stmts = [_]Ast.StmtId{
+            try self.program.addStmt(.{ .let_ = .{ .pat = item_pat, .value = item_expr } }),
+            try self.program.addStmt(.{ .let_ = .{ .pat = carry_bind, .value = carry_expr } }),
+        };
+        return try self.program.addExpr(.{ .ty = canonical.carry_ty, .data = .{ .block = .{
+            .statements = try self.program.addStmtSpan(&stmts),
+            .final_expr = body,
+        } } });
+    }
+
+    /// Deep-clone a loop-body arm with all bound locals renamed fresh,
+    /// replacing the tail `continue` with its accumulator value. Returns null
+    /// for any construct outside the pure per-element computation set (a nested
+    /// loop, an early `break`/`return`, a lambda), keeping the peel from
+    /// reconstructing a shape it cannot fold.
+    fn cloneNewCarry(self: *Pass, expr_id: Ast.ExprId, renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.ExprId {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .continue_ => |cont| {
+                const values = self.program.exprSpan(cont.values);
+                if (values.len != 2) return null;
+                return try self.cloneExprFresh(values[1], renames);
+            },
+            .block => |block| {
+                const source = try self.allocator.dupe(Ast.StmtId, self.program.stmtSpan(block.statements));
+                defer self.allocator.free(source);
+                var stmts = std.ArrayList(Ast.StmtId).empty;
+                defer stmts.deinit(self.allocator);
+                for (source) |stmt_id| {
+                    const cloned = (try self.cloneStmtFresh(stmt_id, renames)) orelse return null;
+                    try stmts.append(self.allocator, cloned);
+                }
+                const final = (try self.cloneNewCarry(block.final_expr, renames)) orelse return null;
+                return try self.program.addExpr(.{ .ty = expr.ty, .data = .{ .block = .{
+                    .statements = try self.program.addStmtSpan(stmts.items),
+                    .final_expr = final,
+                } } });
+            },
+            .if_ => |if_| {
+                const branches = try self.allocator.dupe(Ast.IfBranch, self.program.ifBranchSpan(if_.branches));
+                defer self.allocator.free(branches);
+                var rewritten = try self.allocator.alloc(Ast.IfBranch, branches.len);
+                defer self.allocator.free(rewritten);
+                for (branches, 0..) |br, index| {
+                    const cond = (try self.cloneExprFresh(br.cond, renames)) orelse return null;
+                    const arm = (try self.cloneNewCarry(br.body, renames)) orelse return null;
+                    rewritten[index] = .{ .cond = cond, .body = arm };
+                }
+                const final_else = (try self.cloneNewCarry(if_.final_else, renames)) orelse return null;
+                return try self.program.addExpr(.{ .ty = expr.ty, .data = .{ .if_ = .{
+                    .branches = try self.program.addIfBranchSpan(rewritten),
+                    .final_else = final_else,
+                } } });
+            },
+            .match_ => |match| {
+                const scrutinee = (try self.cloneExprFresh(match.scrutinee, renames)) orelse return null;
+                const branches = try self.allocator.dupe(Ast.Branch, self.program.branchSpan(match.branches));
+                defer self.allocator.free(branches);
+                var rewritten = try self.allocator.alloc(Ast.Branch, branches.len);
+                defer self.allocator.free(rewritten);
+                for (branches, 0..) |br, index| {
+                    if (br.guard != null) return null;
+                    const pat = (try self.clonePatFresh(br.pat, renames)) orelse return null;
+                    const arm = (try self.cloneNewCarry(br.body, renames)) orelse return null;
+                    rewritten[index] = .{ .pat = pat, .guard = null, .body = arm };
+                }
+                return try self.program.addExpr(.{ .ty = expr.ty, .data = .{ .match_ = .{
+                    .scrutinee = scrutinee,
+                    .branches = try self.program.addBranchSpan(rewritten),
+                    .comptime_site = match.comptime_site,
+                } } });
+            },
+            else => return try self.cloneExprFresh(expr_id, renames),
+        }
+    }
+
+    fn cloneStmtFresh(self: *Pass, stmt_id: Ast.StmtId, renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.StmtId {
+        switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+            .let_ => |let_| {
+                const value = (try self.cloneExprFresh(let_.value, renames)) orelse return null;
+                const pat = (try self.clonePatFresh(let_.pat, renames)) orelse return null;
+                return try self.program.addStmt(.{ .let_ = .{
+                    .pat = pat,
+                    .value = value,
+                    .recursive = let_.recursive,
+                    .comptime_site = let_.comptime_site,
+                } });
+            },
+            .expr => |e| {
+                const cloned = (try self.cloneExprFresh(e, renames)) orelse return null;
+                return try self.program.addStmt(.{ .expr = cloned });
+            },
+            else => return null,
+        }
+    }
+
+    /// Deep-clone a pure-computation expression, applying local renames and
+    /// allocating fresh locals at binding sites. Returns null for constructs
+    /// outside the foldable set.
+    fn cloneExprFresh(self: *Pass, expr_id: Ast.ExprId, renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.ExprId {
+        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        const data: Ast.ExprData = switch (expr.data) {
+            .local => |local| .{ .local = renames.get(local) orelse local },
+            .unit => .unit,
+            .int_lit => |v| .{ .int_lit = v },
+            .frac_f32_lit => |v| .{ .frac_f32_lit = v },
+            .frac_f64_lit => |v| .{ .frac_f64_lit = v },
+            .dec_lit => |v| .{ .dec_lit = v },
+            .str_lit => |v| .{ .str_lit = v },
+            .crash => |v| .{ .crash = v },
+            .list => |items| .{ .list = (try self.cloneExprSpanFresh(items, renames)) orelse return null },
+            .tuple => |items| .{ .tuple = (try self.cloneExprSpanFresh(items, renames)) orelse return null },
+            .record => |fields| .{ .record = (try self.cloneFieldSpanFresh(fields, renames)) orelse return null },
+            .tag => |tag| .{ .tag = .{
+                .name = tag.name,
+                .payloads = (try self.cloneExprSpanFresh(tag.payloads, renames)) orelse return null,
+            } },
+            .nominal => |backing| .{ .nominal = (try self.cloneExprFresh(backing, renames)) orelse return null },
+            .fn_ref => |fn_ref| .{ .fn_ref = .{
+                .fn_id = fn_ref.fn_id,
+                .captures = (try self.cloneExprSpanFresh(fn_ref.captures, renames)) orelse return null,
+            } },
+            .field_access => |field| .{ .field_access = .{
+                .receiver = (try self.cloneExprFresh(field.receiver, renames)) orelse return null,
+                .field = field.field,
+            } },
+            .tuple_access => |access| .{ .tuple_access = .{
+                .tuple = (try self.cloneExprFresh(access.tuple, renames)) orelse return null,
+                .elem_index = access.elem_index,
+            } },
+            .structural_eq => |eq| .{ .structural_eq = .{
+                .lhs = (try self.cloneExprFresh(eq.lhs, renames)) orelse return null,
+                .rhs = (try self.cloneExprFresh(eq.rhs, renames)) orelse return null,
+                .negated = eq.negated,
+            } },
+            .structural_hash => |h| .{ .structural_hash = .{
+                .value = (try self.cloneExprFresh(h.value, renames)) orelse return null,
+                .hasher = (try self.cloneExprFresh(h.hasher, renames)) orelse return null,
+            } },
+            .low_level => |call| .{ .low_level = .{
+                .op = call.op,
+                .args = (try self.cloneExprSpanFresh(call.args, renames)) orelse return null,
+            } },
+            .call_proc => |call| .{ .call_proc = .{
+                .callee = call.callee,
+                .args = (try self.cloneExprSpanFresh(call.args, renames)) orelse return null,
+                .captures = (try self.cloneExprSpanFresh(call.captures, renames)) orelse return null,
+                .is_cold = call.is_cold,
+            } },
+            .call_value => |call| .{ .call_value = .{
+                .callee = (try self.cloneExprFresh(call.callee, renames)) orelse return null,
+                .args = (try self.cloneExprSpanFresh(call.args, renames)) orelse return null,
+            } },
+            .let_ => |let_| blk: {
+                const value = (try self.cloneExprFresh(let_.value, renames)) orelse return null;
+                const pat = (try self.clonePatFresh(let_.bind, renames)) orelse return null;
+                const rest = (try self.cloneExprFresh(let_.rest, renames)) orelse return null;
+                break :blk .{ .let_ = .{
+                    .bind = pat,
+                    .value = value,
+                    .rest = rest,
+                    .comptime_site = let_.comptime_site,
+                } };
+            },
+            .block => |block| blk: {
+                const source = try self.allocator.dupe(Ast.StmtId, self.program.stmtSpan(block.statements));
+                defer self.allocator.free(source);
+                var stmts = std.ArrayList(Ast.StmtId).empty;
+                defer stmts.deinit(self.allocator);
+                for (source) |stmt_id| {
+                    const cloned = (try self.cloneStmtFresh(stmt_id, renames)) orelse return null;
+                    try stmts.append(self.allocator, cloned);
+                }
+                const final = (try self.cloneExprFresh(block.final_expr, renames)) orelse return null;
+                break :blk .{ .block = .{
+                    .statements = try self.program.addStmtSpan(stmts.items),
+                    .final_expr = final,
+                } };
+            },
+            .if_ => |if_| blk: {
+                const branches = try self.allocator.dupe(Ast.IfBranch, self.program.ifBranchSpan(if_.branches));
+                defer self.allocator.free(branches);
+                var rewritten = try self.allocator.alloc(Ast.IfBranch, branches.len);
+                defer self.allocator.free(rewritten);
+                for (branches, 0..) |br, index| {
+                    const cond = (try self.cloneExprFresh(br.cond, renames)) orelse return null;
+                    const arm = (try self.cloneExprFresh(br.body, renames)) orelse return null;
+                    rewritten[index] = .{ .cond = cond, .body = arm };
+                }
+                const final_else = (try self.cloneExprFresh(if_.final_else, renames)) orelse return null;
+                break :blk .{ .if_ = .{
+                    .branches = try self.program.addIfBranchSpan(rewritten),
+                    .final_else = final_else,
+                } };
+            },
+            .match_ => |match| blk: {
+                const scrutinee = (try self.cloneExprFresh(match.scrutinee, renames)) orelse return null;
+                const branches = try self.allocator.dupe(Ast.Branch, self.program.branchSpan(match.branches));
+                defer self.allocator.free(branches);
+                var rewritten = try self.allocator.alloc(Ast.Branch, branches.len);
+                defer self.allocator.free(rewritten);
+                for (branches, 0..) |br, index| {
+                    if (br.guard != null) return null;
+                    const pat = (try self.clonePatFresh(br.pat, renames)) orelse return null;
+                    const arm = (try self.cloneExprFresh(br.body, renames)) orelse return null;
+                    rewritten[index] = .{ .pat = pat, .guard = null, .body = arm };
+                }
+                break :blk .{ .match_ = .{
+                    .scrutinee = scrutinee,
+                    .branches = try self.program.addBranchSpan(rewritten),
+                    .comptime_site = match.comptime_site,
+                } };
+            },
+            else => return null,
+        };
+        return try self.program.addExpr(.{ .ty = expr.ty, .data = data });
+    }
+
+    fn cloneExprSpanFresh(self: *Pass, span: Ast.Span(Ast.ExprId), renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.Span(Ast.ExprId) {
+        const source = try self.allocator.dupe(Ast.ExprId, self.program.exprSpan(span));
+        defer self.allocator.free(source);
+        var out = try self.allocator.alloc(Ast.ExprId, source.len);
+        defer self.allocator.free(out);
+        for (source, 0..) |item, index| {
+            out[index] = (try self.cloneExprFresh(item, renames)) orelse return null;
+        }
+        return try self.program.addExprSpan(out);
+    }
+
+    fn cloneFieldSpanFresh(self: *Pass, span: Ast.Span(Ast.FieldExpr), renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.Span(Ast.FieldExpr) {
+        const source = try self.allocator.dupe(Ast.FieldExpr, self.program.fieldExprSpan(span));
+        defer self.allocator.free(source);
+        var out = try self.allocator.alloc(Ast.FieldExpr, source.len);
+        defer self.allocator.free(out);
+        for (source, 0..) |field, index| {
+            out[index] = .{
+                .name = field.name,
+                .value = (try self.cloneExprFresh(field.value, renames)) orelse return null,
+            };
+        }
+        return try self.program.addFieldExprSpan(out);
+    }
+
+    /// Clone a pattern, allocating a fresh local for every binding site and
+    /// recording the rename. Returns null for list/string patterns, which the
+    /// fold does not reconstruct.
+    fn clonePatFresh(self: *Pass, pat_id: Ast.PatId, renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.PatId {
+        const pat = self.program.pats.items[@intFromEnum(pat_id)];
+        const data: Ast.PatData = switch (pat.data) {
+            .bind => |local| blk: {
+                const fresh = try self.program.addLocal(self.symbols.fresh(), pat.ty);
+                try renames.put(local, fresh);
+                break :blk .{ .bind = fresh };
+            },
+            .wildcard => .wildcard,
+            .int_lit => |v| .{ .int_lit = v },
+            .dec_lit => |v| .{ .dec_lit = v },
+            .frac_f32_lit => |v| .{ .frac_f32_lit = v },
+            .frac_f64_lit => |v| .{ .frac_f64_lit = v },
+            .str_lit => |v| .{ .str_lit = v },
+            .as => |as| blk: {
+                const inner = (try self.clonePatFresh(as.pattern, renames)) orelse return null;
+                const fresh = try self.program.addLocal(self.symbols.fresh(), pat.ty);
+                try renames.put(as.local, fresh);
+                break :blk .{ .as = .{ .pattern = inner, .local = fresh } };
+            },
+            .record => |fields_span| blk: {
+                const fields = try self.allocator.dupe(Ast.RecordDestruct, self.program.recordDestructSpan(fields_span));
+                defer self.allocator.free(fields);
+                var out = try self.allocator.alloc(Ast.RecordDestruct, fields.len);
+                defer self.allocator.free(out);
+                for (fields, 0..) |field, index| {
+                    out[index] = .{
+                        .name = field.name,
+                        .pattern = (try self.clonePatFresh(field.pattern, renames)) orelse return null,
+                    };
+                }
+                break :blk .{ .record = try self.program.addRecordDestructSpan(out) };
+            },
+            .tuple => |items_span| blk: {
+                const cloned = (try self.clonePatSpanFresh(items_span, renames)) orelse return null;
+                break :blk .{ .tuple = cloned };
+            },
+            .tag => |tag| blk: {
+                const cloned = (try self.clonePatSpanFresh(tag.payloads, renames)) orelse return null;
+                break :blk .{ .tag = .{ .name = tag.name, .payloads = cloned } };
+            },
+            .nominal => |backing| .{ .nominal = (try self.clonePatFresh(backing, renames)) orelse return null },
+            else => return null,
+        };
+        return try self.program.addPat(.{ .ty = pat.ty, .data = data });
+    }
+
+    fn clonePatSpanFresh(self: *Pass, span: Ast.Span(Ast.PatId), renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.Span(Ast.PatId) {
+        const source = try self.allocator.dupe(Ast.PatId, self.program.patSpan(span));
+        defer self.allocator.free(source);
+        var out = try self.allocator.alloc(Ast.PatId, source.len);
+        defer self.allocator.free(out);
+        for (source, 0..) |child, index| {
+            out[index] = (try self.clonePatFresh(child, renames)) orelse return null;
+        }
+        return try self.program.addPatSpan(out);
     }
 
     /// Clone a whole function body through the value pass and replace it. The
