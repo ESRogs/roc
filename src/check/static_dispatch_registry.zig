@@ -60,12 +60,14 @@ pub const ProcedureTemplateLookupEntry = struct {
 };
 
 /// Public `MethodOwner` declaration.
+///
+/// A method owner is identified by CONTENT: the declaring module's deep
+/// content identity plus the declared type name (see `base.module_identity`
+/// and `canonical.NominalTypeKey`). Statement indices and module name text
+/// never participate. Compiler-builtin owners keep their dedicated enum so
+/// builtin dispatch stays exact across differently-spelled builtin idents.
 pub const MethodOwner = union(enum) {
     nominal: canonical.NominalTypeKey,
-    source_decl: struct {
-        module_name: canonical.ModuleNameId,
-        statement: u32,
-    },
     builtin: BuiltinOwner,
 };
 
@@ -171,6 +173,7 @@ pub const MethodRegistry = struct {
         module: TypedCIR.Module,
         names: *canonical.CanonicalNameStore,
         local_templates: *const ProcedureTemplateLookup,
+        available_artifacts: anytype,
         checked_types: anytype,
         checked_bodies: anytype,
     ) Allocator.Error!MethodRegistry {
@@ -230,7 +233,7 @@ pub const MethodRegistry = struct {
 
             try entries.append(allocator, .{
                 .key = .{
-                    .owner = try methodOwnerForRegistryEntry(module, names, entry.key.ownerIdent()),
+                    .owner = try methodOwnerForRegistryEntry(module, names, available_artifacts, entry.key.ownerIdent()),
                     .method = try names.internMethodIdent(idents, entry.key.methodIdent()),
                 },
                 .target = .{
@@ -399,26 +402,106 @@ fn localProcedureExpr(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) bool {
 fn methodOwnerForRegistryEntry(
     module: TypedCIR.Module,
     names: *canonical.CanonicalNameStore,
+    available_artifacts: anytype,
     owner: ModuleEnv.MethodOwner,
 ) Allocator.Error!MethodOwner {
-    if (owner.moduleIdent().eql(module.qualifiedModuleIdent())) {
-        if (builtinOwnerForRegistryEntry(module, owner.owner)) |builtin_owner| {
-            return .{ .builtin = builtin_owner };
-        }
+    const owner_env = methodOwnerEnvForRegistryEntry(module, available_artifacts, owner);
+    if (builtinOwnerForRegistryEntry(owner_env, owner.owner)) |builtin_owner| {
+        return .{ .builtin = builtin_owner };
     }
 
-    const idents = module.identStoreConst();
-    return .{ .source_decl = .{
-        .module_name = try names.internModuleIdent(idents, owner.moduleIdent()),
-        .statement = @intFromEnum(owner.owner),
+    const identity_hash = owner_env.contentIdentityHash() orelse {
+        if (@import("builtin").mode == .Debug) {
+            std.debug.panic(
+                "checked static dispatch registry invariant violated: module '{s}' has no content identity",
+                .{owner_env.module_name},
+            );
+        }
+        unreachable;
+    };
+    const stmt = owner_env.store.getStatement(owner.owner);
+    const header_idx = switch (stmt) {
+        .s_nominal_decl => |nominal| nominal.header,
+        .s_alias_decl => |alias| alias.header,
+        else => {
+            if (@import("builtin").mode == .Debug) {
+                std.debug.panic(
+                    "checked static dispatch registry invariant violated: method owner statement {d} is not a type declaration",
+                    .{@intFromEnum(owner.owner)},
+                );
+            }
+            unreachable;
+        },
+    };
+    const header = owner_env.store.getTypeHeader(header_idx);
+    return .{ .nominal = .{
+        .module = try names.internModuleIdentity(identity_hash),
+        .type_name = try names.internTypeIdent(owner_env.getIdentStoreConst(), header.relative_name),
+        .source_decl = @intFromEnum(owner.owner),
     } };
 }
 
-fn builtinOwnerForRegistryEntry(
+fn methodOwnerEnvForRegistryEntry(
     module: TypedCIR.Module,
+    available_artifacts: anytype,
+    owner: ModuleEnv.MethodOwner,
+) *const ModuleEnv {
+    const module_env = module.moduleEnvConst();
+    const owner_hash = methodOwnerIdentityHashForRegistryEntry(module_env, owner);
+
+    if (ownerEnvIdentityMatches(module_env, owner_hash)) return module_env;
+
+    for (available_artifacts) |artifact| {
+        const candidate = artifact.module_env;
+        if (ownerEnvIdentityMatches(candidate, owner_hash)) return candidate;
+    }
+
+    if (@import("builtin").mode == .Debug) {
+        std.debug.panic(
+            "checked static dispatch registry invariant violated: could not find owner module '{s}' for receiver method",
+            .{module.getIdent(owner.moduleIdent())},
+        );
+    }
+    unreachable;
+}
+
+fn methodOwnerIdentityHashForRegistryEntry(
+    module_env: *const ModuleEnv,
+    owner: ModuleEnv.MethodOwner,
+) *const base.ModuleIdentity.Hash {
+    if (owner.moduleIdent().eql(module_env.qualified_module_ident)) {
+        return module_env.contentIdentityHash() orelse {
+            if (@import("builtin").mode == .Debug) {
+                std.debug.panic(
+                    "checked static dispatch registry invariant violated: local module '{s}' has no content identity",
+                    .{module_env.module_name},
+                );
+            }
+            unreachable;
+        };
+    }
+
+    const owner_identity = module_env.moduleIdentityForDisplayIdent(owner.moduleIdent()) orelse {
+        if (@import("builtin").mode == .Debug) {
+            std.debug.panic(
+                "checked static dispatch registry invariant violated: receiver owner module '{s}' has no content identity in module '{s}'",
+                .{ module_env.getIdent(owner.moduleIdent()), module_env.module_name },
+            );
+        }
+        unreachable;
+    };
+    return module_env.moduleIdentityHash(owner_identity);
+}
+
+fn ownerEnvIdentityMatches(candidate: *const ModuleEnv, owner_hash: *const base.ModuleIdentity.Hash) bool {
+    const candidate_hash = candidate.contentIdentityHash() orelse return false;
+    return base.ModuleIdentity.eql(candidate_hash, owner_hash);
+}
+
+fn builtinOwnerForRegistryEntry(
+    module_env: *const ModuleEnv,
     owner_stmt: CIR.Statement.Idx,
 ) ?BuiltinOwner {
-    const module_env = module.moduleEnvConst();
     const common = module_env.idents;
     if (module_env.module_role != .builtin) return null;
 
@@ -498,19 +581,11 @@ fn methodOwnerOrder(a: MethodOwner, b: MethodOwner) std.math.Order {
     return switch (a) {
         .nominal => |a_nominal| switch (b) {
             .nominal => |b_nominal| blk: {
-                const module_order = orderEnum(canonical.ModuleNameId, a_nominal.module_name, b_nominal.module_name);
+                const module_order = orderEnum(canonical.ModuleIdentityId, a_nominal.module, b_nominal.module);
                 if (module_order != .eq) break :blk module_order;
                 const type_order = orderEnum(canonical.TypeNameId, a_nominal.type_name, b_nominal.type_name);
                 if (type_order != .eq) break :blk type_order;
                 break :blk orderOptionalU32(a_nominal.source_decl, b_nominal.source_decl);
-            },
-            else => unreachable,
-        },
-        .source_decl => |a_decl| switch (b) {
-            .source_decl => |b_decl| blk: {
-                const module_order = orderEnum(canonical.ModuleNameId, a_decl.module_name, b_decl.module_name);
-                if (module_order != .eq) break :blk module_order;
-                break :blk orderU32(a_decl.statement, b_decl.statement);
             },
             else => unreachable,
         },
@@ -524,8 +599,7 @@ fn methodOwnerOrder(a: MethodOwner, b: MethodOwner) std.math.Order {
 fn methodOwnerTagRank(owner: MethodOwner) u32 {
     return switch (owner) {
         .nominal => 0,
-        .source_decl => 1,
-        .builtin => 2,
+        .builtin => 1,
     };
 }
 
@@ -1309,16 +1383,11 @@ fn methodOwnerForCheckedPayload(payload: anytype) ?MethodOwner {
     return switch (payload) {
         .nominal => |nominal| if (nominal.builtin) |builtin|
             .{ .builtin = builtinOwnerForCheckedBuiltin(builtin) }
-        else if (nominal.source_decl) |source_decl|
-            .{ .source_decl = .{
-                .module_name = nominal.origin_module,
-                .statement = source_decl,
-            } }
         else
             .{ .nominal = .{
-                .module_name = nominal.origin_module,
+                .module = nominal.origin_module,
                 .type_name = nominal.name,
-                .source_decl = null,
+                .source_decl = nominal.source_decl,
             } },
         else => null,
     };
@@ -1366,7 +1435,7 @@ fn lookupCheckedMethodTarget(
 
     const method_name = names.methodNameText(method);
     for (imported_views) |imported| {
-        const imported_owner = methodOwnerInImportedNames(names, imported.canonical_names, owner) orelse continue;
+        const imported_owner = methodOwnerInImportedStore(names, imported.canonical_names, owner) orelse continue;
         const imported_method = imported.canonical_names.lookupMethodName(method_name) orelse continue;
         if (imported.method_registry.lookup(.{ .owner = imported_owner, .method = imported_method })) |target| {
             switch (target.kind) {
@@ -1381,19 +1450,19 @@ fn lookupCheckedMethodTarget(
     return null;
 }
 
-fn methodOwnerInImportedNames(
+/// Rebase a method owner into an imported artifact's store: the module
+/// component crosses by 32-byte content identity (one map probe, full-value
+/// comparison), the type-name component by declared-name interning. This is
+/// the single cross-artifact owner resolution point — no module name text.
+fn methodOwnerInImportedStore(
     source_names: *const canonical.CanonicalNameStore,
     imported_names: *const canonical.CanonicalNameStore,
     owner: MethodOwner,
 ) ?MethodOwner {
     return switch (owner) {
         .builtin => |builtin| .{ .builtin = builtin },
-        .source_decl => |decl| .{ .source_decl = .{
-            .module_name = imported_names.lookupModuleName(source_names.moduleNameText(decl.module_name)) orelse return null,
-            .statement = decl.statement,
-        } },
         .nominal => |nominal| .{ .nominal = .{
-            .module_name = imported_names.lookupModuleName(source_names.moduleNameText(nominal.module_name)) orelse return null,
+            .module = imported_names.lookupModuleIdentity(source_names.moduleIdentityBytes(nominal.module)) orelse return null,
             .type_name = imported_names.lookupTypeName(source_names.typeNameText(nominal.type_name)) orelse return null,
             .source_decl = nominal.source_decl,
         } },

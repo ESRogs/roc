@@ -183,6 +183,7 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         return error.BuildEnvInit;
     };
     defer build_env.deinit();
+    build_env.setSyntheticRootPackageIdentity();
 
     build_env.build(synthetic_app_path) catch {
         _ = try build_env.renderDiagnostics(stderr);
@@ -278,14 +279,15 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
             try entrypoint_type_ids.put(name, type_id);
         }
 
-        for (provides_entries.items) |provides_entry| {
-            const def_idx = findTopLevelDefByName(artifact, provides_entry.name) orelse continue;
+        for (artifact.provides_requires.provides) |provides_entry| {
+            const def_idx = provides_entry.def orelse continue;
             const top_level = artifact.top_level_values.lookupByDef(def_idx) orelse
                 glueInvariant("provided entry has no top-level value", .{});
             const scheme = artifact.checked_types.schemeForKey(top_level.source_scheme) orelse
                 glueInvariant("provided entry has no checked type scheme", .{});
             const type_id = try type_table.getOrInsert(artifact, scheme.root);
-            try provides_type_ids.put(provides_entry.ffi_symbol, type_id);
+            const ffi_symbol = artifact.canonical_names.externalSymbolNameText(provides_entry.ffi_symbol);
+            try provides_type_ids.put(ffi_symbol, type_id);
         }
         break;
     }
@@ -677,26 +679,6 @@ fn collectHostedSymbols(
     }
 
     return hosted_symbols;
-}
-
-fn findTopLevelDefByName(
-    artifact: *const CheckedArtifact.CheckedModuleArtifact,
-    local_name: []const u8,
-) ?can.CIR.Def.Idx {
-    const module_name = artifact.canonical_names.moduleNameText(artifact.module_identity.module_name);
-
-    for (artifact.top_level_values.entries) |entry| {
-        const def_name = artifact.canonical_names.exportNameText(entry.source_name);
-        const candidate = if (std.mem.startsWith(u8, def_name, module_name) and
-            def_name.len > module_name.len and
-            def_name[module_name.len] == '.')
-            def_name[module_name.len + 1 ..]
-        else
-            def_name;
-        if (std.mem.eql(u8, candidate, local_name)) return entry.def;
-    }
-
-    return null;
 }
 
 fn selectGlueSpecRootProc(
@@ -2852,20 +2834,23 @@ fn collectModuleTypeInfo(
         hosted_functions.deinit(gpa);
     }
 
-    const module_prefix = try std.fmt.allocPrint(gpa, "{s}.", .{module_name});
-    defer gpa.free(module_prefix);
+    // Membership and local names come from the module's structured method
+    // tables (owner declaration + bare member ident), not from re-parsing
+    // qualified export-name strings.
+    const module_env = artifact.moduleEnvConst();
+    var member_by_def = std.AutoHashMap(can.CIR.Def.Idx, can.ModuleEnv.MethodKey).init(gpa);
+    defer member_by_def.deinit();
+    for (module_env.method_defs.entries.items) |member_entry| {
+        try member_by_def.put(member_entry.value.def_idx, member_entry.key);
+    }
 
     for (artifact.top_level_values.entries) |entry| {
         const def_idx = entry.def;
 
-        const def_name = artifact.canonical_names.exportNameText(entry.source_name);
-
-        if (std.mem.eql(u8, def_name, module_name)) continue;
-
-        const local_name = if (std.mem.startsWith(u8, def_name, module_prefix))
-            def_name[module_prefix.len..]
-        else
-            continue;
+        _ = member_by_def.get(def_idx) orelse continue;
+        const source_name = artifact.canonical_names.exportNameText(entry.source_name);
+        const local_name = try moduleLocalMemberName(gpa, module_name, source_name);
+        defer gpa.free(local_name);
 
         const checked_type = checkedTypeRootForScheme(artifact, entry.source_scheme);
         const type_str = try typeStringAlloc(gpa, artifact, checked_type);
@@ -2947,6 +2932,18 @@ fn collectModuleTypeInfo(
         .functions = functions,
         .hosted_functions = hosted_functions,
     };
+}
+
+fn moduleLocalMemberName(
+    allocator: Allocator,
+    module_name: []const u8,
+    source_name: []const u8,
+) Allocator.Error![]const u8 {
+    if (module_name.len == 0) return try allocator.dupe(u8, source_name);
+    if (!std.mem.startsWith(u8, source_name, module_name)) return try allocator.dupe(u8, source_name);
+    if (source_name.len == module_name.len) return try allocator.dupe(u8, source_name);
+    if (source_name[module_name.len] != '.') return try allocator.dupe(u8, source_name);
+    return try allocator.dupe(u8, source_name[module_name.len + 1 ..]);
 }
 
 /// Print a type annotation to a buffer (for requires entries which use AST types)

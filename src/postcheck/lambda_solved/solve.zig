@@ -1519,7 +1519,8 @@ const Solver = struct {
             .named => |named| {
                 writeBytes(hasher, "named");
                 hasher.update(&named.named_type.module.bytes);
-                writeBytes(hasher, self.lifted.names.moduleNameText(named.def.module_name));
+                writeBytes(hasher, self.lifted.names.moduleIdentityBytes(named.def.module));
+                writeOptionalU32(hasher, named.def.source_decl);
                 writeBytes(hasher, self.lifted.names.typeNameText(named.def.type_name));
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
@@ -1564,6 +1565,15 @@ const Solver = struct {
 fn writeBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     writeU32(hasher, @intCast(bytes.len));
     hasher.update(bytes);
+}
+
+fn writeOptionalU32(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
+    if (value) |v| {
+        hasher.update(&[_]u8{1});
+        writeU32(hasher, v);
+    } else {
+        hasher.update(&[_]u8{0});
+    }
 }
 
 fn writeU32(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
@@ -1732,7 +1742,7 @@ fn isGeneratedOpaqueEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
 }
 
 fn sameMonoTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
-    return left.module_name == right.module_name and
+    return left.module == right.module and
         left.type_name == right.type_name and
         left.source_decl == right.source_decl;
 }

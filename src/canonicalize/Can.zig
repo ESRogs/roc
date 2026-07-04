@@ -989,7 +989,18 @@ fn receiverMethodOwnerFromExternalType(
     const owner_module_ident = if (self.lookupAvailableModuleEnv(import_ident)) |info| blk: {
         if (info.env.module_role == .builtin) return null;
         const owner_module_text = info.env.getIdent(info.env.qualified_module_ident);
-        break :blk try self.env.insertIdent(Ident.for_text(owner_module_text));
+        const local_owner_module_ident = try self.env.insertIdent(Ident.for_text(owner_module_text));
+        const owner_hash = info.env.contentIdentityHash() orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic(
+                    "canonicalization invariant violated: receiver method owner module '{s}' has no content identity",
+                    .{info.env.module_name},
+                );
+            }
+            unreachable;
+        };
+        _ = try self.env.internModuleIdentity(owner_hash, local_owner_module_ident);
+        break :blk local_owner_module_ident;
     } else import_ident;
 
     return ModuleEnv.MethodOwner.init(owner_module_ident, @enumFromInt(external.target_node_idx));

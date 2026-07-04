@@ -242,13 +242,20 @@ fn hashModuleIdentity(identity: ModuleIdentity) [32]u8 {
     return identity.stable_hash;
 }
 
+/// A module's identity hash IS its deep content identity: a pure function of
+/// the transitive closure's module names and source bytes (see
+/// `base.module_identity`). No coordinator-assigned display strings, package
+/// names, or paths participate — cache keys and serialized identities are
+/// bit-identical no matter which pipeline built the artifact or what
+/// directory the build ran in.
 fn computeStableModuleIdentityHash(module_env: *const ModuleEnv) [32]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashByteSlice(&hasher, module_env.module_name);
-    hashByteSlice(&hasher, module_env.getIdentText(module_env.display_module_name_idx));
-    hashByteSlice(&hasher, module_env.getIdentText(module_env.qualified_module_ident));
-    hasher.update(@tagName(module_env.module_kind));
-    return hasher.finalResult();
+    const hash = module_env.contentIdentityHash() orelse {
+        std.debug.panic(
+            "checked artifact identity requested before module content identity was finalized for module '{s}'",
+            .{module_env.module_name},
+        );
+    };
+    return hash.*;
 }
 
 fn hashCheckingContextIdentity(identity: CheckingContextIdentity) [32]u8 {
@@ -537,6 +544,11 @@ pub const ExportTableView = struct {
 pub const ProvidesEntry = struct {
     source_name: canonical.ExportNameId,
     ffi_symbol: canonical.ExternalSymbolNameId,
+    /// The top-level definition this provides entry binds, resolved by the
+    /// producer within its own module (the canonicalize->check boundary is
+    /// the one legitimate name-resolution point). Consumers (glue) use this
+    /// instead of re-matching definition names.
+    def: ?CIR.Def.Idx = null,
 };
 
 /// Public `RequiresEntry` declaration.
@@ -607,8 +619,11 @@ pub const ProvidedExportTable = struct {
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
-        checked_types: *const CheckedTypePublication,
+        names: *canonical.CanonicalNameStore,
+        checked_types: *CheckedTypePublication,
         top_level_values: *const TopLevelValueTable,
+        platform_required_declarations: *const PlatformRequiredDeclarationTable,
+        platform_requirement_relations: *const PlatformRequirementRelationTable,
         published_provides: []const ProvidesEntry,
     ) Allocator.Error!ProvidedExportTable {
         const module_env = module.moduleEnvConst();
@@ -619,6 +634,18 @@ pub const ProvidedExportTable = struct {
 
         var exports = std.ArrayList(ProvidedExport).empty;
         errdefer exports.deinit(allocator);
+
+        var relation_resolver = PlatformAppRelationTypeResolver.init(allocator, names, &checked_types.store);
+        defer relation_resolver.deinit();
+        const has_relation = platform_requirement_relations.relations.len != 0;
+        if (has_relation) {
+            try relation_resolver.replayPublishedRelations(
+                module,
+                checked_types,
+                platform_required_declarations,
+                platform_requirement_relations,
+            );
+        }
 
         for (source, published_provides) |provides_entry, published| {
             const def_node_idx = module_env.getExposedValueNodeIndexById(provides_entry.ident) orelse {
@@ -640,12 +667,16 @@ pub const ProvidedExportTable = struct {
                 }
                 unreachable;
             };
-            const checked_type = try checkedTypeIdForRootSource(
+            const source_checked_type = try checkedTypeIdForRootSource(
                 allocator,
                 module,
                 checked_types,
                 .{ .def = def_idx },
             );
+            const checked_type = if (has_relation)
+                try relation_resolver.resolvePlatformRoot(source_checked_type)
+            else
+                source_checked_type;
             switch (top_level.value) {
                 .procedure_binding => |binding| try exports.append(allocator, .{ .procedure = .{
                     .source_name = published.source_name,
@@ -2778,7 +2809,9 @@ pub fn builtinRuntimeEncoding(builtin_nominal: CheckedBuiltinNominal) CheckedBui
 /// Public `CheckedAliasType` declaration.
 pub const CheckedAliasType = struct {
     name: canonical.TypeNameId,
-    origin_module: canonical.ModuleNameId,
+    /// Deep content identity of the declaring module (dense id into this
+    /// artifact's `canonical_names.module_identities`).
+    origin_module: canonical.ModuleIdentityId,
     source_decl: ?u32 = null,
     builtin_origin: bool = false,
     backing: CheckedTypeId,
@@ -2830,7 +2863,9 @@ pub const CheckedNominalRepresentationRef = union(enum) {
 /// Public `CheckedNominalType` declaration.
 pub const CheckedNominalType = struct {
     name: canonical.TypeNameId,
-    origin_module: canonical.ModuleNameId,
+    /// Deep content identity of the declaring module (dense id into this
+    /// artifact's `canonical_names.module_identities`).
+    origin_module: canonical.ModuleIdentityId,
     source_decl: ?u32 = null,
     builtin: ?CheckedBuiltinNominal = null,
     is_opaque: bool,
@@ -2899,7 +2934,7 @@ pub const no_var_name: u32 = std.math.maxInt(u32);
 /// POD form of `CheckedAliasType`: `args` is a range into `type_id_pool`.
 pub const StoredAlias = struct {
     name: canonical.TypeNameId,
-    origin_module: canonical.ModuleNameId,
+    origin_module: canonical.ModuleIdentityId,
     source_decl: ?u32 = null,
     builtin_origin: bool = false,
     backing: CheckedTypeId,
@@ -2910,7 +2945,7 @@ pub const StoredAlias = struct {
 /// into `type_id_pool`.
 pub const StoredNominal = struct {
     name: canonical.TypeNameId,
-    origin_module: canonical.ModuleNameId,
+    origin_module: canonical.ModuleIdentityId,
     source_decl: ?u32 = null,
     builtin: ?CheckedBuiltinNominal = null,
     is_opaque: bool,
@@ -3374,6 +3409,11 @@ fn checkedTypeViewTagsAreConcreteConstProducerScheme(
 pub const CheckedNominalDeclaration = struct {
     id: CheckedNominalDeclarationId,
     nominal: canonical.NominalTypeKey,
+    /// CIR statement index of the declaration in its (content-identified)
+    /// declaring module. A decl LOCATOR for reading declared field order from
+    /// the module's CIR — never part of identity. Stable across artifacts
+    /// because equal content identities imply byte-identical module source.
+    source_statement: u32,
     declaration_root: CheckedTypeId,
     backing: CheckedTypeId,
     fa_start: u32 = 0,
@@ -3736,7 +3776,7 @@ pub const CheckedTypeStore = struct {
             const scheme_key = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 required_var,
             );
             if (findCheckedTypeScheme(store.schemes.items, scheme_key) == null) {
@@ -3767,7 +3807,7 @@ pub const CheckedTypeStore = struct {
             const scheme_key = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 module.defType(def_idx),
             );
             if (findCheckedTypeScheme(store.schemes.items, scheme_key) == null) {
@@ -5518,7 +5558,7 @@ fn appendCheckedNominalDeclarationFromPayload(
     };
 
     const nominal_key = canonical.NominalTypeKey{
-        .module_name = nominal.origin_module,
+        .module = nominal.origin_module,
         .type_name = nominal.name,
         .source_decl = nominal.source_decl,
     };
@@ -5547,6 +5587,8 @@ fn appendCheckedNominalDeclarationFromPayload(
     try declarations.append(allocator, .{
         .id = @enumFromInt(@as(u32, @intCast(declarations.items.len))),
         .nominal = nominal_key,
+        .source_statement = nominal.source_decl orelse
+            checkedArtifactInvariant("checked nominal declaration payload had no source declaration", .{}),
         .declaration_root = root,
         .backing = nominal.backing,
         .fa_start = fa.start,
@@ -6119,8 +6161,8 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
         if (value) |v| self.writeU32(v);
     }
 
-    fn writeNamedSourceIdentity(self: *SubstitutedCheckedTypeKeyBuilder, origin_module: canonical.ModuleNameId, name: canonical.TypeNameId, source_decl: ?u32) void {
-        self.writeBytes(self.names.moduleNameText(origin_module));
+    fn writeNamedSourceIdentity(self: *SubstitutedCheckedTypeKeyBuilder, origin_module: canonical.ModuleIdentityId, name: canonical.TypeNameId, source_decl: ?u32) void {
+        self.writeBytes(self.names.moduleIdentityBytes(origin_module));
         self.writeOptionalU32(source_decl);
         if (source_decl == null) {
             self.writeBytes(self.names.typeNameText(name));
@@ -6279,7 +6321,7 @@ fn appendCheckedTypeRootWithRowDefault(
     const key_info = try canonical_type_keys.fromVarInfo(
         allocator,
         module.typeStoreConst(),
-        module.identStoreConst(),
+        module.moduleEnvConst(),
         resolved_var,
     );
     if (!key_info.contains_identity_variables) {
@@ -6394,7 +6436,7 @@ fn copyCheckedTypePayload(
         } },
         .alias => |alias| .{ .alias = .{
             .name = try names.internTypeIdent(module.identStoreConst(), alias.ident.ident_idx),
-            .origin_module = try names.internModuleIdent(module.identStoreConst(), alias.origin_module),
+            .origin_module = try names.internModuleIdentity(module.moduleEnvConst().moduleIdentityHash(alias.origin_module)),
             .source_decl = alias.source_decl.toOptional(),
             .builtin_origin = alias.source_decl.originIsBuiltin(),
             .backing = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, module.typeStoreConst().getAliasBackingVar(alias)),
@@ -6473,7 +6515,7 @@ fn copyCheckedFlatType(
             break :blk .{
                 .nominal = .{
                     .name = try names.internTypeIdent(module.identStoreConst(), nominal.ident.ident_idx),
-                    .origin_module = try names.internModuleIdent(module.identStoreConst(), nominal.origin_module),
+                    .origin_module = try names.internModuleIdentity(module.moduleEnvConst().moduleIdentityHash(nominal.origin_module)),
                     .source_decl = nominal.sourceDeclOptional(),
                     .builtin = builtin_nominal,
                     .is_opaque = nominal.isOpaque(),
@@ -6615,25 +6657,25 @@ fn categorizeBuiltinNominal(module: TypedCIR.Module, imports: CheckedImportViews
     if (!nominal.originIsBuiltin()) return null;
 
     const source_decl = nominal.sourceDeclOptional() orelse return null;
-    const origin_text = module.getIdent(nominal.origin_module);
     const module_env = module.moduleEnvConst();
+    const origin_hash = module_env.moduleIdentityHash(nominal.origin_module);
 
-    if (module_env.module_role == .builtin and moduleEnvNameMatches(module_env, origin_text)) {
+    if (module_env.module_role == .builtin and moduleEnvIdentityMatches(module_env, origin_hash)) {
         return checkedBuiltinNominalForSourceDecl(module_env, source_decl);
     }
-    if (checkedBuiltinNominalForImportedSource(imports.direct, origin_text, source_decl)) |builtin_nominal| return builtin_nominal;
-    if (checkedBuiltinNominalForAvailableSource(imports.available, origin_text, source_decl)) |builtin_nominal| return builtin_nominal;
+    if (checkedBuiltinNominalForImportedSource(imports.direct, origin_hash, source_decl)) |builtin_nominal| return builtin_nominal;
+    if (checkedBuiltinNominalForAvailableSource(imports.available, origin_hash, source_decl)) |builtin_nominal| return builtin_nominal;
     return null;
 }
 
 fn checkedBuiltinNominalForImportedSource(
     imports: []const PublishImportArtifact,
-    origin_text: []const u8,
+    origin_hash: *const [32]u8,
     source_decl: u32,
 ) ?CheckedBuiltinNominal {
     var found: ?CheckedBuiltinNominal = null;
     for (imports) |import| {
-        if (checkedBuiltinNominalForView(import.view, origin_text, source_decl)) |builtin_nominal| {
+        if (checkedBuiltinNominalForView(import.view, origin_hash, source_decl)) |builtin_nominal| {
             if (found) |existing| {
                 if (existing != builtin_nominal) {
                     checkedArtifactInvariant("checked builtin nominal source resolved to multiple builtin declarations", .{});
@@ -6648,12 +6690,12 @@ fn checkedBuiltinNominalForImportedSource(
 
 fn checkedBuiltinNominalForAvailableSource(
     views: []const ImportedModuleView,
-    origin_text: []const u8,
+    origin_hash: *const [32]u8,
     source_decl: u32,
 ) ?CheckedBuiltinNominal {
     var found: ?CheckedBuiltinNominal = null;
     for (views) |view| {
-        if (checkedBuiltinNominalForView(view, origin_text, source_decl)) |builtin_nominal| {
+        if (checkedBuiltinNominalForView(view, origin_hash, source_decl)) |builtin_nominal| {
             if (found) |existing| {
                 if (existing != builtin_nominal) {
                     checkedArtifactInvariant("checked builtin nominal source resolved to multiple builtin declarations", .{});
@@ -6666,8 +6708,8 @@ fn checkedBuiltinNominalForAvailableSource(
     return found;
 }
 
-fn checkedBuiltinNominalForView(view: ImportedModuleView, origin_text: []const u8, source_decl: u32) ?CheckedBuiltinNominal {
-    if (!importedViewModuleNameMatches(view, origin_text)) return null;
+fn checkedBuiltinNominalForView(view: ImportedModuleView, origin_hash: *const [32]u8, source_decl: u32) ?CheckedBuiltinNominal {
+    if (!importedViewIdentityMatches(view, origin_hash)) return null;
     if (sourceDeclTypeIdent(view.module_env, source_decl) == null) return null;
     if (view.module_env.module_role != .builtin) return null;
     return checkedBuiltinNominalForSourceDecl(view.module_env, source_decl);
@@ -6830,33 +6872,20 @@ test "checked artifact builtin nominal categorization requires explicit builtin 
     }};
 
     const bool_source_decl = try testTypeDeclSourceDeclForIdent(builtin_env, builtin_env.idents.bool_type);
+    const builtin_hash = builtin_env.contentIdentityHash() orelse unreachable;
     const nominal = types.NominalType{
         .ident = .{ .ident_idx = module.commonIdents().bool_type },
         .vars = undefined,
-        .origin_module = module.commonIdents().builtin_module,
+        .origin_module = try @constCast(module.moduleEnvConst()).internModuleIdentity(builtin_hash, base.Ident.Idx.NONE),
         .source = try types.NominalType.Source.initChecked(try types.types.SourceDecl.fromStatementChecked(bool_source_decl), false, false),
     };
 
     try testing.expect(categorizeBuiltinNominal(module, .{ .direct = &imports }, nominal) == null);
 }
 
-fn moduleEnvNameMatches(module_env: *const ModuleEnv, origin_text: []const u8) bool {
-    if (module_env.module_role == .builtin and
-        Ident.textEql(module_env.getIdent(module_env.idents.builtin_module), origin_text))
-    {
-        return true;
-    }
-    if (!module_env.qualified_module_ident.isNone() and
-        Ident.textEql(module_env.getIdent(module_env.qualified_module_ident), origin_text))
-    {
-        return true;
-    }
-    if (!module_env.display_module_name_idx.isNone() and
-        Ident.textEql(module_env.getIdent(module_env.display_module_name_idx), origin_text))
-    {
-        return true;
-    }
-    return module_env.module_name.len > 0 and Ident.textEql(module_env.module_name, origin_text);
+fn moduleEnvIdentityMatches(module_env: *const ModuleEnv, origin_hash: *const [32]u8) bool {
+    const env_hash = module_env.contentIdentityHash() orelse return false;
+    return base.ModuleIdentity.eql(env_hash, origin_hash);
 }
 
 fn checkedNominalRepresentationForSourceNominal(
@@ -6868,46 +6897,40 @@ fn checkedNominalRepresentationForSourceNominal(
 ) Allocator.Error!CheckedNominalRepresentationRef {
     if (builtin_nominal) |builtin_id| return .{ .builtin = builtin_id };
 
-    const origin_module = try names.internModuleIdent(module.identStoreConst(), nominal.origin_module);
-    const type_name = try names.internTypeIdent(module.identStoreConst(), nominal.ident.ident_idx);
-    const current_module = try names.internModuleIdent(module.identStoreConst(), module.qualifiedModuleIdent());
+    const module_env = module.moduleEnvConst();
     const source_decl = nominal.sourceDeclOptional();
-    if (origin_module == current_module) {
+    if (nominal.origin_module == module_env.selfModuleIdentity()) {
         const statement = source_decl orelse
             checkedArtifactInvariant("checked local nominal representation had no source declaration", .{});
         return .{ .local_declaration = localNominalDeclarationIdForStatement(module, @enumFromInt(statement)) };
     }
 
+    const origin_hash = module_env.moduleIdentityHash(nominal.origin_module);
+    const type_name = try names.internTypeIdent(module.identStoreConst(), nominal.ident.ident_idx);
     return .{ .imported_declaration = importedNominalDeclarationRefForSourceNominal(
         names,
         imports,
-        origin_module,
+        origin_hash,
         type_name,
-        source_decl,
     ) };
 }
 
+/// Resolve the artifact + declaration that owns an imported nominal type:
+/// the declaring module by 32-byte content identity, the declaration by its
+/// declared (module-relative) type name.
 fn importedNominalDeclarationRefForSourceNominal(
     names: *const canonical.CanonicalNameStore,
     imports: CheckedImportViews,
-    origin_module: canonical.ModuleNameId,
+    origin_hash: *const [32]u8,
     type_name: canonical.TypeNameId,
-    source_decl: ?u32,
 ) ImportedNominalDeclarationRef {
-    const origin_text = names.moduleNameText(origin_module);
     const type_text = names.typeNameText(type_name);
-    const nominal_key = canonical.NominalTypeKey{
-        .module_name = origin_module,
-        .type_name = type_name,
-        .source_decl = source_decl,
-    };
     var found: ?ImportedNominalDeclarationRef = null;
 
     for (imports.direct) |import| {
-        if (!importedViewModuleNameMatches(import.view, origin_text)) continue;
+        if (!importedViewIdentityMatches(import.view, origin_hash)) continue;
         for (import.view.checked_types.nominal_declarations) |declaration| {
             if (!Ident.textEql(import.view.canonical_names.typeNameText(declaration.nominal.type_name), type_text)) continue;
-            if (declaration.nominal.source_decl != nominal_key.source_decl) continue;
             const next = ImportedNominalDeclarationRef{
                 .artifact = import.key,
                 .declaration = declaration.id,
@@ -6922,10 +6945,9 @@ fn importedNominalDeclarationRefForSourceNominal(
         }
     }
     for (imports.available) |view| {
-        if (!importedViewModuleNameMatches(view, origin_text)) continue;
+        if (!importedViewIdentityMatches(view, origin_hash)) continue;
         for (view.checked_types.nominal_declarations) |declaration| {
             if (!Ident.textEql(view.canonical_names.typeNameText(declaration.nominal.type_name), type_text)) continue;
-            if (declaration.nominal.source_decl != nominal_key.source_decl) continue;
             const next = ImportedNominalDeclarationRef{
                 .artifact = view.key,
                 .declaration = declaration.id,
@@ -6941,8 +6963,8 @@ fn importedNominalDeclarationRefForSourceNominal(
     }
 
     return found orelse checkedArtifactInvariant(
-        "checked nominal representation referenced a missing imported nominal declaration for {s}.{s} source_decl {?}",
-        .{ origin_text, type_text, source_decl },
+        "checked nominal representation referenced a missing imported nominal declaration for owner identity {any} type {s}",
+        .{ origin_hash.*, type_text },
     );
 }
 
@@ -12106,7 +12128,7 @@ pub const ResolvedValueRefTable = struct {
             const checked_type_key = try canonical_type_keys.fromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 module.exprType(expr_idx),
             );
             const checked_ty = checked_types.rootForSourceVar(module, module.exprType(expr_idx)) orelse {
@@ -13588,7 +13610,7 @@ pub const CheckedProcedureTemplateTable = struct {
             const checked_fn_scheme = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 module.defType(def_idx),
             );
             const body: CheckedProcedureBody = if (intrinsic) |intrinsic_id| blk: {
@@ -14323,7 +14345,7 @@ pub const PlatformRequiredDeclarationTable = struct {
                 .declared_source_ty = try canonical_type_keys.schemeFromVar(
                     allocator,
                     module.typeStoreConst(),
-                    module.identStoreConst(),
+                    module.moduleEnvConst(),
                     ModuleEnv.varFrom(required_type.type_anno),
                 ),
                 .type_anno = required_type.type_anno,
@@ -14910,6 +14932,1438 @@ fn platformRequiredPayloadForDeclaration(
     };
 }
 
+fn applyPlatformRequiredSignatureSubstitutions(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *canonical.CanonicalNameStore,
+    checked_types: *CheckedTypePublication,
+    platform_requirement_context: ?PlatformRequirementContextKey,
+    platform_requirement_artifact: ?ImportedModuleView,
+) Allocator.Error!void {
+    const context = platform_requirement_context orelse return;
+    const platform = platform_requirement_artifact orelse {
+        checkedArtifactInvariant("platform requirement substitution missing platform declaration artifact", .{});
+    };
+    const expected_context = PlatformRequirementContextKey.compute(
+        platform.module_identity,
+        platform.platform_required_declarations.identityHash(platform.canonical_names),
+    );
+    if (!std.meta.eql(context.bytes, expected_context.bytes)) {
+        checkedArtifactInvariant("platform requirement substitution context does not match declaration artifact", .{});
+    }
+
+    if (platform.platform_required_declarations.declarations.len == 0) return;
+
+    var projector = CheckedTypeStoreImportProjector.init(allocator, &checked_types.store, names, platform);
+    defer projector.deinit();
+
+    var formals = std.ArrayList(CheckedTypeId).empty;
+    defer formals.deinit(allocator);
+    var actuals = std.ArrayList(CheckedTypeId).empty;
+    defer actuals.deinit(allocator);
+    var app_scheme_keys = std.ArrayList(canonical.CanonicalTypeSchemeKey).empty;
+    defer app_scheme_keys.deinit(allocator);
+
+    var active = std.AutoHashMap(PlatformRequirementTypePair, void).init(allocator);
+    defer active.deinit();
+
+    for (platform.platform_required_declarations.declarations) |declaration| {
+        const required_name = try names.internExportName(platform.canonical_names.exportNameText(declaration.platform_name));
+        const app_def = appDefByRequiredName(module, names, required_name) orelse continue;
+        const app_root = checked_types.rootForSourceVar(module, module.defType(app_def)) orelse {
+            checkedArtifactInvariant("platform requirement substitution missing app def checked root", .{});
+        };
+        const app_scheme_key = try canonical_type_keys.schemeFromVar(
+            allocator,
+            module.typeStoreConst(),
+            module.moduleEnvConst(),
+            module.defType(app_def),
+        );
+        const platform_scheme = platform.checked_types.schemeForKey(declaration.declared_source_ty) orelse {
+            checkedArtifactInvariant("platform requirement substitution missing platform declaration checked scheme", .{});
+        };
+        const expected_root = try projector.project(platform_scheme.root);
+
+        active.clearRetainingCapacity();
+        try collectPlatformRequiredSignatureSubstitutions(
+            allocator,
+            names,
+            &checked_types.store,
+            expected_root,
+            app_root,
+            &formals,
+            &actuals,
+            &active,
+        );
+        try app_scheme_keys.append(allocator, app_scheme_key);
+    }
+
+    if (formals.items.len == 0) return;
+
+    var clone_active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+    defer clone_active.deinit();
+
+    for (checked_types.source_type_roots) |*entry| {
+        clone_active.clearRetainingCapacity();
+        entry.checked_root = try checked_types.store.cloneCheckedTypeRootSubstituting(
+            allocator,
+            names,
+            entry.checked_root,
+            formals.items,
+            actuals.items,
+            &clone_active,
+        );
+    }
+
+    for (app_scheme_keys.items) |scheme_key| {
+        for (checked_types.store.schemes.items) |*scheme| {
+            if (!std.meta.eql(scheme.key.bytes, scheme_key.bytes)) continue;
+            clone_active.clearRetainingCapacity();
+            scheme.root = try checked_types.store.cloneCheckedTypeRootSubstituting(
+                allocator,
+                names,
+                scheme.root,
+                formals.items,
+                actuals.items,
+                &clone_active,
+            );
+            break;
+        }
+    }
+}
+
+fn appDefByRequiredName(
+    module: TypedCIR.Module,
+    names: *const canonical.CanonicalNameStore,
+    required_name: canonical.ExportNameId,
+) ?CIR.Def.Idx {
+    const module_env = module.moduleEnvConst();
+    for (module_env.store.sliceDefs(module_env.global_value_defs)) |def_idx| {
+        const def = module.def(def_idx);
+        const name = def.patternName() orelse continue;
+        if (names.lookupExportIdent(module.identStoreConst(), name) == required_name) return def_idx;
+    }
+    return null;
+}
+
+fn collectPlatformRequiredSignatureSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    expected: CheckedTypeId,
+    actual: CheckedTypeId,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    if (expected == actual) return;
+
+    const pair = PlatformRequirementTypePair{
+        .expected = @intFromEnum(expected),
+        .actual = @intFromEnum(actual),
+    };
+    if (active.contains(pair)) return;
+    try active.put(pair, {});
+    defer _ = active.remove(pair);
+
+    const expected_payload = store.payload(expected);
+    const actual_payload = store.payload(actual);
+
+    if (checkedTypePayloadIsIdentity(actual_payload)) {
+        if (checkedTypePayloadIsIdentity(expected_payload)) return;
+        if (checkedTypePayloadIsLiteralDefaultPinnedVar(actual_payload) and
+            checkedTypePayloadIsStructuralAggregate(expected_payload))
+        {
+            return;
+        }
+        try appendUniquePlatformForClauseSubstitution(formals, actuals, allocator, actual, expected);
+        return;
+    }
+    if (checkedTypePayloadIsIdentity(expected_payload)) return;
+
+    switch (expected_payload) {
+        .alias => |alias| return try collectPlatformRequiredSignatureSubstitutions(
+            allocator,
+            names,
+            store,
+            alias.backing,
+            actual,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+    switch (actual_payload) {
+        .alias => |alias| return try collectPlatformRequiredSignatureSubstitutions(
+            allocator,
+            names,
+            store,
+            expected,
+            alias.backing,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+
+    switch (expected_payload) {
+        .function => |expected_fn| {
+            const actual_fn = switch (actual_payload) {
+                .function => |actual_fn| actual_fn,
+                else => return,
+            };
+            if (expected_fn.args.len != actual_fn.args.len) return;
+            for (expected_fn.args, actual_fn.args) |expected_arg, actual_arg| {
+                try collectPlatformRequiredSignatureSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    expected_arg,
+                    actual_arg,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+            try collectPlatformRequiredSignatureSubstitutions(
+                allocator,
+                names,
+                store,
+                expected_fn.ret,
+                actual_fn.ret,
+                formals,
+                actuals,
+                active,
+            );
+        },
+        .nominal => |expected_nominal| {
+            const actual_nominal = switch (actual_payload) {
+                .nominal => |actual_nominal| actual_nominal,
+                else => {
+                    if (!expected_nominal.is_opaque) {
+                        try collectPlatformRequiredSignatureSubstitutions(
+                            allocator,
+                            names,
+                            store,
+                            expected_nominal.backing,
+                            actual,
+                            formals,
+                            actuals,
+                            active,
+                        );
+                    }
+                    return;
+                },
+            };
+            if (expected_nominal.name != actual_nominal.name or
+                expected_nominal.origin_module != actual_nominal.origin_module or
+                expected_nominal.source_decl != actual_nominal.source_decl or
+                expected_nominal.builtin != actual_nominal.builtin or
+                expected_nominal.args.len != actual_nominal.args.len)
+            {
+                return;
+            }
+            for (expected_nominal.args, actual_nominal.args) |expected_arg, actual_arg| {
+                try collectPlatformRequiredSignatureSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    expected_arg,
+                    actual_arg,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+            if (!expected_nominal.is_opaque) {
+                try collectPlatformRequiredSignatureSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    expected_nominal.backing,
+                    actual_nominal.backing,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+        },
+        .tuple => |expected_items| {
+            const actual_items = switch (actual_payload) {
+                .tuple => |actual_items| actual_items,
+                else => return,
+            };
+            if (expected_items.len != actual_items.len) return;
+            for (expected_items, actual_items) |expected_item, actual_item| {
+                try collectPlatformRequiredSignatureSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    expected_item,
+                    actual_item,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+        },
+        .empty_record,
+        .record,
+        .record_unbound,
+        => try collectPlatformRequiredRecordSignatureSubstitutions(
+            allocator,
+            names,
+            store,
+            expected_payload,
+            actual_payload,
+            formals,
+            actuals,
+            active,
+        ),
+        .empty_tag_union,
+        .tag_union,
+        => try collectPlatformRequiredTagSignatureSubstitutions(
+            allocator,
+            names,
+            store,
+            expected_payload,
+            actual_payload,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+}
+
+fn collectPlatformRequiredRecordSignatureSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    expected_payload: CheckedTypePayload,
+    actual_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    const expected_parts = recordParts(expected_payload) orelse return;
+    const actual_parts = recordParts(actual_payload) orelse return;
+    const expected_row = try flattenPlatformRequirementRecordRow(allocator, store, expected_parts.fields, expected_parts.ext);
+    defer expected_row.deinit(allocator);
+    const actual_row = try flattenPlatformRequirementRecordRow(allocator, store, actual_parts.fields, actual_parts.ext);
+    defer actual_row.deinit(allocator);
+
+    for (expected_row.fields) |expected_field| {
+        const actual_field = findRecordField(names, actual_row.fields, expected_field.name) orelse {
+            if (actual_row.tail) |tail| {
+                if (checkedTypePayloadIsIdentity(platformRequirementPayload(store, tail))) continue;
+            }
+            continue;
+        };
+        try collectPlatformRequiredSignatureSubstitutions(
+            allocator,
+            names,
+            store,
+            expected_field.ty,
+            actual_field.ty,
+            formals,
+            actuals,
+            active,
+        );
+    }
+
+    if (expected_row.tail) |expected_tail| {
+        if (actual_row.tail) |actual_tail| {
+            try collectPlatformRequiredSignatureSubstitutions(
+                allocator,
+                names,
+                store,
+                expected_tail,
+                actual_tail,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+}
+
+fn collectPlatformRequiredTagSignatureSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    expected_payload: CheckedTypePayload,
+    actual_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    const expected_union = tagUnionParts(expected_payload) orelse return;
+    const actual_union = tagUnionParts(actual_payload) orelse return;
+    const expected_row = try flattenPlatformRequirementTagRow(allocator, store, expected_union.tags, expected_union.ext);
+    defer expected_row.deinit(allocator);
+    const actual_row = try flattenPlatformRequirementTagRow(allocator, store, actual_union.tags, actual_union.ext);
+    defer actual_row.deinit(allocator);
+
+    for (expected_row.tags) |expected_tag| {
+        const actual_tag = findTag(names, actual_row.tags, expected_tag.name) orelse {
+            if (actual_row.tail) |tail| {
+                if (checkedTypePayloadIsIdentity(platformRequirementPayload(store, tail))) continue;
+            }
+            continue;
+        };
+        const expected_args = expected_tag.argsSlice(store);
+        const actual_args = actual_tag.argsSlice(store);
+        if (expected_args.len != actual_args.len) continue;
+        for (expected_args, actual_args) |expected_arg, actual_arg| {
+            try collectPlatformRequiredSignatureSubstitutions(
+                allocator,
+                names,
+                store,
+                expected_arg,
+                actual_arg,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+
+    if (expected_row.tail) |expected_tail| {
+        if (actual_row.tail) |actual_tail| {
+            try collectPlatformRequiredSignatureSubstitutions(
+                allocator,
+                names,
+                store,
+                expected_tail,
+                actual_tail,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+}
+
+fn specializeResolvedStaticDispatchPlanCallables(
+    allocator: Allocator,
+    names: *canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    artifact_key: CheckedModuleArtifactKey,
+    module_idx: u32,
+    available_artifacts: []const ImportedModuleView,
+    plans: *static_dispatch.StaticDispatchPlanTable,
+) Allocator.Error!void {
+    for (plans.plans) |*plan| {
+        const target = switch (plan.resolution) {
+            .resolved_target => |target| target,
+            .unresolved_checked_plan => continue,
+        };
+        const target_callable = try projectResolvedDispatchTargetCallable(
+            allocator,
+            names,
+            store,
+            artifact_key,
+            module_idx,
+            available_artifacts,
+            target,
+        );
+        plan.callable_ty = try instantiateResolvedDispatchTargetCallable(
+            allocator,
+            names,
+            store,
+            target_callable,
+            plan.callable_ty,
+        );
+    }
+}
+
+fn projectResolvedDispatchTargetCallable(
+    allocator: Allocator,
+    names: *canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    artifact_key: CheckedModuleArtifactKey,
+    module_idx: u32,
+    available_artifacts: []const ImportedModuleView,
+    target: static_dispatch.MethodTarget,
+) Allocator.Error!CheckedTypeId {
+    const target_key = switch (target.kind) {
+        .local_proc => return target.callable_ty,
+        .generated_structural_parser,
+        .generated_structural_encoder,
+        => {
+            if (target.module_idx == module_idx) return target.callable_ty;
+            const imported = importedModuleViewByModuleIdx(available_artifacts, target.module_idx) orelse {
+                checkedArtifactInvariant("resolved generated structural dispatch target module was not available during checked publication", .{});
+            };
+            var projector = CheckedTypeStoreImportProjector.init(allocator, store, names, imported);
+            defer projector.deinit();
+            return try projector.project(target.callable_ty);
+        },
+        .procedure => |procedure| checkedArtifactKeyFromArtifactRef(procedure.template.artifact),
+    };
+    if (checkedArtifactKeyEql(target_key, artifact_key)) return target.callable_ty;
+
+    const imported = importedModuleViewByKey(available_artifacts, target_key) orelse {
+        checkedArtifactInvariant("resolved dispatch target artifact was not available during checked publication", .{});
+    };
+    var projector = CheckedTypeStoreImportProjector.init(allocator, store, names, imported);
+    defer projector.deinit();
+    return try projector.project(target.callable_ty);
+}
+
+fn instantiateResolvedDispatchTargetCallable(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_callable: CheckedTypeId,
+    plan_callable: CheckedTypeId,
+) Allocator.Error!CheckedTypeId {
+    const target_fn = checkedFunctionPayload(store, target_callable, "resolved dispatch target callable");
+    const plan_fn = checkedFunctionPayload(store, plan_callable, "resolved dispatch plan callable");
+    if (target_fn.args.len != plan_fn.args.len) {
+        checkedArtifactInvariant("resolved dispatch target arity differed from plan arity", .{});
+    }
+    const target_args = try allocator.dupe(CheckedTypeId, target_fn.args);
+    defer allocator.free(target_args);
+    const plan_args = try allocator.dupe(CheckedTypeId, plan_fn.args);
+    defer allocator.free(plan_args);
+    const plan_ret = plan_fn.ret;
+
+    var target_formals = std.ArrayList(CheckedTypeId).empty;
+    defer target_formals.deinit(allocator);
+    var target_actuals = std.ArrayList(CheckedTypeId).empty;
+    defer target_actuals.deinit(allocator);
+    var active = std.AutoHashMap(PlatformRequirementTypePair, void).init(allocator);
+    defer active.deinit();
+    var target_conflicts = std.AutoHashMap(CheckedTypeId, void).init(allocator);
+    defer target_conflicts.deinit();
+
+    for (target_args, plan_args) |target_arg, plan_arg| {
+        try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            target_arg,
+            plan_arg,
+            &target_formals,
+            &target_actuals,
+            &active,
+            &target_conflicts,
+        );
+    }
+
+    var clone_active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+    defer clone_active.deinit();
+    const instantiated_target = try store.cloneCheckedTypeRootSubstituting(
+        allocator,
+        names,
+        target_callable,
+        target_formals.items,
+        target_actuals.items,
+        &clone_active,
+    );
+    const target_instantiated_fn = checkedFunctionPayload(store, instantiated_target, "instantiated resolved dispatch target callable");
+    const target_instantiated_args = try allocator.dupe(CheckedTypeId, target_instantiated_fn.args);
+    defer allocator.free(target_instantiated_args);
+    const target_instantiated_ret = target_instantiated_fn.ret;
+
+    var plan_formals = std.ArrayList(CheckedTypeId).empty;
+    defer plan_formals.deinit(allocator);
+    var plan_actuals = std.ArrayList(CheckedTypeId).empty;
+    defer plan_actuals.deinit(allocator);
+
+    active.clearRetainingCapacity();
+    for (target_instantiated_args, plan_args) |target_arg, plan_arg| {
+        try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_arg,
+            plan_arg,
+            &plan_formals,
+            &plan_actuals,
+            &active,
+        );
+    }
+    active.clearRetainingCapacity();
+    try collectDispatchPlanIdentitySubstitutions(
+        allocator,
+        names,
+        store,
+        target_instantiated_ret,
+        plan_ret,
+        &plan_formals,
+        &plan_actuals,
+        &active,
+    );
+
+    clone_active.clearRetainingCapacity();
+    return try store.cloneCheckedTypeRootSubstituting(
+        allocator,
+        names,
+        plan_callable,
+        plan_formals.items,
+        plan_actuals.items,
+        &clone_active,
+    );
+}
+
+fn checkedFunctionPayload(
+    store: *const CheckedTypeStore,
+    root: CheckedTypeId,
+    comptime context: []const u8,
+) CheckedFunctionType {
+    var current = root;
+    var remaining = store.payloads.items.len;
+    while (true) {
+        switch (store.payload(current)) {
+            .alias => |alias| current = alias.backing,
+            .function => |function| return function,
+            else => checkedArtifactInvariant(context ++ " was not a function", .{}),
+        }
+        if (remaining == 0) {
+            checkedArtifactInvariant(context ++ " alias chain was cyclic", .{});
+        }
+        remaining -= 1;
+    }
+}
+
+fn collectResolvedDispatchTargetSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target: CheckedTypeId,
+    plan: CheckedTypeId,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!void {
+    if (target == plan) return;
+
+    const pair = PlatformRequirementTypePair{
+        .expected = @intFromEnum(target),
+        .actual = @intFromEnum(plan),
+    };
+    if (active.contains(pair)) return;
+    try active.put(pair, {});
+    defer _ = active.remove(pair);
+
+    const target_payload = store.payload(target);
+    const plan_payload = store.payload(plan);
+
+    if (checkedTypePayloadIsIdentity(target_payload)) {
+        try appendConsistentDispatchTargetSubstitution(formals, actuals, conflicts, allocator, target, plan);
+        return;
+    }
+    if (checkedTypePayloadIsIdentity(plan_payload)) return;
+
+    switch (target_payload) {
+        .alias => |alias| return try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            alias.backing,
+            plan,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        else => {},
+    }
+    switch (plan_payload) {
+        .alias => |alias| return try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            target,
+            alias.backing,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        else => {},
+    }
+
+    switch (target_payload) {
+        .function => |target_fn| {
+            const plan_fn = switch (plan_payload) {
+                .function => |function| function,
+                else => return,
+            };
+            if (target_fn.args.len != plan_fn.args.len) return;
+            for (target_fn.args, plan_fn.args) |target_arg, plan_arg| {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+        },
+        .nominal => |target_nominal| {
+            const plan_nominal = switch (plan_payload) {
+                .nominal => |nominal| nominal,
+                else => {
+                    if (!target_nominal.is_opaque) {
+                        try collectResolvedDispatchTargetSubstitutions(
+                            allocator,
+                            names,
+                            store,
+                            target_nominal.backing,
+                            plan,
+                            formals,
+                            actuals,
+                            active,
+                            conflicts,
+                        );
+                    }
+                    return;
+                },
+            };
+            if (target_nominal.name != plan_nominal.name or
+                target_nominal.origin_module != plan_nominal.origin_module or
+                target_nominal.source_decl != plan_nominal.source_decl or
+                target_nominal.builtin != plan_nominal.builtin or
+                target_nominal.args.len != plan_nominal.args.len)
+            {
+                return;
+            }
+            for (target_nominal.args, plan_nominal.args) |target_arg, plan_arg| {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+            if (!target_nominal.is_opaque) {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_nominal.backing,
+                    plan_nominal.backing,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+        },
+        .tuple => |target_items| {
+            const plan_items = switch (plan_payload) {
+                .tuple => |items| items,
+                else => return,
+            };
+            if (target_items.len != plan_items.len) return;
+            for (target_items, plan_items) |target_item, plan_item| {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_item,
+                    plan_item,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+        },
+        .empty_record,
+        .record,
+        .record_unbound,
+        => try collectResolvedDispatchRecordSubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        .empty_tag_union,
+        .tag_union,
+        => try collectResolvedDispatchTagSubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        else => {},
+    }
+}
+
+fn collectResolvedDispatchRecordSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!void {
+    const target_parts = recordParts(target_payload) orelse return;
+    const plan_parts = recordParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementRecordRow(allocator, store, target_parts.fields, target_parts.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementRecordRow(allocator, store, plan_parts.fields, plan_parts.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.fields) |target_field| {
+        const plan_field = findRecordField(names, plan_row.fields, target_field.name) orelse continue;
+        try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            target_field.ty,
+            plan_field.ty,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        );
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectResolvedDispatchTargetSubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+                conflicts,
+            );
+        }
+    }
+}
+
+fn collectResolvedDispatchTagSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!void {
+    const target_union = tagUnionParts(target_payload) orelse return;
+    const plan_union = tagUnionParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementTagRow(allocator, store, target_union.tags, target_union.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementTagRow(allocator, store, plan_union.tags, plan_union.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.tags) |target_tag| {
+        const plan_tag = findTag(names, plan_row.tags, target_tag.name) orelse continue;
+        const target_args = target_tag.argsSlice(store);
+        const plan_args = plan_tag.argsSlice(store);
+        if (target_args.len != plan_args.len) continue;
+        for (target_args, plan_args) |target_arg, plan_arg| {
+            try collectResolvedDispatchTargetSubstitutions(
+                allocator,
+                names,
+                store,
+                target_arg,
+                plan_arg,
+                formals,
+                actuals,
+                active,
+                conflicts,
+            );
+        }
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectResolvedDispatchTargetSubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+                conflicts,
+            );
+        }
+    }
+}
+
+fn collectDispatchPlanIdentitySubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target: CheckedTypeId,
+    plan: CheckedTypeId,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    if (target == plan) return;
+
+    const pair = PlatformRequirementTypePair{
+        .expected = @intFromEnum(target),
+        .actual = @intFromEnum(plan),
+    };
+    if (active.contains(pair)) return;
+    try active.put(pair, {});
+    defer _ = active.remove(pair);
+
+    const target_payload = store.payload(target);
+    const plan_payload = store.payload(plan);
+
+    if (checkedTypePayloadIsIdentity(plan_payload)) {
+        if (!checkedTypePayloadIsIdentity(target_payload)) {
+            try appendUniqueCheckedTypeSubstitution(formals, actuals, allocator, plan, target);
+        }
+        return;
+    }
+    if (checkedTypePayloadIsIdentity(target_payload)) return;
+
+    switch (target_payload) {
+        .alias => |alias| return try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            alias.backing,
+            plan,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+    switch (plan_payload) {
+        .alias => |alias| return try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target,
+            alias.backing,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+
+    switch (target_payload) {
+        .function => |target_fn| {
+            const plan_fn = switch (plan_payload) {
+                .function => |function| function,
+                else => return,
+            };
+            if (target_fn.args.len != plan_fn.args.len) return;
+            for (target_fn.args, plan_fn.args) |target_arg, plan_arg| {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_fn.ret,
+                plan_fn.ret,
+                formals,
+                actuals,
+                active,
+            );
+        },
+        .nominal => |target_nominal| {
+            const plan_nominal = switch (plan_payload) {
+                .nominal => |nominal| nominal,
+                else => {
+                    if (!target_nominal.is_opaque) {
+                        try collectDispatchPlanIdentitySubstitutions(
+                            allocator,
+                            names,
+                            store,
+                            target_nominal.backing,
+                            plan,
+                            formals,
+                            actuals,
+                            active,
+                        );
+                    }
+                    return;
+                },
+            };
+            if (target_nominal.name != plan_nominal.name or
+                target_nominal.origin_module != plan_nominal.origin_module or
+                target_nominal.source_decl != plan_nominal.source_decl or
+                target_nominal.builtin != plan_nominal.builtin or
+                target_nominal.args.len != plan_nominal.args.len)
+            {
+                return;
+            }
+            for (target_nominal.args, plan_nominal.args) |target_arg, plan_arg| {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+            if (!target_nominal.is_opaque) {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_nominal.backing,
+                    plan_nominal.backing,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+        },
+        .tuple => |target_items| {
+            const plan_items = switch (plan_payload) {
+                .tuple => |items| items,
+                else => return,
+            };
+            if (target_items.len != plan_items.len) return;
+            for (target_items, plan_items) |target_item, plan_item| {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_item,
+                    plan_item,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+        },
+        .empty_record,
+        .record,
+        .record_unbound,
+        => try collectDispatchPlanRecordIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+        ),
+        .empty_tag_union,
+        .tag_union,
+        => try collectDispatchPlanTagIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+}
+
+fn collectDispatchPlanRecordIdentitySubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    const target_parts = recordParts(target_payload) orelse return;
+    const plan_parts = recordParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementRecordRow(allocator, store, target_parts.fields, target_parts.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementRecordRow(allocator, store, plan_parts.fields, plan_parts.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.fields) |target_field| {
+        const plan_field = findRecordField(names, plan_row.fields, target_field.name) orelse continue;
+        try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_field.ty,
+            plan_field.ty,
+            formals,
+            actuals,
+            active,
+        );
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+}
+
+fn collectDispatchPlanTagIdentitySubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    const target_union = tagUnionParts(target_payload) orelse return;
+    const plan_union = tagUnionParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementTagRow(allocator, store, target_union.tags, target_union.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementTagRow(allocator, store, plan_union.tags, plan_union.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.tags) |target_tag| {
+        const plan_tag = findTag(names, plan_row.tags, target_tag.name) orelse continue;
+        const target_args = target_tag.argsSlice(store);
+        const plan_args = plan_tag.argsSlice(store);
+        if (target_args.len != plan_args.len) continue;
+        for (target_args, plan_args) |target_arg, plan_arg| {
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_arg,
+                plan_arg,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+}
+
+fn applyPlatformForClauseSubstitutions(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *canonical.CanonicalNameStore,
+    checked_types: *CheckedTypePublication,
+    relation_artifacts: []const ImportedModuleView,
+    relation: ?PlatformAppRelation,
+) Allocator.Error!void {
+    const active_relation = relation orelse return;
+    const app_view = relationArtifactByKey(relation_artifacts, active_relation.app_artifact) orelse {
+        checkedArtifactInvariant("platform for-clause substitution missing app relation artifact", .{});
+    };
+
+    const module_env = module.moduleEnvConst();
+    if (module_env.for_clause_aliases.len() == 0) return;
+
+    var projector = CheckedTypeStoreImportProjector.init(allocator, &checked_types.store, names, app_view);
+    defer projector.deinit();
+
+    var formals = std.ArrayList(CheckedTypeId).empty;
+    defer formals.deinit(allocator);
+    var actuals = std.ArrayList(CheckedTypeId).empty;
+    defer actuals.deinit(allocator);
+
+    var projected_aliases = std.ArrayList(PlatformForClauseProjectedAlias).empty;
+    defer projected_aliases.deinit(allocator);
+
+    for (module.requiresTypes()) |required_type| {
+        const aliases = module_env.for_clause_aliases.sliceRange(required_type.type_aliases);
+        for (aliases) |alias| {
+            const alias_statement = module_env.store.getStatement(alias.alias_stmt_idx);
+            const alias_anno = switch (alias_statement) {
+                .s_alias_decl => |decl| decl.anno,
+                else => checkedArtifactInvariant("platform for-clause substitution referenced a non-alias statement", .{}),
+            };
+
+            const formal_alias = checked_types.rootForSourceVar(module, ModuleEnv.varFrom(alias.alias_stmt_idx)) orelse {
+                checkedArtifactInvariant("platform for-clause substitution missing platform alias checked root", .{});
+            };
+            const formal_rigid = checked_types.rootForSourceVar(module, ModuleEnv.varFrom(alias_anno)) orelse {
+                checkedArtifactInvariant("platform for-clause substitution missing platform rigid checked root", .{});
+            };
+            const alias_name = module_env.getIdent(alias.alias_name);
+            const app_type = (try appTypeDeclCheckedRootForName(allocator, app_view, alias_name)) orelse {
+                checkedArtifactInvariant("platform for-clause substitution missing matching app type declaration", .{});
+            };
+            const actual = try projector.project(app_type);
+
+            const formal_alias_payload = switch (checked_types.store.payload(formal_alias)) {
+                .alias => |payload| payload,
+                else => checkedArtifactInvariant("platform for-clause substitution platform alias root was not an alias", .{}),
+            };
+            try projected_aliases.append(allocator, .{
+                .name = formal_alias_payload.name,
+                .origin_module = formal_alias_payload.origin_module,
+                .source_decl = formal_alias_payload.source_decl orelse {
+                    checkedArtifactInvariant("platform for-clause substitution platform alias had no source declaration", .{});
+                },
+                .app_decl_root = actual,
+            });
+
+            try appendUniquePlatformForClauseSubstitution(&formals, &actuals, allocator, formal_alias, actual);
+            try appendUniquePlatformForClauseSubstitution(&formals, &actuals, allocator, formal_rigid, actual);
+        }
+    }
+
+    try appendPlatformForClauseAliasApplicationSubstitutions(
+        allocator,
+        names,
+        &checked_types.store,
+        projected_aliases.items,
+        &formals,
+        &actuals,
+    );
+
+    if (formals.items.len == 0) return;
+
+    var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+    defer active.deinit();
+
+    for (checked_types.source_type_roots) |*entry| {
+        active.clearRetainingCapacity();
+        entry.checked_root = try checked_types.store.cloneCheckedTypeRootSubstituting(
+            allocator,
+            names,
+            entry.checked_root,
+            formals.items,
+            actuals.items,
+            &active,
+        );
+    }
+}
+
+const PlatformForClauseProjectedAlias = struct {
+    name: canonical.TypeNameId,
+    origin_module: canonical.ModuleIdentityId,
+    source_decl: u32,
+    app_decl_root: CheckedTypeId,
+};
+
+fn appendPlatformForClauseAliasApplicationSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    projected_aliases: []const PlatformForClauseProjectedAlias,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+) Allocator.Error!void {
+    if (projected_aliases.len == 0) return;
+
+    const payload_count = store.payloads.items.len;
+    var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+    defer active.deinit();
+
+    var root_index: usize = 0;
+    while (root_index < payload_count) : (root_index += 1) {
+        const platform_root: CheckedTypeId = @enumFromInt(@as(u32, @intCast(root_index)));
+        const platform_alias = switch (store.payload(platform_root)) {
+            .alias => |alias| alias,
+            else => continue,
+        };
+        const projected = projectedForClauseAlias(projected_aliases, platform_alias) orelse continue;
+        if (platform_alias.args.len == 0) continue;
+
+        const actual = try applyProjectedForClauseAlias(
+            allocator,
+            names,
+            store,
+            projected.app_decl_root,
+            platform_alias.args,
+            formals.items,
+            actuals.items,
+            &active,
+        );
+        try appendUniquePlatformForClauseSubstitution(formals, actuals, allocator, platform_root, actual);
+    }
+}
+
+fn projectedForClauseAlias(
+    projected_aliases: []const PlatformForClauseProjectedAlias,
+    alias: CheckedAliasType,
+) ?PlatformForClauseProjectedAlias {
+    const source_decl = alias.source_decl orelse return null;
+    for (projected_aliases) |projected| {
+        if (projected.source_decl != source_decl) continue;
+        if (projected.name != alias.name) continue;
+        if (projected.origin_module != alias.origin_module) continue;
+        return projected;
+    }
+    return null;
+}
+
+fn applyProjectedForClauseAlias(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    app_decl_root: CheckedTypeId,
+    platform_args_view: []const CheckedTypeId,
+    base_formals: []const CheckedTypeId,
+    base_actuals: []const CheckedTypeId,
+    active: *std.AutoHashMap(CheckedTypeId, CheckedTypeId),
+) Allocator.Error!CheckedTypeId {
+    const platform_args = try allocator.dupe(CheckedTypeId, platform_args_view);
+    defer allocator.free(platform_args);
+
+    const applied_args = try allocator.alloc(CheckedTypeId, platform_args.len);
+    defer allocator.free(applied_args);
+
+    for (platform_args, 0..) |platform_arg, i| {
+        active.clearRetainingCapacity();
+        applied_args[i] = try store.cloneCheckedTypeRootSubstituting(
+            allocator,
+            names,
+            platform_arg,
+            base_formals,
+            base_actuals,
+            active,
+        );
+    }
+
+    const app_formals_view = switch (store.payload(app_decl_root)) {
+        .alias => |alias| alias.args,
+        .nominal => |nominal| nominal.args,
+        else => checkedArtifactInvariant("platform for-clause substitution app type root was not a type declaration", .{}),
+    };
+    if (app_formals_view.len != applied_args.len) {
+        checkedArtifactInvariant("platform for-clause substitution app type arity did not match platform alias application", .{});
+    }
+
+    const app_formals = try allocator.dupe(CheckedTypeId, app_formals_view);
+    defer allocator.free(app_formals);
+
+    active.clearRetainingCapacity();
+    return try store.cloneCheckedTypeRootSubstituting(
+        allocator,
+        names,
+        app_decl_root,
+        app_formals,
+        applied_args,
+        active,
+    );
+}
+
+fn appendUniquePlatformForClauseSubstitution(
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    allocator: Allocator,
+    formal: CheckedTypeId,
+    actual: CheckedTypeId,
+) Allocator.Error!void {
+    return appendUniqueCheckedTypeSubstitution(formals, actuals, allocator, formal, actual);
+}
+
+fn appendConsistentDispatchTargetSubstitution(
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+    allocator: Allocator,
+    formal: CheckedTypeId,
+    actual: CheckedTypeId,
+) Allocator.Error!void {
+    if (conflicts.contains(formal)) return;
+
+    for (formals.items, actuals.items, 0..) |existing_formal, existing_actual, i| {
+        if (existing_formal != formal) continue;
+        if (existing_actual == actual) return;
+
+        try conflicts.put(formal, {});
+        _ = formals.orderedRemove(i);
+        _ = actuals.orderedRemove(i);
+        return;
+    }
+
+    try formals.append(allocator, formal);
+    try actuals.append(allocator, actual);
+}
+
+fn appendUniqueCheckedTypeSubstitution(
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    allocator: Allocator,
+    formal: CheckedTypeId,
+    actual: CheckedTypeId,
+) Allocator.Error!void {
+    for (formals.items, actuals.items) |existing_formal, existing_actual| {
+        if (existing_formal != formal) continue;
+        if (existing_actual != actual) {
+            checkedArtifactInvariant("checked type substitution mapped one formal to multiple actuals", .{});
+        }
+        return;
+    }
+    try formals.append(allocator, formal);
+    try actuals.append(allocator, actual);
+}
+
 fn importedModuleViewByKey(
     artifacts: []const ImportedModuleView,
     key: CheckedModuleArtifactKey,
@@ -14920,11 +16374,69 @@ fn importedModuleViewByKey(
     return null;
 }
 
+fn importedModuleViewByModuleIdx(
+    artifacts: []const ImportedModuleView,
+    module_idx: u32,
+) ?ImportedModuleView {
+    for (artifacts) |artifact| {
+        if (artifact.module_identity.module_idx == module_idx) return artifact;
+    }
+    return null;
+}
+
 fn relationArtifactByKey(
     relation_artifacts: []const ImportedModuleView,
     key: CheckedModuleArtifactKey,
 ) ?ImportedModuleView {
     return importedModuleViewByKey(relation_artifacts, key);
+}
+
+fn platformRequirementArtifactByContext(
+    available_artifacts: []const ImportedModuleView,
+    context: ?PlatformRequirementContextKey,
+) ?ImportedModuleView {
+    const expected_context = context orelse return null;
+    for (available_artifacts) |artifact| {
+        const artifact_context = PlatformRequirementContextKey.compute(
+            artifact.module_identity,
+            artifact.platform_required_declarations.identityHash(artifact.canonical_names),
+        );
+        if (std.meta.eql(expected_context.bytes, artifact_context.bytes)) return artifact;
+    }
+    return null;
+}
+
+fn appTypeDeclCheckedRootForName(
+    allocator: Allocator,
+    app_view: ImportedModuleView,
+    alias_name: []const u8,
+) Allocator.Error!?CheckedTypeId {
+    const app_env = app_view.module_env;
+    for (app_env.store.sliceStatements(app_env.all_statements)) |statement_idx| {
+        const statement = app_env.store.getStatement(statement_idx);
+        // A platform for-clause type (`[Model : model]`) may be satisfied by either a plain
+        // alias (`Model : {}`) or a nominal declaration (`Model := {}`); both publish a checked
+        // root keyed on the statement's var, so resolve the header from either form.
+        const header_idx = switch (statement) {
+            .s_alias_decl => |decl| decl.header,
+            .s_nominal_decl => |decl| decl.header,
+            else => continue,
+        };
+        const header = app_env.store.getTypeHeader(header_idx);
+        if (!Ident.textEql(app_env.getIdent(header.relative_name), alias_name)) continue;
+
+        const key = try canonical_type_keys.fromVar(
+            allocator,
+            &app_env.types,
+            app_env,
+            ModuleEnv.varFrom(statement_idx),
+        );
+        for (app_view.checked_types.roots) |root| {
+            if (canonicalTypeKeyEql(root.key, key)) return root.id;
+        }
+        checkedArtifactInvariant("platform for-clause substitution app type was not published in app checked types", .{});
+    }
+    return null;
 }
 
 fn validatePlatformBindingRelation(
@@ -15069,7 +16581,7 @@ pub fn buildPlatformAppRelation(
         const requested_source_ty = try canonical_type_keys.fromVar(
             allocator,
             &platform_module_env.types,
-            platform_module_env.getIdentStoreConst(),
+            platform_module_env,
             ModuleEnv.varFrom(declaration.type_anno),
         );
         const app_value_ref = TopLevelValueRef{
@@ -15687,6 +17199,7 @@ const PlatformAppRelationTypeResolver = struct {
     store: *CheckedTypeStore,
     finalizing: std.AutoHashMap(PlatformAppRelationFinalizeInput, CheckedTypeId),
     merging: std.AutoHashMap(PlatformAppRelationMergeInput, CheckedTypeId),
+    substitutions: std.AutoHashMap(CheckedTypeId, CheckedTypeId),
     /// When set, records each platform `requires` type variable that a relation
     /// resolves to an app type. `subst_formals[i]` is the platform-owned
     /// identity variable root and `subst_actuals[i]` is the concrete app root it
@@ -15706,12 +17219,73 @@ const PlatformAppRelationTypeResolver = struct {
             .store = store,
             .finalizing = std.AutoHashMap(PlatformAppRelationFinalizeInput, CheckedTypeId).init(allocator),
             .merging = std.AutoHashMap(PlatformAppRelationMergeInput, CheckedTypeId).init(allocator),
+            .substitutions = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator),
         };
     }
 
     fn deinit(self: *PlatformAppRelationTypeResolver) void {
+        self.substitutions.deinit();
         self.merging.deinit();
         self.finalizing.deinit();
+    }
+
+    fn replayPublishedRelations(
+        self: *PlatformAppRelationTypeResolver,
+        module: TypedCIR.Module,
+        checked_types: *const CheckedTypePublication,
+        declarations: *const PlatformRequiredDeclarationTable,
+        relations: *const PlatformRequirementRelationTable,
+    ) Allocator.Error!void {
+        for (relations.relations) |relation| {
+            const declaration = declarations.lookupByDeclarationId(relation.declaration) orelse {
+                checkedArtifactInvariant("platform/app relation replay referenced missing requirement declaration", .{});
+            };
+            const platform_payload = platformRequiredPayloadForDeclaration(module, checked_types, declaration);
+            _ = try self.merge(platform_payload, relation.requested_source_ty_payload, .value);
+            try self.replayForClauseAliasSubstitutions(module, checked_types, declaration);
+        }
+    }
+
+    fn replayForClauseAliasSubstitutions(
+        self: *PlatformAppRelationTypeResolver,
+        module: TypedCIR.Module,
+        checked_types: *const CheckedTypePublication,
+        declaration: PlatformRequiredDeclaration,
+    ) Allocator.Error!void {
+        const module_env = module.moduleEnvConst();
+        if (declaration.requires_idx >= module_env.requires_types.items.items.len) {
+            checkedArtifactInvariant("platform/app relation alias replay referenced an out-of-range requirement", .{});
+        }
+        const required_type = module_env.requires_types.items.items[declaration.requires_idx];
+        const aliases = module_env.for_clause_aliases.sliceRange(required_type.type_aliases);
+        for (aliases) |alias| {
+            const alias_statement = module_env.store.getStatement(alias.alias_stmt_idx);
+            const alias_anno = switch (alias_statement) {
+                .s_alias_decl => |decl| decl.anno,
+                else => checkedArtifactInvariant("platform/app relation alias replay referenced a non-alias statement", .{}),
+            };
+            const alias_anno_root = checked_types.rootForSourceVar(module, ModuleEnv.varFrom(alias_anno)) orelse {
+                checkedArtifactInvariant("platform/app relation alias replay could not find alias backing checked root", .{});
+            };
+            const resolved = self.substitutions.get(alias_anno_root) orelse continue;
+
+            const alias_root = checked_types.rootForSourceVar(module, ModuleEnv.varFrom(alias.alias_stmt_idx)) orelse {
+                checkedArtifactInvariant("platform/app relation alias replay could not find alias checked root", .{});
+            };
+            _ = try self.recordPlatformRootSubstitution(alias_root, resolved);
+            switch (self.payload(alias_root)) {
+                .alias => |alias_payload| _ = try self.recordPlatformRootSubstitution(alias_payload.backing, resolved),
+                else => {},
+            }
+            _ = try self.recordPlatformRootSubstitution(alias_anno_root, resolved);
+        }
+    }
+
+    fn resolvePlatformRoot(
+        self: *PlatformAppRelationTypeResolver,
+        root: CheckedTypeId,
+    ) Allocator.Error!CheckedTypeId {
+        return try self.finalize(root, .value);
     }
 
     fn merge(
@@ -15720,6 +17294,15 @@ const PlatformAppRelationTypeResolver = struct {
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!CheckedTypeId {
+        if (self.substitutions.get(platform_root)) |replacement| {
+            const merged = try self.mergeSubstitutedPlatformRoot(replacement, app_root, context);
+            if (context == .value) {
+                const resolved = try self.recordPlatformRootSubstitution(platform_root, merged);
+                try self.recordRequiredVariableSubstitution(platform_root, resolved);
+                return resolved;
+            }
+            return merged;
+        }
         if (platform_root == app_root) {
             return try self.finalize(platform_root, context);
         }
@@ -15728,12 +17311,17 @@ const PlatformAppRelationTypeResolver = struct {
         const app_payload = self.payload(app_root);
 
         if (checkedTypePayloadIsIdentity(platform_payload)) {
-            const resolved = try self.mergeIdentityWith(platform_root, app_root, app_payload, context);
+            const resolved = try self.mergePlatformIdentityWith(
+                platform_root,
+                app_root,
+                app_payload,
+                context,
+            );
             try self.recordRequiredVariableSubstitution(platform_root, resolved);
             return resolved;
         }
         if (checkedTypePayloadIsIdentity(app_payload)) {
-            return try self.mergeIdentityWith(app_root, platform_root, platform_payload, context);
+            return try self.identityMergeResult(platform_root, platform_payload, context);
         }
         if (platform_root == app_root) {
             return platform_root;
@@ -15780,10 +17368,10 @@ const PlatformAppRelationTypeResolver = struct {
         };
         if (self.merging.get(merge_input)) |existing| return existing;
 
-        if (try platformAppRelationMergeResultIsEmptyRecord(self.allocator, self.names, self.store, platform_root, app_root, context)) {
+        if (try platformAppRelationMergeResultIsEmptyRecord(self.allocator, self.names, self.store, platform_root, app_root, context, &self.substitutions)) {
             return try self.emptyRecordRoot();
         }
-        if (try platformAppRelationMergeResultIsEmptyTagUnion(self.allocator, self.names, self.store, platform_root, app_root, context)) {
+        if (try platformAppRelationMergeResultIsEmptyTagUnion(self.allocator, self.names, self.store, platform_root, app_root, context, &self.substitutions)) {
             return try self.emptyTagUnionRoot();
         }
 
@@ -15794,8 +17382,16 @@ const PlatformAppRelationTypeResolver = struct {
             platform_root,
             app_root,
             context,
+            &self.substitutions,
         );
-        if (self.store.rootForKey(result_key)) |existing| return existing;
+        if (self.store.rootForKey(result_key)) |existing| {
+            try self.merging.put(merge_input, existing);
+            defer _ = self.merging.remove(merge_input);
+
+            var learned_payload = try self.mergePayload(platform_root, platform_payload, app_root, app_payload);
+            deinitCheckedTypePayloadBuild(self.allocator, &learned_payload);
+            return existing;
+        }
 
         const target = try self.store.reserveSyntheticTypeRoot(self.allocator, result_key);
         try self.merging.put(merge_input, target);
@@ -15875,9 +17471,33 @@ const PlatformAppRelationTypeResolver = struct {
         };
     }
 
-    fn mergeIdentityWith(
+    fn mergeSubstitutedPlatformRoot(
         self: *PlatformAppRelationTypeResolver,
-        _: CheckedTypeId,
+        replacement: CheckedTypeId,
+        app_root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!CheckedTypeId {
+        const replacement_payload = self.payload(replacement);
+        if (checkedTypePayloadIsIdentity(replacement_payload)) {
+            return try self.identityMergeResult(app_root, self.payload(app_root), context);
+        }
+        return try self.merge(replacement, app_root, context);
+    }
+
+    fn mergePlatformIdentityWith(
+        self: *PlatformAppRelationTypeResolver,
+        platform_root: CheckedTypeId,
+        other_root: CheckedTypeId,
+        other_payload: CheckedTypePayload,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!CheckedTypeId {
+        const resolved = try self.identityMergeResult(other_root, other_payload, context);
+        if (context == .value) return try self.recordIdentitySubstitution(platform_root, resolved);
+        return resolved;
+    }
+
+    fn identityMergeResult(
+        self: *PlatformAppRelationTypeResolver,
         other_root: CheckedTypeId,
         other_payload: CheckedTypePayload,
         context: PlatformAppRelationMergeContext,
@@ -15892,11 +17512,51 @@ const PlatformAppRelationTypeResolver = struct {
         return try self.finalize(other_root, context);
     }
 
+    fn recordIdentitySubstitution(
+        self: *PlatformAppRelationTypeResolver,
+        identity_root: CheckedTypeId,
+        resolved_root: CheckedTypeId,
+    ) Allocator.Error!CheckedTypeId {
+        if (identity_root == resolved_root) return resolved_root;
+        switch (self.payload(identity_root)) {
+            .flex, .rigid => {},
+            else => checkedArtifactInvariant("platform/app relation attempted to substitute a non-identity root", .{}),
+        }
+        return try self.recordPlatformRootSubstitution(identity_root, resolved_root);
+    }
+
+    fn recordPlatformRootSubstitution(
+        self: *PlatformAppRelationTypeResolver,
+        platform_root: CheckedTypeId,
+        resolved_root: CheckedTypeId,
+    ) Allocator.Error!CheckedTypeId {
+        if (platform_root == resolved_root) return resolved_root;
+        const existing = self.substitutions.get(platform_root) orelse {
+            try self.substitutions.put(platform_root, resolved_root);
+            return resolved_root;
+        };
+        const refined = try self.refineIdentitySubstitution(existing, resolved_root);
+        try self.substitutions.put(platform_root, refined);
+        return refined;
+    }
+
+    fn refineIdentitySubstitution(
+        self: *PlatformAppRelationTypeResolver,
+        existing: CheckedTypeId,
+        candidate: CheckedTypeId,
+    ) Allocator.Error!CheckedTypeId {
+        if (existing == candidate) return existing;
+        if (checkedTypePayloadIsIdentity(self.payload(existing))) return candidate;
+        if (checkedTypePayloadIsIdentity(self.payload(candidate))) return existing;
+        return try self.merge(existing, candidate, .value);
+    }
+
     fn finalize(
         self: *PlatformAppRelationTypeResolver,
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!CheckedTypeId {
+        if (self.substitutions.get(root)) |replacement| return try self.finalize(replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) {
             return switch (context) {
@@ -15920,10 +17580,10 @@ const PlatformAppRelationTypeResolver = struct {
         };
         if (self.finalizing.get(finalize_input)) |existing| return existing;
 
-        if (try platformAppRelationFinalizeResultIsEmptyRecord(self.allocator, self.names, self.store, root, context)) {
+        if (try platformAppRelationFinalizeResultIsEmptyRecord(self.allocator, self.names, self.store, root, context, &self.substitutions)) {
             return try self.emptyRecordRoot();
         }
-        if (try platformAppRelationFinalizeResultIsEmptyTagUnion(self.allocator, self.names, self.store, root, context)) {
+        if (try platformAppRelationFinalizeResultIsEmptyTagUnion(self.allocator, self.names, self.store, root, context, &self.substitutions)) {
             return try self.emptyTagUnionRoot();
         }
 
@@ -15933,6 +17593,7 @@ const PlatformAppRelationTypeResolver = struct {
             self.store,
             root,
             context,
+            &self.substitutions,
         );
         if (self.store.rootForKey(result_key)) |existing| return existing;
 
@@ -16449,6 +18110,7 @@ const PlatformAppRelationTypeResolver = struct {
         root: CheckedTypeId,
         active: *std.AutoHashMap(CheckedTypeId, void),
     ) Allocator.Error!bool {
+        if (self.substitutions.get(root)) |replacement| return try self.typeContainsIdentityVariablesHelp(replacement, active);
         const index: usize = @intFromEnum(root);
         if (index >= self.store.payloads.items.len) {
             checkedArtifactInvariant("platform/app relation identity scan referenced missing checked type payload", .{});
@@ -16545,8 +18207,9 @@ fn platformAppRelationMergeResultKey(
     platform_root: CheckedTypeId,
     app_root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
+    substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 ) Allocator.Error!canonical.CanonicalTypeKey {
-    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store);
+    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
     try builder.writeMerge(platform_root, app_root, context);
     return .{ .bytes = builder.hasher.finalResult() };
@@ -16558,8 +18221,9 @@ fn platformAppRelationFinalizeResultKey(
     store: *const CheckedTypeStore,
     root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
+    substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 ) Allocator.Error!canonical.CanonicalTypeKey {
-    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store);
+    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
     try builder.writeFinalize(root, context);
     return .{ .bytes = builder.hasher.finalResult() };
@@ -16572,8 +18236,9 @@ fn platformAppRelationMergeResultIsEmptyRecord(
     platform_root: CheckedTypeId,
     app_root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
+    substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 ) Allocator.Error!bool {
-    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store);
+    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
     return try builder.mergeIsEmptyRecord(platform_root, app_root, context);
 }
@@ -16585,8 +18250,9 @@ fn platformAppRelationMergeResultIsEmptyTagUnion(
     platform_root: CheckedTypeId,
     app_root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
+    substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 ) Allocator.Error!bool {
-    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store);
+    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
     return try builder.mergeIsEmptyTagUnion(platform_root, app_root, context);
 }
@@ -16597,8 +18263,9 @@ fn platformAppRelationFinalizeResultIsEmptyRecord(
     store: *const CheckedTypeStore,
     root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
+    substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 ) Allocator.Error!bool {
-    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store);
+    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
     return try builder.finalizeIsEmptyRecord(root, context);
 }
@@ -16609,8 +18276,9 @@ fn platformAppRelationFinalizeResultIsEmptyTagUnion(
     store: *const CheckedTypeStore,
     root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
+    substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 ) Allocator.Error!bool {
-    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store);
+    var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
     return try builder.finalizeIsEmptyTagUnion(root, context);
 }
@@ -16624,6 +18292,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     finalizing: std.AutoHashMap(PlatformAppRelationFinalizeInput, u32),
     merging: std.AutoHashMap(PlatformAppRelationMergeInput, u32),
     identity_variables: std.AutoHashMap(CheckedTypeId, u32),
+    substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 
     const TypeWrite = union(enum) {
         source: CheckedTypeId,
@@ -16652,6 +18321,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         allocator: Allocator,
         names: *const canonical.CanonicalNameStore,
         store: *const CheckedTypeStore,
+        substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
     ) PlatformAppRelationTypeDigestBuilder {
         return .{
             .allocator = allocator,
@@ -16662,6 +18332,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .finalizing = std.AutoHashMap(PlatformAppRelationFinalizeInput, u32).init(allocator),
             .merging = std.AutoHashMap(PlatformAppRelationMergeInput, u32).init(allocator),
             .identity_variables = std.AutoHashMap(CheckedTypeId, u32).init(allocator),
+            .substitutions = substitutions,
         };
     }
 
@@ -16684,12 +18355,18 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         return self.store.payload(root);
     }
 
+    fn substitution(self: *const PlatformAppRelationTypeDigestBuilder, root: CheckedTypeId) ?CheckedTypeId {
+        const substitutions = self.substitutions orelse return null;
+        return substitutions.get(root);
+    }
+
     fn writeMerge(
         self: *PlatformAppRelationTypeDigestBuilder,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!void {
+        if (self.substitution(platform_root)) |replacement| return try self.writeMerge(replacement, app_root, context);
         if (platform_root == app_root) return try self.writeFinalize(platform_root, context);
 
         const platform_payload = self.payload(platform_root);
@@ -16851,6 +18528,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!void {
+        if (self.substitution(root)) |replacement| return try self.writeFinalize(replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) {
             return switch (context) {
@@ -17449,6 +19127,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
+        if (self.substitution(root)) |replacement| return try self.finalizeIsEmptyRecord(replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) return context == .record_tail;
         switch (root_payload) {
@@ -17485,6 +19164,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
+        if (self.substitution(root)) |replacement| return try self.finalizeIsEmptyTagUnion(replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) return context == .tag_tail;
         switch (root_payload) {
@@ -17521,6 +19201,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
+        if (self.substitution(platform_root)) |replacement| return try self.mergeIsEmptyRecord(replacement, app_root, context);
         if (platform_root == app_root) return try self.finalizeIsEmptyRecord(platform_root, context);
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
@@ -17587,6 +19268,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
+        if (self.substitution(platform_root)) |replacement| return try self.mergeIsEmptyTagUnion(replacement, app_root, context);
         if (platform_root == app_root) return try self.finalizeIsEmptyTagUnion(platform_root, context);
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
@@ -17716,6 +19398,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
+        if (self.substitution(root)) |replacement| return try self.finalizeContainsIdentityVariables(replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) {
             return context == .value;
@@ -17795,6 +19478,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
+        if (self.substitution(platform_root)) |replacement| return try self.mergeContainsIdentityVariables(replacement, app_root, context);
         if (platform_root == app_root) return try self.finalizeContainsIdentityVariables(platform_root, context);
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
@@ -18119,11 +19803,15 @@ const PlatformAppRelationTypeDigestBuilder = struct {
 
     fn writeNamedSourceIdentity(
         self: *PlatformAppRelationTypeDigestBuilder,
-        origin_module: canonical.ModuleNameId,
+        origin_module: canonical.ModuleIdentityId,
         name: canonical.TypeNameId,
         source_decl: ?u32,
     ) void {
-        self.writeBytes(self.names.moduleNameText(origin_module));
+        // Must stay byte-compatible with
+        // `SubstitutedCheckedTypeKeyBuilder.writeNamedSourceIdentity`: merge/
+        // finalize result keys share the checked-type key space, so an
+        // identity-preserving finalize must reproduce the root's stored key.
+        self.writeBytes(self.names.moduleIdentityBytes(origin_module));
         self.writeOptionalU32(source_decl);
         if (source_decl == null) {
             self.writeBytes(self.names.typeNameText(name));
@@ -18143,6 +19831,24 @@ const PlatformAppRelationTypeDigestBuilder = struct {
 fn checkedTypePayloadIsIdentity(payload: CheckedTypePayload) bool {
     return switch (payload) {
         .flex, .rigid => true,
+        else => false,
+    };
+}
+
+/// A structural aggregate type: a tag union, record, or tuple. A value pinned to a
+/// numeric default can never have one of these shapes.
+fn checkedTypePayloadIsStructuralAggregate(payload: CheckedTypePayload) bool {
+    return switch (payload) {
+        .empty_record, .record, .record_unbound, .tuple, .empty_tag_union, .tag_union => true,
+        else => false,
+    };
+}
+
+/// A flex/rigid variable pinned to a literal default: a number literal/expression
+/// that defaults to `Dec`, or a string literal that defaults to `Str`.
+fn checkedTypePayloadIsLiteralDefaultPinnedVar(payload: CheckedTypePayload) bool {
+    return switch (payload) {
+        .flex, .rigid => |variable| variable.numeric_default_phase != null,
         else => false,
     };
 }
@@ -18305,9 +20011,10 @@ fn topLevelDefSourceName(
 
 fn publishProvidesMetadata(
     allocator: Allocator,
-    module_env: *const ModuleEnv,
+    module: TypedCIR.Module,
     names: *canonical.CanonicalNameStore,
 ) Allocator.Error![]ProvidesEntry {
+    const module_env = module.moduleEnvConst();
     const source = module_env.provides_entries.items.items;
     const provides = try allocator.alloc(ProvidesEntry, source.len);
     errdefer allocator.free(provides);
@@ -18316,6 +20023,7 @@ fn publishProvidesMetadata(
         provides[i] = .{
             .source_name = try names.internExportIdent(module_env.getIdentStoreConst(), entry.ident),
             .ffi_symbol = try names.internExternalSymbolName(module_env.getString(entry.ffi_symbol)),
+            .def = module.topLevelDefByIdent(entry.ident),
         };
     }
 
@@ -18337,7 +20045,7 @@ fn publishRequiresMetadata(
             .declared_source_ty = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 ModuleEnv.varFrom(entry.type_anno),
             ),
         };
@@ -18452,7 +20160,13 @@ pub const ModuleInterfaceCapabilities = struct {
         platform_required_declarations: *const PlatformRequiredDeclarationTable,
         names: *const canonical.CanonicalNameStore,
     ) Allocator.Error!ModuleInterfaceCapabilities {
-        const current_module = names.lookupModuleIdent(module.identStoreConst(), module.qualifiedModuleIdent()) orelse {
+        const current_module_hash = module.moduleEnvConst().contentIdentityHash() orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("checked artifact invariant violated: module content identity missing during interface capability publication", .{});
+            }
+            unreachable;
+        };
+        const current_module = names.lookupModuleIdentity(current_module_hash) orelse {
             if (builtin.mode == .Debug) {
                 std.debug.panic("checked artifact invariant violated: module identity was not interned before interface capability publication", .{});
             }
@@ -18486,7 +20200,7 @@ pub const ModuleInterfaceCapabilities = struct {
             if (nominal.origin_module != current_module) continue;
             const source_key = checked_types.roots.items[i].key;
             const nominal_key = canonical.NominalTypeKey{
-                .module_name = nominal.origin_module,
+                .module = nominal.origin_module,
                 .type_name = nominal.name,
                 .source_decl = nominal.source_decl,
             };
@@ -18700,7 +20414,7 @@ fn canonicalTypeKeyEql(a: canonical.CanonicalTypeKey, b: canonical.CanonicalType
 }
 
 fn canonicalNominalTypeKeyEql(a: canonical.NominalTypeKey, b: canonical.NominalTypeKey) bool {
-    return a.module_name == b.module_name and a.type_name == b.type_name and a.source_decl == b.source_decl;
+    return a.module == b.module and a.type_name == b.type_name and a.source_decl == b.source_decl;
 }
 
 fn testCanonicalTypeKey(byte: u8) canonical.CanonicalTypeKey {
@@ -18720,7 +20434,7 @@ fn appendRecursiveNominalTestType(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
-    module_name: canonical.ModuleNameId,
+    module_name: canonical.ModuleIdentityId,
     type_name: canonical.TypeNameId,
     tag_name: canonical.TagLabelId,
     arg: ?CheckedTypeId,
@@ -18742,9 +20456,10 @@ fn appendRecursiveNominalTestType(
         args[0] = arg_root;
         break :blk args;
     } else &.{};
-    const source_decl: ?u32 = null;
+    // Synthetic test declarations carry a placeholder statement locator.
+    const source_decl: ?u32 = 0;
     const declaration_id: CheckedNominalDeclarationId, const should_append_declaration = if (store.nominalDeclaration(.{
-        .module_name = module_name,
+        .module = module_name,
         .type_name = type_name,
         .source_decl = source_decl,
     })) |declaration| blk: {
@@ -20319,7 +22034,7 @@ pub const TopLevelValueTable = struct {
             const source_scheme = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 source_ty,
             );
             const value: TopLevelValueKind = if (templates.lookupByDef(def_idx)) |template| blk: {
@@ -20525,7 +22240,7 @@ pub const HoistedConstTable = struct {
             const source_scheme = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 source_var,
             );
             const const_ref = try const_templates.reserveHoisted(
@@ -21157,6 +22872,7 @@ fn collectPublicApiDependencies(
     const_templates: *const ConstTemplateTable,
     resolved_value_refs: *const ResolvedValueRefTable,
     top_level_bindings: *const TopLevelProcedureBindingTable,
+    platform_required_declarations: *const PlatformRequiredDeclarationTable,
     platform_required_bindings: *const PlatformRequiredBindingTable,
     imports: []const PublishImportArtifact,
     available_artifacts: []const ImportedModuleView,
@@ -21206,6 +22922,22 @@ fn collectPublicApiDependencies(
         &type_owner_keys,
     );
 
+    try appendPlatformRequiredDeclarationPublicApiDependencies(
+        allocator,
+        module,
+        names,
+        module_identity,
+        artifact_key,
+        checked_type_publication,
+        checked_types,
+        platform_required_declarations,
+        imports,
+        available_artifacts,
+        &active_types,
+        &keys,
+        &type_owner_keys,
+    );
+
     var closure_dependencies = PublicApiClosureDependencyCollector.init(
         allocator,
         artifact_key,
@@ -21219,6 +22951,7 @@ fn collectPublicApiDependencies(
         top_level_bindings,
         platform_required_bindings,
         &keys,
+        &type_owner_keys,
     );
     defer closure_dependencies.deinit();
 
@@ -21287,6 +23020,39 @@ fn appendExposedTypeDeclarationPublicApiDependencies(
             },
             else => {},
         }
+    }
+}
+
+fn appendPlatformRequiredDeclarationPublicApiDependencies(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *const canonical.CanonicalNameStore,
+    module_identity: ModuleIdentity,
+    artifact_key: CheckedModuleArtifactKey,
+    checked_type_publication: *const CheckedTypePublication,
+    checked_types: *const CheckedTypeStore,
+    platform_required_declarations: *const PlatformRequiredDeclarationTable,
+    imports: []const PublishImportArtifact,
+    available_artifacts: []const ImportedModuleView,
+    active_types: *std.AutoHashMap(CheckedTypeId, void),
+    keys: *ArtifactKeyAccumulator,
+    type_owner_keys: *ArtifactKeyAccumulator,
+) Allocator.Error!void {
+    for (platform_required_declarations.declarations) |declaration| {
+        const root = platformRequiredPayloadForDeclaration(module, checked_type_publication, declaration);
+        try appendPublicApiTypeDependencies(
+            allocator,
+            names,
+            module_identity,
+            artifact_key,
+            checked_types,
+            root,
+            active_types,
+            imports,
+            available_artifacts,
+            keys,
+            type_owner_keys,
+        );
     }
 }
 
@@ -21436,71 +23202,43 @@ fn appendPublicApiModuleDependency(
     names: *const canonical.CanonicalNameStore,
     module_identity: ModuleIdentity,
     artifact_key: CheckedModuleArtifactKey,
-    origin_module: canonical.ModuleNameId,
+    origin_module: canonical.ModuleIdentityId,
     imports: []const PublishImportArtifact,
     available_artifacts: []const ImportedModuleView,
     keys: *ArtifactKeyAccumulator,
     type_owner_keys: *ArtifactKeyAccumulator,
 ) Allocator.Error!void {
-    const origin_name = names.moduleNameText(origin_module);
-    if (isSelfPublicApiModuleName(names, module_identity, origin_name)) return;
+    const origin_hash = names.moduleIdentityBytes(origin_module);
+    if (base.ModuleIdentity.eql(origin_hash, &module_identity.stable_hash)) return;
 
-    const view = publicApiDependencyViewByModuleName(origin_name, imports, available_artifacts) orelse {
-        checkedArtifactInvariant("public API dependency scan could not find checked artifact for module {s}", .{origin_name});
+    const view = publicApiDependencyViewByIdentity(origin_hash, imports, available_artifacts) orelse {
+        checkedArtifactInvariant("public API dependency scan could not find checked artifact for a type-owning module", .{});
     };
     if (view.module_env.module_role == .builtin) return;
     try appendPublicApiDependencyView(allocator, artifact_key, keys, view);
     try appendPublicApiDependencyView(allocator, artifact_key, type_owner_keys, view);
 }
 
-fn isSelfPublicApiModuleName(
-    names: *const canonical.CanonicalNameStore,
-    module_identity: ModuleIdentity,
-    origin_name: []const u8,
-) bool {
-    return Ident.textEql(origin_name, names.moduleNameText(module_identity.module_name)) or
-        Ident.textEql(origin_name, names.moduleNameText(module_identity.display_module_name)) or
-        Ident.textEql(origin_name, names.moduleNameText(module_identity.qualified_module_name));
-}
-
-fn publicApiDependencyViewByModuleName(
-    module_name: []const u8,
+/// Resolve the checked artifact view that declares a type by the declaring
+/// module's 32-byte content identity. Byte-identical module content reached
+/// through several artifacts is interchangeable as a type owner, so the first
+/// direct match wins.
+fn publicApiDependencyViewByIdentity(
+    origin_hash: *const [32]u8,
     imports: []const PublishImportArtifact,
     available_artifacts: []const ImportedModuleView,
 ) ?ImportedModuleView {
-    var direct: ?ImportedModuleView = null;
     for (imports) |import_artifact| {
-        if (importedViewModuleNameMatches(import_artifact.view, module_name)) {
-            direct = publicApiDependencyUniqueView(module_name, direct, import_artifact.view);
-        }
+        if (importedViewIdentityMatches(import_artifact.view, origin_hash)) return import_artifact.view;
     }
-    if (direct) |view| return view;
-
-    var found: ?ImportedModuleView = null;
     for (available_artifacts) |view| {
-        if (importedViewModuleNameMatches(view, module_name)) {
-            found = publicApiDependencyUniqueView(module_name, found, view);
-        }
+        if (importedViewIdentityMatches(view, origin_hash)) return view;
     }
-    return found;
+    return null;
 }
 
-fn publicApiDependencyUniqueView(
-    module_name: []const u8,
-    existing: ?ImportedModuleView,
-    next: ImportedModuleView,
-) ImportedModuleView {
-    const view = existing orelse return next;
-    if (!checkedArtifactKeyEql(view.key, next.key)) {
-        checkedArtifactInvariant("public API dependency scan found multiple checked artifacts for module {s}", .{module_name});
-    }
-    return view;
-}
-
-fn importedViewModuleNameMatches(view: ImportedModuleView, module_name: []const u8) bool {
-    return Ident.textEql(module_name, view.canonical_names.moduleNameText(view.module_identity.module_name)) or
-        Ident.textEql(module_name, view.canonical_names.moduleNameText(view.module_identity.display_module_name)) or
-        Ident.textEql(module_name, view.canonical_names.moduleNameText(view.module_identity.qualified_module_name));
+fn importedViewIdentityMatches(view: ImportedModuleView, origin_hash: *const [32]u8) bool {
+    return base.ModuleIdentity.eql(&view.module_identity.stable_hash, origin_hash);
 }
 
 fn appendPublicApiDependencyView(
@@ -21550,6 +23288,7 @@ const PublicApiClosureDependencyCollector = struct {
     top_level_bindings: *const TopLevelProcedureBindingTable,
     platform_required_bindings: *const PlatformRequiredBindingTable,
     keys: *ArtifactKeyAccumulator,
+    type_owner_keys: *ArtifactKeyAccumulator,
     visited_templates: std.AutoHashMap(canonical.ProcedureTemplateRef, void),
     visited_consts: std.AutoHashMap(ConstRef, void),
     visited_callable_eval_templates: std.AutoHashMap(ArtifactCallableEvalTemplateRef, void),
@@ -21567,6 +23306,7 @@ const PublicApiClosureDependencyCollector = struct {
         top_level_bindings: *const TopLevelProcedureBindingTable,
         platform_required_bindings: *const PlatformRequiredBindingTable,
         keys: *ArtifactKeyAccumulator,
+        type_owner_keys: *ArtifactKeyAccumulator,
     ) PublicApiClosureDependencyCollector {
         return .{
             .allocator = allocator,
@@ -21581,6 +23321,7 @@ const PublicApiClosureDependencyCollector = struct {
             .top_level_bindings = top_level_bindings,
             .platform_required_bindings = platform_required_bindings,
             .keys = keys,
+            .type_owner_keys = type_owner_keys,
             .visited_templates = std.AutoHashMap(canonical.ProcedureTemplateRef, void).init(allocator),
             .visited_consts = std.AutoHashMap(ConstRef, void).init(allocator),
             .visited_callable_eval_templates = std.AutoHashMap(ArtifactCallableEvalTemplateRef, void).init(allocator),
@@ -21607,8 +23348,14 @@ const PublicApiClosureDependencyCollector = struct {
         closure: ImportedTemplateClosureView,
     ) Allocator.Error!void {
         for (closure.checked_bodies) |value| try self.appendArtifactKey(value.artifact);
-        for (closure.checked_type_roots) |value| try self.appendArtifactKey(value.artifact);
-        for (closure.checked_type_schemes) |value| try self.appendArtifactKey(value.artifact);
+        for (closure.checked_type_roots) |value| {
+            try self.appendArtifactKey(value.artifact);
+            try self.appendTypeOwnerArtifactKey(value.artifact);
+        }
+        for (closure.checked_type_schemes) |value| {
+            try self.appendArtifactKey(value.artifact);
+            try self.appendTypeOwnerArtifactKey(value.artifact);
+        }
         for (closure.checked_callable_bodies) |value| try self.appendArtifactKey(value.artifact);
         for (closure.checked_const_bodies) |value| try self.appendArtifactKey(value.artifact);
         for (closure.checked_procedure_templates) |value| try self.appendProcedureTemplateRef(value);
@@ -21630,6 +23377,20 @@ const PublicApiClosureDependencyCollector = struct {
             self.imports,
             self.available_artifacts,
             self.keys,
+            key,
+        );
+    }
+
+    fn appendTypeOwnerArtifactKey(
+        self: *PublicApiClosureDependencyCollector,
+        key: CheckedModuleArtifactKey,
+    ) Allocator.Error!void {
+        try appendPublicApiClosureDependencyKey(
+            self.allocator,
+            self.artifact_key,
+            self.imports,
+            self.available_artifacts,
+            self.type_owner_keys,
             key,
         );
     }
@@ -21881,7 +23642,7 @@ pub const ExportedProcedureTemplateTable = struct {
             const source_scheme = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
-                module.identStoreConst(),
+                module.moduleEnvConst(),
                 module.defType(def_idx),
             );
             const template_data = checked_templates.get(template.template);
@@ -23478,7 +25239,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 181);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 184);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -24547,7 +26308,7 @@ pub const CheckedTypeProjector = struct {
             .rigid => |rigid| .{ .rigid = try self.projectCheckedTypeViewVariable(source, source_names, rigid, active) },
             .alias => |alias| .{ .alias = .{
                 .name = try self.remapViewTypeName(source_names, alias.name),
-                .origin_module = try self.remapViewModuleName(source_names, alias.origin_module),
+                .origin_module = try self.remapViewModuleIdentity(source_names, alias.origin_module),
                 .source_decl = alias.source_decl,
                 .builtin_origin = alias.builtin_origin,
                 .backing = try self.projectCheckedTypeViewRootInner(source, source_names, alias.backing, active),
@@ -24563,7 +26324,7 @@ pub const CheckedTypeProjector = struct {
             .tuple => |items| .{ .tuple = try self.projectCheckedTypeViewIds(source, source_names, items, active) },
             .nominal => |nominal| .{ .nominal = .{
                 .name = try self.remapViewTypeName(source_names, nominal.name),
-                .origin_module = try self.remapViewModuleName(source_names, nominal.origin_module),
+                .origin_module = try self.remapViewModuleIdentity(source_names, nominal.origin_module),
                 .source_decl = nominal.source_decl,
                 .builtin = nominal.builtin,
                 .is_opaque = nominal.is_opaque,
@@ -24687,13 +26448,13 @@ pub const CheckedTypeProjector = struct {
         return out;
     }
 
-    fn remapViewModuleName(
+    fn remapViewModuleIdentity(
         self: *CheckedTypeProjector,
         source_names: ?*const canonical.CanonicalNameStore,
-        id: canonical.ModuleNameId,
-    ) Allocator.Error!canonical.ModuleNameId {
+        id: canonical.ModuleIdentityId,
+    ) Allocator.Error!canonical.ModuleIdentityId {
         const names = source_names orelse return id;
-        return try self.target.canonical_names.internModuleName(names.moduleNameText(id));
+        return try self.target.canonical_names.internModuleIdentity(names.moduleIdentityBytes(id));
     }
 
     fn remapViewTypeName(
@@ -24888,7 +26649,7 @@ pub const CheckedTypeProjector = struct {
         errdefer self.allocator.free(args);
         return .{ .alias = .{
             .name = try self.remapTypeName(imported, alias.name),
-            .origin_module = try self.remapModuleName(imported, alias.origin_module),
+            .origin_module = try self.remapModuleIdentity(imported, alias.origin_module),
             .source_decl = alias.source_decl,
             .builtin_origin = alias.builtin_origin,
             .backing = try self.projectImportedCheckedType(imported, alias.backing),
@@ -24907,7 +26668,7 @@ pub const CheckedTypeProjector = struct {
         errdefer self.allocator.free(padding_field_types);
         return .{ .nominal = .{
             .name = try self.remapTypeName(imported, nominal.name),
-            .origin_module = try self.remapModuleName(imported, nominal.origin_module),
+            .origin_module = try self.remapModuleIdentity(imported, nominal.origin_module),
             .source_decl = nominal.source_decl,
             .builtin = nominal.builtin,
             .is_opaque = nominal.is_opaque,
@@ -24992,12 +26753,12 @@ pub const CheckedTypeProjector = struct {
         return out;
     }
 
-    fn remapModuleName(
+    fn remapModuleIdentity(
         self: *CheckedTypeProjector,
         imported: ImportedModuleView,
-        id: canonical.ModuleNameId,
-    ) Allocator.Error!canonical.ModuleNameId {
-        return try self.target.canonical_names.internModuleName(imported.canonical_names.moduleNameText(id));
+        id: canonical.ModuleIdentityId,
+    ) Allocator.Error!canonical.ModuleIdentityId {
+        return try self.target.canonical_names.internModuleIdentity(imported.canonical_names.moduleIdentityBytes(id));
     }
 
     fn remapTypeName(
@@ -25023,14 +26784,9 @@ pub const CheckedTypeProjector = struct {
     ) Allocator.Error!static_dispatch.MethodOwner {
         return switch (owner) {
             .builtin => |builtin_owner| .{ .builtin = builtin_owner },
-            .source_decl => |decl| .{ .source_decl = .{
-                .module_name = try self.remapModuleName(imported, decl.module_name),
-                .statement = decl.statement,
-            } },
             .nominal => |nominal| .{ .nominal = .{
-                .module_name = try self.remapModuleName(imported, nominal.module_name),
+                .module = try self.remapModuleIdentity(imported, nominal.module),
                 .type_name = try self.remapTypeName(imported, nominal.type_name),
-                .source_decl = nominal.source_decl,
             } },
         };
     }
@@ -25111,7 +26867,7 @@ const CheckedTypeStoreImportProjector = struct {
             .rigid => |rigid| .{ .rigid = try self.projectVariable(rigid) },
             .alias => |alias| .{ .alias = .{
                 .name = try self.remapTypeName(alias.name),
-                .origin_module = try self.remapModuleName(alias.origin_module),
+                .origin_module = try self.remapModuleIdentity(alias.origin_module),
                 .source_decl = alias.source_decl,
                 .builtin_origin = alias.builtin_origin,
                 .backing = try self.project(alias.backing),
@@ -25127,7 +26883,7 @@ const CheckedTypeStoreImportProjector = struct {
             .tuple => |items| .{ .tuple = try self.projectIds(items) },
             .nominal => |nominal| .{ .nominal = .{
                 .name = try self.remapTypeName(nominal.name),
-                .origin_module = try self.remapModuleName(nominal.origin_module),
+                .origin_module = try self.remapModuleIdentity(nominal.origin_module),
                 .source_decl = nominal.source_decl,
                 .builtin = nominal.builtin,
                 .is_opaque = nominal.is_opaque,
@@ -25233,11 +26989,11 @@ const CheckedTypeStoreImportProjector = struct {
         return out;
     }
 
-    fn remapModuleName(
+    fn remapModuleIdentity(
         self: *CheckedTypeStoreImportProjector,
-        id: canonical.ModuleNameId,
-    ) Allocator.Error!canonical.ModuleNameId {
-        return try self.target_names.internModuleName(self.imported.canonical_names.moduleNameText(id));
+        id: canonical.ModuleIdentityId,
+    ) Allocator.Error!canonical.ModuleIdentityId {
+        return try self.target_names.internModuleIdentity(self.imported.canonical_names.moduleIdentityBytes(id));
     }
 
     fn remapTypeName(
@@ -25260,14 +27016,9 @@ const CheckedTypeStoreImportProjector = struct {
     ) Allocator.Error!static_dispatch.MethodOwner {
         return switch (owner) {
             .builtin => |builtin_owner| .{ .builtin = builtin_owner },
-            .source_decl => |decl| .{ .source_decl = .{
-                .module_name = try self.remapModuleName(decl.module_name),
-                .statement = decl.statement,
-            } },
             .nominal => |nominal| .{ .nominal = .{
-                .module_name = try self.remapModuleName(nominal.module_name),
+                .module = try self.remapModuleIdentity(nominal.module),
                 .type_name = try self.remapTypeName(nominal.type_name),
-                .source_decl = nominal.source_decl,
             } },
         };
     }
@@ -25636,6 +27387,9 @@ pub fn publishFromTypedModule(
         .qualified_module_name = qualified_module_name,
         .kind = module_env.module_kind,
     };
+    // Intern this module's content identity up front so later publication
+    // steps (e.g. interface capability collection) can resolve it by lookup.
+    _ = try canonical_names.internModuleIdentity(&module_identity.stable_hash);
 
     try internLoweringVisibleNames(module_env, &canonical_names);
 
@@ -25664,7 +27418,7 @@ pub fn publishFromTypedModule(
     const exports = try collectPublishedExportDefs(allocator, module);
     errdefer allocator.free(exports);
 
-    const provides = try publishProvidesMetadata(allocator, module_env, &canonical_names);
+    const provides = try publishProvidesMetadata(allocator, module, &canonical_names);
     errdefer allocator.free(provides);
 
     const requires = try publishRequiresMetadata(allocator, module, &canonical_names);
@@ -25678,6 +27432,23 @@ pub fn publishFromTypedModule(
     var checked_type_publication = try CheckedTypeStore.fromModule(allocator, module, &canonical_names, inputs.imports, inputs.available_artifacts, &source_nodes);
     defer checked_type_publication.deinitIndex(allocator);
     errdefer checked_type_publication.store.deinit(allocator);
+    const platform_requirement_artifact = platformRequirementArtifactByContext(inputs.available_artifacts, inputs.platform_requirement_context);
+    try applyPlatformRequiredSignatureSubstitutions(
+        allocator,
+        module,
+        &canonical_names,
+        &checked_type_publication,
+        inputs.platform_requirement_context,
+        platform_requirement_artifact,
+    );
+    try applyPlatformForClauseSubstitutions(
+        allocator,
+        module,
+        &canonical_names,
+        &checked_type_publication,
+        inputs.relation_artifacts,
+        inputs.platform_app_relation,
+    );
     const checked_types = &checked_type_publication.store;
 
     var checked_body_builder = try CheckedBodyStoreBuilder.fromModule(allocator, module, &canonical_names, &checked_type_publication, &source_nodes);
@@ -25703,7 +27474,15 @@ pub fn publishFromTypedModule(
     errdefer checked_procedure_templates.deinit(allocator);
     const template_lookup = checked_procedure_templates.asLookup(module_idx);
 
-    var method_registry = try static_dispatch.MethodRegistry.fromModule(allocator, module, &canonical_names, &template_lookup, &checked_type_publication, checked_bodies);
+    var method_registry = try static_dispatch.MethodRegistry.fromModule(
+        allocator,
+        module,
+        &canonical_names,
+        &template_lookup,
+        inputs.available_artifacts,
+        &checked_type_publication,
+        checked_bodies,
+    );
     errdefer method_registry.deinit(allocator);
 
     var static_dispatch_plans = try static_dispatch.StaticDispatchPlanTable.fromModule(
@@ -25716,6 +27495,15 @@ pub fn publishFromTypedModule(
         inputs.available_artifacts,
     );
     errdefer static_dispatch_plans.deinit(allocator);
+    try specializeResolvedStaticDispatchPlanCallables(
+        allocator,
+        &canonical_names,
+        checked_types,
+        artifact_key,
+        module_idx,
+        inputs.available_artifacts,
+        &static_dispatch_plans,
+    );
     checked_bodies.attachStaticDispatchPlans(&static_dispatch_plans);
     checked_bodies.attachNumeralPlans(&static_dispatch_plans);
     checked_bodies.attachQuotePlans(&static_dispatch_plans);
@@ -25858,8 +27646,11 @@ pub fn publishFromTypedModule(
     var provided_exports = try ProvidedExportTable.fromModule(
         allocator,
         module,
+        &canonical_names,
         &checked_type_publication,
         &top_level_values,
+        &platform_required_declarations,
+        &platform_requirement_relations,
         provides,
     );
     errdefer provided_exports.deinit(allocator);
@@ -26010,6 +27801,7 @@ pub fn publishFromTypedModule(
         &const_templates,
         &resolved_value_refs,
         &top_level_procedure_bindings,
+        &platform_required_declarations,
         &platform_required_bindings,
         inputs.imports,
         inputs.available_artifacts,
@@ -26249,7 +28041,15 @@ fn expectProvidedExportKind(
     defer checked_procedure_templates.deinit(allocator);
 
     const template_lookup = checked_procedure_templates.asLookup(module.moduleIndex());
-    var method_registry = try static_dispatch.MethodRegistry.fromModule(allocator, module, &canonical_names, &template_lookup, &checked_type_publication, checked_bodies);
+    var method_registry = try static_dispatch.MethodRegistry.fromModule(
+        allocator,
+        module,
+        &canonical_names,
+        &template_lookup,
+        &.{},
+        &checked_type_publication,
+        checked_bodies,
+    );
     defer method_registry.deinit(allocator);
 
     var static_dispatch_plans = try static_dispatch.StaticDispatchPlanTable.fromModule(
@@ -26351,7 +28151,7 @@ fn expectProvidedExportKind(
     );
     defer hoisted_constants.deinit(allocator);
 
-    const provides = try publishProvidesMetadata(allocator, module_env, &canonical_names);
+    const provides = try publishProvidesMetadata(allocator, module, &canonical_names);
     defer allocator.free(provides);
 
     var resolved_value_refs = try ResolvedValueRefTable.fromModule(
@@ -26391,8 +28191,11 @@ fn expectProvidedExportKind(
     var provided_exports = try ProvidedExportTable.fromModule(
         allocator,
         module,
+        &canonical_names,
         &checked_type_publication,
         &top_level_values,
+        &platform_required_declarations,
+        &platform_requirement_relations,
         provides,
     );
     defer provided_exports.deinit(allocator);
@@ -26699,7 +28502,7 @@ test "platform app relation resolver handles same recursive checked root" {
     var names = canonical.CanonicalNameStore.init(allocator);
     defer names.deinit();
 
-    const module_name = try names.internModuleName("Test");
+    const module_name = try names.internModuleIdentity(&([_]u8{0x88} ** 32));
     const type_name = try names.internTypeName("Tree");
     const tag_name = try names.internTagLabel("Node");
 
@@ -26729,7 +28532,7 @@ test "platform app relation resolver handles distinct recursive checked roots" {
     var names = canonical.CanonicalNameStore.init(allocator);
     defer names.deinit();
 
-    const module_name = try names.internModuleName("Test");
+    const module_name = try names.internModuleIdentity(&([_]u8{0x88} ** 32));
     const type_name = try names.internTypeName("Tree");
     const tag_name = try names.internTagLabel("Node");
 
@@ -26765,6 +28568,75 @@ test "platform app relation resolver handles distinct recursive checked roots" {
     defer resolver.deinit();
 
     try std.testing.expectEqual(app_tree.nominal, try resolver.merge(platform_tree.nominal, app_tree.nominal, .value));
+}
+
+test "platform app relation resolver substitutes required identity in provided function root" {
+    const allocator = std.testing.allocator;
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+
+    const module_name = try names.internModuleIdentity(&([_]u8{0x88} ** 32));
+    const type_name = try names.internTypeName("Player");
+    const model_alias_name = try names.internTypeName("Model");
+    const tag_name = try names.internTagLabel("Player");
+    const init_field = try names.internRecordFieldLabel("init");
+
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+
+    const platform_model = try store.reserveSyntheticTypeRoot(allocator, testCanonicalTypeKey(80));
+    try store.fillSyntheticTypeRoot(allocator, platform_model, .{ .flex = .{} });
+
+    const app_player = try appendRecursiveNominalTestType(
+        allocator,
+        &names,
+        &store,
+        module_name,
+        type_name,
+        tag_name,
+        null,
+        82,
+    );
+    const app_model_alias = try appendExplicitCheckedTypePayload(allocator, &names, &store, .{ .alias = .{
+        .name = model_alias_name,
+        .origin_module = module_name,
+        .backing = app_player.nominal,
+    } });
+
+    const empty_record = try store.appendSyntheticPayloadRoot(allocator, &names, .empty_record);
+    const platform_fields = try allocator.alloc(CheckedRecordField, 1);
+    platform_fields[0] = .{ .name = init_field, .ty = platform_model };
+    const platform_program = try appendExplicitCheckedTypePayload(allocator, &names, &store, .{ .record = .{
+        .fields = platform_fields,
+        .ext = empty_record,
+    } });
+    const app_fields = try allocator.alloc(CheckedRecordField, 1);
+    app_fields[0] = .{ .name = init_field, .ty = app_model_alias };
+    const app_program = try appendExplicitCheckedTypePayload(allocator, &names, &store, .{ .record = .{
+        .fields = app_fields,
+        .ext = empty_record,
+    } });
+
+    var relation_builder = PlatformAppRelationTypeResolver.init(allocator, &names, &store);
+    defer relation_builder.deinit();
+    const relation_program = try relation_builder.merge(platform_program, app_program, .value);
+
+    var replay_resolver = PlatformAppRelationTypeResolver.init(allocator, &names, &store);
+    defer replay_resolver.deinit();
+    _ = try replay_resolver.merge(platform_program, relation_program, .value);
+    const platform_fn = try store.appendSyntheticFunctionRoot(allocator, .pure, &.{}, platform_model);
+    const resolved_fn = try replay_resolver.resolvePlatformRoot(platform_fn);
+    const resolved_payload = switch (store.payload(resolved_fn)) {
+        .function => |function| function,
+        else => return error.ExpectedFunction,
+    };
+    const resolved_ret = switch (store.payload(resolved_payload.ret)) {
+        .alias => |alias| alias.backing,
+        .nominal => resolved_payload.ret,
+        else => return error.ExpectedNominalReturn,
+    };
+    try std.testing.expectEqual(app_player.nominal, resolved_ret);
 }
 
 test "platform app relation resolver merges recursive structural checked roots as fixed point" {
@@ -27191,7 +29063,8 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     const rf = try store.appendNominalRecordFields(gpa, &.{ .{ .named = field_name }, .{ .padding = a } });
     try store.nominal_declarations.append(gpa, .{
         .id = @enumFromInt(@as(u32, @intCast(store.nominal_declarations.items.len))),
-        .nominal = .{ .module_name = @enumFromInt(1), .type_name = @enumFromInt(2), .source_decl = null },
+        .nominal = .{ .module = @enumFromInt(3), .type_name = @enumFromInt(2), .source_decl = null },
+        .source_statement = 0,
         .declaration_root = b,
         .backing = a,
         .fa_start = fa.start,
@@ -27468,8 +29341,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x30, 0xA3, 0x59, 0x0C, 0x39, 0x30, 0xC6, 0xA1, 0xB3, 0x10, 0x61, 0xAC, 0x8A, 0xB9, 0x6A, 0x48,
-        0x9A, 0x83, 0x1B, 0x15, 0x16, 0x28, 0x9C, 0x03, 0x36, 0x4B, 0xD3, 0x62, 0xE3, 0xEC, 0xB7, 0x8E,
+        0xA3, 0x20, 0xAD, 0x3D, 0xFB, 0x97, 0x4B, 0x2A, 0x7A, 0x02, 0xE0, 0x5B, 0x55, 0x1A, 0x72, 0x65,
+        0x37, 0xB4, 0xA9, 0xBE, 0xB4, 0x6F, 0x33, 0xA1, 0x11, 0xE3, 0x81, 0xEA, 0x0A, 0x72, 0x66, 0x04,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
