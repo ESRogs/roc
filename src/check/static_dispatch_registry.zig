@@ -517,40 +517,46 @@ fn methodEntryOrder(e: MethodRegistryEntry, key: MethodKey) std.math.Order {
 }
 
 fn methodOwnerOrder(a: MethodOwner, b: MethodOwner) std.math.Order {
-    const a_tag = methodOwnerTagRank(a);
-    const b_tag = methodOwnerTagRank(b);
-    if (a_tag != b_tag) return orderU32(a_tag, b_tag);
-
-    return switch (a) {
-        .nominal => |a_nominal| switch (b) {
-            .nominal => |b_nominal| blk: {
-                const module_order = orderEnum(canonical.ModuleIdentityId, a_nominal.module, b_nominal.module);
-                if (module_order != .eq) break :blk module_order;
-                const type_order = orderEnum(canonical.TypeNameId, a_nominal.type_name, b_nominal.type_name);
-                if (type_order != .eq) break :blk type_order;
-                break :blk orderOptionalU32(a_nominal.source_decl, b_nominal.source_decl);
-            },
-            else => unreachable,
-        },
-        .builtin => |a_builtin| switch (b) {
-            .builtin => |b_builtin| orderEnum(BuiltinOwner, a_builtin, b_builtin),
-            else => unreachable,
-        },
-    };
+    return methodOwnerSortKey(a).order(methodOwnerSortKey(b));
 }
 
-fn methodOwnerTagRank(owner: MethodOwner) u32 {
-    return switch (owner) {
-        .nominal => 0,
-        .builtin => 1,
-    };
-}
+/// A fully-defined scalar projection of a `MethodOwner` for ordering.
+/// Comparing the union directly reads memory whose inactive-variant bytes are
+/// undefined for runtime-built registries and stack keys; projecting first
+/// writes every compared scalar explicitly. The order matches the previous
+/// per-variant comparison (nominal < builtin; module identity then type name;
+/// `source_decl == null` sorts before any value), so registries sorted by
+/// earlier builds search identically.
+const MethodOwnerSortKey = struct {
+    tag: u32,
+    first: u32,
+    second: u32,
+    third: u32,
 
-fn orderOptionalU32(a: ?u32, b: ?u32) std.math.Order {
-    if (a) |a_value| {
-        return if (b) |b_value| orderU32(a_value, b_value) else .gt;
+    fn order(a: @This(), b: @This()) std.math.Order {
+        if (a.tag != b.tag) return orderU32(a.tag, b.tag);
+        if (a.first != b.first) return orderU32(a.first, b.first);
+        if (a.second != b.second) return orderU32(a.second, b.second);
+        return orderU32(a.third, b.third);
     }
-    return if (b == null) .eq else .lt;
+};
+
+fn methodOwnerSortKey(owner: MethodOwner) MethodOwnerSortKey {
+    return switch (owner) {
+        .nominal => |nominal| .{
+            .tag = 0,
+            .first = @intFromEnum(nominal.module),
+            .second = @intFromEnum(nominal.type_name),
+            // null sorts before any statement value.
+            .third = if (nominal.source_decl) |source_decl| source_decl +| 1 else 0,
+        },
+        .builtin => |builtin_owner| .{
+            .tag = 1,
+            .first = @intFromEnum(builtin_owner),
+            .second = 0,
+            .third = 0,
+        },
+    };
 }
 
 fn orderEnum(comptime T: type, a: T, b: T) std.math.Order {
