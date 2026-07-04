@@ -115,7 +115,7 @@ fn runTidy(gpa: Allocator, io: std.Io) !void {
         try tidyFile(gpa, &counter, source_file, &errors);
     }
 
-    try checkNoCommittedScratchFiles(gpa, io, &errors);
+    checkNoCommittedScratchFiles(paths, &errors);
 
     if (errors.count > 0) {
         std.debug.print("\n{s}[FAIL]{s} Found {d} tidy violations\n", .{ TermColor.red, TermColor.reset, errors.count });
@@ -131,22 +131,11 @@ fn runTidy(gpa: Allocator, io: std.Io) !void {
 /// git-tracked; an untracked scratch file in the working tree is fine. The
 /// pathspecs match across directories, so this is not limited to tidy's normal
 /// file set.
-fn checkNoCommittedScratchFiles(gpa: Allocator, io: std.Io, errors: *Errors) !void {
-    // `:(glob)**/plan.md` matches a file named exactly `plan.md` in any directory
-    // (including the repo root) without also catching e.g. `rollout_plan.md`.
-    const run_result = try std.process.run(gpa, io, .{
-        .argv = &.{ "git", "ls-files", "-z", "--", "*.mdtodo", ":(glob)**/plan.md" },
-    });
-    defer gpa.free(run_result.stdout);
-    defer gpa.free(run_result.stderr);
-
-    if (run_result.term != .exited or run_result.term.exited != 0) return error.GitFailed;
-
-    var lines = std.mem.splitScalar(u8, run_result.stdout, 0);
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
+fn checkNoCommittedScratchFiles(paths: []const []const u8, errors: *Errors) void {
+    for (paths) |line| {
+        if (!std.mem.endsWith(u8, line, ".mdtodo") and !std.mem.eql(u8, std.fs.path.basename(line), "plan.md")) continue;
         errors.emit(
-            "{s}: error: working/planning scratch files (plan.md, *.mdtodo) must not be checked in; keep it on the filesystem but `git rm --cached` it\n",
+            "{s}: error: working/planning scratch files (plan.md, *.mdtodo) must not be checked in; keep it on the filesystem but remove it from version control\n",
             .{line},
         );
     }

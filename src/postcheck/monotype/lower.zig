@@ -738,11 +738,10 @@ const Builder = struct {
         self.hosted_catalog = try entries.toOwnedSlice(self.allocator);
     }
 
-    /// Find the selected platform ModuleEnv hosted section and resolve it to
-    /// qualified keys plus linker symbols. Imported CheckedModule views can
-    /// carry platform metadata during app checking, but only the selected
-    /// platform ModuleEnv defines the hosted dispatch order for this app
-    /// output.
+    /// Find the platform module's hosted section and resolve it to qualified
+    /// keys plus linker symbols. Imported modules can carry platform metadata
+    /// during app checking, but they do not define the hosted dispatch order
+    /// for this lowering pass.
     fn buildHostedSectionMap(self: *Builder) Allocator.Error!?HostedSectionMap {
         const platform_env = blk: {
             const root_env = moduleView(self.root_view).module_env;

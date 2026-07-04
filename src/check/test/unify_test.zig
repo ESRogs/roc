@@ -424,7 +424,7 @@ test "unify - alias with concrete" {
     try std.testing.expect(resolved_alias.var_ != resolved_backing.var_);
 
     const occurs_result = try occurs.occurs(&env.module_env.types, &env.occurs_scratch, a);
-    try std.testing.expectEqual(.not_recursive, occurs_result);
+    try std.testing.expectEqual(.valid, occurs_result);
 }
 
 test "unify - alias with concrete other way" {
@@ -456,7 +456,7 @@ test "unify - alias with concrete other way" {
     try std.testing.expect(resolved_alias.var_ != resolved_backing.var_);
 
     const occurs_result = try occurs.occurs(&env.module_env.types, &env.occurs_scratch, b);
-    try std.testing.expectEqual(.not_recursive, occurs_result);
+    try std.testing.expectEqual(.valid, occurs_result);
 }
 
 test "unify - alias with own backing structure" {
@@ -483,7 +483,7 @@ test "unify - alias with own backing structure" {
     try std.testing.expect(resolved_alias.var_ != resolved_backing.var_);
 
     const occurs_result = try occurs.occurs(&env.module_env.types, &env.occurs_scratch, alias_var);
-    try std.testing.expectEqual(.not_recursive, occurs_result);
+    try std.testing.expectEqual(.valid, occurs_result);
 }
 
 test "unify - own backing structure with alias" {
@@ -510,7 +510,7 @@ test "unify - own backing structure with alias" {
     try std.testing.expect(resolved_alias.var_ != resolved_backing.var_);
 
     const occurs_result = try occurs.occurs(&env.module_env.types, &env.occurs_scratch, alias_var);
-    try std.testing.expectEqual(.not_recursive, occurs_result);
+    try std.testing.expectEqual(.valid, occurs_result);
 }
 
 test "unify - alias (flex backing) with rigid" {
@@ -1697,6 +1697,24 @@ test "unify - succeeds on nominal, tag union recursion" {
 
     const result_tag_union = try env.unify(a_backing, b_backing);
     try std.testing.expectEqual(.ok, result_tag_union);
+}
+
+test "unify - deeply nested tuples do not depend on native call stack" {
+    const gpa = std.testing.allocator;
+    var env = try TestEnv.init(gpa);
+    defer env.deinit();
+
+    const depth = 128;
+    var a = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
+    var b = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
+
+    for (0..depth) |_| {
+        a = try env.module_env.types.freshFromContent(try env.mkTuple(&.{a}));
+        b = try env.module_env.types.freshFromContent(try env.mkTuple(&.{b}));
+    }
+
+    const result = try env.unify(a, b);
+    try std.testing.expectEqual(.ok, result);
 }
 
 // static dispatch constraints //

@@ -677,6 +677,43 @@ pub const ProvidedExportTable = struct {
     }
 };
 
+/// Rewrite each provided export's checked type by replacing platform `requires`
+/// type variables (`formals`) with the concrete app types (`actuals`) that the
+/// platform/app relation resolved them to. A platform entry point such as
+/// `init_for_host : () -> Model` keeps mentioning the requirement variable `model`
+/// in its published signature; without this rewrite Monotype lowering defaults the
+/// unresolved variable to an empty tag union and the emitted body then fails
+/// Lambda-Solved unification against the app's concrete value.
+fn substitutePlatformRequiredVariablesInProvidedExports(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    provided_exports: *ProvidedExportTable,
+    formals: []const CheckedTypeId,
+    actuals: []const CheckedTypeId,
+) Allocator.Error!void {
+    if (formals.len == 0) return;
+
+    var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+    defer active.deinit();
+
+    for (provided_exports.exports) |*provided| {
+        const checked_type_ptr = switch (provided.*) {
+            .procedure => |*procedure| &procedure.checked_type,
+            .data => |*data| &data.checked_type,
+        };
+        active.clearRetainingCapacity();
+        checked_type_ptr.* = try store.cloneCheckedTypeRootSubstituting(
+            allocator,
+            names,
+            checked_type_ptr.*,
+            formals,
+            actuals,
+            &active,
+        );
+    }
+}
+
 /// Public `RootRequestKind` declaration.
 pub const RootRequestKind = enum(u8) {
     runtime_entrypoint,
@@ -14517,6 +14554,8 @@ pub const PlatformRequirementRelationTable = struct {
         declarations: *const PlatformRequiredDeclarationTable,
         relation_artifacts: []const ImportedModuleView,
         relation: ?PlatformAppRelation,
+        subst_formals: ?*std.ArrayList(CheckedTypeId),
+        subst_actuals: ?*std.ArrayList(CheckedTypeId),
     ) Allocator.Error!PlatformRequirementRelationTable {
         const active_relation = relation orelse return .{};
         validatePlatformAppRelationForModule(
@@ -14596,6 +14635,8 @@ pub const PlatformRequirementRelationTable = struct {
                 active_relation,
                 input,
                 declaration,
+                subst_formals,
+                subst_actuals,
             );
             const payload_key = checked_types.store.roots.items[@intFromEnum(payload)].key;
 
@@ -15601,6 +15642,8 @@ fn platformRequiredResolvedPayloadForRelation(
     active_relation: PlatformAppRelation,
     input: PlatformRequirementRelationInput,
     declaration: PlatformRequiredDeclaration,
+    subst_formals: ?*std.ArrayList(CheckedTypeId),
+    subst_actuals: ?*std.ArrayList(CheckedTypeId),
 ) Allocator.Error!CheckedTypeId {
     const platform_payload = platformRequiredPayloadForDeclaration(module, checked_types, declaration);
     const app_view = relationArtifactByKey(relation_artifacts, active_relation.app_artifact) orelse {
@@ -15616,6 +15659,8 @@ fn platformRequiredResolvedPayloadForRelation(
 
     var resolver = PlatformAppRelationTypeResolver.init(allocator, names, &checked_types.store);
     defer resolver.deinit();
+    resolver.subst_formals = subst_formals;
+    resolver.subst_actuals = subst_actuals;
     return try resolver.merge(platform_payload, projected_app_root, .value);
 }
 
@@ -15642,6 +15687,13 @@ const PlatformAppRelationTypeResolver = struct {
     store: *CheckedTypeStore,
     finalizing: std.AutoHashMap(PlatformAppRelationFinalizeInput, CheckedTypeId),
     merging: std.AutoHashMap(PlatformAppRelationMergeInput, CheckedTypeId),
+    /// When set, records each platform `requires` type variable that a relation
+    /// resolves to an app type. `subst_formals[i]` is the platform-owned
+    /// identity variable root and `subst_actuals[i]` is the concrete app root it
+    /// resolves to. Callers use these pairs to rewrite platform provided-export
+    /// signatures that still mention the type variable.
+    subst_formals: ?*std.ArrayList(CheckedTypeId) = null,
+    subst_actuals: ?*std.ArrayList(CheckedTypeId) = null,
 
     fn init(
         allocator: Allocator,
@@ -15676,7 +15728,9 @@ const PlatformAppRelationTypeResolver = struct {
         const app_payload = self.payload(app_root);
 
         if (checkedTypePayloadIsIdentity(platform_payload)) {
-            return try self.mergeIdentityWith(platform_root, app_root, app_payload, context);
+            const resolved = try self.mergeIdentityWith(platform_root, app_root, app_payload, context);
+            try self.recordRequiredVariableSubstitution(platform_root, resolved);
+            return resolved;
         }
         if (checkedTypePayloadIsIdentity(app_payload)) {
             return try self.mergeIdentityWith(app_root, platform_root, platform_payload, context);
@@ -15751,6 +15805,26 @@ const PlatformAppRelationTypeResolver = struct {
         try self.store.fillSyntheticTypeRoot(self.allocator, target, result_payload);
         _ = self.merging.remove(merge_input);
         return target;
+    }
+
+    /// Record that the platform-owned identity variable `formal` was resolved
+    /// to `actual` by the relation, so provided-export signatures that still
+    /// mention `formal` can be rewritten. Only concrete resolutions are kept; a
+    /// variable that stays a variable carries no substitution.
+    fn recordRequiredVariableSubstitution(
+        self: *PlatformAppRelationTypeResolver,
+        formal: CheckedTypeId,
+        actual: CheckedTypeId,
+    ) Allocator.Error!void {
+        const formals = self.subst_formals orelse return;
+        const actuals = self.subst_actuals.?;
+        if (formal == actual) return;
+        if (checkedTypePayloadIsIdentity(self.payload(actual))) return;
+        for (formals.items) |existing| {
+            if (existing == formal) return;
+        }
+        try formals.append(self.allocator, formal);
+        try actuals.append(self.allocator, actual);
     }
 
     fn mergePayload(
@@ -25650,6 +25724,16 @@ pub fn publishFromTypedModule(
     var hosted_procs = try HostedProcTable.fromModule(allocator, module, global_value_defs, &canonical_names, &checked_procedure_templates);
     errdefer hosted_procs.deinit(allocator);
 
+    // Platform `requires` type variables (e.g. `model` in `for program : { init : model }`)
+    // are resolved against the app's provided values while resolving the relation.
+    // Capture those resolved pairs so provided-export signatures that still mention the
+    // variable (like `init_for_host : () -> Model`) can be rewritten to the app's type
+    // before Monotype lowering.
+    var required_variable_formals = std.ArrayList(CheckedTypeId).empty;
+    defer required_variable_formals.deinit(allocator);
+    var required_variable_actuals = std.ArrayList(CheckedTypeId).empty;
+    defer required_variable_actuals.deinit(allocator);
+
     var platform_requirement_relations = try PlatformRequirementRelationTable.fromRelation(
         allocator,
         module,
@@ -25659,6 +25743,8 @@ pub fn publishFromTypedModule(
         &platform_required_declarations,
         inputs.relation_artifacts,
         inputs.platform_app_relation,
+        &required_variable_formals,
+        &required_variable_actuals,
     );
     errdefer platform_requirement_relations.deinit(allocator);
 
@@ -25777,6 +25863,15 @@ pub fn publishFromTypedModule(
         provides,
     );
     errdefer provided_exports.deinit(allocator);
+
+    try substitutePlatformRequiredVariablesInProvidedExports(
+        allocator,
+        &canonical_names,
+        &checked_type_publication.store,
+        &provided_exports,
+        required_variable_formals.items,
+        required_variable_actuals.items,
+    );
 
     var root_requests = try RootRequestTable.fromModule(
         allocator,
@@ -26183,6 +26278,8 @@ fn expectProvidedExportKind(
         &checked_type_publication,
         &platform_required_declarations,
         &.{},
+        null,
+        null,
         null,
     );
     defer platform_requirement_relations.deinit(allocator);
