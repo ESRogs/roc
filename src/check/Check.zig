@@ -159,8 +159,10 @@ interpolation_constraint_metadata: std.ArrayListUnmanaged(InterpolationConstrain
 /// constraint failing in multiple passes (or reachable through several aliased
 /// type variables) is reported once.
 reported_constraint_errors: std.AutoHashMap(ReportedConstraintError, void),
-/// Static dispatch constraints created while checking an expect body.
-expect_region_by_constraint_fn_var: std.AutoHashMap(Var, Region),
+/// Constraint fn vars already reported as effectful dispatches in an expect
+/// body, so a constraint revisited across passes is reported once (replaces the
+/// old expect_region side table's fetchRemove dedup).
+reported_effectful_expect: std.AutoHashMap(Var, void),
 /// Region of the expect body currently being checked, if any.
 current_expect_region: ?Region,
 /// Map representation all top level patterns, and if we've processed them yet
@@ -1237,7 +1239,7 @@ fn initAssumePrepared(
         .interpolation_constraint_ids_by_fn_var = std.AutoHashMap(Var, InterpolationConstraintId).init(gpa),
         .interpolation_constraint_metadata = .empty,
         .reported_constraint_errors = std.AutoHashMap(ReportedConstraintError, void).init(gpa),
-        .expect_region_by_constraint_fn_var = std.AutoHashMap(Var, Region).init(gpa),
+        .reported_effectful_expect = std.AutoHashMap(Var, void).init(gpa),
         .current_expect_region = null,
         .top_level_ptrns = std.AutoHashMap(CIR.Pattern.Idx, DefProcessed).init(gpa),
         .platform_requirements = null,
@@ -1371,7 +1373,7 @@ pub fn deinit(self: *Self) void {
     }
     self.interpolation_constraint_metadata.deinit(self.gpa);
     self.reported_constraint_errors.deinit();
-    self.expect_region_by_constraint_fn_var.deinit();
+    self.reported_effectful_expect.deinit();
     self.top_level_ptrns.deinit();
     self.platform_required_defs.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
@@ -6365,19 +6367,6 @@ fn constraintIntroExpr(constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
     return @enumFromInt(raw);
 }
 
-fn expectRegionForFnVar(self: *Self, fn_var: Var) ?Region {
-    if (self.expect_region_by_constraint_fn_var.count() == 0) return null;
-
-    if (self.expect_region_by_constraint_fn_var.get(fn_var)) |region| return region;
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        if (self.expect_region_by_constraint_fn_var.get(resolved)) |region| return region;
-    }
-
-    return null;
-}
-
 fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationConstraintId {
     if (self.interpolation_constraint_ids_by_fn_var.count() == 0) return null;
 
@@ -6389,19 +6378,6 @@ fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationCon
     }
 
     return null;
-}
-
-fn recordExpectRegionForFnVar(
-    self: *Self,
-    fn_var: Var,
-    region: Region,
-) std.mem.Allocator.Error!void {
-    try self.expect_region_by_constraint_fn_var.put(fn_var, region);
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        try self.expect_region_by_constraint_fn_var.put(resolved, region);
-    }
 }
 
 fn recordInterpolationConstraintIdForFnVar(
@@ -6449,11 +6425,6 @@ fn linkConstraintMetadata(
     left: Var,
     right: Var,
 ) std.mem.Allocator.Error!void {
-    if (self.expectRegionForFnVar(left) orelse self.expectRegionForFnVar(right)) |region| {
-        try self.recordExpectRegionForFnVar(left, region);
-        try self.recordExpectRegionForFnVar(right, region);
-    }
-
     if (self.interpolationConstraintIdForFnVar(left) orelse self.interpolationConstraintIdForFnVar(right)) |id| {
         try self.recordInterpolationConstraintIdForFnVar(left, id);
         try self.recordInterpolationConstraintIdForFnVar(right, id);
@@ -6461,8 +6432,7 @@ fn linkConstraintMetadata(
 }
 
 fn hasConstraintMetadata(self: *Self) bool {
-    return self.expect_region_by_constraint_fn_var.count() > 0 or
-        self.interpolation_constraint_ids_by_fn_var.count() > 0;
+    return self.interpolation_constraint_ids_by_fn_var.count() > 0;
 }
 
 fn instantiatedMetadataVar(self: *Self, var_: Var) Var {
@@ -6477,31 +6447,18 @@ fn copyConstraintMetadata(
 ) std.mem.Allocator.Error!void {
     std.debug.assert(self.hasConstraintMetadata());
 
-    var maybe_region = self.expect_region_by_constraint_fn_var.get(old_var);
     var maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(old_var);
 
-    if (maybe_region == null or maybe_interpolation_id == null) {
+    if (maybe_interpolation_id == null) {
         const resolved_old = self.types.resolveVar(old_var).var_;
         if (resolved_old != old_var) {
-            if (maybe_region == null) {
-                maybe_region = self.expect_region_by_constraint_fn_var.get(resolved_old);
-            }
-            if (maybe_interpolation_id == null) {
-                maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(resolved_old);
-            }
+            maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(resolved_old);
         }
     }
 
-    if (maybe_region == null and maybe_interpolation_id == null) return;
+    if (maybe_interpolation_id == null) return;
 
     const resolved_fresh = self.types.resolveVar(fresh_var).var_;
-    if (maybe_region) |region| {
-        try self.expect_region_by_constraint_fn_var.put(fresh_var, region);
-        if (resolved_fresh != fresh_var) {
-            try self.expect_region_by_constraint_fn_var.put(resolved_fresh, region);
-        }
-    }
-
     if (maybe_interpolation_id) |old_id| {
         const old_metadata = self.interpolation_constraint_metadata.items[@intFromEnum(old_id)];
         // Remap each interpolated-part var through the instantiation var-map, exactly as
@@ -8654,7 +8611,6 @@ fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereCl
                     .fn_name = method.method_name,
                     .fn_var = func_var,
                     .origin = .{ .where_clause = .{} },
-                    .provenance = .{ .expect_region = StaticDispatchConstraint.Provenance.OptRegion.some(where_region) },
                 },
             });
         },
@@ -14423,7 +14379,7 @@ fn mkBinopConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .{ .desugared_binop = .{ .negated = negated } },
-        .provenance = self.constraintProvenance(binop_expr_idx),
+        .provenance = constraintProvenance(binop_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (binop_expr_idx) |expr_idx| {
@@ -14505,7 +14461,7 @@ fn mkUnaryOp(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .desugared_unaryop,
-        .provenance = self.constraintProvenance(unary_expr_idx),
+        .provenance = constraintProvenance(unary_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (unary_expr_idx) |expr_idx| {
@@ -14615,21 +14571,28 @@ fn mkMethodCallConstraint(
 }
 
 /// Build provenance for a static dispatch constraint from its introducing
-/// expression (if any) and the current where-clause "expect" region (if any).
-/// Mirrors the data the ambiguity sweep's side tables record today so the
-/// generalization-time rule can consume it in place of those maps. Provenance is
-/// metadata: it never participates in type identity.
-fn constraintProvenance(self: *const Self, intro_expr: ?CIR.Expr.Idx) StaticDispatchConstraint.Provenance {
+/// expression (if any). Mirrors the data the ambiguity sweep's side tables
+/// record today so the generalization-time rule can consume it in place of those
+/// maps. Provenance is metadata: it never participates in type identity.
+fn constraintProvenance(intro_expr: ?CIR.Expr.Idx) StaticDispatchConstraint.Provenance {
     return .{
         .intro_expr = if (intro_expr) |e|
             StaticDispatchConstraint.Provenance.OptExprIdx.from(@intFromEnum(e))
         else
             .none,
-        .expect_region = if (self.current_expect_region) |r|
-            StaticDispatchConstraint.Provenance.OptRegion.some(r)
-        else
-            StaticDispatchConstraint.Provenance.OptRegion.none,
     };
+}
+
+/// Like `constraintProvenance`, but also captures the current expect-body region.
+/// Only method-dispatch constraints carry it — the region feeds the
+/// "effectful dispatch in expect" diagnostic, matching what the old
+/// expect_region side table recorded (never for binop/unary origins).
+fn methodDispatchProvenance(self: *const Self, intro_expr: ?CIR.Expr.Idx) StaticDispatchConstraint.Provenance {
+    var provenance = constraintProvenance(intro_expr);
+    if (self.current_expect_region) |r| {
+        provenance.expect_region = StaticDispatchConstraint.Provenance.OptRegion.some(r);
+    }
+    return provenance;
 }
 
 fn mkSyntheticReceiverDispatchConstraint(
@@ -14680,12 +14643,9 @@ fn mkReceiverDispatchConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .method_call,
-        .provenance = self.constraintProvenance(method_expr_idx),
+        .provenance = self.methodDispatchProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    if (self.current_expect_region) |expect_region| {
-        try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
-    }
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -14718,12 +14678,9 @@ fn mkTypeMethodCallConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .method_call,
-        .provenance = self.constraintProvenance(method_expr_idx),
+        .provenance = self.methodDispatchProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    if (self.current_expect_region) |expect_region| {
-        try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
-    }
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -14757,13 +14714,10 @@ fn mkInterpolationConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .{ .from_literal = .interpolation },
-        .provenance = self.constraintProvenance(expr_idx),
+        .provenance = self.methodDispatchProvenance(expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     try self.recordInterpolationConstraintMetadata(constraint_fn_var, expr_idx, item_var);
-    if (self.current_expect_region) |expect_region| {
-        try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
-    }
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -17812,11 +17766,13 @@ fn reportEffectfulDispatchInExpect(
     constraint: StaticDispatchConstraint,
 ) std.mem.Allocator.Error!void {
     if (!self.varIsEffectfulFunction(constraint.fn_var)) return;
-    if (self.expect_region_by_constraint_fn_var.fetchRemove(constraint.fn_var)) |entry| {
-        _ = try self.problems.appendProblem(self.gpa, .{ .effectful_expect = .{
-            .region = entry.value,
-        } });
-    }
+    const expect_region = constraint.provenance.expect_region.get() orelse return;
+    // Report each constraint once even though constraint checking revisits it
+    // across passes — the dedup set replaces the old side table's fetchRemove.
+    if ((try self.reported_effectful_expect.getOrPut(constraint.fn_var)).found_existing) return;
+    _ = try self.problems.appendProblem(self.gpa, .{ .effectful_expect = .{
+        .region = expect_region,
+    } });
 }
 
 fn interpolationExprForConstraint(self: *Self, constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
