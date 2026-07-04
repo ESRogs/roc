@@ -28148,7 +28148,7 @@ test "platform app relation resolver substitutes required identity in provided f
     var names = canonical.CanonicalNameStore.init(allocator);
     defer names.deinit();
 
-    const module_name = try names.internModuleName("Test");
+    const module_name = try names.internModuleIdentity(&([_]u8{0x89} ** 32));
     const type_name = try names.internTypeName("Player");
     const model_alias_name = try names.internTypeName("Model");
     const tag_name = try names.internTagLabel("Player");
