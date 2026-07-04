@@ -157,7 +157,13 @@ pub const MethodRegistry = struct {
     };
 
     pub fn lookup(self: *const MethodRegistry, key: MethodKey) ?MethodTarget {
-        const found = artifact_serialize.binarySearchByKey(MethodRegistryEntry, MethodKey, self.entries, key, methodEntryOrder) orelse return null;
+        // Stack-built keys carry undefined bytes in the owner union's padding
+        // and inactive-variant region; ReleaseFast fuses the comparator's
+        // field reads into wide loads that touch them. Zero those bytes so
+        // every load is defined (entries are zeroed at build/serialization).
+        var normalized = key;
+        collections.CompactWriter.zeroValuePadding(MethodKey, @ptrCast(&normalized));
+        const found = artifact_serialize.binarySearchByKey(MethodRegistryEntry, MethodKey, self.entries, normalized, methodEntryOrder) orelse return null;
         return found.target;
     }
 
@@ -490,6 +496,13 @@ fn methodRegistryEntryLessThan(_: void, a: MethodRegistryEntry, b: MethodRegistr
 }
 
 fn finalizeMethodRegistryEntries(entries: []MethodRegistryEntry) void {
+    // Zero padding and inactive-union bytes first: at ReleaseFast the sorted
+    // entries are compared with fused wide loads that touch those bytes, and
+    // runtime-built entries would otherwise carry undefined memory there
+    // (serialized registries are already zeroed by appendSlicePodZeroed).
+    for (entries) |*entry| {
+        collections.CompactWriter.zeroValuePadding(MethodRegistryEntry, @ptrCast(entry));
+    }
     std.mem.sort(MethodRegistryEntry, entries, {}, methodRegistryEntryLessThan);
     assertMethodRegistryKeysUnique(entries);
 }
