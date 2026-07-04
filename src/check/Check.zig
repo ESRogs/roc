@@ -8691,6 +8691,7 @@ fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereCl
                     .fn_name = method.method_name,
                     .fn_var = func_var,
                     .origin = .{ .where_clause = .{} },
+                    .provenance = .{ .expect_region = StaticDispatchConstraint.Provenance.OptRegion.some(where_region) },
                 },
             });
         },
@@ -14459,6 +14460,7 @@ fn mkBinopConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .{ .desugared_binop = .{ .negated = negated } },
+        .provenance = self.constraintProvenance(binop_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (binop_expr_idx) |expr_idx| {
@@ -14541,6 +14543,7 @@ fn mkUnaryOp(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .desugared_unaryop,
+        .provenance = self.constraintProvenance(unary_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (unary_expr_idx) |expr_idx| {
@@ -14650,6 +14653,24 @@ fn mkMethodCallConstraint(
     );
 }
 
+/// Build provenance for a static dispatch constraint from its introducing
+/// expression (if any) and the current where-clause "expect" region (if any).
+/// Mirrors the data the ambiguity sweep's side tables record today so the
+/// generalization-time rule can consume it in place of those maps. Provenance is
+/// metadata: it never participates in type identity.
+fn constraintProvenance(self: *const Self, intro_expr: ?CIR.Expr.Idx) StaticDispatchConstraint.Provenance {
+    return .{
+        .intro_expr = if (intro_expr) |e|
+            StaticDispatchConstraint.Provenance.OptExprIdx.from(@intFromEnum(e))
+        else
+            .none,
+        .expect_region = if (self.current_expect_region) |r|
+            StaticDispatchConstraint.Provenance.OptRegion.some(r)
+        else
+            StaticDispatchConstraint.Provenance.OptRegion.none,
+    };
+}
+
 fn mkSyntheticReceiverDispatchConstraint(
     self: *Self,
     receiver_var: Var,
@@ -14698,6 +14719,7 @@ fn mkReceiverDispatchConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .method_call,
+        .provenance = self.constraintProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (method_expr_idx) |expr_idx| {
@@ -14738,6 +14760,7 @@ fn mkTypeMethodCallConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .method_call,
+        .provenance = self.constraintProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     try self.constraint_expr_by_fn_var.put(constraint_fn_var, method_expr_idx);
@@ -14777,6 +14800,7 @@ fn mkInterpolationConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .{ .from_literal = .interpolation },
+        .provenance = self.constraintProvenance(expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
