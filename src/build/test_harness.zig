@@ -902,6 +902,8 @@ pub fn PoolConfig(comptime Spec: type, comptime Result: type) type {
         stabilizeResult: *const fn (Allocator, Result) Result,
         /// Extract test name from spec (for timeout messages).
         getName: *const fn (Spec) []const u8,
+        /// Optionally customize the timeout budget for a specific spec.
+        getTimeoutMs: ?*const fn (Spec, u64) u64 = null,
         /// Use setsid() + kill(-pid) for process group cleanup.
         /// Enable when children spawn subprocesses (e.g., roc build).
         use_process_groups: bool = false,
@@ -929,11 +931,19 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
             worker_index: usize,
             start_ns: u64,
             start_time_ms: i64,
+            timeout_ms: u64,
             buf: std.ArrayListUnmanaged(u8),
             timed_out: bool,
         };
 
         var global_slots: ?[]?ChildSlot = null;
+
+        fn specTimeoutMs(spec: Spec, default_timeout_ms: u64) u64 {
+            if (cfg.getTimeoutMs) |getTimeoutMs| {
+                return getTimeoutMs(spec, default_timeout_ms);
+            }
+            return default_timeout_ms;
+        }
 
         fn recordSpan(
             spans: ?[]?PoolSpan,
@@ -1026,6 +1036,7 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
                 .worker_index = worker_index,
                 .start_ns = start_ns,
                 .start_time_ms = milliTimestamp(),
+                .timeout_ms = timeout_ms,
                 .buf = .empty,
                 .timed_out = false,
             };
@@ -1137,7 +1148,8 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
             // Fill initial slots
             for (slots, 0..) |*slot, worker_index| {
                 if (next_test >= specs.len) break;
-                if (!launchChild(io, slot, specs, next_test, worker_index, timeout_ms, pool_start_ns, spans)) {
+                const child_timeout_ms = specTimeoutMs(specs[next_test], timeout_ms);
+                if (!launchChild(io, slot, specs, next_test, worker_index, child_timeout_ms, pool_start_ns, spans)) {
                     results[next_test] = cfg.default_result;
                     completed += 1;
                 }
@@ -1178,7 +1190,8 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
                         completed += 1;
 
                         if (next_test < specs.len) {
-                            if (!launchChild(io, &slots[slot_idx], specs, next_test, slot_idx, timeout_ms, pool_start_ns, spans)) {
+                            const child_timeout_ms = specTimeoutMs(specs[next_test], timeout_ms);
+                            if (!launchChild(io, &slots[slot_idx], specs, next_test, slot_idx, child_timeout_ms, pool_start_ns, spans)) {
                                 results[next_test] = cfg.default_result;
                                 completed += 1;
                             }
@@ -1188,12 +1201,12 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
                 }
 
                 // Check timeouts
-                if (timeout_ms > 0) {
-                    const now = milliTimestamp();
-                    for (slots) |*slot_opt| {
-                        if (slot_opt.*) |*slot| {
+                const now = milliTimestamp();
+                for (slots) |*slot_opt| {
+                    if (slot_opt.*) |*slot| {
+                        if (slot.timeout_ms > 0) {
                             const elapsed: u64 = @intCast(@max(0, now - slot.start_time_ms));
-                            const kill_after_ms = timeout_ms +| cfg.timeout_report_grace_ms;
+                            const kill_after_ms = slot.timeout_ms +| cfg.timeout_report_grace_ms;
                             if (elapsed > kill_after_ms and !slot.timed_out) {
                                 slot.timed_out = true;
                                 const test_name = cfg.getName(specs[slot.test_index]);
@@ -1240,7 +1253,7 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
                 _ = arena.reset(.retain_capacity);
                 const start_ns = monotonicNs() -| pool_start_ns;
                 if (cfg.onTestStarted) |cb| cb(spec);
-                const unstable_result = cfg.runTest(io, arena.allocator(), spec, timeout_ms);
+                const unstable_result = cfg.runTest(io, arena.allocator(), spec, specTimeoutMs(spec, timeout_ms));
                 results[i] = cfg.stabilizeResult(gpa, unstable_result);
                 recordSpan(spans, i, 0, start_ns, monotonicNs() -| pool_start_ns);
             }
@@ -1264,6 +1277,7 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
             worker_index: usize,
             start_ns: u64,
             start_ms: i64,
+            timeout_ms: u64,
             timed_out: bool,
         };
 
@@ -1400,8 +1414,16 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
 
                 const start_ns = monotonicNs() -| state.pool_start_ns;
                 if (cfg.onTestStarted) |cb| cb(state.specs[idx]);
+                const child_timeout_ms = specTimeoutMs(state.specs[idx], state.timeout_ms);
 
-                state.results[idx] = switch (spawnSingleWorker(state.io, state.gpa, state.template, idx, &.{}, state.timeout_ms)) {
+                const timeout_arg = std.fmt.allocPrint(state.gpa, "{d}", .{child_timeout_ms}) catch {
+                    state.results[idx] = cfg.default_result;
+                    recordSpan(state.spans, idx, worker_index, start_ns, monotonicNs() -| state.pool_start_ns);
+                    continue;
+                };
+                defer state.gpa.free(timeout_arg);
+
+                state.results[idx] = switch (spawnSingleWorker(state.io, state.gpa, state.template, idx, &.{ "--timeout", timeout_arg }, child_timeout_ms)) {
                     .ok => |result| result,
                     .timed_out => cfg.timeout_result,
                     .crashed => cfg.default_result,
@@ -1456,6 +1478,7 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
 
                 const start_ns = monotonicNs() -| state.pool_start_ns;
                 if (cfg.onTestStarted) |cb| cb(state.specs[idx]);
+                const child_timeout_ms = specTimeoutMs(state.specs[idx], state.timeout_ms);
 
                 state.slots_mutex.lockUncancelable(io);
                 state.slots[slot_idx] = ActiveChild{
@@ -1464,6 +1487,7 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
                     .worker_index = slot_idx,
                     .start_ns = start_ns,
                     .start_ms = milliTimestamp(),
+                    .timeout_ms = child_timeout_ms,
                     .timed_out = false,
                 };
                 state.slots_mutex.unlock(io);
@@ -1551,15 +1575,15 @@ pub fn ProcessPool(comptime Spec: type, comptime Result: type, comptime cfg: Poo
             while (!state.watchdog_done.load(.acquire)) {
                 // Swallow cancel: watchdog cleanup happens on the next tick.
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-                if (state.timeout_ms == 0) continue;
 
                 const now = milliTimestamp();
                 state.slots_mutex.lockUncancelable(io);
                 defer state.slots_mutex.unlock(io);
                 for (state.slots) |*slot_opt| {
                     if (slot_opt.*) |*slot| {
+                        if (slot.timeout_ms == 0) continue;
                         const elapsed: u64 = @intCast(@max(0, now - slot.start_ms));
-                        const kill_after_ms = state.timeout_ms +| cfg.timeout_report_grace_ms;
+                        const kill_after_ms = slot.timeout_ms +| cfg.timeout_report_grace_ms;
                         if (elapsed > kill_after_ms and !slot.timed_out) {
                             slot.timed_out = true;
                             if (slot.child.id) |id| terminateProcess(id);
