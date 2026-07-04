@@ -2064,6 +2064,36 @@ pub const Coordinator = struct {
         return false;
     }
 
+    fn appendTypeOwnerAvailableArtifactClosure(
+        self: *Coordinator,
+        views: *std.ArrayList(check.CheckedArtifact.ImportedModuleView),
+        allocator: Allocator,
+        seed: *const check.CheckedArtifact.CheckedModuleArtifact,
+    ) Allocator.Error!void {
+        var pending = std.ArrayList(*const check.CheckedArtifact.CheckedModuleArtifact).empty;
+        defer pending.deinit(allocator);
+        var seen = std.AutoHashMap(check.CheckedArtifact.CheckedModuleArtifactKey, void).init(allocator);
+        defer seen.deinit();
+
+        try pending.append(allocator, seed);
+        while (pending.pop()) |artifact| {
+            const entry = try seen.getOrPut(artifact.key);
+            if (entry.found_existing) continue;
+            entry.value_ptr.* = {};
+
+            if (!importedArtifactViewExists(views.items, artifact.key)) {
+                try views.append(allocator, check.CheckedArtifact.importedView(artifact));
+            }
+
+            for (artifact.public_api_dependencies.type_owner_artifacts) |dependency_key| {
+                const dependency = self.checkedArtifactByKey(dependency_key) orelse {
+                    coordinatorInvariant("compile.coordinator missing type-owner dependency checked artifact", .{});
+                };
+                try pending.append(allocator, dependency);
+            }
+        }
+    }
+
     /// Finalize the build's executable artifacts (link app + platform, build
     /// the platform-app relation, republish the root artifact).
     ///
@@ -2365,8 +2395,10 @@ pub const Coordinator = struct {
             const root_key = if (mod.checkedArtifact()) |current| current.key else CheckedArtifact.CheckedModuleArtifactKey{};
             for (publication.relation_artifacts) |relation_artifact| {
                 if (checkedArtifactKeyEql(relation_artifact.key, root_key)) continue;
-                if (importedArtifactViewExists(extended_available.items, relation_artifact.key)) continue;
-                try extended_available.append(self.gpa, relation_artifact);
+                const relation_checked_artifact = self.checkedArtifactByKey(relation_artifact.key) orelse {
+                    coordinatorInvariant("platform/app relation publication references unavailable checked module", .{});
+                };
+                try self.appendTypeOwnerAvailableArtifactClosure(&extended_available, self.gpa, relation_checked_artifact);
             }
 
             var dependency_collector = RelationLoweringDependencyCollector.init(
