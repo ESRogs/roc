@@ -20138,7 +20138,7 @@ fn appendRecursiveNominalTestType(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
-    module_name: canonical.ModuleIdentityId,
+    module_identity: canonical.ModuleIdentityId,
     type_name: canonical.TypeNameId,
     tag_name: canonical.TagLabelId,
     arg: ?CheckedTypeId,
@@ -20163,7 +20163,7 @@ fn appendRecursiveNominalTestType(
     // Synthetic test declarations carry a placeholder statement locator.
     const source_decl: ?u32 = 0;
     const declaration_id: CheckedNominalDeclarationId, const should_append_declaration = if (store.nominalDeclaration(.{
-        .module = module_name,
+        .module = module_identity,
         .type_name = type_name,
         .source_decl = source_decl,
     })) |declaration| blk: {
@@ -20179,7 +20179,7 @@ fn appendRecursiveNominalTestType(
     } });
     try store.fillSyntheticTypeRoot(allocator, nominal_root, .{ .nominal = .{
         .name = type_name,
-        .origin_module = module_name,
+        .origin_module = module_identity,
         .source_decl = source_decl,
         .builtin = null,
         .is_opaque = false,
@@ -28254,7 +28254,7 @@ test "platform app relation resolver substitutes required identity in provided f
     var names = canonical.CanonicalNameStore.init(allocator);
     defer names.deinit();
 
-    const module_name = try names.internModuleName("Test");
+    const module_identity = try names.internModuleIdentity(&([_]u8{0x89} ** 32));
     const type_name = try names.internTypeName("Player");
     const model_alias_name = try names.internTypeName("Model");
     const tag_name = try names.internTagLabel("Player");
@@ -28270,7 +28270,7 @@ test "platform app relation resolver substitutes required identity in provided f
         allocator,
         &names,
         &store,
-        module_name,
+        module_identity,
         type_name,
         tag_name,
         null,
@@ -28278,7 +28278,7 @@ test "platform app relation resolver substitutes required identity in provided f
     );
     const app_model_alias = try appendExplicitCheckedTypePayload(allocator, &names, &store, .{ .alias = .{
         .name = model_alias_name,
-        .origin_module = module_name,
+        .origin_module = module_identity,
         .backing = app_player.nominal,
     } });
 
