@@ -102,7 +102,7 @@ const SpecEntryId = union(enum(u8)) {
 /// the source function type digest, and one closed monomorphic function type
 /// digest (a record is reachable under its requested digest and, once ready
 /// with a different solved type, under its solved digest as an alias).
-const SpecKey = struct {
+const SpecLookupAddress = struct {
     callable_kind: u8,
     module_bytes: [32]u8,
     index_a: u32,
@@ -116,8 +116,8 @@ const SpecKey = struct {
         callable: Ast.CallableIdentity,
         source_digest: names.TypeDigest,
         type_digest: names.TypeDigest,
-    ) SpecKey {
-        var key: SpecKey = .{
+    ) SpecLookupAddress {
+        var key: SpecLookupAddress = .{
             .callable_kind = @intFromEnum(callable),
             .module_bytes = @splat(0),
             .index_a = 0,
@@ -169,7 +169,7 @@ pub const SpecBuilder = struct {
     types: *const Type.Store,
     records: *std.ArrayList(Ast.SpecRecord),
     loaded_records: std.ArrayList(LoadedSpec),
-    lookup: std.AutoHashMap(SpecKey, std.ArrayList(SpecEntryId)),
+    lookup: std.AutoHashMap(SpecLookupAddress, std.ArrayList(SpecEntryId)),
     counters: ?*Counters,
     reserved_identities: if (identity_shadow_enabled) std.ArrayList(Ast.SpecIdentity) else void,
 
@@ -185,7 +185,7 @@ pub const SpecBuilder = struct {
             .types = type_store,
             .records = records,
             .loaded_records = .empty,
-            .lookup = std.AutoHashMap(SpecKey, std.ArrayList(SpecEntryId)).init(allocator),
+            .lookup = std.AutoHashMap(SpecLookupAddress, std.ArrayList(SpecEntryId)).init(allocator),
             .counters = null,
             .reserved_identities = if (identity_shadow_enabled) .empty else {},
         };
@@ -289,7 +289,7 @@ pub const SpecBuilder = struct {
         identity: Ast.SpecIdentity,
         scope: FindScope,
     ) std.mem.Allocator.Error!?LookupResult {
-        const key = SpecKey.from(identity.callable, identity.source_fn_ty_digest, identity.request_fn_ty_digest);
+        const key = SpecLookupAddress.from(identity.callable, identity.source_fn_ty_digest, identity.request_fn_ty_digest);
         const entries = self.lookup.get(key) orelse return null;
         self.countCandidatesBy(identity.callable, entries.items.len);
 
@@ -430,7 +430,7 @@ pub const SpecBuilder = struct {
         type_digest: names.TypeDigest,
         entry_id: SpecEntryId,
     ) std.mem.Allocator.Error!void {
-        const key = SpecKey.from(callable, source_digest, type_digest);
+        const key = SpecLookupAddress.from(callable, source_digest, type_digest);
         const gop = try self.lookup.getOrPut(key);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         for (gop.value_ptr.items) |existing| {
@@ -515,7 +515,7 @@ pub const SpecBuilder = struct {
                     .loaded => continue,
                 };
                 const record = self.records.items[@intFromEnum(spec_id)];
-                const expected = expectedKeysForRecord(record);
+                const expected = expectedAddressesForRecord(record);
                 var reachable = false;
                 for (expected.slice()) |expected_key| {
                     if (std.meta.eql(entry.key_ptr.*, expected_key)) {
@@ -531,22 +531,22 @@ pub const SpecBuilder = struct {
         }
 
         for (self.records.items, reach_counts) |record, reach_count| {
-            if (reach_count != expectedKeysForRecord(record).len) {
+            if (reach_count != expectedAddressesForRecord(record).len) {
                 return .record_missing_expected_key;
             }
         }
         return null;
     }
 
-    const ExpectedKeys = struct {
-        keys: [3]SpecKey,
+    const ExpectedAddresses = struct {
+        keys: [3]SpecLookupAddress,
         len: usize,
 
-        fn slice(self: *const ExpectedKeys) []const SpecKey {
+        fn slice(self: *const ExpectedAddresses) []const SpecLookupAddress {
             return self.keys[0..self.len];
         }
 
-        fn push(self: *ExpectedKeys, key: SpecKey) void {
+        fn push(self: *ExpectedAddresses, key: SpecLookupAddress) void {
             for (self.slice()) |existing| {
                 if (std.meta.eql(existing, key)) return;
             }
@@ -555,12 +555,12 @@ pub const SpecBuilder = struct {
         }
     };
 
-    fn expectedKeysForRecord(record: Ast.SpecRecord) ExpectedKeys {
-        var expected: ExpectedKeys = .{ .keys = undefined, .len = 0 };
-        expected.push(SpecKey.from(record.identity.callable, record.identity.source_fn_ty_digest, record.identity.request_fn_ty_digest));
-        expected.push(SpecKey.from(record.identity.callable, record.identity.source_fn_ty_digest, record.request_fn_ty_digest));
+    fn expectedAddressesForRecord(record: Ast.SpecRecord) ExpectedAddresses {
+        var expected: ExpectedAddresses = .{ .keys = undefined, .len = 0 };
+        expected.push(SpecLookupAddress.from(record.identity.callable, record.identity.source_fn_ty_digest, record.identity.request_fn_ty_digest));
+        expected.push(SpecLookupAddress.from(record.identity.callable, record.identity.source_fn_ty_digest, record.request_fn_ty_digest));
         if (record.status == .ready) {
-            expected.push(SpecKey.from(record.identity.callable, record.identity.source_fn_ty_digest, record.solved_fn_ty_digest));
+            expected.push(SpecLookupAddress.from(record.identity.callable, record.identity.source_fn_ty_digest, record.solved_fn_ty_digest));
         }
         return expected;
     }

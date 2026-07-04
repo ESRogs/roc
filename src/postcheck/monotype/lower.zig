@@ -24112,10 +24112,6 @@ fn moduleBytesEqual(a: [32]u8, b: [32]u8) bool {
     return std.mem.eql(u8, a[0..], b[0..]);
 }
 
-fn digestEql(a: names.TypeDigest, b: names.TypeDigest) bool {
-    return std.mem.eql(u8, a.bytes[0..], b.bytes[0..]);
-}
-
 fn verifyMonotypeTypeStore(program: *const Ast.Program) void {
     if (program.types.verify(&program.names)) |err| switch (err) {
         .type_digest_count_mismatch => Common.invariant("Monotype type digest section length differed from type node count"),
