@@ -1442,6 +1442,20 @@ test "check type - alias with arg" {
     try checkTypesModule(source, .{ .pass = .last_def }, "MyListAlias(I64)");
 }
 
+test "check type - tuple access through alias" {
+    const source =
+        \\main! = |_| {}
+        \\
+        \\Pair : (Str, U8)
+        \\
+        \\p : Pair
+        \\p = ("x", 1)
+        \\
+        \\x = p.1
+    ;
+    try checkTypesModule(source, .{ .pass = .last_def }, "U8");
+}
+
 test "check type - alias with mismatch arg" {
     const source =
         \\MyListAlias(a) : List(a)
