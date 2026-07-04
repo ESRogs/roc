@@ -146,8 +146,6 @@ u64_var: Var,
 builtin_types_copied: bool,
 /// Map representation of Ident -> Var, used in checking static dispatch constraints
 ident_to_var_map: std.AutoHashMap(Ident.Idx, Var),
-/// Checker-local source-site mapping for method/equality rewrites.
-constraint_expr_by_fn_var: std.AutoHashMap(Var, CIR.Expr.Idx),
 /// Hidden field-access expressions preallocated for method-call nodes. If a
 /// method call resolves to a record field function, the checker rewrites the
 /// method call to an ordinary call using this field access as the callee.
@@ -1235,7 +1233,6 @@ fn initAssumePrepared(
         .u64_var = undefined,
         .builtin_types_copied = false,
         .ident_to_var_map = std.AutoHashMap(Ident.Idx, Var).init(gpa),
-        .constraint_expr_by_fn_var = std.AutoHashMap(Var, CIR.Expr.Idx).init(gpa),
         .method_field_access_exprs = .{},
         .interpolation_constraint_ids_by_fn_var = std.AutoHashMap(Var, InterpolationConstraintId).init(gpa),
         .interpolation_constraint_metadata = .empty,
@@ -1367,7 +1364,6 @@ pub fn deinit(self: *Self) void {
     self.scratch_deferred_static_dispatch_constraints.deinit();
     self.import_cache.deinit(self.gpa);
     self.ident_to_var_map.deinit();
-    self.constraint_expr_by_fn_var.deinit();
     self.method_field_access_exprs.deinit(self.gpa);
     self.interpolation_constraint_ids_by_fn_var.deinit();
     for (self.interpolation_constraint_metadata.items) |meta| {
@@ -3314,7 +3310,7 @@ fn tryResolveStructuralRecordFieldDispatch(
     }
 
     const field_var = self.recordTypeFieldVarByName(dispatcher_var, constraint.fn_name) orelse return false;
-    const expr_idx = self.constraintExprForFnVar(constraint.fn_var) orelse return false;
+    const expr_idx = constraintIntroExpr(constraint) orelse return false;
     const expr_region = self.cir.store.getExprRegion(expr_idx);
 
     const dispatch_call = switch (self.cir.store.getExpr(expr_idx)) {
@@ -6359,17 +6355,14 @@ fn collectPinnableVars(
     }
 }
 
-fn constraintExprForFnVar(self: *Self, fn_var: Var) ?CIR.Expr.Idx {
-    if (self.constraint_expr_by_fn_var.count() == 0) return null;
-
-    if (self.constraint_expr_by_fn_var.get(fn_var)) |expr_idx| return expr_idx;
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        if (self.constraint_expr_by_fn_var.get(resolved)) |expr_idx| return expr_idx;
-    }
-
-    return null;
+/// The introducing dispatch expression recorded in a constraint's provenance,
+/// or null for a synthetic constraint with no source expression. This replaces
+/// the `constraint_expr_by_fn_var` side table: provenance is set at creation and
+/// copied verbatim by instantiation and unification, so it travels with the
+/// constraint instead of alongside it in a var-keyed map.
+fn constraintIntroExpr(constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
+    const raw = constraint.provenance.intro_expr.get() orelse return null;
+    return @enumFromInt(raw);
 }
 
 fn expectRegionForFnVar(self: *Self, fn_var: Var) ?Region {
@@ -6396,19 +6389,6 @@ fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationCon
     }
 
     return null;
-}
-
-fn recordConstraintExprForFnVar(
-    self: *Self,
-    fn_var: Var,
-    expr_idx: CIR.Expr.Idx,
-) std.mem.Allocator.Error!void {
-    try self.constraint_expr_by_fn_var.put(fn_var, expr_idx);
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        try self.constraint_expr_by_fn_var.put(resolved, expr_idx);
-    }
 }
 
 fn recordExpectRegionForFnVar(
@@ -6469,11 +6449,6 @@ fn linkConstraintMetadata(
     left: Var,
     right: Var,
 ) std.mem.Allocator.Error!void {
-    if (self.constraintExprForFnVar(left) orelse self.constraintExprForFnVar(right)) |expr_idx| {
-        try self.recordConstraintExprForFnVar(left, expr_idx);
-        try self.recordConstraintExprForFnVar(right, expr_idx);
-    }
-
     if (self.expectRegionForFnVar(left) orelse self.expectRegionForFnVar(right)) |region| {
         try self.recordExpectRegionForFnVar(left, region);
         try self.recordExpectRegionForFnVar(right, region);
@@ -6486,8 +6461,7 @@ fn linkConstraintMetadata(
 }
 
 fn hasConstraintMetadata(self: *Self) bool {
-    return self.constraint_expr_by_fn_var.count() > 0 or
-        self.expect_region_by_constraint_fn_var.count() > 0 or
+    return self.expect_region_by_constraint_fn_var.count() > 0 or
         self.interpolation_constraint_ids_by_fn_var.count() > 0;
 }
 
@@ -6503,16 +6477,12 @@ fn copyConstraintMetadata(
 ) std.mem.Allocator.Error!void {
     std.debug.assert(self.hasConstraintMetadata());
 
-    var maybe_expr_idx = self.constraint_expr_by_fn_var.get(old_var);
     var maybe_region = self.expect_region_by_constraint_fn_var.get(old_var);
     var maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(old_var);
 
-    if (maybe_expr_idx == null or maybe_region == null or maybe_interpolation_id == null) {
+    if (maybe_region == null or maybe_interpolation_id == null) {
         const resolved_old = self.types.resolveVar(old_var).var_;
         if (resolved_old != old_var) {
-            if (maybe_expr_idx == null) {
-                maybe_expr_idx = self.constraint_expr_by_fn_var.get(resolved_old);
-            }
             if (maybe_region == null) {
                 maybe_region = self.expect_region_by_constraint_fn_var.get(resolved_old);
             }
@@ -6522,16 +6492,9 @@ fn copyConstraintMetadata(
         }
     }
 
-    if (maybe_expr_idx == null and maybe_region == null and maybe_interpolation_id == null) return;
+    if (maybe_region == null and maybe_interpolation_id == null) return;
 
     const resolved_fresh = self.types.resolveVar(fresh_var).var_;
-    if (maybe_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(fresh_var, expr_idx);
-        if (resolved_fresh != fresh_var) {
-            try self.constraint_expr_by_fn_var.put(resolved_fresh, expr_idx);
-        }
-    }
-
     if (maybe_region) |region| {
         try self.expect_region_by_constraint_fn_var.put(fresh_var, region);
         if (resolved_fresh != fresh_var) {
@@ -6565,10 +6528,10 @@ fn copyConstraintMetadata(
 
 fn findStaticDispatchUseForConstraint(
     self: *Self,
-    method_name: Ident.Idx,
-    constraint_fn_var: Var,
+    constraint: StaticDispatchConstraint,
 ) Allocator.Error!?StaticDispatchUse {
-    const expr_idx = self.constraintExprForFnVar(constraint_fn_var) orelse return null;
+    const method_name = constraint.fn_name;
+    const expr_idx = constraintIntroExpr(constraint) orelse return null;
     if (self.cir.store.getExpr(expr_idx) == .e_runtime_error) return null;
 
     switch (self.cir.store.getExpr(expr_idx)) {
@@ -6723,7 +6686,7 @@ fn reportAmbiguousStaticDispatchPerInstantiation(
         // dispatch use to be a dead end; without one it is not reported.
         const body_forced = is_instantiated_where_clause and constraint.origin.where_clause.body_required;
         const where_dispatch_use = if (is_instantiated_where_clause)
-            try self.findStaticDispatchUseForConstraint(constraint.fn_name, constraint.fn_var)
+            try self.findStaticDispatchUseForConstraint(constraint)
         else
             null;
         if (is_instantiated_where_clause and where_dispatch_use == null and !body_forced) continue;
@@ -14464,7 +14427,6 @@ fn mkBinopConstraint(
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (binop_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
         try self.publishBinopDispatchExpr(expr_idx, method_name, region, constraint_fn_var);
     }
 
@@ -14547,7 +14509,6 @@ fn mkUnaryOp(
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (unary_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
         try self.publishUnaryDispatchExpr(expr_idx, method_name, region, constraint_fn_var);
     }
 
@@ -14722,9 +14683,6 @@ fn mkReceiverDispatchConstraint(
         .provenance = self.constraintProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    if (method_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
-    }
     if (self.current_expect_region) |expect_region| {
         try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
     }
@@ -14763,7 +14721,6 @@ fn mkTypeMethodCallConstraint(
         .provenance = self.constraintProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    try self.constraint_expr_by_fn_var.put(constraint_fn_var, method_expr_idx);
     if (self.current_expect_region) |expect_region| {
         try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
     }
@@ -14803,7 +14760,6 @@ fn mkInterpolationConstraint(
         .provenance = self.constraintProvenance(expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
     try self.recordInterpolationConstraintMetadata(constraint_fn_var, expr_idx, item_var);
     if (self.current_expect_region) |expect_region| {
         try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
@@ -14826,7 +14782,7 @@ fn rewriteDerivedIsEqMethodCallAsStructuralEq(
     self: *Self,
     constraint: StaticDispatchConstraint,
 ) bool {
-    const expr_idx = self.constraint_expr_by_fn_var.get(constraint.fn_var) orelse return true;
+    const expr_idx = constraintIntroExpr(constraint) orelse return true;
 
     switch (self.cir.store.getExpr(expr_idx)) {
         .e_method_call => |method_call| {
@@ -14866,7 +14822,7 @@ fn rewriteDerivedMethodCallAsStructuralHash(
     self: *Self,
     constraint: StaticDispatchConstraint,
 ) bool {
-    const expr_idx = self.constraint_expr_by_fn_var.get(constraint.fn_var) orelse return true;
+    const expr_idx = constraintIntroExpr(constraint) orelse return true;
 
     switch (self.cir.store.getExpr(expr_idx)) {
         .e_method_call => |method_call| {
@@ -14893,7 +14849,7 @@ fn rewriteDerivedMethodCallAsStructuralHash(
 
 fn rewriteEqBinopAsMethodEq(self: *Self, constraint: StaticDispatchConstraint) void {
     if (constraint.origin != .desugared_binop) return;
-    const expr_idx = self.constraint_expr_by_fn_var.get(constraint.fn_var) orelse return;
+    const expr_idx = constraintIntroExpr(constraint) orelse return;
     switch (self.cir.store.getExpr(expr_idx)) {
         .e_binop => |binop| {
             if (binop.op != .eq and binop.op != .ne) return;
@@ -16986,6 +16942,14 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             for (rc_start..rc_start + rc_len) |i| {
                                 if (backing[i].origin == .where_clause and backing[i].fn_name.eql(constraint.fn_name)) {
                                     backing[i].origin.where_clause.body_required = true;
+                                    // Stamp the where-clause constraint's provenance with the
+                                    // body dispatch that forced it, so instantiated copies point
+                                    // at a concrete dispatch use (what the old side table's
+                                    // cross-unification linking supplied). Only adopt a real
+                                    // introducing expression; never clobber an existing one.
+                                    if (backing[i].provenance.intro_expr == .none) {
+                                        backing[i].provenance.intro_expr = constraint.provenance.intro_expr;
+                                    }
                                 }
                             }
                         }
@@ -17313,7 +17277,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     // key is set records the instantiation as `dispatch_target`
                     // evidence for the constraint being discharged.
                     self.evidence_target_site = .{
-                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .node_idx = if (constraintIntroExpr(constraint)) |expr| @intFromEnum(expr) else 0,
                         .constraint_fn_var = constraint.fn_var,
                     };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
@@ -17595,7 +17559,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     // chosen method target's scheme instantiation is recorded as
                     // `dispatch_target` evidence for this constraint.
                     self.evidence_target_site = .{
-                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .node_idx = if (constraintIntroExpr(constraint)) |expr| @intFromEnum(expr) else 0,
                         .constraint_fn_var = constraint.fn_var,
                     };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
