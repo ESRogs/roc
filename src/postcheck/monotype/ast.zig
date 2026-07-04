@@ -175,10 +175,10 @@ pub const SpecStatus = enum(u8) {
 ///
 /// `identity` is the immutable creation-time key. The type views are data:
 /// `request_fn_ty` starts as the identity's requested type and may be refined
-/// once, while still `.reserved`, when the requester's graph seals deferred
-/// request types; `solved_fn_ty` mirrors the request view until `.ready`
-/// records the body's solved type. Both views only ever become more specific;
-/// a finished record is never widened (one-way snapshot rule).
+/// while the record is still `.reserved` — once per deferring graph that
+/// seals its view of the request; `solved_fn_ty` mirrors the request view
+/// until `.ready` records the body's solved type. Both views only ever become
+/// more specific; a finished record is never widened (one-way snapshot rule).
 pub const SpecRecord = struct {
     identity: SpecIdentity,
     request_fn_ty: Type.TypeId,

@@ -455,6 +455,12 @@ pub const MappedProgramView = struct {
             if (!self.exprRefInBounds(branch.body)) return false;
         }
 
+        for (self.specs) |spec| {
+            if (!self.typeRefInBounds(spec.identity.request_fn_ty)) return false;
+            if (!self.typeRefInBounds(spec.request_fn_ty)) return false;
+            if (!self.typeRefInBounds(spec.solved_fn_ty)) return false;
+            if (!self.fnRefInBounds(spec.fn_id)) return false;
+        }
         for (self.defs) |def| {
             if (def.fn_id) |fn_id| {
                 if (!self.fnRefInBounds(fn_id)) return false;

@@ -2603,14 +2603,17 @@ collisions are therefore harmless.
 The identity is immutable: it is written once when the record is reserved and
 never rewritten, so no structure that indexes by identity ever needs a rekey or
 a second synchronized entry. Later refinements are data on the record. The
-request view may be refined once, while the record is still `reserved`, when
-the requesting graph seals a deferred request type; the solved view records the
+request view may be refined while the record is still `reserved` — once per
+deferring graph that seals its view of the request; the solved view records the
 body's solved type when the record becomes `ready`. Each refinement registers
 an *alias* lookup entry (the new digest also reaches the same record), so a
-request shaped like the original request reuses the record even after the body
+request shaped like the current request reuses the record even after the body
 solved a more specific type — the record is never widened (the one-way snapshot
 rule above). Status transitions (`reserved → lowering → ready`) and both
-refinements happen only through the specialization store's API.
+refinements happen only through the specialization store's API. A record
+loaded from another shard's cache is a finished snapshot and matches only at
+its solved shape: a requester that matches it already has the solved type, so
+no evidence needs to flow back.
 
 The in-memory builder owns a transient hash table from lookup keys to
 `SpecId`, plus the append-only `SpecRecord` array. The output program owns the
