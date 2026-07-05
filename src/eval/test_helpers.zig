@@ -651,6 +651,16 @@ fn parseAndCheckProgramForProblemsImpl(
         };
     }
 
+    var explicit_problem_root_names_storage: [1][]const u8 = undefined;
+    var explicit_problem_root_names: []const []const u8 = &.{};
+    switch (source_kind) {
+        .expr => {
+            explicit_problem_root_names_storage[0] = evalRootName(source_kind, false);
+            explicit_problem_root_names = explicit_problem_root_names_storage[0..];
+        },
+        .module => {},
+    }
+
     const main_checked = try parseCheckModule(
         allocator,
         "Test",
@@ -659,7 +669,7 @@ fn parseAndCheckProgramForProblemsImpl(
         false,
         false,
         .checked_artifact,
-        &.{},
+        explicit_problem_root_names,
         builtin_env,
         builtin_indices,
         main_imports,
@@ -1295,7 +1305,6 @@ pub fn parseCheckModule(
 
     try module_env.initCIRFields(module_name);
     const builtin_ctx: Check.BuiltinContext = .{
-        .module_name = try module_env.insertIdent(base.Ident.for_text(module_name)),
         .bool_stmt = builtin_indices.bool_type,
         .try_stmt = builtin_indices.try_type,
         .str_stmt = builtin_indices.str_type,
@@ -1372,6 +1381,15 @@ pub fn parseCheckModule(
         builtin_ctx,
     );
     checker.fixupTypeWriter();
+    for (explicit_root_names) |root_name| {
+        const root_def_idx = czer.explicitRootDefByName(root_name) orelse {
+            if (@import("builtin").mode == .Debug) {
+                std.debug.panic("eval helper invariant violated: explicit executable root `{s}` was not found", .{root_name});
+            }
+            unreachable;
+        };
+        try checker.addExecutableRootDef(root_def_idx);
+    }
     errdefer checker.deinit();
     var check_timer = try StageTimer.start();
     try checker.checkFile();
@@ -1716,6 +1734,7 @@ fn renderCheckedModuleProblemsWithConfig(
             &.{},
             &main.checker.import_mapping,
             &main.checker.regions,
+            null,
         );
         defer report_builder.deinit();
 

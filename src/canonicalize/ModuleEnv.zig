@@ -132,6 +132,8 @@ pub const CommonIdents = extern struct {
     list: Ident.Idx,
     iter: Ident.Idx,
     box: Ident.Idx,
+    dict: Ident.Idx,
+    set: Ident.Idx,
 
     // Unqualified builtin type names (for checking if a type name shadows a builtin)
     num: Ident.Idx,
@@ -157,10 +159,16 @@ pub const CommonIdents = extern struct {
     builtin_str: Ident.Idx,
     builtin_list: Ident.Idx,
     builtin_box: Ident.Idx,
-    builtin_parse_tag_union_spec: Ident.Idx,
-    builtin_str_field_names: Ident.Idx,
-    builtin_str_field_name: Ident.Idx,
+    builtin_dict: Ident.Idx,
+    builtin_set: Ident.Idx,
+    builtin_encoding_parse_tag_union_spec: Ident.Idx,
+    builtin_encoding_field_names: Ident.Idx,
+    builtin_encoding_field_name: Ident.Idx,
     builtin_str_inspect: Ident.Idx,
+    builtin_crypto_sha256_digest: Ident.Idx,
+    builtin_crypto_sha256_hasher: Ident.Idx,
+    builtin_crypto_blake3_digest: Ident.Idx,
+    builtin_crypto_blake3_hasher: Ident.Idx,
     u8_type: Ident.Idx,
     i8_type: Ident.Idx,
     u16_type: Ident.Idx,
@@ -243,6 +251,8 @@ pub const CommonIdents = extern struct {
             .list = try common.insertIdent(gpa, Ident.for_text("List")),
             .iter = try common.insertIdent(gpa, Ident.for_text("Iter")),
             .box = try common.insertIdent(gpa, Ident.for_text("Box")),
+            .dict = try common.insertIdent(gpa, Ident.for_text("Dict")),
+            .set = try common.insertIdent(gpa, Ident.for_text("Set")),
             // Unqualified builtin type names
             .num = try common.insertIdent(gpa, Ident.for_text("Num")),
             .bool = try common.insertIdent(gpa, Ident.for_text("Bool")),
@@ -265,10 +275,16 @@ pub const CommonIdents = extern struct {
             .builtin_str = try common.insertIdent(gpa, Ident.for_text("Builtin.Str")),
             .builtin_list = try common.insertIdent(gpa, Ident.for_text("Builtin.List")),
             .builtin_box = try common.insertIdent(gpa, Ident.for_text("Builtin.Box")),
-            .builtin_parse_tag_union_spec = try common.insertIdent(gpa, Ident.for_text("Builtin.Str.ParseTagUnionSpec")),
-            .builtin_str_field_names = try common.insertIdent(gpa, Ident.for_text("Builtin.Str.FieldName.FieldNames")),
-            .builtin_str_field_name = try common.insertIdent(gpa, Ident.for_text("Builtin.Str.FieldName")),
+            .builtin_dict = try common.insertIdent(gpa, Ident.for_text("Builtin.Dict")),
+            .builtin_set = try common.insertIdent(gpa, Ident.for_text("Builtin.Set")),
+            .builtin_encoding_parse_tag_union_spec = try common.insertIdent(gpa, Ident.for_text("Builtin.Encoding.ParseTagUnionSpec")),
+            .builtin_encoding_field_names = try common.insertIdent(gpa, Ident.for_text("Builtin.Encoding.FieldName.FieldNames")),
+            .builtin_encoding_field_name = try common.insertIdent(gpa, Ident.for_text("Builtin.Encoding.FieldName")),
             .builtin_str_inspect = try common.insertIdent(gpa, Ident.for_text("Builtin.Str.inspect")),
+            .builtin_crypto_sha256_digest = try common.insertIdent(gpa, Ident.for_text("Builtin.Crypto.SHA256.Digest")),
+            .builtin_crypto_sha256_hasher = try common.insertIdent(gpa, Ident.for_text("Builtin.Crypto.SHA256.Hasher")),
+            .builtin_crypto_blake3_digest = try common.insertIdent(gpa, Ident.for_text("Builtin.Crypto.BLAKE3.Digest")),
+            .builtin_crypto_blake3_hasher = try common.insertIdent(gpa, Ident.for_text("Builtin.Crypto.BLAKE3.Hasher")),
             .u8_type = try common.insertIdent(gpa, Ident.for_text("Builtin.Num.U8")),
             .i8_type = try common.insertIdent(gpa, Ident.for_text("Builtin.Num.I8")),
             .u16_type = try common.insertIdent(gpa, Ident.for_text("Builtin.Num.U16")),
@@ -352,6 +368,8 @@ pub const CommonIdents = extern struct {
             .list = common.findIdent("List") orelse unreachable,
             .iter = common.findIdent("Iter") orelse unreachable,
             .box = common.findIdent("Box") orelse unreachable,
+            .dict = common.findIdent("Dict") orelse unreachable,
+            .set = common.findIdent("Set") orelse unreachable,
             // Unqualified builtin type names
             .num = common.findIdent("Num") orelse unreachable,
             .bool = common.findIdent("Bool") orelse unreachable,
@@ -374,10 +392,16 @@ pub const CommonIdents = extern struct {
             .builtin_str = common.findIdent("Builtin.Str") orelse unreachable,
             .builtin_list = common.findIdent("Builtin.List") orelse unreachable,
             .builtin_box = common.findIdent("Builtin.Box") orelse unreachable,
-            .builtin_parse_tag_union_spec = common.findIdent("Builtin.Str.ParseTagUnionSpec") orelse unreachable,
-            .builtin_str_field_names = common.findIdent("Builtin.Str.FieldName.FieldNames") orelse unreachable,
-            .builtin_str_field_name = common.findIdent("Builtin.Str.FieldName") orelse unreachable,
+            .builtin_dict = common.findIdent("Builtin.Dict") orelse unreachable,
+            .builtin_set = common.findIdent("Builtin.Set") orelse unreachable,
+            .builtin_encoding_parse_tag_union_spec = common.findIdent("Builtin.Encoding.ParseTagUnionSpec") orelse unreachable,
+            .builtin_encoding_field_names = common.findIdent("Builtin.Encoding.FieldName.FieldNames") orelse unreachable,
+            .builtin_encoding_field_name = common.findIdent("Builtin.Encoding.FieldName") orelse unreachable,
             .builtin_str_inspect = common.findIdent("Builtin.Str.inspect") orelse unreachable,
+            .builtin_crypto_sha256_digest = common.findIdent("Builtin.Crypto.SHA256.Digest") orelse unreachable,
+            .builtin_crypto_sha256_hasher = common.findIdent("Builtin.Crypto.SHA256.Hasher") orelse unreachable,
+            .builtin_crypto_blake3_digest = common.findIdent("Builtin.Crypto.BLAKE3.Digest") orelse unreachable,
+            .builtin_crypto_blake3_hasher = common.findIdent("Builtin.Crypto.BLAKE3.Hasher") orelse unreachable,
             .u8_type = common.findIdent("Builtin.Num.U8") orelse unreachable,
             .i8_type = common.findIdent("Builtin.Num.I8") orelse unreachable,
             .u16_type = common.findIdent("Builtin.Num.U16") orelse unreachable,
@@ -627,9 +651,23 @@ module_name: []const u8,
 /// The module's bare name as an interned identifier (e.g., "Color").
 /// Used for display, type module validation, and method name construction.
 display_module_name_idx: Ident.Idx,
-/// Package-qualified module identity (e.g., "pf.Color"). Used as origin_module on types
-/// for identity comparisons across packages. Set by the coordinator after parse or cache hit.
+/// Package-qualified module display name (e.g., "pf.Color"). Display-only; identity
+/// comparisons use content-based module identities (see `module_identities`).
+/// Set by the coordinator after parse or cache hit.
 qualified_module_ident: Ident.Idx,
+/// Env-local module identity table: dense `base.ModuleIdentity.Idx` -> 32-byte
+/// deep content hash (see `base.module_identity`). Entry ids are the
+/// `origin_module` values stored on nominal/alias types in this env's type
+/// store. Populated by `setContentIdentity` (self) and by cross-store type
+/// copies rebasing imported origins into this table.
+module_identities: base.SerialStringInterner,
+/// Display ident (into this env's ident store) for each `module_identities`
+/// entry, parallel by index. Display-only — never used for identity.
+module_identity_displays: collections.SafeList(Ident.Idx),
+/// This module's own entry in `module_identities`; `NONE` until the deep
+/// content identity has been computed (after import resolution, before
+/// type-checking).
+self_module_identity: base.ModuleIdentity.Idx,
 /// Diagnostics collected during canonicalization (optional)
 diagnostics: CIR.Diagnostic.Span,
 /// Stores the raw nodes which represent the intermediate representation
@@ -765,6 +803,8 @@ pub fn relocate(self: *Self, offset: isize) void {
     // Relocate all sub-structures that contain pointers
     self.common.relocate(offset);
     self.types.relocate(offset);
+    self.module_identities.relocate(offset);
+    self.module_identity_displays.relocate(offset);
     self.external_decls.relocate(offset);
     self.requires_types.relocate(offset);
     self.for_clause_aliases.relocate(offset);
@@ -846,6 +886,9 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .module_name = "", // May be set later during canonicalization
         .display_module_name_idx = Ident.Idx.NONE, // Will be set later during canonicalization
         .qualified_module_ident = Ident.Idx.NONE, // Will be set by coordinator
+        .module_identities = .{},
+        .module_identity_displays = .{},
+        .self_module_identity = base.ModuleIdentity.Idx.NONE,
         .diagnostics = CIR.Diagnostic.Span{ .span = base.DataSpan{ .start = 0, .len = 0 } },
         .store = try NodeStore.initCapacity(gpa, node_capacity),
         .evaluation_order = null, // Will be set after canonicalization completes
@@ -867,6 +910,8 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
 pub fn deinit(self: *Self) void {
     self.common.deinit(self.gpa);
     self.types.deinit();
+    self.module_identities.deinit(self.gpa);
+    self.module_identity_displays.deinit(self.gpa);
     self.external_decls.deinit(self.gpa);
     self.requires_types.deinit(self.gpa);
     self.for_clause_aliases.deinit(self.gpa);
@@ -929,6 +974,11 @@ pub fn deinitCachedModule(self: *Self) void {
     // that needs to be freed. The interner.deinit checks supports_inserts internally
     // and will only free if memory was actually allocated (not for pure cached data).
     self.common.idents.interner.deinit(self.gpa);
+
+    // Same pattern for the module identity table: frozen (buffer-aliased) data is
+    // a no-op to deinit; runtime-grown data is freed.
+    self.module_identities.deinit(self.gpa);
+    self.module_identity_displays.deinit(self.gpa);
 }
 
 /// Record a relative file dependency before its final read state is known.
@@ -1012,6 +1062,7 @@ fn getDiagnosticRegion(diagnostic: CIR.Diagnostic) Region {
         .type_alias_redeclared => |data| data.redeclared_region,
         .nominal_type_redeclared => |data| data.redeclared_region,
         .duplicate_record_field => |data| data.duplicate_region,
+        .duplicate_tag => |data| data.duplicate_region,
         inline else => |data| data.region,
     };
 }
@@ -1106,16 +1157,12 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             const region_info = self.calcRegionInfo(data.region);
             const ident_name = self.getIdent(data.ident);
 
-            var report = try Report.init(allocator, "Undefined Variable", "", .runtime_error);
+            var report = try Report.init(allocator, "Name Not In Scope", "", .runtime_error);
             const owned_ident = try report.addOwnedString(ident_name);
             try report.headline.addReflowingText("Nothing is named ");
             try report.headline.addUnqualifiedSymbol(owned_ident);
             try report.headline.addReflowingText(" in this scope.");
-            try report.document.addReflowingText("Is there an ");
-            try report.document.addKeyword("import");
-            try report.document.addReflowingText(" or ");
-            try report.document.addKeyword("exposing");
-            try report.document.addReflowingText(" missing up-top?");
+            try report.document.addReflowingText("Is it misspelled, or is there an import missing?");
             try report.document.addLineBreak();
             try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
@@ -1672,6 +1719,21 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText("Record fields must have unique names. Consider renaming one of these fields or removing the duplicate.");
 
             break :blk report;
+        },
+        .duplicate_tag => |data| blk: {
+            const tag_name = self.getIdent(data.tag_name);
+            const duplicate_region_info = self.calcRegionInfo(data.duplicate_region);
+            const original_region_info = self.calcRegionInfo(data.original_region);
+
+            break :blk try CIR.Diagnostic.buildDuplicateTagReport(
+                allocator,
+                tag_name,
+                duplicate_region_info,
+                original_region_info,
+                filename,
+                self.getSourceAll(),
+                self.getLineStartsAll(),
+            );
         },
         .redundant_exposed => |data| blk: {
             const ident_name = self.getIdent(data.ident);
@@ -3054,6 +3116,10 @@ pub const Serialized = extern struct {
     module_name: [2]u64, // Reserve space for slice (ptr + len), provided during deserialization
     display_module_name_idx_reserved: u32, // Reserved space for display_module_name_idx field (interned during deserialization)
     qualified_module_ident_reserved: u32, // Reserved space for qualified_module_ident field
+    module_identities: base.SerialStringInterner.Serialized,
+    module_identity_displays: collections.SafeList(Ident.Idx).Serialized,
+    self_module_identity_reserved: u32,
+    self_module_identity_padding: u32 = 0,
     diagnostics: CIR.Diagnostic.Span,
     store: NodeStore.Serialized,
     evaluation_order_reserved: u64, // Reserved space for evaluation_order field (required for in-place deserialization cast)
@@ -3115,6 +3181,10 @@ pub const Serialized = extern struct {
         self.module_name = .{ 0, 0 };
         self.display_module_name_idx_reserved = @bitCast(env.display_module_name_idx);
         self.qualified_module_ident_reserved = @bitCast(env.qualified_module_ident);
+        try self.module_identities.serialize(&env.module_identities, allocator, writer);
+        try self.module_identity_displays.serialize(&env.module_identity_displays, allocator, writer);
+        self.self_module_identity_reserved = @intFromEnum(env.self_module_identity);
+        self.self_module_identity_padding = 0;
         self.evaluation_order_reserved = 0;
         self.runtime_prepared = env.module_role == .builtin and env.runtime_prepared;
         self.runtime_prepared_padding = .{ 0, 0, 0, 0, 0, 0, 0 };
@@ -3178,6 +3248,9 @@ pub const Serialized = extern struct {
             .module_name = module_name,
             .display_module_name_idx = @bitCast(self.display_module_name_idx_reserved),
             .qualified_module_ident = @bitCast(self.qualified_module_ident_reserved),
+            .module_identities = self.module_identities.deserialize(base_addr),
+            .module_identity_displays = self.module_identity_displays.deserializeInto(base_addr),
+            .self_module_identity = @enumFromInt(self.self_module_identity_reserved),
             .diagnostics = self.diagnostics,
             .store = self.store.deserializeInto(base_addr, gpa),
             .evaluation_order = null, // Not serialized, will be recomputed if needed
@@ -3234,6 +3307,9 @@ pub const Serialized = extern struct {
             .module_name = module_name,
             .display_module_name_idx = @bitCast(self.display_module_name_idx_reserved),
             .qualified_module_ident = @bitCast(self.qualified_module_ident_reserved),
+            .module_identities = self.module_identities.deserialize(base_addr),
+            .module_identity_displays = self.module_identity_displays.deserializeInto(base_addr),
+            .self_module_identity = @enumFromInt(self.self_module_identity_reserved),
             .diagnostics = self.diagnostics,
             .store = self.store.deserializeInto(base_addr, gpa),
             .evaluation_order = null,
@@ -3290,6 +3366,10 @@ pub const Serialized = extern struct {
             .module_name = module_name,
             .display_module_name_idx = @bitCast(self.display_module_name_idx_reserved),
             .qualified_module_ident = @bitCast(self.qualified_module_ident_reserved),
+            .module_identities = self.module_identities.deserialize(base_addr),
+            // Copy so the display list can grow if runtime type copies add identities.
+            .module_identity_displays = try self.module_identity_displays.deserializeWithCopy(base_addr, gpa),
+            .self_module_identity = @enumFromInt(self.self_module_identity_reserved),
             .diagnostics = self.diagnostics,
             // Use deserializeWithCopy for NodeStore so regions can be extended
             .store = try self.store.deserializeWithCopy(base_addr, gpa),
@@ -4141,6 +4221,126 @@ pub fn insertQualifiedIdent(
     const qualified = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ parent, child });
     defer self.gpa.free(qualified);
     return try self.insertIdent(Ident.for_text(qualified));
+}
+
+// Module identity table --------------------------------------------------
+//
+// See `base.module_identity` for the identity model. The table maps dense
+// env-local ids to 32-byte deep content hashes; `origin_module` fields on
+// nominal/alias types in this env's type store are indices into this table.
+
+/// Intern a 32-byte module content identity into this env's identity table,
+/// recording `display` (an ident in this env's ident store, used only for
+/// diagnostics) when the hash is new. Returns the dense env-local index.
+pub fn internModuleIdentity(
+    self: *Self,
+    hash: *const base.ModuleIdentity.Hash,
+    display: Ident.Idx,
+) std.mem.Allocator.Error!base.ModuleIdentity.Idx {
+    const before = self.module_identities.count();
+    const id = try self.module_identities.insert(self.gpa, hash);
+    if (id == before) {
+        _ = try self.module_identity_displays.append(self.gpa, display);
+    }
+    std.debug.assert(self.module_identity_displays.len() == self.module_identities.count());
+    return @enumFromInt(id);
+}
+
+/// Look up a module content identity in this env's table without inserting.
+pub fn lookupModuleIdentity(self: *const Self, hash: *const base.ModuleIdentity.Hash) ?base.ModuleIdentity.Idx {
+    const id = self.module_identities.lookup(hash) orelse return null;
+    return @enumFromInt(id);
+}
+
+/// The 32-byte content identity hash for an env-local identity index.
+pub fn moduleIdentityHash(self: *const Self, idx: base.ModuleIdentity.Idx) *const base.ModuleIdentity.Hash {
+    std.debug.assert(!idx.isNone());
+    const bytes = self.module_identities.getText(@intFromEnum(idx));
+    std.debug.assert(bytes.len == 32);
+    return @ptrCast(bytes.ptr);
+}
+
+/// Display ident for an env-local identity index. Diagnostics only — never
+/// use for identity decisions.
+pub fn moduleIdentityDisplayIdent(self: *const Self, idx: base.ModuleIdentity.Idx) Ident.Idx {
+    std.debug.assert(!idx.isNone());
+    return self.module_identity_displays.items.items[@intFromEnum(idx)];
+}
+
+/// Display text for an env-local identity index. Diagnostics only.
+pub fn moduleIdentityDisplayText(self: *const Self, idx: base.ModuleIdentity.Idx) []const u8 {
+    const display = self.moduleIdentityDisplayIdent(idx);
+    if (display.isNone()) return "";
+    return self.getIdent(display);
+}
+
+/// This module's own deep content identity hash; null until finalized.
+pub fn contentIdentityHash(self: *const Self) ?*const base.ModuleIdentity.Hash {
+    if (self.self_module_identity.isNone()) return null;
+    return self.moduleIdentityHash(self.self_module_identity);
+}
+
+/// This module's own identity table entry. Panics if not yet finalized:
+/// callers run after import resolution, where the identity must exist.
+pub fn selfModuleIdentity(self: *const Self) base.ModuleIdentity.Idx {
+    if (self.self_module_identity.isNone()) {
+        std.debug.panic("module content identity not finalized for module '{s}'", .{self.module_name});
+    }
+    return self.self_module_identity;
+}
+
+/// Record this module's deep content identity. Idempotent for an equal hash;
+/// panics if a different identity was already recorded.
+pub fn setContentIdentity(self: *Self, hash: base.ModuleIdentity.Hash) std.mem.Allocator.Error!void {
+    if (self.contentIdentityHash()) |existing| {
+        if (!std.mem.eql(u8, existing, &hash)) {
+            std.debug.panic("conflicting module content identity for module '{s}'", .{self.module_name});
+        }
+        return;
+    }
+    self.self_module_identity = try self.internModuleIdentity(&hash, self.display_module_name_idx);
+}
+
+/// Compute and record this module's deep content identity from its resolved
+/// direct imports: H(module name, source bytes, import identity hashes).
+/// Idempotent. Every imported env must already be finalized — imports are
+/// checked (or at least identity-finalized) before their dependents.
+pub fn ensureContentIdentity(
+    self: *Self,
+    imported_envs: []const *const Self,
+) std.mem.Allocator.Error!void {
+    if (!self.self_module_identity.isNone()) return;
+
+    var import_hashes = try std.ArrayList(base.ModuleIdentity.Hash).initCapacity(self.gpa, imported_envs.len);
+    defer import_hashes.deinit(self.gpa);
+    for (imported_envs) |imported_env| {
+        if (imported_env == @as(*const Self, self)) continue;
+        // An import that is this module's own content (same name, same source
+        // bytes — e.g. the baked Builtin env while `roc check Builtin.roc`
+        // checks the identical source) contributes nothing to the transitive
+        // closure; folding it in would make byte-identical modules disagree
+        // on identity depending on which copy was loaded first.
+        if (std.mem.eql(u8, imported_env.module_name, self.module_name) and
+            std.mem.eql(u8, imported_env.common.source, self.common.source))
+        {
+            continue;
+        }
+        const import_hash = imported_env.contentIdentityHash() orelse {
+            std.debug.panic(
+                "module content identity missing for import '{s}' of module '{s}'",
+                .{ imported_env.module_name, self.module_name },
+            );
+        };
+        import_hashes.appendAssumeCapacity(import_hash.*);
+    }
+
+    const hash = try base.ModuleIdentity.computeDeep(
+        self.gpa,
+        self.module_name,
+        self.common.source,
+        import_hashes.items,
+    );
+    try self.setContentIdentity(hash);
 }
 
 /// Registers a method identifier mapping for an explicit owner declaration.

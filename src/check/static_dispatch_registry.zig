@@ -60,12 +60,14 @@ pub const ProcedureTemplateLookupEntry = struct {
 };
 
 /// Public `MethodOwner` declaration.
+///
+/// A method owner is identified by CONTENT: the declaring module's deep
+/// content identity plus the declared type name (see `base.module_identity`
+/// and `canonical.NominalTypeKey`). Statement indices and module name text
+/// never participate. Compiler-builtin owners keep their dedicated enum so
+/// builtin dispatch stays exact across differently-spelled builtin idents.
 pub const MethodOwner = union(enum) {
     nominal: canonical.NominalTypeKey,
-    source_decl: struct {
-        module_name: canonical.ModuleNameId,
-        statement: u32,
-    },
     builtin: BuiltinOwner,
 };
 
@@ -73,6 +75,8 @@ pub const MethodOwner = union(enum) {
 pub const BuiltinOwner = enum(u8) {
     list,
     box,
+    dict,
+    set,
     fields,
     field,
     bool,
@@ -91,6 +95,10 @@ pub const BuiltinOwner = enum(u8) {
     f64,
     dec,
     parse_tag_union_spec,
+    crypto_sha256_digest,
+    crypto_sha256_hasher,
+    crypto_blake3_digest,
+    crypto_blake3_hasher,
 };
 
 /// Public `MethodKey` declaration.
@@ -115,6 +123,8 @@ pub const LocalProcedureMethodTarget = struct {
 pub const MethodTargetKind = union(enum) {
     procedure: ProcedureMethodTarget,
     local_proc: LocalProcedureMethodTarget,
+    generated_structural_parser,
+    generated_structural_encoder,
 };
 
 /// Public `MethodTarget` declaration.
@@ -195,7 +205,9 @@ pub const MethodRegistry = struct {
                 unreachable;
             };
             const def_idx = entry.value.def_idx;
-            const target_kind: MethodTargetKind = if (local_templates.templateForDef(def_idx)) |template| blk: {
+            const target_kind: MethodTargetKind = if (generatedStructuralTargetForMethodBinding(module, entry.value, entry.key.methodIdent())) |generated|
+                generated
+            else if (local_templates.templateForDef(def_idx)) |template| blk: {
                 const export_name = try names.internExportIdent(idents, method_ident);
                 const proc_base = try names.internProcBase(.{
                     .module_name = module_name,
@@ -220,7 +232,7 @@ pub const MethodRegistry = struct {
 
             try entries.append(allocator, .{
                 .key = .{
-                    .owner = try methodOwnerForRegistryEntry(module, module_name, entry.key.owner),
+                    .owner = try methodOwnerForRegistryEntry(module, names, entry.key.owner),
                     .method = try names.internMethodIdent(idents, entry.key.methodIdent()),
                 },
                 .target = .{
@@ -246,6 +258,9 @@ fn methodTargetCallableVar(
 ) Var {
     return switch (target_kind) {
         .procedure => module.defType(def_idx),
+        .generated_structural_parser,
+        .generated_structural_encoder,
+        => ModuleEnv.varFrom(binding.type_node_idx),
         .local_proc => blk: {
             const raw_node = @intFromEnum(binding.type_node_idx);
             const statement: CIR.Statement.Idx = @enumFromInt(raw_node);
@@ -255,6 +270,85 @@ fn methodTargetCallableVar(
             };
             break :blk module.exprType(decl.expr);
         },
+    };
+}
+
+fn generatedStructuralTargetForMethodBinding(
+    module: TypedCIR.Module,
+    binding: ModuleEnv.MethodBinding,
+    method_ident: Ident.Idx,
+) ?MethodTargetKind {
+    const expr_idx = methodBindingExpr(module, binding) orelse return null;
+    switch (module.expr(expr_idx).data) {
+        .e_anno_only,
+        .e_hosted_lambda,
+        => {},
+        else => return null,
+    }
+    const annotation_idx = methodBindingAnnotation(module, binding) orelse return null;
+    if (module.moduleEnvConst().store.getTypeAnno(module.moduleEnvConst().store.getAnnotation(annotation_idx).anno) != .underscore) return null;
+
+    const common = module.commonIdents();
+    if (method_ident.eql(common.parser_for)) return .generated_structural_parser;
+    if (method_ident.eql(common.encode_to)) return .generated_structural_encoder;
+    return null;
+}
+
+fn methodBindingAnnotation(
+    module: TypedCIR.Module,
+    binding: ModuleEnv.MethodBinding,
+) ?CIR.Annotation.Idx {
+    const raw_node = @intFromEnum(binding.type_node_idx);
+    if (raw_node >= module.nodeCount()) {
+        if (@import("builtin").mode == .Debug) {
+            std.debug.panic(
+                "checked static dispatch registry invariant violated: method binding node {d} is outside the module node store",
+                .{raw_node},
+            );
+        }
+        unreachable;
+    }
+
+    return switch (module.nodeTag(binding.type_node_idx)) {
+        .def => module.moduleEnvConst().store.getDef(binding.def_idx).annotation,
+        .statement_decl => blk: {
+            const statement: CIR.Statement.Idx = @enumFromInt(raw_node);
+            const decl = switch (module.getStatement(statement)) {
+                .s_decl => |decl| decl,
+                else => return null,
+            };
+            break :blk decl.anno;
+        },
+        else => null,
+    };
+}
+
+fn methodBindingExpr(
+    module: TypedCIR.Module,
+    binding: ModuleEnv.MethodBinding,
+) ?CIR.Expr.Idx {
+    const raw_node = @intFromEnum(binding.type_node_idx);
+    if (raw_node >= module.nodeCount()) {
+        if (@import("builtin").mode == .Debug) {
+            std.debug.panic(
+                "checked static dispatch registry invariant violated: method binding node {d} is outside the module node store",
+                .{raw_node},
+            );
+        }
+        unreachable;
+    }
+
+    return switch (module.nodeTag(binding.type_node_idx)) {
+        .def => module.moduleEnvConst().store.getDef(binding.def_idx).expr,
+        .statement_decl => blk: {
+            const statement: CIR.Statement.Idx = @enumFromInt(raw_node);
+            const decl = switch (module.getStatement(statement)) {
+                .s_decl => |decl| decl,
+                else => return null,
+            };
+            break :blk decl.expr;
+        },
+        else => null,
     };
 }
 
@@ -306,15 +400,42 @@ fn localProcedureExpr(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) bool {
 
 fn methodOwnerForRegistryEntry(
     module: TypedCIR.Module,
-    module_name: canonical.ModuleNameId,
+    names: *canonical.CanonicalNameStore,
     owner_stmt: CIR.Statement.Idx,
 ) Allocator.Error!MethodOwner {
     if (builtinOwnerForRegistryEntry(module, owner_stmt)) |owner| {
         return .{ .builtin = owner };
     }
-    return .{ .source_decl = .{
-        .module_name = module_name,
-        .statement = @intFromEnum(owner_stmt),
+
+    const module_env = module.moduleEnvConst();
+    const identity_hash = module_env.contentIdentityHash() orelse {
+        if (@import("builtin").mode == .Debug) {
+            std.debug.panic(
+                "checked static dispatch registry invariant violated: module '{s}' has no content identity",
+                .{module_env.module_name},
+            );
+        }
+        unreachable;
+    };
+    const stmt = module_env.store.getStatement(owner_stmt);
+    const header_idx = switch (stmt) {
+        .s_nominal_decl => |nominal| nominal.header,
+        .s_alias_decl => |alias| alias.header,
+        else => {
+            if (@import("builtin").mode == .Debug) {
+                std.debug.panic(
+                    "checked static dispatch registry invariant violated: method owner statement {d} is not a type declaration",
+                    .{@intFromEnum(owner_stmt)},
+                );
+            }
+            unreachable;
+        },
+    };
+    const header = module_env.store.getTypeHeader(header_idx);
+    return .{ .nominal = .{
+        .module = try names.internModuleIdentity(identity_hash),
+        .type_name = try names.internTypeIdent(module.identStoreConst(), header.relative_name),
+        .source_decl = @intFromEnum(owner_stmt),
     } };
 }
 
@@ -351,9 +472,15 @@ fn builtinOwnerForRegistryEntry(
 
     if (type_ident.eql(common.list) or type_ident.eql(common.builtin_list)) return .list;
     if (type_ident.eql(common.box) or type_ident.eql(common.builtin_box)) return .box;
-    if (type_ident.eql(common.builtin_str_field_names)) return .fields;
-    if (type_ident.eql(common.builtin_str_field_name)) return .field;
-    if (type_ident.eql(common.builtin_parse_tag_union_spec)) return .parse_tag_union_spec;
+    if (type_ident.eql(common.dict) or type_ident.eql(common.builtin_dict)) return .dict;
+    if (type_ident.eql(common.set) or type_ident.eql(common.builtin_set)) return .set;
+    if (type_ident.eql(common.builtin_encoding_field_names)) return .fields;
+    if (type_ident.eql(common.builtin_encoding_field_name)) return .field;
+    if (type_ident.eql(common.builtin_encoding_parse_tag_union_spec)) return .parse_tag_union_spec;
+    if (type_ident.eql(common.builtin_crypto_sha256_digest)) return .crypto_sha256_digest;
+    if (type_ident.eql(common.builtin_crypto_sha256_hasher)) return .crypto_sha256_hasher;
+    if (type_ident.eql(common.builtin_crypto_blake3_digest)) return .crypto_blake3_digest;
+    if (type_ident.eql(common.builtin_crypto_blake3_hasher)) return .crypto_blake3_hasher;
     return null;
 }
 
@@ -396,19 +523,11 @@ fn methodOwnerOrder(a: MethodOwner, b: MethodOwner) std.math.Order {
     return switch (a) {
         .nominal => |a_nominal| switch (b) {
             .nominal => |b_nominal| blk: {
-                const module_order = orderEnum(canonical.ModuleNameId, a_nominal.module_name, b_nominal.module_name);
+                const module_order = orderEnum(canonical.ModuleIdentityId, a_nominal.module, b_nominal.module);
                 if (module_order != .eq) break :blk module_order;
                 const type_order = orderEnum(canonical.TypeNameId, a_nominal.type_name, b_nominal.type_name);
                 if (type_order != .eq) break :blk type_order;
                 break :blk orderOptionalU32(a_nominal.source_decl, b_nominal.source_decl);
-            },
-            else => unreachable,
-        },
-        .source_decl => |a_decl| switch (b) {
-            .source_decl => |b_decl| blk: {
-                const module_order = orderEnum(canonical.ModuleNameId, a_decl.module_name, b_decl.module_name);
-                if (module_order != .eq) break :blk module_order;
-                break :blk orderU32(a_decl.statement, b_decl.statement);
             },
             else => unreachable,
         },
@@ -422,8 +541,7 @@ fn methodOwnerOrder(a: MethodOwner, b: MethodOwner) std.math.Order {
 fn methodOwnerTagRank(owner: MethodOwner) u32 {
     return switch (owner) {
         .nominal => 0,
-        .source_decl => 1,
-        .builtin => 2,
+        .builtin => 1,
     };
 }
 
@@ -1207,16 +1325,11 @@ fn methodOwnerForCheckedPayload(payload: anytype) ?MethodOwner {
     return switch (payload) {
         .nominal => |nominal| if (nominal.builtin) |builtin|
             .{ .builtin = builtinOwnerForCheckedBuiltin(builtin) }
-        else if (nominal.source_decl) |source_decl|
-            .{ .source_decl = .{
-                .module_name = nominal.origin_module,
-                .statement = source_decl,
-            } }
         else
             .{ .nominal = .{
-                .module_name = nominal.origin_module,
+                .module = nominal.origin_module,
                 .type_name = nominal.name,
-                .source_decl = null,
+                .source_decl = nominal.source_decl,
             } },
         else => null,
     };
@@ -1241,9 +1354,15 @@ fn builtinOwnerForCheckedBuiltin(builtin: anytype) BuiltinOwner {
         .dec => .dec,
         .list => .list,
         .box => .box,
+        .dict => .dict,
+        .set => .set,
         .fields => .fields,
         .field => .field,
         .parse_tag_union_spec => .parse_tag_union_spec,
+        .crypto_sha256_digest => .crypto_sha256_digest,
+        .crypto_sha256_hasher => .crypto_sha256_hasher,
+        .crypto_blake3_digest => .crypto_blake3_digest,
+        .crypto_blake3_hasher => .crypto_blake3_hasher,
     };
 }
 
@@ -1258,11 +1377,14 @@ fn lookupCheckedMethodTarget(
 
     const method_name = names.methodNameText(method);
     for (imported_views) |imported| {
-        const imported_owner = methodOwnerInImportedNames(names, imported.canonical_names, owner) orelse continue;
+        const imported_owner = methodOwnerInImportedStore(names, imported.canonical_names, owner) orelse continue;
         const imported_method = imported.canonical_names.lookupMethodName(method_name) orelse continue;
         if (imported.method_registry.lookup(.{ .owner = imported_owner, .method = imported_method })) |target| {
             switch (target.kind) {
                 .procedure => return target,
+                .generated_structural_parser,
+                .generated_structural_encoder,
+                => return target,
                 .local_proc => continue,
             }
         }
@@ -1270,19 +1392,19 @@ fn lookupCheckedMethodTarget(
     return null;
 }
 
-fn methodOwnerInImportedNames(
+/// Rebase a method owner into an imported artifact's store: the module
+/// component crosses by 32-byte content identity (one map probe, full-value
+/// comparison), the type-name component by declared-name interning. This is
+/// the single cross-artifact owner resolution point — no module name text.
+fn methodOwnerInImportedStore(
     source_names: *const canonical.CanonicalNameStore,
     imported_names: *const canonical.CanonicalNameStore,
     owner: MethodOwner,
 ) ?MethodOwner {
     return switch (owner) {
         .builtin => |builtin| .{ .builtin = builtin },
-        .source_decl => |decl| .{ .source_decl = .{
-            .module_name = imported_names.lookupModuleName(source_names.moduleNameText(decl.module_name)) orelse return null,
-            .statement = decl.statement,
-        } },
         .nominal => |nominal| .{ .nominal = .{
-            .module_name = imported_names.lookupModuleName(source_names.moduleNameText(nominal.module_name)) orelse return null,
+            .module = imported_names.lookupModuleIdentity(source_names.moduleIdentityBytes(nominal.module)) orelse return null,
             .type_name = imported_names.lookupTypeName(source_names.typeNameText(nominal.type_name)) orelse return null,
             .source_decl = nominal.source_decl,
         } },

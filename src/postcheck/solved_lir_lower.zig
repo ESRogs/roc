@@ -237,7 +237,9 @@ const FnEntry = struct {
     spec: FnSpec,
     symbol: Common.Symbol,
     source: ?Mono.FnTemplate,
+    args: Type.Span,
     ret: Type.TypeId,
+    capture_arg_ty: ?Type.TypeId,
     proc: ?LIR.LirProcSpecId,
 };
 
@@ -674,13 +676,29 @@ const Lowerer = struct {
             .func => |func| func,
             else => Common.invariant("direct Lambda Mono function table contains a non-function type"),
         };
+        const solved_args = self.solved.types.span(func.args);
+        const lifted_args = self.solved.lifted.typedLocalSpan(source_fn.args);
+        if (solved_args.len != lifted_args.len) Common.invariant("direct Lambda Mono function arity changed after Lambda Solved");
+
+        const arg_tys = try self.allocator.alloc(Type.TypeId, solved_args.len);
+        defer self.allocator.free(arg_tys);
+        for (solved_args, 0..) |arg_ty, i| {
+            arg_tys[i] = try self.lowerType(arg_ty);
+        }
+
         const ret_ty = try self.lowerType(func.ret);
+        const capture_arg_ty = switch (spec.abi) {
+            .finite => spec.capture_ty,
+            .erased => try self.erasedCapturePtrType(),
+        };
 
         self.fn_entries.items[@intFromEnum(fn_id)] = .{
             .spec = spec,
             .symbol = symbol,
             .source = source_fn.source,
+            .args = try self.types.addSpan(arg_tys),
             .ret = ret_ty,
+            .capture_arg_ty = capture_arg_ty,
             .proc = null,
         };
         return fn_id;
@@ -708,31 +726,19 @@ const Lowerer = struct {
         var entry = self.fn_entries.items[index];
         const spec = entry.spec;
         const source_fn = self.solved.lifted.fns.items[@intFromEnum(spec.source)];
-        const func = switch (self.solved.types.rootContent(spec.solved_fn_ty)) {
-            .func => |func| func,
-            else => Common.invariant("direct Lambda Mono function table contains a non-function type"),
-        };
-        const solved_args = self.solved.types.span(func.args);
+        const arg_tys = self.types.span(entry.args);
         const lifted_args = self.solved.lifted.typedLocalSpan(source_fn.args);
-        if (solved_args.len != lifted_args.len) Common.invariant("direct Lambda Mono function arity changed after Lambda Solved");
+        if (arg_tys.len != lifted_args.len) Common.invariant("direct Lambda Mono function arity changed after Lambda Solved");
 
-        const arg_count = lifted_args.len + switch (spec.abi) {
-            .finite => if (spec.capture_ty == null) @as(usize, 0) else 1,
-            .erased => 1,
-        };
+        const arg_count = lifted_args.len + if (entry.capture_arg_ty == null) @as(usize, 0) else 1;
         const arg_locals = try self.allocator.alloc(LIR.LocalId, arg_count);
         defer self.allocator.free(arg_locals);
 
-        for (solved_args, 0..) |arg_ty, i| {
-            arg_locals[i] = try self.addLocalForLayout(try self.layoutOfType(try self.lowerType(arg_ty)));
+        for (arg_tys, 0..) |arg_ty, i| {
+            arg_locals[i] = try self.addLocalForLayout(try self.layoutOfType(arg_ty));
         }
-        switch (spec.abi) {
-            .finite => if (spec.capture_ty) |capture_ty| {
-                arg_locals[lifted_args.len] = try self.addLocalForLayout(try self.layoutOfType(capture_ty));
-            },
-            .erased => {
-                arg_locals[lifted_args.len] = try self.addLocalForLayout(try self.layoutOfType(try self.erasedCapturePtrType()));
-            },
+        if (entry.capture_arg_ty) |capture_arg_ty| {
+            arg_locals[lifted_args.len] = try self.addLocalForLayout(try self.layoutOfType(capture_arg_ty));
         }
 
         const saved_loc = self.result.store.current_loc;
@@ -782,7 +788,7 @@ const Lowerer = struct {
         if (captures.len != fields.len) Common.invariant("function capture argument arity differed from capture slots");
 
         for (captures, fields) |capture, field| {
-            if (capture.symbol != field.symbol or capture.binder != field.binder or capture.capture_id != field.capture_id) {
+            if (capture.capture_id != field.capture_id) {
                 Common.invariant("function capture argument fields differed from capture slots");
             }
             try self.captures.put(capture.local, .{
@@ -819,15 +825,29 @@ const Lowerer = struct {
         return found;
     }
 
-    fn captureLocalMatchesLocal(self: *Lowerer, local_id: Lifted.LocalId, capture_id: Lifted.LocalId) bool {
-        if (local_id == capture_id) return true;
+    fn captureLocalMatchesLocal(self: *Lowerer, local_id: Lifted.LocalId, capture_local: Lifted.LocalId) bool {
+        if (local_id == capture_local) return true;
 
+        // A body reference and a capture slot name the same captured binding
+        // iff they carry the same CaptureId (the exact join key that
+        // survives specialization/cloning). This is only used to search a
+        // function's own capture set, where CaptureIds are unique.
         const local = self.solved.lifted.locals.items[@intFromEnum(local_id)];
-        const capture = self.solved.lifted.locals.items[@intFromEnum(capture_id)];
-        if (local.symbol == capture.symbol) return true;
-        if (local.capture_id != null and capture.capture_id != null and local.capture_id.? == capture.capture_id.?) return true;
+        const capture = self.solved.lifted.locals.items[@intFromEnum(capture_local)];
+        return local.capture_id != null and capture.capture_id != null and local.capture_id.? == capture.capture_id.?;
+    }
 
-        return false;
+    /// Whether two lifted locals are aliases of the same lowered binding, used
+    /// to collapse locals that spec_constr cloning produced for one value. This
+    /// is a general local-identity remap, NOT a capture join: it must match by
+    /// the per-binding symbol, because CaptureId is deliberately coarser than a
+    /// symbol (a mutable variable's loop-carried instances all share one
+    /// captured-binder CaptureId yet are distinct lowered bindings).
+    fn aliasedLocalMatches(self: *Lowerer, local_id: Lifted.LocalId, other: Lifted.LocalId) bool {
+        if (local_id == other) return true;
+        const local = self.solved.lifted.locals.items[@intFromEnum(local_id)];
+        const alias = self.solved.lifted.locals.items[@intFromEnum(other)];
+        return local.symbol == alias.symbol;
     }
 
     fn lowerCaptureBindingInto(self: *Lowerer, target: LIR.LocalId, capture: CaptureBinding, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
@@ -1340,7 +1360,7 @@ const Lowerer = struct {
 
     fn constTypeDef(self: *Lowerer, def: MonoType.TypeDef) std.mem.Allocator.Error!const_store.TypeDef {
         return .{
-            .module_name = try self.result.const_type_names.internModuleName(self.solved.lifted.names.moduleNameText(def.module_name)),
+            .module = try self.result.const_type_names.internModuleIdentity(self.solved.lifted.names.moduleIdentityBytes(def.module)),
             .type_name = try self.result.const_type_names.internTypeName(self.solved.lifted.names.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
         };
@@ -1702,12 +1722,7 @@ const Lowerer = struct {
         errdefer self.allocator.free(slots);
         for (fields, 0..) |field, index| {
             slots[index] = .{
-                .id = if (field.binder) |binder|
-                    .{ .binder = binder }
-                else if (field.capture_id) |capture_id|
-                    .{ .generated = capture_id }
-                else
-                    .{ .generated = @intFromEnum(field.symbol) },
+                .id = field.capture_id orelse Common.invariant("capture record field had no CaptureId"),
                 .slot = @intCast(index),
                 .ty = try self.constTypeOfType(field.ty),
                 .plan = try self.constPlanOfType(field.ty),
@@ -1735,7 +1750,7 @@ const Lowerer = struct {
             .named => |named| named,
             else => Common.invariant("runtime schema request did not reference a named Lambda Mono type"),
         };
-        if (named.def.module_name != request.def.module_name or named.def.type_name != request.def.type_name) {
+        if (named.def.module != request.def.module or named.def.type_name != request.def.type_name) {
             Common.invariant("runtime schema request named type identity changed before LIR lowering");
         }
 
@@ -1836,14 +1851,22 @@ const Lowerer = struct {
     }
 
     fn verifyFnEntriesMatch(self: *Lowerer, materialized: *const LambdaMono.Program) Common.LowerError!void {
-        if (self.fn_entries.items.len > materialized.fns.items.len) {
+        var reachable_count: usize = 0;
+        for (self.fn_reachable.items) |reachable| {
+            if (reachable) reachable_count += 1;
+        }
+        if (reachable_count > materialized.fns.items.len) {
             Common.invariant("debug Lambda Mono verifier saw too many direct function specs");
         }
         const used = try self.allocator.alloc(bool, materialized.fns.items.len);
         defer self.allocator.free(used);
         @memset(used, false);
 
-        for (self.fn_entries.items) |entry| {
+        for (self.fn_entries.items, 0..) |entry, entry_index| {
+            // Direct LIR keeps type-level entries so callable layouts and
+            // ConstStore metadata can refer to source templates without forcing
+            // every queued Lambda Mono function into a LIR proc.
+            if (!self.fn_reachable.items[entry_index]) continue;
             for (materialized.fns.items, 0..) |fn_, index| {
                 if (used[index]) continue;
                 if (try self.fnEntryMatchesMaterialized(entry, fn_, materialized)) {
@@ -1869,32 +1892,14 @@ const Lowerer = struct {
         if (!try type_equivalence.equivalent(entry.ret, fn_.ret)) return false;
 
         const args = materialized.typedLocalSpan(fn_.args);
-        const spec = entry.spec;
-        const source_fn = self.solved.lifted.fns.items[@intFromEnum(spec.source)];
-        const lifted_args = self.solved.lifted.typedLocalSpan(source_fn.args);
-        const func = switch (self.solved.types.rootContent(spec.solved_fn_ty)) {
-            .func => |func| func,
-            else => Common.invariant("debug Lambda Mono verifier saw non-function fn spec type"),
-        };
-        const solved_args = self.solved.types.span(func.args);
-        if (solved_args.len != lifted_args.len) Common.invariant("debug Lambda Mono verifier saw changed source arity");
-        const expected_arg_count = lifted_args.len + switch (spec.abi) {
-            .finite => if (spec.capture_ty == null) @as(usize, 0) else 1,
-            .erased => 1,
-        };
+        const arg_tys = self.types.span(entry.args);
+        const expected_arg_count = arg_tys.len + if (entry.capture_arg_ty == null) @as(usize, 0) else 1;
         if (args.len != expected_arg_count) return false;
-        for (solved_args, 0..) |solved_arg, arg_index| {
-            const expected = try self.lowerType(solved_arg);
-            if (!try type_equivalence.equivalent(expected, args[arg_index].ty)) return false;
+        for (arg_tys, 0..) |arg_ty, arg_index| {
+            if (!try type_equivalence.equivalent(arg_ty, args[arg_index].ty)) return false;
         }
-        switch (spec.abi) {
-            .finite => if (spec.capture_ty) |capture_ty| {
-                if (!try type_equivalence.equivalent(capture_ty, args[lifted_args.len].ty)) return false;
-            },
-            .erased => {
-                const erased_ptr = self.erased_capture_ptr_ty orelse Common.invariant("debug Lambda Mono verifier expected an erased capture pointer type");
-                if (!try type_equivalence.equivalent(erased_ptr, args[lifted_args.len].ty)) return false;
-            },
+        if (entry.capture_arg_ty) |capture_arg_ty| {
+            if (!try type_equivalence.equivalent(capture_arg_ty, args[arg_tys.len].ty)) return false;
         }
         return true;
     }
@@ -1996,6 +2001,14 @@ const Lowerer = struct {
                     .next = next,
                 } });
             },
+            .bytes_lit => |literal| blk: {
+                const bytes_lit = self.stringLiteral(literal);
+                break :blk try self.result.store.addCFStmt(.{ .assign_literal = .{
+                    .target = target,
+                    .value = .{ .bytes_literal = try self.result.store.insertStringView(bytes_lit.backing, bytes_lit.offset, bytes_lit.len) },
+                    .next = next,
+                } });
+            },
             .uninitialized, .uninitialized_payload => next,
             .list => |items| try self.lowerListInto(target, items, next),
             .tuple => |items| try self.lowerTupleInto(target, items, next),
@@ -2005,7 +2018,7 @@ const Lowerer = struct {
             .def_ref,
             .fn_def,
             => Common.invariant("pre-lift function expression reached direct LIR lowering"),
-            .fn_ref => |fn_ref| try self.lowerFnRefInto(target, expr_id, fn_ref.fn_id, self.solved.lifted.exprSpan(fn_ref.captures), next),
+            .fn_ref => |fn_ref| try self.lowerFnRefInto(target, expr_id, fn_ref.fn_id, self.solved.lifted.captureOperandSpan(fn_ref.captures), next),
             .nominal => |backing| try self.lowerNominalInto(target, expr_ty, backing, next),
             .let_ => |let_| try self.lowerLetInto(target, let_, next),
             .call_proc => |call| switch (Lifted.directCallee(call)) {
@@ -2014,7 +2027,7 @@ const Lowerer = struct {
                     expr_ty,
                     callee,
                     self.solved.lifted.exprSpan(call.args),
-                    self.solved.lifted.exprSpan(call.captures),
+                    self.solved.lifted.captureOperandSpan(call.captures),
                     call.is_cold,
                     next,
                 ),
@@ -2095,7 +2108,7 @@ const Lowerer = struct {
                     ty,
                     callee,
                     self.solved.lifted.exprSpan(call.args),
-                    self.solved.lifted.exprSpan(call.captures),
+                    self.solved.lifted.captureOperandSpan(call.captures),
                     call.is_cold,
                     next,
                 ),
@@ -2105,7 +2118,7 @@ const Lowerer = struct {
                 target,
                 expr_id,
                 fn_ref.fn_id,
-                self.solved.lifted.exprSpan(fn_ref.captures),
+                self.solved.lifted.captureOperandSpan(fn_ref.captures),
                 ty,
                 next,
             ),
@@ -2290,9 +2303,8 @@ const Lowerer = struct {
     fn lowerCaptureRecordFromCaptureExprsInto(
         self: *Lowerer,
         target: LIR.LocalId,
-        fn_id: Lifted.FnId,
         capture_span: SolvedType.Span,
-        capture_exprs: []const Lifted.ExprId,
+        capture_operands: []const Lifted.CaptureOperand,
         capture_ty: Type.TypeId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
@@ -2302,7 +2314,7 @@ const Lowerer = struct {
             else => Common.invariant("callable capture payload was not a capture record"),
         };
         if (captures.len != fields.len) Common.invariant("callable capture payload arity differed from captured locals");
-        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(fn_id)].captures).len != capture_exprs.len) {
+        if (captures.len != capture_operands.len) {
             Common.invariant("function reference capture operand count differed from lifted function captures");
         }
 
@@ -2312,10 +2324,14 @@ const Lowerer = struct {
         defer self.allocator.free(field_locals);
 
         const target_is_zst = self.isZstLocal(target);
-        for (captures, fields, 0..) |capture, field, i| {
-            if (capture.symbol != field.symbol or capture.binder != field.binder or capture.capture_id != field.capture_id) {
+        // Member captures, capture-record fields, and keyed operands are all in
+        // ascending CaptureId order, so the join is an exact indexed walk.
+        for (captures, fields, capture_operands, 0..) |capture, field, operand, i| {
+            if (capture.capture_id != field.capture_id) {
                 Common.invariant("callable capture payload fields differed from captured locals");
             }
+            const capture_id = capture.capture_id orelse Common.invariant("member capture had no CaptureId");
+            if (operand.id != capture_id) Common.invariant("capture operand CaptureId did not match its member capture slot");
             expr_locals[i] = try self.addTemp(field.ty);
             if (target_is_zst) {
                 field_locals[i] = expr_locals[i];
@@ -2348,38 +2364,9 @@ const Lowerer = struct {
                     current,
                 );
             }
-            const capture_expr = self.captureExprForMemberCapture(fn_id, capture_exprs, captures[i]) orelse
-                Common.invariant("callable capture payload field had no explicit operand");
-            current = try self.lowerExprInto(expr_locals[i], capture_expr, current);
+            current = try self.lowerExprInto(expr_locals[i], capture_operands[i].value, current);
         }
         return current;
-    }
-
-    fn captureExprForMemberCapture(
-        self: *Lowerer,
-        fn_id: Lifted.FnId,
-        capture_exprs: []const Lifted.ExprId,
-        member_capture: SolvedType.Capture,
-    ) ?Lifted.ExprId {
-        const fn_captures = self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(fn_id)].captures);
-        for (fn_captures, capture_exprs) |fn_capture, capture_expr| {
-            if (self.captureLocalMatchesMember(fn_capture.local, member_capture)) return capture_expr;
-        }
-        return null;
-    }
-
-    fn captureLocalMatchesMember(
-        self: *Lowerer,
-        local_id: Lifted.LocalId,
-        member_capture: SolvedType.Capture,
-    ) bool {
-        if (local_id == member_capture.local) return true;
-
-        const local = self.solved.lifted.locals.items[@intFromEnum(local_id)];
-        if (local.symbol == member_capture.symbol) return true;
-        if (local.capture_id != null and member_capture.capture_id != null and local.capture_id.? == member_capture.capture_id.?) return true;
-
-        return false;
     }
 
     fn lowerRecordInto(
@@ -2992,10 +2979,10 @@ const Lowerer = struct {
         target: LIR.LocalId,
         expr_id: Lifted.ExprId,
         fn_id: Lifted.FnId,
-        capture_exprs: []const Lifted.ExprId,
+        capture_operands: []const Lifted.CaptureOperand,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
-        return try self.lowerFnRefIntoAtType(target, expr_id, fn_id, capture_exprs, try self.lowerExprTy(expr_id), next);
+        return try self.lowerFnRefIntoAtType(target, expr_id, fn_id, capture_operands, try self.lowerExprTy(expr_id), next);
     }
 
     fn lowerFnRefIntoAtType(
@@ -3003,12 +2990,12 @@ const Lowerer = struct {
         target: LIR.LocalId,
         expr_id: Lifted.ExprId,
         fn_id: Lifted.FnId,
-        capture_exprs: []const Lifted.ExprId,
+        capture_operands: []const Lifted.CaptureOperand,
         ty: Type.TypeId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         const captures = self.memberCapturesForExpr(expr_id, fn_id);
-        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(fn_id)].captures).len != capture_exprs.len) {
+        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(fn_id)].captures).len != capture_operands.len) {
             Common.invariant("function reference capture operand count differed from lifted function captures");
         }
         const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
@@ -3017,14 +3004,14 @@ const Lowerer = struct {
                 const variants = self.types.fnVariantSpan(variants_span);
                 for (variants, 0..) |variant, variant_index| {
                     if (variant.source != fn_symbol) continue;
-                    break :blk try self.lowerFiniteCallableValueInto(target, @intCast(variant_index), fn_id, captures, capture_exprs, variant.capture_ty, next);
+                    break :blk try self.lowerFiniteCallableValueInto(target, @intCast(variant_index), fn_id, captures, capture_operands, variant.capture_ty, next);
                 }
                 Common.invariant("finite callable type did not contain referenced function");
             },
             .erased_fn => |erased| blk: {
                 for (self.types.fnVariantSpan(erased.members)) |variant| {
                     if (variant.source != fn_symbol) continue;
-                    break :blk try self.lowerPackedErasedFnInto(target, variant.target, fn_id, captures, capture_exprs, variant.capture_ty, next);
+                    break :blk try self.lowerPackedErasedFnInto(target, variant.target, fn_id, captures, capture_operands, variant.capture_ty, next);
                 }
                 Common.invariant("erased callable type did not contain referenced function");
             },
@@ -3038,12 +3025,12 @@ const Lowerer = struct {
         variant_index: u16,
         lifted_fn_id: Lifted.FnId,
         captures: SolvedType.Span,
-        capture_exprs: []const Lifted.ExprId,
+        capture_operands: []const Lifted.CaptureOperand,
         capture_ty: ?Type.TypeId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         if (capture_ty) |payload_ty| {
-            if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(lifted_fn_id)].captures).len != capture_exprs.len) {
+            if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(lifted_fn_id)].captures).len != capture_operands.len) {
                 Common.invariant("finite callable capture operand count differed from lifted function captures");
             }
             const payload = try self.addTemp(payload_ty);
@@ -3060,9 +3047,9 @@ const Lowerer = struct {
                     .payload = payload,
                     .next = next,
                 } });
-            return try self.lowerCaptureRecordFromCaptureExprsInto(payload, lifted_fn_id, captures, capture_exprs, payload_ty, assign);
+            return try self.lowerCaptureRecordFromCaptureExprsInto(payload, captures, capture_operands, payload_ty, assign);
         }
-        if (capture_exprs.len != 0) Common.invariant("finite callable without capture payload carried capture operands");
+        if (capture_operands.len != 0) Common.invariant("finite callable without capture payload carried capture operands");
         if (self.isZstLocal(target)) return try self.assignZst(target, next);
         return try self.result.store.addCFStmt(.{ .assign_tag = .{
             .target = target,
@@ -3079,11 +3066,11 @@ const Lowerer = struct {
         fn_id: Type.FnId,
         lifted_fn_id: Lifted.FnId,
         captures: SolvedType.Span,
-        capture_exprs: []const Lifted.ExprId,
+        capture_operands: []const Lifted.CaptureOperand,
         capture_ty: ?Type.TypeId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
-        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(lifted_fn_id)].captures).len != capture_exprs.len) {
+        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(lifted_fn_id)].captures).len != capture_operands.len) {
             Common.invariant("erased callable capture operand count differed from lifted function captures");
         }
         const capture = if (capture_ty) |ty| try self.addTemp(ty) else null;
@@ -3104,8 +3091,8 @@ const Lowerer = struct {
             .on_drop = on_drop,
             .next = next,
         } });
-        if (capture_ty) |ty| return try self.lowerCaptureRecordFromCaptureExprsInto(capture.?, lifted_fn_id, captures, capture_exprs, ty, assign);
-        if (capture_exprs.len != 0) Common.invariant("erased callable without capture payload carried capture operands");
+        if (capture_ty) |ty| return try self.lowerCaptureRecordFromCaptureExprsInto(capture.?, captures, capture_operands, ty, assign);
+        if (capture_operands.len != 0) Common.invariant("erased callable without capture payload carried capture operands");
         return assign;
     }
 
@@ -3115,22 +3102,22 @@ const Lowerer = struct {
         result_ty: Type.TypeId,
         callee: Lifted.FnId,
         args: []const Lifted.ExprId,
-        capture_exprs: []const Lifted.ExprId,
+        capture_operands: []const Lifted.CaptureOperand,
         is_cold: bool,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         const target_fn = try self.ensureOwnFnSpec(callee, .finite);
         const captures = self.capturesForFn(callee);
         if (captures.len == 0) {
-            if (capture_exprs.len != 0) Common.invariant("direct call carried capture operands for a capture-free callee");
+            if (capture_operands.len != 0) Common.invariant("direct call carried capture operands for a capture-free callee");
             return try self.lowerKnownCallInto(target, result_ty, target_fn, args, null, is_cold, next);
         }
-        if (captures.len != capture_exprs.len) Common.invariant("direct call capture operand count differed from callee capture count");
+        if (captures.len != capture_operands.len) Common.invariant("direct call capture operand count differed from callee capture count");
         const capture_ty = self.fn_entries.items[@intFromEnum(target_fn)].spec.capture_ty orelse
             Common.invariant("capturing direct call target had no capture record type");
         const capture_local = try self.addTemp(capture_ty);
         const call = try self.lowerKnownCallInto(target, result_ty, target_fn, args, capture_local, is_cold, next);
-        return try self.lowerCaptureRecordFromCaptureExprsInto(capture_local, callee, captures, capture_exprs, capture_ty, call);
+        return try self.lowerCaptureRecordFromCaptureExprsInto(capture_local, captures, capture_operands, capture_ty, call);
     }
 
     fn lowerKnownCallInto(
@@ -5847,7 +5834,7 @@ const Lowerer = struct {
         for (self.local_map, 0..) |maybe_existing, raw_other| {
             const existing = maybe_existing orelse continue;
             const other: Lifted.LocalId = @enumFromInt(@as(u32, @intCast(raw_other)));
-            if (!self.captureLocalMatchesLocal(local, other)) continue;
+            if (!self.aliasedLocalMatches(local, other)) continue;
             if (!try self.liftedLocalTypesMatch(local, other)) continue;
             if (found) |previous| {
                 if (previous != existing) {
@@ -5934,6 +5921,12 @@ const Lowerer = struct {
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         if (try self.maybeAssignDirectLayoutBoundary(target, source, next)) |stmt| return stmt;
+
+        const target_runtime_ty = self.runtimeBackingType(target_ty);
+        const source_runtime_ty = self.runtimeBackingType(source_ty);
+        if (target_runtime_ty != target_ty or source_runtime_ty != source_ty) {
+            return try self.assignTypedBoundary(target, target_runtime_ty, source, source_runtime_ty, next);
+        }
 
         const target_content = self.types.get(target_ty);
         const source_content = self.types.get(source_ty);
@@ -6479,9 +6472,8 @@ const Lowerer = struct {
 
     fn captureFieldIndexInFields(fields: []const Type.CaptureField, needle: Type.CaptureField) usize {
         for (fields, 0..) |field, index| {
-            if (field.symbol == needle.symbol and field.binder == needle.binder and field.capture_id == needle.capture_id) {
-                return index;
-            }
+            // CaptureId is the exact identity of a capture-record field.
+            if (field.capture_id == needle.capture_id) return index;
         }
         Common.invariant("capture record boundary target field was absent from source");
     }
@@ -6618,7 +6610,7 @@ const Lowerer = struct {
     ) Common.LowerError!bool {
         if (lhs.kind != rhs.kind) return false;
         if (!std.mem.eql(u8, lhs.named_type.module.bytes[0..], rhs.named_type.module.bytes[0..])) return false;
-        if (!std.mem.eql(u8, self.solved.lifted.names.moduleNameText(lhs.def.module_name), self.solved.lifted.names.moduleNameText(rhs.def.module_name))) return false;
+        if (!std.mem.eql(u8, self.solved.lifted.names.moduleIdentityBytes(lhs.def.module), self.solved.lifted.names.moduleIdentityBytes(rhs.def.module))) return false;
         if (lhs.def.source_decl != rhs.def.source_decl) return false;
         if (lhs.def.source_decl == null and
             !std.mem.eql(u8, self.solved.lifted.names.typeNameText(lhs.def.type_name), self.solved.lifted.names.typeNameText(rhs.def.type_name)))
@@ -6695,8 +6687,6 @@ const Lowerer = struct {
         const rhs = self.types.captureFieldSpan(rhs_span);
         if (lhs.len != rhs.len) return false;
         for (lhs, rhs) |lhs_field, rhs_field| {
-            if (lhs_field.symbol != rhs_field.symbol) return false;
-            if (!std.meta.eql(lhs_field.binder, rhs_field.binder)) return false;
             if (!std.meta.eql(lhs_field.capture_id, rhs_field.capture_id)) return false;
             if (!try self.publicTypesEquivalent(lhs_field.ty, rhs_field.ty, visited)) return false;
         }
@@ -6870,33 +6860,35 @@ const Lowerer = struct {
                         return layout.localGraphInput(node);
                     }
 
-                    if (self.lowerer.knownLayoutForType(backing.ty)) |layout_idx| return layout.committedGraphInput(layout_idx);
-
-                    const backing_index = @intFromEnum(backing.ty);
-                    if (self.local_nodes[backing_index]) |node| {
-                        self.local_nodes[index] = node;
-                        return layout.localGraphInput(node);
-                    }
-
-                    const node = try self.graph.reserveNode(self.lowerer.allocator);
-                    self.local_nodes[index] = node;
-                    self.local_nodes[backing_index] = node;
-
                     // A nominal or opaque record lays out its fields in declared
                     // order. The declared-order channel carries that order (the
                     // backing row stays lexicographic for name resolution); build
                     // the struct node from it and mark it nominal so the shared
                     // commit keeps declared order, repaired only for padding.
-                    if (named.kind != .alias and named.declared_order.len != 0) {
+                    // Reserve the node first (mapping both the named type and its
+                    // backing) so a recursive backing field resolves to it.
+                    if (named.kind != .alias and named.declared_order.len != 0 and
+                        self.lowerer.types.get(backing.ty) == .record)
+                    {
+                        const node = try self.graph.reserveNode(self.lowerer.allocator);
+                        self.local_nodes[index] = node;
+                        self.local_nodes[@intFromEnum(backing.ty)] = node;
                         if (try self.declaredOrderStructFields(named.declared_order, backing.ty)) |field_span| {
                             self.graph.setNode(node, .{ .struct_ = field_span });
                             try self.graph.markNominalStruct(self.lowerer.allocator, node);
-                            return layout.localGraphInput(node);
+                        } else {
+                            self.graph.setNode(node, try self.nodeForType(backing.ty));
                         }
+                        return layout.localGraphInput(node);
                     }
 
-                    self.graph.setNode(node, try self.nodeForType(backing.ty));
-                    return layout.localGraphInput(node);
+                    const backing_input = try self.inputForType(backing.ty);
+                    if (layout.graphInputCommitted(backing_input)) |layout_idx| return layout.committedGraphInput(layout_idx);
+                    if (layout.graphInputLocal(backing_input)) |node| {
+                        self.local_nodes[index] = node;
+                        return layout.localGraphInput(node);
+                    }
+                    Common.invariant("named backing layout input was neither committed nor local");
                 },
                 else => {},
             }
@@ -7099,9 +7091,15 @@ const Lowerer = struct {
             .dec => .dec,
             .list,
             .box,
+            .dict,
+            .set,
             .parse_tag_union_spec,
             .fields,
             .field,
+            .crypto_sha256_digest,
+            .crypto_sha256_hasher,
+            .crypto_blake3_digest,
+            .crypto_blake3_hasher,
             => null,
         };
     }
@@ -7345,8 +7343,6 @@ const TypeEquivalence = struct {
         const rhs = self.materialized.captureFieldSpan(materialized);
         if (lhs.len != rhs.len) return false;
         for (lhs, rhs) |a, b| {
-            if (a.symbol != b.symbol) return false;
-            if (!std.meta.eql(a.binder, b.binder)) return false;
             if (!std.meta.eql(a.capture_id, b.capture_id)) return false;
             if (!try self.equivalent(a.ty, b.ty)) return false;
         }
@@ -7438,11 +7434,13 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
         .stmt_ids = try cloneArrayList(Lifted.StmtId, allocator, &program.stmt_ids),
         .field_exprs = try cloneArrayList(Lifted.FieldExpr, allocator, &program.field_exprs),
         .fn_def_captures = try cloneArrayList(Lifted.FnDefCapture, allocator, &program.fn_def_captures),
+        .capture_operands = try cloneArrayList(Lifted.CaptureOperand, allocator, &program.capture_operands),
         .record_destructs = try cloneArrayList(Lifted.RecordDestruct, allocator, &program.record_destructs),
         .str_pattern_steps = try cloneArrayList(Lifted.StrPatternStep, allocator, &program.str_pattern_steps),
         .branches = try cloneArrayList(Lifted.Branch, allocator, &program.branches),
         .if_branches = try cloneArrayList(Lifted.IfBranch, allocator, &program.if_branches),
         .string_literals = string_literals,
+        .next_lift_capture_id = program.next_lift_capture_id,
         .proc_debug_names = try cloneProcDebugNameMap(allocator, &program.proc_debug_names),
         .roots = try cloneArrayList(Lifted.Root, allocator, &program.roots),
         .layout_requests = try cloneArrayList(Lifted.LayoutRequest, allocator, &program.layout_requests),
@@ -7650,6 +7648,96 @@ fn constFnDefFromMono(fn_def: Mono.FnDef) check.ConstStore.FnDef {
             .expr = runtime.expr,
         } },
     };
+}
+
+fn emptySolvedProgramForTest(allocator: std.mem.Allocator) Solved.Program {
+    const lifted = Lifted.Program.init(
+        allocator,
+        NameStore.init(allocator),
+        MonoType.Store.init(allocator),
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        Mono.ProcDebugNameMap.init(allocator),
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        0,
+    );
+    return Solved.Program.init(allocator, lifted);
+}
+
+test "layout lowering accepts tag payload alias backed by primitive" {
+    const allocator = std.testing.allocator;
+
+    var solved = emptySolvedProgramForTest(allocator);
+    defer solved.deinit();
+
+    const module_identity = try solved.lifted.names.internModuleIdentity(&([_]u8{0xAB} ** 32));
+    const repro_name = try solved.lifted.names.internTypeName("Repro");
+    const alias_name = try solved.lifted.names.internTypeName("Alias");
+    const wrap_name = try solved.lifted.names.internTagLabel("Wrap");
+
+    var lowerer = try Lowerer.init(allocator, .u64, &solved, .{});
+    defer lowerer.deinit();
+
+    const u32_ty = try lowerer.types.add(.{ .primitive = .u32 });
+    const alias_ty = try lowerer.types.add(.{
+        .named = .{
+            // Layout lowering does not read checked type ids for this synthetic type.
+            .named_type = .{ .module = .{}, .ty = undefined },
+            .def = .{ .module = module_identity, .type_name = alias_name },
+            .kind = .alias,
+            .args = .empty(),
+            .backing = .{ .ty = u32_ty, .use = .inspectable },
+        },
+    });
+
+    const payloads = try lowerer.types.addSpan(&.{alias_ty});
+    const tags = try lowerer.types.addTags(&.{.{
+        .name = wrap_name,
+        .checked_name = wrap_name,
+        .payloads = payloads,
+    }});
+    const tag_union_ty = try lowerer.types.add(.{ .tag_union = tags });
+
+    const repro_ty = try lowerer.types.add(.{
+        .named = .{
+            // Layout lowering does not read checked type ids for this synthetic type.
+            .named_type = .{ .module = .{}, .ty = undefined },
+            .def = .{ .module = module_identity, .type_name = repro_name },
+            .kind = .nominal,
+            .args = .empty(),
+            .backing = .{ .ty = tag_union_ty, .use = .inspectable },
+        },
+    });
+
+    // Regression for #9878: the primitive-backed alias payload lowers to the
+    // primitive payload layout instead of requiring a graph node for U32.
+    const repro_layout_idx = try lowerer.layoutOfType(repro_ty);
+    const repro_layout = lowerer.result.layouts.getLayout(repro_layout_idx);
+    try std.testing.expectEqual(layout.LayoutTag.tag_union, repro_layout.tag);
+
+    const tag_union_info = lowerer.result.layouts.getTagUnionInfo(repro_layout);
+    try std.testing.expectEqual(@as(usize, 1), tag_union_info.variants.len);
+    try std.testing.expectEqual(layout.Idx.u32, tag_union_info.variants.get(0).payload_layout);
 }
 
 test "direct LIR lower declarations are referenced" {

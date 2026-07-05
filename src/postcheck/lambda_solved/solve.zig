@@ -52,6 +52,7 @@ const Solver = struct {
     expr_tys: []?Type.TypeVarId,
     pat_tys: []?Type.TypeVarId,
     expr_done: []bool,
+    generated_backing_pats: []bool,
     loop_results: std.ArrayList(Type.TypeVarId),
     loop_params: std.ArrayList(Type.Span),
     return_contexts: std.ArrayList(ReturnContext),
@@ -87,6 +88,10 @@ const Solver = struct {
         errdefer allocator.free(pat_tys);
         @memset(pat_tys, null);
 
+        const generated_backing_pats = try allocator.alloc(bool, lifted.pats.len);
+        errdefer allocator.free(generated_backing_pats);
+        @memset(generated_backing_pats, false);
+
         return .{
             .allocator = allocator,
             .program = program,
@@ -95,6 +100,7 @@ const Solver = struct {
             .expr_tys = expr_tys,
             .pat_tys = pat_tys,
             .expr_done = expr_done,
+            .generated_backing_pats = generated_backing_pats,
             .loop_results = .empty,
             .loop_params = .empty,
             .return_contexts = .empty,
@@ -107,6 +113,7 @@ const Solver = struct {
         self.return_contexts.deinit(self.allocator);
         self.loop_params.deinit(self.allocator);
         self.loop_results.deinit(self.allocator);
+        self.allocator.free(self.generated_backing_pats);
         self.allocator.free(self.expr_done);
         self.allocator.free(self.pat_tys);
         self.allocator.free(self.expr_tys);
@@ -390,6 +397,7 @@ const Solver = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             .uninitialized,
             .uninitialized_payload,
             .crash,
@@ -426,8 +434,8 @@ const Solver = struct {
             },
             .nominal => |backing| {
                 if (try self.namedBacking(expected)) |backing_ty| {
-                    if (self.hasBuiltinOwner(expected, .fields)) {
-                        _ = try self.inferExpr(backing);
+                    if (self.hasBuiltinOwner(expected, .fields) or self.hasBuiltinOwner(expected, .field)) {
+                        try self.inferGeneratedOpaqueBacking(backing);
                     } else {
                         _ = try self.expectExpr(backing, backing_ty);
                     }
@@ -447,12 +455,15 @@ const Solver = struct {
             .fn_ref => |fn_ref| {
                 try self.unify(expected, self.program.fn_tys.items[@intFromEnum(fn_ref.fn_id)]);
                 const captures = self.liftedCapturesForFn(fn_ref.fn_id);
-                const capture_exprs = self.lifted.exprSpan(fn_ref.captures);
-                if (captures.len != capture_exprs.len) {
+                const capture_operands = self.lifted.captureOperandSpan(fn_ref.captures);
+                if (captures.len != capture_operands.len) {
                     Common.invariant("function reference capture count differs from its target");
                 }
-                for (captures, capture_exprs) |capture, capture_expr| {
-                    _ = try self.expectExpr(capture_expr, self.localTy(capture.local));
+                for (captures, capture_operands) |capture, operand| {
+                    if (operand.id != self.lifted.captureIdOfLocal(capture.local)) {
+                        Common.invariant("function reference capture operand CaptureId did not match its slot");
+                    }
+                    _ = try self.expectExpr(operand.value, self.localTy(capture.local));
                 }
             },
             .call_value => |call| {
@@ -475,10 +486,13 @@ const Solver = struct {
                             _ = try self.expectExpr(arg, self.program.types.spanItem(func.args, i));
                         }
                         const captures = self.liftedCapturesForFn(callee);
-                        const capture_exprs = self.lifted.exprSpan(call.captures);
-                        if (captures.len != capture_exprs.len) Common.invariant("procedure call capture count differs from its callee");
-                        for (captures, capture_exprs) |capture, capture_expr| {
-                            _ = try self.expectExpr(capture_expr, self.localTy(capture.local));
+                        const capture_operands = self.lifted.captureOperandSpan(call.captures);
+                        if (captures.len != capture_operands.len) Common.invariant("procedure call capture count differs from its callee");
+                        for (captures, capture_operands) |capture, operand| {
+                            if (operand.id != self.lifted.captureIdOfLocal(capture.local)) {
+                                Common.invariant("procedure call capture operand CaptureId did not match its slot");
+                            }
+                            _ = try self.expectExpr(operand.value, self.localTy(capture.local));
                         }
                     },
                     .imported => {
@@ -640,9 +654,62 @@ const Solver = struct {
         }
     }
 
+    fn inferGeneratedOpaqueBacking(self: *Solver, expr_id: Lifted.ExprId) Allocator.Error!void {
+        const index = @intFromEnum(expr_id);
+        if (self.expr_done[index]) return;
+
+        const expr = self.lifted.exprs[index];
+        switch (expr.data) {
+            .record => |fields| {
+                _ = try self.exprSlot(expr_id);
+                self.expr_done[index] = true;
+                for (self.lifted.fieldExprSpan(fields)) |field| {
+                    _ = try self.inferExpr(field.value);
+                }
+            },
+            .tuple => |items| {
+                _ = try self.exprSlot(expr_id);
+                self.expr_done[index] = true;
+                for (self.lifted.exprSpan(items)) |item| {
+                    _ = try self.inferExpr(item);
+                }
+            },
+            .tag => |tag| {
+                _ = try self.exprSlot(expr_id);
+                self.expr_done[index] = true;
+                for (self.lifted.exprSpan(tag.payloads)) |payload| {
+                    _ = try self.inferExpr(payload);
+                }
+            },
+            .nominal => |backing| {
+                _ = try self.exprSlot(expr_id);
+                self.expr_done[index] = true;
+                try self.inferGeneratedOpaqueBacking(backing);
+            },
+            .let_ => |let_| {
+                _ = try self.exprSlot(expr_id);
+                self.expr_done[index] = true;
+                const value_ty = try self.inferExpr(let_.value);
+                try self.bindPattern(let_.bind, value_ty);
+                try self.inferGeneratedOpaqueBacking(let_.rest);
+            },
+            else => _ = try self.inferExpr(expr_id),
+        }
+    }
+
     fn bindPattern(self: *Solver, pat_id: Lifted.PatId, value_ty: Type.TypeVarId) Allocator.Error!void {
-        const pat = self.lifted.pats[@intFromEnum(pat_id)];
+        const index = @intFromEnum(pat_id);
+        if (self.generated_backing_pats[index]) {
+            const pat_ty = self.pat_tys[index] orelse Common.invariant("generated backing pattern was marked before its type was assigned");
+            try self.unifyGeneratedOpaqueBacking(pat_ty, value_ty);
+            return;
+        }
         const pat_ty = try self.expectPat(pat_id, value_ty);
+        try self.bindPatternAtType(pat_id, pat_ty);
+    }
+
+    fn bindPatternAtType(self: *Solver, pat_id: Lifted.PatId, pat_ty: Type.TypeVarId) Allocator.Error!void {
+        const pat = self.lifted.pats[@intFromEnum(pat_id)];
         switch (pat.data) {
             .bind => |local| try self.unify(self.localTy(local), pat_ty),
             .wildcard,
@@ -695,12 +762,55 @@ const Solver = struct {
                 }
             },
             .nominal => |backing| {
-                if (try self.namedBacking(pat_ty)) |backing_ty| {
-                    try self.bindPattern(backing, backing_ty);
+                if (self.hasGeneratedOpaquePatOwner(pat_id) or self.hasBuiltinOwner(pat_ty, .fields) or self.hasBuiltinOwner(pat_ty, .field)) {
+                    try self.bindGeneratedOpaqueBackingPattern(backing);
                 } else {
-                    try self.bindPattern(backing, pat_ty);
+                    if (try self.namedBacking(pat_ty)) |backing_ty| {
+                        try self.bindPattern(backing, backing_ty);
+                    } else {
+                        try self.bindPattern(backing, pat_ty);
+                    }
                 }
             },
+        }
+    }
+
+    fn hasGeneratedOpaquePatOwner(self: *Solver, pat_id: Lifted.PatId) bool {
+        return switch (self.lifted.types.get(self.lifted.pats[@intFromEnum(pat_id)].ty)) {
+            .named => |named| isGeneratedOpaqueEvidenceOwner(named.builtin_owner),
+            else => false,
+        };
+    }
+
+    fn bindGeneratedOpaqueBackingPattern(self: *Solver, pat_id: Lifted.PatId) Allocator.Error!void {
+        const index = @intFromEnum(pat_id);
+        if (self.generated_backing_pats[index]) return;
+        self.generated_backing_pats[index] = true;
+        const pat_ty = try self.lowerTypeFresh(self.lifted.pats[@intFromEnum(pat_id)].ty);
+        self.pat_tys[index] = pat_ty;
+        try self.bindPatternAtType(pat_id, pat_ty);
+    }
+
+    fn unifyGeneratedOpaqueBacking(self: *Solver, generated_ty: Type.TypeVarId, expected_ty: Type.TypeVarId) Allocator.Error!void {
+        const generated = self.program.types.root(generated_ty);
+        const expected = self.program.types.root(expected_ty);
+        if (generated == expected) return;
+
+        const generated_score = generatedBackingScore(self.program.types.get(generated)) orelse {
+            try self.unify(generated, expected);
+            return;
+        };
+        const expected_score = generatedBackingScore(self.program.types.get(expected)) orelse {
+            try self.unify(generated, expected);
+            return;
+        };
+
+        if (generated_score > expected_score) {
+            self.program.types.set(expected, .{ .link = generated });
+        } else if (expected_score > generated_score) {
+            self.program.types.set(generated, .{ .link = expected });
+        } else {
+            try self.unify(generated, expected);
         }
     }
 
@@ -947,11 +1057,7 @@ const Solver = struct {
         if (!isGeneratedOpaqueEvidenceOwner(named.builtin_owner)) return 0;
 
         const backing = named.backing orelse return 0;
-        return switch (self.program.types.rootContent(backing.ty)) {
-            .record => |fields| if (fields.count() == 0) 1 else 2,
-            .zst => 1,
-            else => 2,
-        };
+        return generatedBackingScore(self.program.types.rootContent(backing.ty)) orelse 2;
     }
 
     fn bindLowLevelTypes(
@@ -1025,6 +1131,17 @@ const Solver = struct {
             },
             .dict_pseudo_seed => expectLowLevelArity(op, args, 0),
             .hasher_finish => expectLowLevelArity(op, args, 1),
+            .crypto_sha256_hash_bytes,
+            .crypto_sha256_hasher_finish,
+            .crypto_blake3_hash_bytes,
+            .crypto_blake3_hasher_finish,
+            => expectLowLevelArity(op, args, 1),
+            .crypto_sha256_hasher_empty,
+            .crypto_blake3_hasher_empty,
+            => expectLowLevelArity(op, args, 0),
+            .crypto_sha256_hasher_write,
+            .crypto_blake3_hasher_write,
+            => expectLowLevelArity(op, args, 2),
             .hasher_write_bool,
             .hasher_write_u8,
             .hasher_write_u16,
@@ -1122,6 +1239,27 @@ const Solver = struct {
         if (transparentAliasBacking(right)) |backing| {
             try self.unify(a, backing);
             self.program.types.set(b, .{ .link = self.program.types.root(backing) });
+            return;
+        }
+
+        // An empty tag union is the seal for a slot that no value reached: a
+        // variable that was defaulted at Monotype materialization rather than
+        // constrained by evidence (see Monotype import, which re-enters it as an
+        // unresolved node instead of a closed row). Two representations of the
+        // same runtime type can therefore disagree here — most visibly in the
+        // phantom argument types of a function value that is inspected but never
+        // called (`|x, y| x + y` rendered as `<function>`), where the callee's
+        // own body solves an argument to a concrete number while the referencing
+        // site left the shared variable to seal as `[]`. Such a slot fixes no
+        // layout, so it yields to a concrete peer instead of tripping the
+        // exact-match invariant, matching how the Monotype layer lets local
+        // evidence supersede an empty tag union.
+        if (isEmptyTagUnion(left) and !isEmptyTagUnion(right)) {
+            self.program.types.set(a, .{ .link = b });
+            return;
+        }
+        if (isEmptyTagUnion(right) and !isEmptyTagUnion(left)) {
+            self.program.types.set(b, .{ .link = a });
             return;
         }
 
@@ -1266,6 +1404,15 @@ const Solver = struct {
         };
     }
 
+    /// A tag union with no tags is the materialized seal for an unconstrained
+    /// slot; it is uninhabited and fixes no layout.
+    fn isEmptyTagUnion(content: Type.Content) bool {
+        return switch (content) {
+            .tag_union => |tags| tags.count() == 0,
+            else => false,
+        };
+    }
+
     fn unifySpans(self: *Solver, lhs: Type.Span, rhs: Type.Span, comptime message: []const u8) Allocator.Error!void {
         if (lhs.count() != rhs.count()) Common.invariant(message);
         for (0..lhs.count()) |i| {
@@ -1321,11 +1468,7 @@ const Solver = struct {
         for (0..lhs.count()) |i| {
             const left_capture = self.program.types.captureItem(lhs, i);
             const right_capture = self.program.types.captureItem(rhs, i);
-            if (left_capture.local != right_capture.local or
-                left_capture.symbol != right_capture.symbol or
-                left_capture.binder != right_capture.binder or
-                left_capture.capture_id != right_capture.capture_id)
-            {
+            if (left_capture.capture_id != right_capture.capture_id) {
                 Common.invariant("capture identity failed Lambda Solved unification");
             }
             try self.unify(left_capture.ty, right_capture.ty);
@@ -1405,7 +1548,8 @@ const Solver = struct {
             .named => |named| {
                 writeBytes(hasher, "named");
                 hasher.update(&named.named_type.module.bytes);
-                writeBytes(hasher, self.lifted.names.moduleNameText(named.def.module_name));
+                writeBytes(hasher, self.lifted.names.moduleIdentityBytes(named.def.module));
+                writeOptionalU32(hasher, named.def.source_decl);
                 writeBytes(hasher, self.lifted.names.typeNameText(named.def.type_name));
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
@@ -1450,6 +1594,15 @@ const Solver = struct {
 fn writeBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     writeU32(hasher, @intCast(bytes.len));
     hasher.update(bytes);
+}
+
+fn writeOptionalU32(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
+    if (value) |v| {
+        hasher.update(&[_]u8{1});
+        writeU32(hasher, v);
+    } else {
+        hasher.update(&[_]u8{0});
+    }
 }
 
 fn writeU32(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
@@ -1543,9 +1696,15 @@ const TypeCloner = struct {
                     .kind = named.kind,
                     .builtin_owner = named.builtin_owner,
                     .args = try self.solver.program.types.addSpan(args),
-                    .backing = if (named.backing) |raw_backing| .{
-                        .ty = try self.lower(try self.structuralBackingForNamed(named.def, raw_backing.ty)),
-                        .use = raw_backing.use,
+                    .backing = if (named.backing) |raw_backing| blk_backing: {
+                        const backing_ty = if (isGeneratedOpaqueEvidenceOwner(named.builtin_owner))
+                            raw_backing.ty
+                        else
+                            try self.structuralBackingForNamed(named.def, raw_backing.ty);
+                        break :blk_backing .{
+                            .ty = try self.lower(backing_ty),
+                            .use = raw_backing.use,
+                        };
                     } else null,
                     .declared_order = try self.lowerDeclaredOrder(named.declared_order),
                 } };
@@ -1592,10 +1751,19 @@ const TypeCloner = struct {
     }
 };
 
+fn generatedBackingScore(content: Type.Content) ?u8 {
+    return switch (content) {
+        .record => |fields| if (fields.count() == 0) 1 else 2,
+        .zst => 1,
+        else => null,
+    };
+}
+
 fn isGeneratedOpaqueEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
     const actual = owner orelse return false;
     return switch (actual) {
         .fields,
+        .field,
         .parse_tag_union_spec,
         => true,
         else => false,
@@ -1603,7 +1771,7 @@ fn isGeneratedOpaqueEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
 }
 
 fn sameMonoTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
-    return left.module_name == right.module_name and
+    return left.module == right.module and
         left.type_name == right.type_name and
         left.source_decl == right.source_decl;
 }

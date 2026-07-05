@@ -32,7 +32,7 @@ DOES NOT EXIST - multi_qualified_import.md:4:16:4:45
 MODULE NOT IMPORTED - multi_qualified_import.md:7:11:7:33
 UNUSED VARIABLE - multi_qualified_import.md:8:12:8:19
 MODULE NOT IMPORTED - multi_qualified_import.md:11:8:11:34
-UNDEFINED VARIABLE - multi_qualified_import.md:12:8:12:12
+NAME NOT IN SCOPE - multi_qualified_import.md:12:8:12:12
 # PROBLEMS
 
 ┌─────────────┐
@@ -134,13 +134,14 @@ UNDEFINED VARIABLE - multi_qualified_import.md:12:8:12:12
 
 
 ┌────────────────┐
-│ DOES NOT EXIST ├─ `Json.Core.Utf8.defaultEncoder` does not exist. ──────────┐
+│ DOES NOT EXIST ├─ `Json.defaultEncoder` does not exist. ────────────────────┐
 └┬───────────────┘                                                            │
  │                                                                            │
  │  json_encoder = Json.Core.Utf8.defaultEncoder                              │
  │                 ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                              │
  └──────────────────────────────────────────── multi_qualified_import.md:4:16 ┘
 
+    `Json` is in scope, but it has no associated `defaultEncoder`.
 
 
 ┌─────────────────────┐
@@ -175,15 +176,15 @@ UNDEFINED VARIABLE - multi_qualified_import.md:12:8:12:12
 
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `json` in this scope. ───────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `json` in this scope. ────────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  data = json.Core.Utf8.encode("hello")                                     │
  │         ‾‾‾‾                                                               │
  └──────────────────────────────────────────── multi_qualified_import.md:12:8 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 # TOKENS
 ~~~zig
@@ -254,7 +255,7 @@ data = json
 (can-ir
 	(d-let
 		(p-assign (ident "json_encoder"))
-		(e-runtime-error (tag "qualified_ident_does_not_exist"))
+		(e-runtime-error (tag "nested_value_not_found"))
 		(annotation
 			(ty-malformed)))
 	(d-let

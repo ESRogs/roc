@@ -440,6 +440,15 @@ hasher_write_f32_bits_import: ?u32 = null,
 hasher_write_f64_bits_import: ?u32 = null,
 hasher_write_bytes_import: ?u32 = null,
 hasher_write_str_import: ?u32 = null,
+/// Wasm function indices for imported crypto host functions.
+crypto_sha256_hash_bytes_import: ?u32 = null,
+crypto_sha256_hasher_empty_import: ?u32 = null,
+crypto_sha256_hasher_write_import: ?u32 = null,
+crypto_sha256_hasher_finish_import: ?u32 = null,
+crypto_blake3_hash_bytes_import: ?u32 = null,
+crypto_blake3_hasher_empty_import: ?u32 = null,
+crypto_blake3_hasher_write_import: ?u32 = null,
+crypto_blake3_hasher_finish_import: ?u32 = null,
 /// Configurable wasm stack size in bytes (default 1MB).
 wasm_stack_bytes: u32 = 1024 * 1024,
 /// Configurable wasm memory pages (0 = auto-compute from stack size).
@@ -917,6 +926,63 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: []const ProcLocalId) 
     }
 }
 
+fn emitCryptoLowLevel(self: *Self, op: lir.LowLevel, args: []const ProcLocalId) Allocator.Error!void {
+    const Arity = enum { zero, one, two };
+    const CryptoCall = struct {
+        arity: Arity,
+        kind: BuiltinKind,
+        host_import: ?u32,
+    };
+
+    const call: CryptoCall = switch (op) {
+        .crypto_sha256_hash_bytes => .{ .arity = .one, .kind = .crypto_sha256_hash_bytes, .host_import = self.crypto_sha256_hash_bytes_import },
+        .crypto_sha256_hasher_empty => .{ .arity = .zero, .kind = .crypto_sha256_hasher_empty, .host_import = self.crypto_sha256_hasher_empty_import },
+        .crypto_sha256_hasher_write => .{ .arity = .two, .kind = .crypto_sha256_hasher_write, .host_import = self.crypto_sha256_hasher_write_import },
+        .crypto_sha256_hasher_finish => .{ .arity = .one, .kind = .crypto_sha256_hasher_finish, .host_import = self.crypto_sha256_hasher_finish_import },
+        .crypto_blake3_hash_bytes => .{ .arity = .one, .kind = .crypto_blake3_hash_bytes, .host_import = self.crypto_blake3_hash_bytes_import },
+        .crypto_blake3_hasher_empty => .{ .arity = .zero, .kind = .crypto_blake3_hasher_empty, .host_import = self.crypto_blake3_hasher_empty_import },
+        .crypto_blake3_hasher_write => .{ .arity = .two, .kind = .crypto_blake3_hasher_write, .host_import = self.crypto_blake3_hasher_write_import },
+        .crypto_blake3_hasher_finish => .{ .arity = .one, .kind = .crypto_blake3_hasher_finish, .host_import = self.crypto_blake3_hasher_finish_import },
+        else => unreachable,
+    };
+
+    const result_offset = try self.allocStackMemory(12, 4);
+    switch (call.arity) {
+        .zero => {
+            try self.emitFpOffset(result_offset);
+            try self.emitLocalGet(self.roc_ops_local);
+        },
+        .one => {
+            try self.emitProcLocal(args[0]);
+            const list_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(list_ptr);
+            const fields = try self.loadRocListFields(list_ptr);
+
+            try self.emitFpOffset(result_offset);
+            try self.emitRocListFields(fields);
+            try self.emitLocalGet(self.roc_ops_local);
+        },
+        .two => {
+            try self.emitProcLocal(args[0]);
+            const first_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(first_ptr);
+            try self.emitProcLocal(args[1]);
+            const second_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(second_ptr);
+            const first = try self.loadRocListFields(first_ptr);
+            const second = try self.loadRocListFields(second_ptr);
+
+            try self.emitFpOffset(result_offset);
+            try self.emitRocListFields(first);
+            try self.emitRocListFields(second);
+            try self.emitLocalGet(self.roc_ops_local);
+        },
+    }
+
+    try self.emitBuiltinCall(call.kind, call.host_import);
+    try self.emitFpOffset(result_offset);
+}
+
 fn compileBuiltinInternalIncrefCallback(self: *Self, helper_key: RcHelperKey) Allocator.Error!u32 {
     if (helper_key.op != .incref) {
         wasmInvariantFmt(
@@ -1322,6 +1388,24 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
     // (seed i64, ptr i32, len i32, cap i32) -> i64
     const hasher_write_str_type = try self.module.addFuncType(&.{ .i64, .i32, .i32, .i32 }, &.{.i64});
     self.hasher_write_str_import = try self.module.addImport("env", "roc_hasher_write_str", hasher_write_str_type);
+
+    // Crypto host functions mirror the builtin wrapper ABI so eval host
+    // imports and relocatable builtin calls use the same lowering.
+    const crypto_hash_bytes_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.crypto_sha256_hash_bytes_import = try self.module.addImport("env", "roc_crypto_sha256_hash_bytes", crypto_hash_bytes_type);
+    self.crypto_blake3_hash_bytes_import = try self.module.addImport("env", "roc_crypto_blake3_hash_bytes", crypto_hash_bytes_type);
+
+    const crypto_hasher_empty_type = try self.module.addFuncType(&.{ .i32, .i32 }, &.{});
+    self.crypto_sha256_hasher_empty_import = try self.module.addImport("env", "roc_crypto_sha256_hasher_empty", crypto_hasher_empty_type);
+    self.crypto_blake3_hasher_empty_import = try self.module.addImport("env", "roc_crypto_blake3_hasher_empty", crypto_hasher_empty_type);
+
+    const crypto_hasher_write_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.crypto_sha256_hasher_write_import = try self.module.addImport("env", "roc_crypto_sha256_hasher_write", crypto_hasher_write_type);
+    self.crypto_blake3_hasher_write_import = try self.module.addImport("env", "roc_crypto_blake3_hasher_write", crypto_hasher_write_type);
+
+    const crypto_hasher_finish_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.crypto_sha256_hasher_finish_import = try self.module.addImport("env", "roc_crypto_sha256_hasher_finish", crypto_hasher_finish_type);
+    self.crypto_blake3_hasher_finish_import = try self.module.addImport("env", "roc_crypto_blake3_hasher_finish", crypto_hasher_finish_type);
 
     // RocOps function imports follow the platform C ABI: each takes a leading `*RocOps`
     // (the i32 pointer to the RocOps struct in linear memory) followed by its natural
@@ -7769,6 +7853,7 @@ fn generateLiteral(self: *Self, value: LIR.LiteralValue) Allocator.Error!void {
         },
         .dec_literal => |lit| try self.generateI128Literal(lit),
         .str_literal => |str_idx| try self.generateStrLiteral(str_idx),
+        .bytes_literal => |bytes_idx| try self.generateBytesLiteral(bytes_idx),
         .null_ptr => {
             self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
             WasmModule.leb128WriteI32(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
@@ -9209,6 +9294,18 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         .hasher_write_str,
         => {
             return self.emitHasherLowLevel(ll.op, args);
+        },
+
+        .crypto_sha256_hash_bytes,
+        .crypto_sha256_hasher_empty,
+        .crypto_sha256_hasher_write,
+        .crypto_sha256_hasher_finish,
+        .crypto_blake3_hash_bytes,
+        .crypto_blake3_hasher_empty,
+        .crypto_blake3_hasher_write,
+        .crypto_blake3_hasher_finish,
+        => {
+            return self.emitCryptoLowLevel(ll.op, args);
         },
 
         // Safe integer widenings (no-op or single instruction)
@@ -13367,6 +13464,58 @@ fn generateStrLiteral(self: *Self, literal: LIR.StrLiteral) Allocator.Error!void
     }
 
     // Push pointer to the RocStr on the stack
+    self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
+    WasmModule.leb128WriteU32(self.allocator, self.currentCode(), base_local) catch return error.OutOfMemory;
+    if (base_offset > 0) {
+        self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+        WasmModule.leb128WriteI32(self.allocator, self.currentCode(), @intCast(base_offset)) catch return error.OutOfMemory;
+        self.currentCode().append(self.allocator, Op.i32_add) catch return error.OutOfMemory;
+    }
+}
+
+/// Generate a RocList(U8) for a byte-list literal.
+/// On wasm32, RocList is 12 bytes: { ptr/bytes[0..3], len/bytes[4..7], encoded cap/bytes[8..11] }.
+fn generateBytesLiteral(self: *Self, literal: LIR.StrLiteral) Allocator.Error!void {
+    const bytes = self.store.getStringLiteral(literal);
+    const backing_bytes = self.store.getStringLiteralBacking(literal);
+    const whole_backing = literal.offset == 0 and @as(usize, literal.len) == backing_bytes.len;
+
+    const base_offset = try self.allocStackMemory(12, 4);
+    const base_local = self.fp_local;
+
+    if (bytes.len == 0) {
+        for (0..3) |i| {
+            self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
+            WasmModule.leb128WriteU32(self.allocator, self.currentCode(), base_local) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI32(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
+            try self.emitStoreOp(.i32, base_offset + @as(u32, @intCast(i)) * 4);
+        }
+    } else {
+        const data_address = try self.staticStrDataOffset(literal.backing);
+
+        self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
+        WasmModule.leb128WriteU32(self.allocator, self.currentCode(), base_local) catch return error.OutOfMemory;
+        try self.emitDataAddressConst(data_address, @intCast(literal.offset));
+        try self.emitStoreOp(.i32, base_offset);
+
+        self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
+        WasmModule.leb128WriteU32(self.allocator, self.currentCode(), base_local) catch return error.OutOfMemory;
+        self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+        WasmModule.leb128WriteI32(self.allocator, self.currentCode(), @intCast(bytes.len)) catch return error.OutOfMemory;
+        try self.emitStoreOp(.i32, base_offset + 4);
+
+        self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
+        WasmModule.leb128WriteU32(self.allocator, self.currentCode(), base_local) catch return error.OutOfMemory;
+        if (whole_backing) {
+            self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI32(self.allocator, self.currentCode(), @intCast(bytes.len << 1)) catch return error.OutOfMemory;
+        } else {
+            try self.emitDataAddressConst(data_address, 1);
+        }
+        try self.emitStoreOp(.i32, base_offset + 8);
+    }
+
     self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
     WasmModule.leb128WriteU32(self.allocator, self.currentCode(), base_local) catch return error.OutOfMemory;
     if (base_offset > 0) {

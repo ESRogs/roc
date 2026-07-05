@@ -2313,6 +2313,7 @@ pub const MonoLlvmCodeGen = struct {
             .f32_literal => |lit| try self.storeFloatLiteral(slot_v.ptr, .f32, lit),
             .dec_literal => |lit| try self.storeI128Literal(slot_v.ptr, .dec, lit),
             .str_literal => |str_idx| try self.emitStrLiteral(slot_v.ptr, str_idx),
+            .bytes_literal => |bytes_idx| try self.emitBytesLiteral(slot_v.ptr, bytes_idx),
             .null_ptr => {
                 if (slot_v.size > 0) try self.zeroBytes(slot_v.ptr, slot_v.size);
             },
@@ -2635,6 +2636,15 @@ pub const MonoLlvmCodeGen = struct {
             .hasher_write_bytes,
             .hasher_write_str,
             => try self.emitHasherLowLevel(target, op, arg_locals),
+            .crypto_sha256_hash_bytes,
+            .crypto_sha256_hasher_empty,
+            .crypto_sha256_hasher_write,
+            .crypto_sha256_hasher_finish,
+            .crypto_blake3_hash_bytes,
+            .crypto_blake3_hasher_empty,
+            .crypto_blake3_hasher_write,
+            .crypto_blake3_hasher_finish,
+            => try self.emitCryptoLowLevel(target, op, arg_locals),
             .u8_from_str => try self.emitIntFromStr(target, arg_locals[0], 1, false),
             .i8_from_str => try self.emitIntFromStr(target, arg_locals[0], 1, true),
             .u16_from_str => try self.emitIntFromStr(target, arg_locals[0], 2, false),
@@ -2774,6 +2784,53 @@ pub const MonoLlvmCodeGen = struct {
         };
 
         try self.storeHasherState(target, result);
+    }
+
+    fn emitCryptoLowLevel(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, args: []const LocalId) Error!void {
+        const Arity = enum { zero, one, two };
+        const CryptoInfo = struct {
+            name: []const u8,
+            arity: Arity,
+        };
+        const info: CryptoInfo = switch (op) {
+            .crypto_sha256_hash_bytes => .{ .name = "roc_builtins_crypto_sha256_hash_bytes", .arity = Arity.one },
+            .crypto_sha256_hasher_empty => .{ .name = "roc_builtins_crypto_sha256_hasher_empty", .arity = Arity.zero },
+            .crypto_sha256_hasher_write => .{ .name = "roc_builtins_crypto_sha256_hasher_write", .arity = Arity.two },
+            .crypto_sha256_hasher_finish => .{ .name = "roc_builtins_crypto_sha256_hasher_finish", .arity = Arity.one },
+            .crypto_blake3_hash_bytes => .{ .name = "roc_builtins_crypto_blake3_hash_bytes", .arity = Arity.one },
+            .crypto_blake3_hasher_empty => .{ .name = "roc_builtins_crypto_blake3_hasher_empty", .arity = Arity.zero },
+            .crypto_blake3_hasher_write => .{ .name = "roc_builtins_crypto_blake3_hasher_write", .arity = Arity.two },
+            .crypto_blake3_hasher_finish => .{ .name = "roc_builtins_crypto_blake3_hasher_finish", .arity = Arity.one },
+            else => return error.UnsupportedLowLevel,
+        };
+
+        var call_args = CallArgs.init();
+        defer call_args.deinit(self.allocator);
+
+        switch (info.arity) {
+            .zero => {
+                if (args.len != 0) return error.CompilationFailed;
+            },
+            .one => {
+                if (args.len != 1) return error.CompilationFailed;
+                call_args = try self.rocListArgs1(args[0]);
+            },
+            .two => {
+                if (args.len != 2) return error.CompilationFailed;
+                call_args = try self.rocListArgs1(args[0]);
+                const rhs = try self.rocListArgs1(args[1]);
+                defer {
+                    var owned = rhs;
+                    owned.deinit(self.allocator);
+                }
+                try call_args.types.appendSlice(self.allocator, rhs.types.items);
+                try call_args.values.appendSlice(self.allocator, rhs.values.items);
+            },
+        }
+
+        try call_args.prepend(self.allocator, try self.ptrType(), self.slot(target).ptr);
+        try call_args.append(self.allocator, try self.ptrType(), self.rocOps());
+        try self.callBuiltinVoid(info.name, call_args.types.items, call_args.values.items);
     }
 
     fn hasherDomain(op: lir.LowLevel) u8 {
@@ -4578,6 +4635,34 @@ pub const MonoLlvmCodeGen = struct {
         );
     }
 
+    fn emitBytesLiteral(self: *MonoLlvmCodeGen, out: LlvmBuilder.Value, literal: StrLiteral) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const wip = self.wip orelse return error.CompilationFailed;
+        const bytes = self.store.getStringLiteral(literal);
+        if (bytes.len == 0) {
+            try self.storeListFields(out, builder.nullValue(try self.ptrType()) catch return error.OutOfMemory, 0, 0);
+            return;
+        }
+
+        const backing_bytes = self.store.getStringLiteralBacking(literal);
+        const whole_backing = literal.offset == 0 and @as(usize, literal.len) == backing_bytes.len;
+        const backing_ptr = try self.staticRefcountedBytes(backing_bytes);
+        const bytes_ptr = try self.offsetPtrValue(
+            backing_ptr,
+            builder.intValue(self.ptrSizedIntType(), literal.offset) catch return error.OutOfMemory,
+        );
+
+        try self.storePointer(out, bytes_ptr);
+        try self.storeListLen(out, builder.intValue(self.ptrSizedIntType(), bytes.len) catch return error.OutOfMemory);
+        if (whole_backing) {
+            try self.storeListCapacity(out, builder.intValue(self.ptrSizedIntType(), bytes.len << 1) catch return error.OutOfMemory);
+        } else {
+            const backing_int = wip.cast(.ptrtoint, backing_ptr, self.ptrSizedIntType(), "") catch return error.OutOfMemory;
+            const alloc_ptr = wip.bin(.add, backing_int, builder.intValue(self.ptrSizedIntType(), 1) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
+            try self.storeListCapacity(out, alloc_ptr);
+        }
+    }
+
     /// Exported global the test harness reads back after an expect_err
     /// unwind: [0] = set flag, [1] = region start offset, [2] = region end
     /// offset. Exported (rather than carried through the host's crash
@@ -4613,6 +4698,28 @@ pub const MonoLlvmCodeGen = struct {
         const value = variable.toValue(builder);
         try self.static_bytes.put(key, value);
         return value;
+    }
+
+    fn staticRefcountedBytes(self: *MonoLlvmCodeGen, bytes: []const u8) Error!LlvmBuilder.Value {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const word_size: usize = self.targetWordSize();
+        const storage = self.allocator.alloc(u8, word_size + bytes.len) catch return error.OutOfMemory;
+        defer self.allocator.free(storage);
+
+        @memset(storage[0..word_size], 0);
+        @memcpy(storage[word_size..][0..bytes.len], bytes);
+
+        const arr_ty = builder.arrayType(storage.len, .i8) catch return error.OutOfMemory;
+        const name = builder.strtabStringFmt(".roc.refcounted_bytes.{d}", .{self.string_counter}) catch return error.OutOfMemory;
+        self.string_counter += 1;
+        const variable = builder.addVariable(name, arr_ty, .default) catch return error.OutOfMemory;
+        variable.ptrConst(builder).global.setLinkage(.internal, builder);
+        variable.setMutability(.constant, builder);
+        variable.setAlignment(self.targetPointerAlignment(), builder);
+        variable.setInitializer(builder.stringConst(builder.string(storage) catch return error.OutOfMemory) catch return error.OutOfMemory, builder) catch return error.OutOfMemory;
+
+        const base = variable.toValue(builder);
+        return try self.offsetPtrValue(base, builder.intValue(self.ptrSizedIntType(), word_size) catch return error.OutOfMemory);
     }
 
     fn emitStrByteSliceForLocal(self: *MonoLlvmCodeGen, local: LocalId) Error!StrByteSlice {

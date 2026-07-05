@@ -232,7 +232,7 @@ UNDECLARED TYPE - fuzz_crash_023.md:45:8:45:10
 UNDECLARED TYPE - fuzz_crash_023.md:46:8:46:17
 UNDECLARED TYPE - fuzz_crash_023.md:52:4:52:6
 UNDECLARED TYPE - fuzz_crash_023.md:53:8:53:17
-UNDEFINED VARIABLE - fuzz_crash_023.md:72:4:72:13
+NAME NOT IN SCOPE - fuzz_crash_023.md:72:4:72:13
 UNUSED VARIABLE - fuzz_crash_023.md:97:3:97:8
 UNUSED VARIABLE - fuzz_crash_023.md:1:1:1:1
 NOT IMPLEMENTED - fuzz_crash_023.md:108:7:108:12
@@ -240,30 +240,30 @@ UNUSED VARIABLE - fuzz_crash_023.md:1:1:1:1
 NOT IMPLEMENTED - fuzz_crash_023.md:111:4:111:9
 UNUSED VARIABLE - fuzz_crash_023.md:1:1:1:1
 NOT IMPLEMENTED - fuzz_crash_023.md:120:7:120:12
-UNDEFINED VARIABLE - fuzz_crash_023.md:121:37:121:40
+NAME NOT IN SCOPE - fuzz_crash_023.md:121:37:121:40
 UNUSED VARIABLE - fuzz_crash_023.md:121:21:121:27
 UNUSED VARIABLE - fuzz_crash_023.md:127:4:128:9
 NOT IMPLEMENTED - fuzz_crash_023.md:130:18:130:23
 NOT IMPLEMENTED - fuzz_crash_023.md:133:9:133:14
 UNUSED VARIABLE - fuzz_crash_023.md:82:2:82:3
-UNDEFINED VARIABLE - fuzz_crash_023.md:141:2:141:6
+NAME NOT IN SCOPE - fuzz_crash_023.md:141:2:141:6
 UNDECLARED TYPE - fuzz_crash_023.md:143:14:143:20
-UNDEFINED VARIABLE - fuzz_crash_023.md:147:9:147:13
-UNDEFINED VARIABLE - fuzz_crash_023.md:158:2:158:11
-UNDEFINED VARIABLE - fuzz_crash_023.md:175:3:175:15
+NAME NOT IN SCOPE - fuzz_crash_023.md:147:9:147:13
+NAME NOT IN SCOPE - fuzz_crash_023.md:158:2:158:11
+NAME NOT IN SCOPE - fuzz_crash_023.md:175:3:175:15
 UNRECOGNIZED SYNTAX - fuzz_crash_023.md:178:38:178:40
 UNRECOGNIZED SYNTAX - fuzz_crash_023.md:178:40:178:41
 UNRECOGNIZED SYNTAX - fuzz_crash_023.md:178:45:178:46
 MALFORMED TYPE - fuzz_crash_023.md:178:52:178:71
-UNDEFINED VARIABLE - fuzz_crash_023.md:179:42:179:48
+NAME NOT IN SCOPE - fuzz_crash_023.md:179:42:179:48
 INVALID ASSIGNMENT TO ITSELF - fuzz_crash_023.md:179:50:179:55
-UNDEFINED VARIABLE - fuzz_crash_023.md:183:3:183:7
-UNDEFINED VARIABLE - fuzz_crash_023.md:185:4:185:10
-UNDEFINED VARIABLE - fuzz_crash_023.md:188:22:188:25
-UNDEFINED VARIABLE - fuzz_crash_023.md:189:26:189:33
-UNDEFINED VARIABLE - fuzz_crash_023.md:189:34:189:38
-UNDEFINED VARIABLE - fuzz_crash_023.md:190:2:190:14
-UNDEFINED VARIABLE - fuzz_crash_023.md:191:2:191:14
+NAME NOT IN SCOPE - fuzz_crash_023.md:183:3:183:7
+NAME NOT IN SCOPE - fuzz_crash_023.md:185:4:185:10
+NAME NOT IN SCOPE - fuzz_crash_023.md:188:22:188:25
+NAME NOT IN SCOPE - fuzz_crash_023.md:189:26:189:33
+NAME NOT IN SCOPE - fuzz_crash_023.md:189:34:189:38
+NAME NOT IN SCOPE - fuzz_crash_023.md:190:2:190:14
+NAME NOT IN SCOPE - fuzz_crash_023.md:191:2:191:14
 DOES NOT EXIST - fuzz_crash_023.md:193:4:193:13
 UNUSED VARIABLE - fuzz_crash_023.md:164:2:164:18
 UNUSED VARIABLE - fuzz_crash_023.md:178:2:178:8
@@ -482,15 +482,15 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `some_func` in this scope. ──────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `some_func` in this scope. ───────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  some_func() # After debug expr                                            │
  │  ‾‾‾‾‾‾‾‾‾                                                                 │
  └──────────────────────────────────────────────────── fuzz_crash_023.md:72:4 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
 ┌─────────────────┐
@@ -577,15 +577,15 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
     want to help improve Roc's error messages!
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `add` in this scope. ────────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `add` in this scope. ─────────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  { foo: 1, bar: 2, ..rest } => 12->add(34)                                 │
  │                                    ‾‾‾                                     │
  └────────────────────────────────────────────────── fuzz_crash_023.md:121:37 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
 ┌─────────────────┐
@@ -649,15 +649,15 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
     suppress this warning.
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `blah` in this scope. ───────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `blah` in this scope. ────────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  blah == 1 # Comment after expect statement                                │
  │  ‾‾‾‾                                                                      │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:141:2 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
 ┌─────────────────┐
@@ -670,37 +670,37 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `blah` in this scope. ───────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `blah` in this scope. ────────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  expect blah == 1                                                          │
  │         ‾‾‾‾                                                               │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:147:9 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `some_func` in this scope. ──────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `some_func` in this scope. ───────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  some_func(                                                                │
  │  ‾‾‾‾‾‾‾‾‾                                                                 │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:158:2 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `line!` in this scope. ──────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `line!` in this scope. ───────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  Stdout.line!("Adding ${n} to ${number}")                                  │
  │  ‾‾‾‾‾‾‾‾‾‾‾‾                                                              │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:175:3 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
 ┌─────────────────────┐
@@ -746,15 +746,15 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `nested` in this scope. ─────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `nested` in this scope. ──────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  tuple = (123, "World", tag, Ok(world), (nested, tuple), [1, 2, 3])        │
  │                                          ‾‾‾‾‾‾                            │
  └────────────────────────────────────────────────── fuzz_crash_023.md:179:42 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
 ┌──────────────────────────────┐
@@ -771,81 +771,81 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
     the value being assigned.
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `tag1` in this scope. ───────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `tag1` in this scope. ────────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  tag1,                                                                     │
  │  ‾‾‾‾                                                                      │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:183:3 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `nested` in this scope. ─────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `nested` in this scope. ──────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  (nested, tuple),                                                          │
  │   ‾‾‾‾‾‾                                                                   │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:185:4 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `foo` in this scope. ────────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `foo` in this scope. ─────────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  …t = Err(foo) ?? 12 > 5 * 5 or 13 + 2 < 5 and 10 - 1 >= 16 or 12 <= 3 / 5 │
  │           ‾‾‾                                                              │
  └────────────────────────────────────────────────── fuzz_crash_023.md:188:22 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `some_fn` in this scope. ────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `some_fn` in this scope. ─────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  …style = some_fn(arg1)?.static_dispatch_method()?.next_static_dispatch_me…│
  │           ‾‾‾‾‾‾‾                                                          │
  └────────────────────────────────────────────────── fuzz_crash_023.md:189:26 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `arg1` in this scope. ───────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `arg1` in this scope. ────────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  …some_fn(arg1)?.static_dispatch_method()?.next_static_dispatch_method()?.…│
  │           ‾‾‾‾                                                             │
  └────────────────────────────────────────────────── fuzz_crash_023.md:189:34 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `line!` in this scope. ──────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `line!` in this scope. ───────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  Stdout.line!(interpolated)?                                               │
  │  ‾‾‾‾‾‾‾‾‾‾‾‾                                                              │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:190:2 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
-┌────────────────────┐
-│ UNDEFINED VARIABLE ├─ Nothing is named `line!` in this scope. ──────────────┐
-└┬───────────────────┘                                                        │
+┌───────────────────┐
+│ NAME NOT IN SCOPE ├─ Nothing is named `line!` in this scope. ───────────────┐
+└┬──────────────────┘                                                         │
  │                                                                            │
  │  Stdout.line!(                                                             │
  │  ‾‾‾‾‾‾‾‾‾‾‾‾                                                              │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:191:2 ┘
 
-    Is there an `import` or `exposing` missing up-top?
+    Is it misspelled, or is there an import missing?
 
 
 ┌────────────────┐
@@ -2402,7 +2402,7 @@ expect {
 				(s-expr
 					(e-not-implemented))
 				(s-expr
-					(e-call (constraint-fn-var 4285)
+					(e-call (constraint-fn-var 4273)
 						(e-lookup-local
 							(p-assign (ident "match_time")))
 						(e-not-implemented)))
@@ -2425,7 +2425,7 @@ expect {
 							(p-assign (ident "#interp_0"))
 							(e-lookup-local
 								(p-assign (ident "world"))))
-						(e-interpolation (constraint-fn-var 4376)
+						(e-interpolation (constraint-fn-var 4364)
 							(first
 								(e-literal (string "Hello, ")))
 							(parts
@@ -2473,7 +2473,7 @@ expect {
 											(e-literal (string "")))))))
 						(s-reassign
 							(p-assign (ident "number"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 4634)
+							(e-dispatch-call (method "plus") (constraint-fn-var 4622)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "number"))))
@@ -2543,7 +2543,7 @@ expect {
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 5067)
+								(e-dispatch-call (method "is_gt") (constraint-fn-var 5055)
 									(receiver
 										(e-match
 											(match
@@ -2568,7 +2568,7 @@ expect {
 														(value
 															(e-num (value "12"))))))))
 									(args
-										(e-dispatch-call (method "times") (constraint-fn-var 5062)
+										(e-dispatch-call (method "times") (constraint-fn-var 5050)
 											(receiver
 												(e-num (value "5")))
 											(args
@@ -2583,18 +2583,18 @@ expect {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_lt") (constraint-fn-var 5184)
+													(e-dispatch-call (method "is_lt") (constraint-fn-var 5172)
 														(receiver
-															(e-dispatch-call (method "plus") (constraint-fn-var 5146)
+															(e-dispatch-call (method "plus") (constraint-fn-var 5134)
 																(receiver
 																	(e-num (value "13")))
 																(args
 																	(e-num (value "2")))))
 														(args
 															(e-num (value "5"))))
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 5293)
+													(e-dispatch-call (method "is_gte") (constraint-fn-var 5281)
 														(receiver
-															(e-dispatch-call (method "minus") (constraint-fn-var 5255)
+															(e-dispatch-call (method "minus") (constraint-fn-var 5243)
 																(receiver
 																	(e-num (value "10")))
 																(args
@@ -2609,11 +2609,11 @@ expect {
 											(builtin)
 											(e-tag (name "True")))))
 								(if-else
-									(e-dispatch-call (method "is_lte") (constraint-fn-var 5412)
+									(e-dispatch-call (method "is_lte") (constraint-fn-var 5400)
 										(receiver
 											(e-num (value "12")))
 										(args
-											(e-dispatch-call (method "div_by") (constraint-fn-var 5407)
+											(e-dispatch-call (method "div_by") (constraint-fn-var 5395)
 												(receiver
 													(e-num (value "3")))
 												(args
@@ -2628,12 +2628,12 @@ expect {
 										(e-match
 											(match
 												(cond
-													(e-dispatch-call (method "next_static_dispatch_method") (constraint-fn-var 5478)
+													(e-dispatch-call (method "next_static_dispatch_method") (constraint-fn-var 5466)
 														(receiver
 															(e-match
 																(match
 																	(cond
-																		(e-dispatch-call (method "static_dispatch_method") (constraint-fn-var 5445)
+																		(e-dispatch-call (method "static_dispatch_method") (constraint-fn-var 5433)
 																			(receiver
 																				(e-match
 																					(match

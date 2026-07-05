@@ -279,6 +279,8 @@ scratch_assoc_alias_sinks: base.Scratch(AssociatedAliasSink),
 scratch_record_fields: base.Scratch(types.RecordField),
 /// Scratch ident
 scratch_seen_record_fields: base.Scratch(SeenRecordField),
+/// Scratch tag names for duplicate detection in type annotations.
+scratch_seen_tags: base.Scratch(SeenTag),
 /// Scratch expression ids for short-lived dynamic lists.
 scratch_expr_ids: base.Scratch(Expr.Idx),
 /// Scratch pattern ids for short-lived dynamic lists.
@@ -407,6 +409,8 @@ const RecordField = CIR.RecordField;
 
 /// Struct to track fields that have been seen before during canonicalization
 const SeenRecordField = struct { ident: base.Ident.Idx, region: base.Region };
+const SeenTag = struct { ident: base.Ident.Idx, region: base.Region };
+const SeenTypeParameter = struct { ident: base.Ident.Idx, region: base.Region };
 
 const RecordBuilderMap2 = union(enum) {
     local: Pattern.Idx,
@@ -627,6 +631,7 @@ pub fn deinit(
     self.scratch_assoc_alias_sinks.deinit();
     self.scratch_record_fields.deinit();
     self.scratch_seen_record_fields.deinit();
+    self.scratch_seen_tags.deinit();
     self.scratch_expr_ids.deinit();
     self.scratch_pattern_ids.deinit();
     self.import_indices.deinit(gpa);
@@ -700,6 +705,7 @@ fn initInternal(
         .scratch_assoc_alias_sinks = try base.Scratch(AssociatedAliasSink).init(gpa),
         .scratch_record_fields = try base.Scratch(types.RecordField).init(gpa),
         .scratch_seen_record_fields = try base.Scratch(SeenRecordField).init(gpa),
+        .scratch_seen_tags = try base.Scratch(SeenTag).init(gpa),
         .scratch_expr_ids = try base.Scratch(Expr.Idx).init(gpa),
         .scratch_pattern_ids = try base.Scratch(Pattern.Idx).init(gpa),
         .type_vars_scope = try base.Scratch(TypeVarScope).init(gpa),
@@ -770,7 +776,10 @@ fn getOrCreateAutoImportedTypeImport(
     }
 
     const import_ident = if (info.is_package_qualified)
-        source_module_ident
+        if (self.scopeLookupModule(source_module_ident)) |module_info|
+            module_info.module_name
+        else
+            source_module_ident
     else
         try self.env.insertIdent(base.Ident.for_text(info.env.module_name));
 
@@ -926,6 +935,14 @@ fn populateBuiltinAutoImportedTypes(
             .qualified_type_ident = qualified_ident,
         });
     }
+
+    const encoding_ident = try calling_module_env.insertIdent(base.Ident.for_text("Encoding"));
+    const encoding_qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text("Builtin.Encoding"));
+    try self.builtin_auto_imported_types.put(gpa, encoding_ident, .{
+        .env = builtin_module_env,
+        .statement_idx = null,
+        .qualified_type_ident = encoding_qualified_ident,
+    });
 }
 
 /// Legacy helper for caller-owned import maps.
@@ -952,6 +969,14 @@ pub fn populateModuleEnvs(
             .qualified_type_ident = qualified_ident,
         });
     }
+
+    const encoding_ident = try calling_module_env.insertIdent(base.Ident.for_text("Encoding"));
+    const encoding_qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text("Builtin.Encoding"));
+    try module_envs_map.put(encoding_ident, .{
+        .env = builtin_module_env,
+        .statement_idx = null,
+        .qualified_type_ident = encoding_qualified_ident,
+    });
 }
 
 /// Set up auto-imported builtin types (Bool, Try, Dict, Set, Str, Iter, and numeric types) from the Builtin module.
@@ -977,7 +1002,7 @@ pub fn setupAutoImportedBuiltinTypes(
         builtin_ident,
     );
 
-    const builtin_types = [_][]const u8{ "Bool", "ParseTagUnionSpec", "Try", "Dict", "Set", "Str", "Iter", "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128", "Dec", "F32", "F64", "Numeral" };
+    const builtin_types = [_][]const u8{ "Bool", "Json", "Encoding", "Try", "Dict", "Set", "Str", "Iter", "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128", "Dec", "F32", "F64", "Numeral", "Crypto" };
     for (builtin_types) |type_name_text| {
         const type_ident = try env.insertIdent(base.Ident.for_text(type_name_text));
         if (self.builtin_auto_imported_types.get(type_ident)) |type_entry| {
@@ -7058,7 +7083,11 @@ fn canonicalizeModuleQualifiedIdent(
             if (qualifier_tokens.len == 1) {
                 break :name_blk field_text;
             }
-            break :name_blk try self.scratchQualifiedText(module_env.module_name, nested_path);
+            const qualified_text = if (compiler_builtin_auto_import)
+                self.env.getIdent(info.qualified_type_ident)
+            else
+                module_env.module_name;
+            break :name_blk try self.scratchQualifiedText(qualified_text, nested_path);
         };
 
         const qname_ident = module_env.common.findIdent(lookup_name) orelse break :blk null;
@@ -13029,7 +13058,7 @@ fn buildMap2Call(
         .e_call = .{
             .func = func_expr_idx,
             .args = args_span,
-            .called_via = CalledVia.apply,
+            .called_via = CalledVia.record_builder,
         },
     }, region);
 }
@@ -13494,6 +13523,27 @@ fn finishNominalConstructionForType(
     const is_imported = self.scopeLookupModule(first_tok_ident) != null;
     const full_type_name = self.parse_ir.resolveQualifiedName(type_expr.qualifiers, type_expr.token, &strip_tokens);
 
+    if (self.lookupAvailableModuleEnv(first_tok_ident)) |auto_imported_type| {
+        if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_tok_ident, full_type_name)) |target_node_idx| {
+            const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type, first_tok_ident);
+            const full_type_ident = try self.env.insertIdent(base.Ident.for_text(full_type_name));
+
+            if (try self.validateImportedNominalTagTarget(Expr.Idx, auto_imported_type.env, target_node_idx, first_tok_ident, full_type_ident, type_region)) |malformed_idx| {
+                return CanonicalizedExpr{ .idx = malformed_idx, .free_vars = DataSpan.empty() };
+            }
+
+            const expr_idx = try self.env.addExpr(CIR.Expr{
+                .e_nominal_external = .{
+                    .module_idx = import_idx,
+                    .target_node_idx = target_node_idx,
+                    .backing_expr = backing_expr_idx,
+                    .backing_type = backing_type,
+                },
+            }, region);
+            return CanonicalizedExpr{ .idx = expr_idx, .free_vars = free_vars };
+        }
+    }
+
     if (!is_imported) {
         const full_type_ident = try self.env.insertIdent(base.Ident.for_text(full_type_name));
         const nominal_type_decl_stmt_idx = (try self.scopeLookupOrPrepareTypeDecl(full_type_ident)) orelse {
@@ -13864,21 +13914,61 @@ fn finishTagExprWithArgs(
 
         if (!is_imported) {
             // Local reference: look up the type locally
-            const nominal_type_decl_stmt_idx = (try self.scopeLookupOrPrepareTypeDecl(full_type_ident)) orelse {
-                return CanonicalizedExpr{
-                    .idx = try self.env.pushMalformed(Expr.Idx, Diagnostic{ .undeclared_type = .{
-                        .name = full_type_ident,
-                        .region = type_tok_region,
-                    } }),
-                    .free_vars = DataSpan.empty(),
-                };
-            };
+            if (try self.scopeLookupOrPrepareTypeDecl(full_type_ident)) |nominal_type_decl_stmt_idx| {
+                switch (self.env.store.getStatement(nominal_type_decl_stmt_idx)) {
+                    .s_nominal_decl => {
+                        const expr_idx = try self.env.addExpr(CIR.Expr{
+                            .e_nominal = .{
+                                .nominal_type_decl = nominal_type_decl_stmt_idx,
+                                .backing_expr = tag_expr_idx,
+                                .backing_type = .tag,
+                            },
+                        }, region);
 
-            switch (self.env.store.getStatement(nominal_type_decl_stmt_idx)) {
-                .s_nominal_decl => {
+                        const free_vars_span = self.scratch_free_vars.spanFrom(free_vars_start);
+                        return CanonicalizedExpr{
+                            .idx = expr_idx,
+                            .free_vars = free_vars_span,
+                        };
+                    },
+                    .s_alias_decl => {
+                        return CanonicalizedExpr{
+                            .idx = try self.env.pushMalformed(Expr.Idx, Diagnostic{ .type_alias_but_needed_nominal = .{
+                                .name = full_type_ident,
+                                .region = type_tok_region,
+                            } }),
+                            .free_vars = DataSpan.empty(),
+                        };
+                    },
+                    else => {
+                        const feature = try self.env.insertString("report an error resolved type decl in scope wasn't actually a type decl");
+                        const malformed_idx = try self.env.pushMalformed(Expr.Idx, Diagnostic{ .not_implemented = .{
+                            .feature = feature,
+                            .region = type_tok_region,
+                        } });
+                        return CanonicalizedExpr{
+                            .idx = malformed_idx,
+                            .free_vars = DataSpan.empty(),
+                        };
+                    },
+                }
+            }
+
+            if (self.lookupAvailableModuleEnv(first_tok_ident)) |auto_imported_type| {
+                if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_tok_ident, full_type_name)) |target_node_idx| {
+                    const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type, first_tok_ident);
+
+                    if (try self.validateImportedNominalTagTarget(Expr.Idx, auto_imported_type.env, target_node_idx, first_tok_ident, full_type_ident, type_tok_region)) |malformed_idx| {
+                        return CanonicalizedExpr{
+                            .idx = malformed_idx,
+                            .free_vars = DataSpan.empty(),
+                        };
+                    }
+
                     const expr_idx = try self.env.addExpr(CIR.Expr{
-                        .e_nominal = .{
-                            .nominal_type_decl = nominal_type_decl_stmt_idx,
+                        .e_nominal_external = .{
+                            .module_idx = import_idx,
+                            .target_node_idx = target_node_idx,
                             .backing_expr = tag_expr_idx,
                             .backing_type = .tag,
                         },
@@ -13889,28 +13979,16 @@ fn finishTagExprWithArgs(
                         .idx = expr_idx,
                         .free_vars = free_vars_span,
                     };
-                },
-                .s_alias_decl => {
-                    return CanonicalizedExpr{
-                        .idx = try self.env.pushMalformed(Expr.Idx, Diagnostic{ .type_alias_but_needed_nominal = .{
-                            .name = full_type_ident,
-                            .region = type_tok_region,
-                        } }),
-                        .free_vars = DataSpan.empty(),
-                    };
-                },
-                else => {
-                    const feature = try self.env.insertString("report an error resolved type decl in scope wasn't actually a type decl");
-                    const malformed_idx = try self.env.pushMalformed(Expr.Idx, Diagnostic{ .not_implemented = .{
-                        .feature = feature,
-                        .region = type_tok_region,
-                    } });
-                    return CanonicalizedExpr{
-                        .idx = malformed_idx,
-                        .free_vars = DataSpan.empty(),
-                    };
-                },
+                }
             }
+
+            return CanonicalizedExpr{
+                .idx = try self.env.pushMalformed(Expr.Idx, Diagnostic{ .undeclared_type = .{
+                    .name = full_type_ident,
+                    .region = type_tok_region,
+                } }),
+                .free_vars = DataSpan.empty(),
+            };
         }
 
         // Import reference: look up the type in the imported file
@@ -14397,11 +14475,40 @@ fn finishTagPattern(
         const type_tok_region = self.parse_ir.tokens.resolve(type_tok_idx);
 
         // Lookup the type ident in scope
-        const nominal_type_decl_stmt_idx = (try self.scopeLookupOrPrepareTypeDecl(type_tok_ident)) orelse
+        const nominal_type_decl_stmt_idx = (try self.scopeLookupOrPrepareTypeDecl(type_tok_ident)) orelse {
+            if (self.lookupAvailableModuleEnv(type_tok_ident)) |auto_imported_type| {
+                if (auto_imported_type.statement_idx) |stmt_idx| {
+                    const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type, type_tok_ident);
+                    const target_node_idx = auto_imported_type.env.getExposedNodeIndexByStatementIdx(stmt_idx) orelse {
+                        const module_name_text = auto_imported_type.env.module_name;
+                        const module_ident = try self.env.insertIdent(base.Ident.for_text(module_name_text));
+                        return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .nested_type_not_found = .{
+                            .parent_name = module_ident,
+                            .nested_name = type_tok_ident,
+                            .region = region,
+                        } });
+                    };
+
+                    if (try self.validateImportedNominalTagTarget(Pattern.Idx, auto_imported_type.env, target_node_idx, type_tok_ident, type_tok_ident, type_tok_region)) |malformed_idx| {
+                        return malformed_idx;
+                    }
+
+                    return try self.env.addPattern(CIR.Pattern{
+                        .nominal_external = .{
+                            .module_idx = import_idx,
+                            .target_node_idx = target_node_idx,
+                            .backing_pattern = tag_pattern_idx,
+                            .backing_type = .tag,
+                        },
+                    }, region);
+                }
+            }
+
             return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .undeclared_type = .{
                 .name = type_tok_ident,
                 .region = type_tok_region,
             } });
+        };
 
         switch (self.env.store.getStatement(nominal_type_decl_stmt_idx)) {
             .s_nominal_decl => {
@@ -14450,39 +14557,58 @@ fn finishTagPattern(
         const full_type_ident = try self.env.insertIdent(base.Ident.for_text(full_type_name));
 
         const module_info = self.scopeLookupModule(first_tok_ident) orelse {
-            const nominal_type_decl_stmt_idx = (try self.scopeLookupOrPrepareTypeDecl(full_type_ident)) orelse {
-                return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .undeclared_type = .{
-                    .name = full_type_ident,
-                    .region = type_tok_region,
-                } });
-            };
+            if (try self.scopeLookupOrPrepareTypeDecl(full_type_ident)) |nominal_type_decl_stmt_idx| {
+                switch (self.env.store.getStatement(nominal_type_decl_stmt_idx)) {
+                    .s_nominal_decl => {
+                        const pattern_idx = try self.env.addPattern(CIR.Pattern{
+                            .nominal = .{
+                                .nominal_type_decl = nominal_type_decl_stmt_idx,
+                                .backing_pattern = tag_pattern_idx,
+                                .backing_type = .tag,
+                            },
+                        }, region);
 
-            switch (self.env.store.getStatement(nominal_type_decl_stmt_idx)) {
-                .s_nominal_decl => {
-                    const pattern_idx = try self.env.addPattern(CIR.Pattern{
-                        .nominal = .{
-                            .nominal_type_decl = nominal_type_decl_stmt_idx,
+                        return pattern_idx;
+                    },
+                    .s_alias_decl => {
+                        return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .type_alias_but_needed_nominal = .{
+                            .name = full_type_ident,
+                            .region = type_tok_region,
+                        } });
+                    },
+                    else => {
+                        const feature = try self.env.insertString("report an error resolved type decl in scope wasn't actually a type decl");
+                        return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .not_implemented = .{
+                            .feature = feature,
+                            .region = type_tok_region,
+                        } });
+                    },
+                }
+            }
+
+            if (self.lookupAvailableModuleEnv(first_tok_ident)) |auto_imported_type| {
+                if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_tok_ident, full_type_name)) |target_node_idx| {
+                    const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type, first_tok_ident);
+
+                    if (try self.validateImportedNominalTagTarget(Pattern.Idx, auto_imported_type.env, target_node_idx, first_tok_ident, full_type_ident, type_tok_region)) |malformed_idx| {
+                        return malformed_idx;
+                    }
+
+                    return try self.env.addPattern(CIR.Pattern{
+                        .nominal_external = .{
+                            .module_idx = import_idx,
+                            .target_node_idx = target_node_idx,
                             .backing_pattern = tag_pattern_idx,
                             .backing_type = .tag,
                         },
                     }, region);
-
-                    return pattern_idx;
-                },
-                .s_alias_decl => {
-                    return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .type_alias_but_needed_nominal = .{
-                        .name = full_type_ident,
-                        .region = type_tok_region,
-                    } });
-                },
-                else => {
-                    const feature = try self.env.insertString("report an error resolved type decl in scope wasn't actually a type decl");
-                    return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .not_implemented = .{
-                        .feature = feature,
-                        .region = type_tok_region,
-                    } });
-                },
+                }
             }
+
+            return try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .undeclared_type = .{
+                .name = full_type_ident,
+                .region = type_tok_region,
+            } });
         };
 
         const module_name = module_info.module_name;
@@ -17094,6 +17220,7 @@ const TypeAnnoKernelRecordNextWork = struct {
     field_index: usize,
     scratch_top: u32,
     scratch_record_fields_top: u32,
+    scratch_seen_record_fields_top: u32,
     /// True when this record is the top-level backing of a nominal/opaque
     /// declaration, where unnamed fields (`_` / `_name`) are permitted.
     is_nominal_backing: bool,
@@ -17104,6 +17231,7 @@ const TypeAnnoKernelRecordAfterFieldWork = struct {
     field_index: usize,
     scratch_top: u32,
     scratch_record_fields_top: u32,
+    scratch_seen_record_fields_top: u32,
     field_name: Ident.Idx,
     field_region: Region,
     is_nominal_backing: bool,
@@ -17116,6 +17244,7 @@ const TypeAnnoKernelRecordAfterNamedExtWork = struct {
     field_anno_idxs: CIR.TypeAnno.RecordField.Span,
     scratch_top: u32,
     scratch_record_fields_top: u32,
+    scratch_seen_record_fields_top: u32,
 };
 const TypeAnnoKernelTagUnionTagsNextWork = struct {
     tag_union: @TypeOf(@as(AST.TypeAnno, undefined).tag_union),
@@ -17123,6 +17252,7 @@ const TypeAnnoKernelTagUnionTagsNextWork = struct {
     ext: ?TypeAnno.Idx,
     next: usize,
     scratch_top: u32,
+    scratch_seen_tags_top: u32,
 };
 const TypeAnnoKernelTagUnionTagAfterWork = struct {
     tag_union: @TypeOf(@as(AST.TypeAnno, undefined).tag_union),
@@ -17130,6 +17260,7 @@ const TypeAnnoKernelTagUnionTagAfterWork = struct {
     ext: ?TypeAnno.Idx,
     next: usize,
     scratch_top: u32,
+    scratch_seen_tags_top: u32,
 };
 const TypeAnnoKernelTagUnionAfterNamedExtWork = struct {
     tag_union: @TypeOf(@as(AST.TypeAnno, undefined).tag_union),
@@ -17554,6 +17685,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                         .field_index = 0,
                         .scratch_top = self.env.store.scratchAnnoRecordFieldTop(),
                         .scratch_record_fields_top = self.scratch_record_fields.top(),
+                        .scratch_seen_record_fields_top = self.scratch_seen_record_fields.top(),
                         .is_nominal_backing = is_nominal_backing,
                     });
                 },
@@ -17596,6 +17728,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                         .ext = mb_ext_anno,
                         .next = 0,
                         .scratch_top = self.env.store.scratchTypeAnnoTop(),
+                        .scratch_seen_tags_top = self.scratch_seen_tags.top(),
                     });
                 },
                 .@"fn" => |func| {
@@ -17729,6 +17862,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                     .closed => {
                         self.env.store.clearScratchAnnoRecordFieldsFrom(state.scratch_top);
                         self.scratch_record_fields.clearFrom(state.scratch_record_fields_top);
+                        self.scratch_seen_record_fields.clearFrom(state.scratch_seen_record_fields_top);
                         last = try self.env.addTypeAnno(.{ .record = .{
                             .fields = field_anno_idxs,
                             .ext = null,
@@ -17742,6 +17876,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                                 } }, state.region);
                                 self.env.store.clearScratchAnnoRecordFieldsFrom(state.scratch_top);
                                 self.scratch_record_fields.clearFrom(state.scratch_record_fields_top);
+                                self.scratch_seen_record_fields.clearFrom(state.scratch_seen_record_fields_top);
                                 last = try self.env.addTypeAnno(.{ .record = .{
                                     .fields = field_anno_idxs,
                                     .ext = ext,
@@ -17750,6 +17885,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                             .type_decl_anno, .for_clause_anno => {
                                 self.env.store.clearScratchAnnoRecordFieldsFrom(state.scratch_top);
                                 self.scratch_record_fields.clearFrom(state.scratch_record_fields_top);
+                                self.scratch_seen_record_fields.clearFrom(state.scratch_seen_record_fields_top);
                                 last = try self.env.pushMalformed(TypeAnno.Idx, Diagnostic{
                                     .open_ext_not_allowed_in_type_decl = .{
                                         .region = self.parse_ir.tokenizedRegionToRegion(.{ .start = open_tok, .end = open_tok + 1 }),
@@ -17764,6 +17900,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                             .field_anno_idxs = field_anno_idxs,
                             .scratch_top = state.scratch_top,
                             .scratch_record_fields_top = state.scratch_record_fields_top,
+                            .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                         });
                         try stacks.pushParse(frame_allocator, named.anno);
                     },
@@ -17777,6 +17914,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                             .field_index = state.field_index + 1,
                             .scratch_top = state.scratch_top,
                             .scratch_record_fields_top = state.scratch_record_fields_top,
+                            .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                             .is_nominal_backing = state.is_nominal_backing,
                         });
                         continue :typeannokernel_loop .dispatch;
@@ -17798,18 +17936,51 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                         .field_index = state.field_index + 1,
                         .scratch_top = state.scratch_top,
                         .scratch_record_fields_top = state.scratch_record_fields_top,
+                        .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                         .is_nominal_backing = state.is_nominal_backing,
                     });
                     continue :typeannokernel_loop .dispatch;
                 }
 
                 const field_name = self.parse_ir.tokens.resolveIdentifier(ast_field.name) orelse try self.env.insertIdent(Ident.for_text("malformed_field"));
+                const field_name_region = self.parse_ir.tokens.resolve(ast_field.name);
+                if (!is_unnamed) {
+                    var found_duplicate = false;
+                    for (self.scratch_seen_record_fields.sliceFromStart(state.scratch_seen_record_fields_top)) |seen_field| {
+                        if (field_name.eql(seen_field.ident)) {
+                            try self.env.pushDiagnostic(Diagnostic{ .duplicate_record_field = .{
+                                .field_name = field_name,
+                                .duplicate_region = field_name_region,
+                                .original_region = seen_field.region,
+                            } });
+                            found_duplicate = true;
+                            break;
+                        }
+                    }
+                    if (found_duplicate) {
+                        try stacks.pushRecordNext(frame_allocator, .{
+                            .record = state.record,
+                            .region = state.region,
+                            .field_index = state.field_index + 1,
+                            .scratch_top = state.scratch_top,
+                            .scratch_record_fields_top = state.scratch_record_fields_top,
+                            .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
+                            .is_nominal_backing = state.is_nominal_backing,
+                        });
+                        continue :typeannokernel_loop .dispatch;
+                    }
+                    try self.scratch_seen_record_fields.append(SeenRecordField{
+                        .ident = field_name,
+                        .region = field_name_region,
+                    });
+                }
                 try stacks.pushRecordAfterField(frame_allocator, .{
                     .record = state.record,
                     .region = state.region,
                     .field_index = state.field_index,
                     .scratch_top = state.scratch_top,
                     .scratch_record_fields_top = state.scratch_record_fields_top,
+                    .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                     .field_name = field_name,
                     .field_region = self.parse_ir.tokenizedRegionToRegion(ast_field.region),
                     .is_nominal_backing = state.is_nominal_backing,
@@ -17845,6 +18016,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                 .field_index = state.field_index + 1,
                 .scratch_top = state.scratch_top,
                 .scratch_record_fields_top = state.scratch_record_fields_top,
+                .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                 .is_nominal_backing = state.is_nominal_backing,
             });
 
@@ -17855,6 +18027,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
             const ext = last orelse unreachable;
             self.env.store.clearScratchAnnoRecordFieldsFrom(state.scratch_top);
             self.scratch_record_fields.clearFrom(state.scratch_record_fields_top);
+            self.scratch_seen_record_fields.clearFrom(state.scratch_seen_record_fields_top);
             last = try self.env.addTypeAnno(.{ .record = .{
                 .fields = state.field_anno_idxs,
                 .ext = ext,
@@ -17871,6 +18044,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                 .ext = ext,
                 .next = 0,
                 .scratch_top = self.env.store.scratchTypeAnnoTop(),
+                .scratch_seen_tags_top = self.scratch_seen_tags.top(),
             });
 
             continue :typeannokernel_loop .dispatch;
@@ -17881,6 +18055,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
             if (state.next >= tags.len) {
                 const tag_anno_idxs = try self.env.store.typeAnnoSpanFrom(state.scratch_top);
                 self.env.store.clearScratchTypeAnnosFrom(state.scratch_top);
+                self.scratch_seen_tags.clearFrom(state.scratch_seen_tags_top);
                 last = try self.env.addTypeAnno(.{ .tag_union = .{
                     .tags = tag_anno_idxs,
                     .ext = state.ext,
@@ -17892,6 +18067,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                     .ext = state.ext,
                     .next = state.next,
                     .scratch_top = state.scratch_top,
+                    .scratch_seen_tags_top = state.scratch_seen_tags_top,
                 });
                 try stacks.pushTagParse(frame_allocator, tags[state.next]);
             }
@@ -17901,13 +18077,39 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
         .tag_union_tag_after => {
             const state = stacks.takeTagUnionTagAfter();
             const tag_idx = last orelse unreachable;
-            try self.env.store.addScratchTypeAnno(tag_idx);
+            var found_duplicate = false;
+            const tag_anno = self.env.store.getTypeAnno(tag_idx);
+            if (tag_anno == .tag) {
+                const tag = tag_anno.tag;
+                const tag_region = self.env.store.getTypeAnnoRegion(tag_idx);
+                for (self.scratch_seen_tags.sliceFromStart(state.scratch_seen_tags_top)) |seen_tag| {
+                    if (tag.name.eql(seen_tag.ident)) {
+                        try self.env.pushDiagnostic(Diagnostic{ .duplicate_tag = .{
+                            .tag_name = tag.name,
+                            .duplicate_region = tag_region,
+                            .original_region = seen_tag.region,
+                        } });
+                        found_duplicate = true;
+                        break;
+                    }
+                }
+                if (!found_duplicate) {
+                    try self.scratch_seen_tags.append(SeenTag{
+                        .ident = tag.name,
+                        .region = tag_region,
+                    });
+                }
+            }
+            if (!found_duplicate) {
+                try self.env.store.addScratchTypeAnno(tag_idx);
+            }
             try stacks.pushTagUnionTagsNext(frame_allocator, .{
                 .tag_union = state.tag_union,
                 .region = state.region,
                 .ext = state.ext,
                 .next = state.next + 1,
                 .scratch_top = state.scratch_top,
+                .scratch_seen_tags_top = state.scratch_seen_tags_top,
             });
 
             continue :typeannokernel_loop .dispatch;
@@ -18241,6 +18443,16 @@ fn canonicalizeTypeAnnoBasicType(
         }
 
         const first_qualifier_ident = self.parse_ir.tokens.resolveIdentifier(qualifier_toks[0]) orelse unreachable;
+        if (self.lookupAvailableModuleEnv(first_qualifier_ident)) |auto_imported_type| {
+            if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_qualifier_ident, qualified_prefix)) |target_node_idx| {
+                const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type, first_qualifier_ident);
+                return try self.env.addTypeAnno(CIR.TypeAnno{ .lookup = .{ .name = qualified_name_ident, .base = .{ .external = .{
+                    .module_idx = import_idx,
+                    .target_node_idx = target_node_idx,
+                } } } }, region);
+            }
+        }
+
         if (self.scopeLookupModule(first_qualifier_ident)) |module_info| {
             const module_name = module_info.module_name;
             const import_idx = self.scopeLookupImportedModule(module_name) orelse {
@@ -18381,6 +18593,93 @@ fn canonicalizeTypeAnnoBasicType(
     }
 }
 
+fn lookupNestedAutoImportedTypeNode(
+    self: *Self,
+    imported_type: AutoImportedType,
+    source_root_ident: Ident.Idx,
+    type_path_text: []const u8,
+) std.mem.Allocator.Error!?u32 {
+    const nested_suffix = self.nestedAutoImportedTypeSuffix(imported_type, source_root_ident, type_path_text);
+
+    const qualified_type_text = self.env.getIdent(imported_type.qualified_type_ident);
+    if (std.mem.eql(u8, qualified_type_text, "Builtin.Encoding") and isHiddenEncodingNestedType(nested_suffix)) {
+        return null;
+    }
+
+    const scratch_top = self.scratchBytesTop();
+    defer self.clearScratchBytesFrom(scratch_top);
+    const lookup_prefix = if (autoImportedTypeUsesCompilerBuiltinImport(imported_type))
+        qualified_type_text
+    else
+        imported_type.env.module_name;
+    const builtin_nested_path = try self.scratchQualifiedText(lookup_prefix, nested_suffix);
+
+    return (try self.lookupImportedExposedTypeNode(imported_type.env, builtin_nested_path)) orelse
+        (try self.lookupImportedTypeDeclNode(imported_type.env, builtin_nested_path));
+}
+
+fn nestedAutoImportedTypeSuffix(
+    self: *Self,
+    imported_type: AutoImportedType,
+    source_root_ident: Ident.Idx,
+    type_path_text: []const u8,
+) []const u8 {
+    const source_root_text = self.env.getIdent(source_root_ident);
+    if (std.mem.startsWith(u8, type_path_text, source_root_text) and
+        type_path_text.len > source_root_text.len and
+        type_path_text[source_root_text.len] == '.')
+    {
+        return type_path_text[source_root_text.len + 1 ..];
+    }
+
+    const qualified_type_text = self.env.getIdent(imported_type.qualified_type_ident);
+    if (std.mem.startsWith(u8, type_path_text, qualified_type_text) and
+        type_path_text.len > qualified_type_text.len and
+        type_path_text[qualified_type_text.len] == '.')
+    {
+        return type_path_text[qualified_type_text.len + 1 ..];
+    }
+
+    return type_path_text;
+}
+
+fn isHiddenAutoImportedNestedType(
+    self: *Self,
+    imported_type: AutoImportedType,
+    source_root_ident: Ident.Idx,
+    type_path_text: []const u8,
+) bool {
+    const qualified_type_text = self.env.getIdent(imported_type.qualified_type_ident);
+    if (!std.mem.eql(u8, qualified_type_text, "Builtin.Encoding")) {
+        return false;
+    }
+
+    const nested_suffix = self.nestedAutoImportedTypeSuffix(imported_type, source_root_ident, type_path_text);
+    return isHiddenEncodingNestedType(nested_suffix);
+}
+
+fn isHiddenEncodingNestedType(nested_suffix: []const u8) bool {
+    const hidden_names = [_][]const u8{
+        "JsonState",
+        "JsonEncodeState",
+        "JsonEncoding",
+        "HttpHeaderState",
+        "HttpHeaderEncoding",
+    };
+
+    inline for (hidden_names) |hidden_name| {
+        if (std.mem.eql(u8, nested_suffix, hidden_name)) return true;
+        if (std.mem.startsWith(u8, nested_suffix, hidden_name) and
+            nested_suffix.len > hidden_name.len and
+            nested_suffix[hidden_name.len] == '.')
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 fn resolveNestedExternalTypeAnno(
     self: *Self,
     external: Scope.ExternalTypeBinding,
@@ -18392,8 +18691,12 @@ fn resolveNestedExternalTypeAnno(
     const imported_type = self.lookupAvailableModuleEnv(external.module_ident) orelse
         self.lookupAvailableModuleEnv(external.original_ident) orelse
         return null;
+    if (self.isHiddenAutoImportedNestedType(imported_type, external.original_ident, type_path_text)) {
+        return null;
+    }
     const target_node_idx = (try self.lookupImportedExposedTypeNode(imported_type.env, type_path_text)) orelse
         (try self.lookupImportedTypeDeclNode(imported_type.env, type_path_text)) orelse
+        (try self.lookupNestedAutoImportedTypeNode(imported_type, external.original_ident, type_path_text)) orelse
         return null;
 
     return try self.env.addTypeAnno(CIR.TypeAnno{ .lookup = .{ .name = type_path_ident, .base = .{ .external = .{
@@ -18403,6 +18706,28 @@ fn resolveNestedExternalTypeAnno(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+fn recordTypeHeaderParameter(
+    self: *Self,
+    seen_type_parameters: *std.ArrayList(SeenTypeParameter),
+    type_name: Ident.Idx,
+    param_ident: Ident.Idx,
+    param_region: Region,
+) std.mem.Allocator.Error!bool {
+    for (seen_type_parameters.items) |seen| {
+        if (param_ident.eql(seen.ident)) {
+            try self.env.pushDiagnostic(Diagnostic{ .type_parameter_conflict = .{
+                .name = type_name,
+                .parameter_name = param_ident,
+                .region = param_region,
+                .original_region = seen.region,
+            } });
+            return true;
+        }
+    }
+    try seen_type_parameters.append(self.env.gpa, .{ .ident = param_ident, .region = param_region });
+    return false;
+}
 
 fn canonicalizeTypeHeader(self: *Self, header_idx: AST.TypeHeader.Idx, type_kind: AST.TypeDeclKind) std.mem.Allocator.Error!CIR.TypeHeader.Idx {
     const trace = tracy.trace(@src());
@@ -18432,6 +18757,8 @@ fn canonicalizeTypeHeader(self: *Self, header_idx: AST.TypeHeader.Idx, type_kind
     // Canonicalize type arguments - these are parameter declarations, not references
     const scratch_top = self.env.store.scratchTypeAnnoTop();
     defer self.env.store.clearScratchTypeAnnosFrom(scratch_top);
+    var seen_type_parameters = std.ArrayList(SeenTypeParameter).empty;
+    defer seen_type_parameters.deinit(self.env.gpa);
 
     for (self.parse_ir.store.typeAnnoSlice(ast_header.args)) |arg_idx| {
         const ast_arg = self.parse_ir.store.getTypeAnno(arg_idx);
@@ -18446,6 +18773,8 @@ fn canonicalizeTypeHeader(self: *Self, header_idx: AST.TypeHeader.Idx, type_kind
                     try self.env.store.addScratchTypeAnno(malformed);
                     continue;
                 };
+
+                if (try self.recordTypeHeaderParameter(&seen_type_parameters, name_ident, param_ident, param_region)) continue;
 
                 // Create type variable annotation for this parameter
                 // Check for underscore in type parameter
@@ -18473,6 +18802,8 @@ fn canonicalizeTypeHeader(self: *Self, header_idx: AST.TypeHeader.Idx, type_kind
                     try self.env.store.addScratchTypeAnno(malformed);
                     continue;
                 };
+
+                if (try self.recordTypeHeaderParameter(&seen_type_parameters, name_ident, param_ident, param_region)) continue;
 
                 // Only reject underscore-prefixed parameters for type aliases, not nominal/opaque types
                 if (type_kind == .alias) {

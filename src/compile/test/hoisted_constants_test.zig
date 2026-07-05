@@ -191,7 +191,7 @@ test "hoisted local constants are finalized and restored during runtime lowering
     try std.testing.expect(!coord.hasUserErrors());
 
     const root = coord.executableRootCheckedArtifact();
-    const app_artifact = coord.rootCheckedArtifact("app");
+    const app_artifact = coord.appRootCheckedArtifact();
     const app_view = check.CheckedArtifact.importedView(app_artifact);
     const imports = try coord.collectImportedArtifactViews(arena, root);
     const relations = try coord.collectRelationArtifactViews(arena, root);
@@ -281,15 +281,15 @@ test "imported checked bodies restore their module's hoisted constants" {
     try tmp_dir.dir.writeFile(std.testing.io, .{
         .sub_path = "Helper.roc",
         .data =
-        \\module [helper, base]
+        \\Helper := [].{
+        \\    base = 41.I64
         \\
-        \\base = 41.I64
-        \\
-        \\helper : I64 -> I64
-        \\helper = |arg| {
-        \\    x = 41.I64
-        \\    y = x + 1.I64
-        \\    y + arg
+        \\    helper : I64 -> I64
+        \\    helper = |arg| {
+        \\        x = 41.I64
+        \\        y = x + 1.I64
+        \\        y + arg
+        \\    }
         \\}
         ,
     });
@@ -357,7 +357,7 @@ test "imported checked bodies restore their module's hoisted constants" {
     try std.testing.expect(!coord.hasUserErrors());
 
     const root = coord.executableRootCheckedArtifact();
-    const app_artifact = coord.rootCheckedArtifact("app");
+    const app_artifact = coord.appRootCheckedArtifact();
     const app_view = check.CheckedArtifact.importedView(app_artifact);
     const imports = try coord.collectImportedArtifactViews(arena, root);
     const relations = try coord.collectRelationArtifactViews(arena, root);
@@ -930,7 +930,7 @@ test "hoisted match guard does not report unused branch warning" {
     }
     try std.testing.expect(!found_unused_branch);
 
-    const artifact = coord.rootCheckedArtifact("app");
+    const artifact = coord.appRootCheckedArtifact();
     var found_hoisted_root = false;
     for (artifact.compile_time_roots.roots) |root| {
         if (root.kind == .hoisted_constant) found_hoisted_root = true;
@@ -1630,7 +1630,7 @@ test "issue 9733: nested expect statements are collected as test roots" {
     try coord.finalizeExecutableArtifacts();
     try std.testing.expect(!coord.hasUserErrors());
 
-    const app_artifact = coord.rootCheckedArtifact("app");
+    const app_artifact = coord.appRootCheckedArtifact();
 
     try std.testing.expectEqual(
         @as(usize, 2),
