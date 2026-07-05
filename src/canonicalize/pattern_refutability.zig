@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+/// Adapter-reported syntactic shape used to recurse through a pattern.
 pub const PatternClass = enum {
     cannot_miss,
     can_miss,
@@ -11,6 +12,7 @@ pub const PatternClass = enum {
     list,
 };
 
+/// Returns whether a pattern can fail to match using only adapter-provided syntax.
 pub fn canMiss(comptime Adapter: type, adapter: Adapter, pattern_id: Adapter.PatternId) bool {
     return switch (adapter.patternClass(pattern_id)) {
         .cannot_miss => false,

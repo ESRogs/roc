@@ -4,12 +4,14 @@ const std = @import("std");
 
 const ProblemStore = @import("problem/store.zig").Store;
 
+/// Syntax sites whose pending exhaustiveness diagnostics can be tracked.
 pub const SiteKind = enum {
     match,
     destructure,
     if_,
 };
 
+/// Returns whether checking records a static pending diagnostic for this site.
 pub fn siteHasPendingStaticDiagnostic(kind: SiteKind) bool {
     return switch (kind) {
         .match,
@@ -19,6 +21,7 @@ pub fn siteHasPendingStaticDiagnostic(kind: SiteKind) bool {
     };
 }
 
+/// Returns whether compile-time evaluation can observe this site.
 pub fn siteCanBeObservedAtCompileTime(kind: SiteKind) bool {
     return switch (kind) {
         .match,
@@ -28,6 +31,7 @@ pub fn siteCanBeObservedAtCompileTime(kind: SiteKind) bool {
     };
 }
 
+/// Tracks compile-time roots that affect exhaustiveness reporting mode.
 pub const Context = struct {
     depth: u32 = 0,
 
@@ -55,6 +59,7 @@ pub const Context = struct {
     }
 };
 
+/// Restores a `Context` after entering or temporarily resetting a root scope.
 pub const Scope = struct {
     context: *Context,
     saved_depth: ?u32,
