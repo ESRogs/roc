@@ -2907,6 +2907,89 @@ fn expectNoReachableErasedCallableLowering(
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, lowered, "packed_erased_fn_count"));
 }
 
+// Zero-allocation gate for iterator chains that escape their construction site
+// (returned from a function, passed to a non-inlined function, chosen by a
+// branch). Range sources carry no list, so a statically-known chain must lower
+// to no heap allocation at all: no boxed iterator state, no erased callable
+// dispatch, no list allocation. This is the static companion to the runtime
+// allocations_at_most=0 gate in eval_iter_alloc_tests.zig, which cannot express
+// module-level function definitions. RED on the recursive-nominal
+// representation (an escaping iterator boxes its state in its constructor).
+fn expectEscapingIterChainAllocatesNothing(source: []const u8) anyerror!void {
+    const allocator = std.testing.allocator;
+    var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
+    defer optimized.deinit(allocator);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "box_box_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "packed_erased_fn_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "list_with_capacity_count", 0);
+}
+
+test "iter alloc static: iterator returned from a function is zero-alloc" {
+    try expectEscapingIterChainAllocatesNothing(
+        \\module [main]
+        \\
+        \\consume : Iter(U64) -> U64
+        \\consume = |it| {
+        \\    var $sum = 0.U64
+        \\    for x in it {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\make : U64 -> Iter(U64)
+        \\make = |n| Iter.map(Iter.exclusive_range(0.U64, n), |x| x + 1)
+        \\
+        \\main : U64
+        \\main = consume(make(5))
+    );
+}
+
+test "iter alloc static: iterator passed to a non-inlined function is zero-alloc" {
+    try expectEscapingIterChainAllocatesNothing(
+        \\module [main]
+        \\
+        \\consume : Iter(U64) -> U64
+        \\consume = |it| {
+        \\    var $sum = 0.U64
+        \\    for x in it {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\main : U64
+        \\main = consume(Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + 1))
+    );
+}
+
+test "iter alloc static: branch-chosen iterator is zero-alloc" {
+    try expectEscapingIterChainAllocatesNothing(
+        \\module [main]
+        \\
+        \\consume : Iter(U64) -> U64
+        \\consume = |it| {
+        \\    var $sum = 0.U64
+        \\    for x in it {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\choose : Bool -> Iter(U64)
+        \\choose = |flag|
+        \\    if flag {
+        \\        Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + 1)
+        \\    } else {
+        \\        Iter.keep_if(Iter.exclusive_range(0.U64, 5), |x| x > 2)
+        \\    }
+        \\
+        \\main : U64
+        \\main = consume(choose(5.U64 > 0))
+    );
+}
+
 fn reachableReturnSlotProcCount(
     allocator: Allocator,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
