@@ -55,4 +55,30 @@ pub const tests = [_]TestCase{
     // module-level function definitions, which the runtime allocation path does
     // not support. They are gated statically by `box_box_count == 0` over
     // reachable procs in lir_inline_test.zig ("iter alloc static: …").
+
+    // Behavioral aliasing guard — the allocation gate is INVERTED for this bug.
+    // A list held by a live iterator must not be seen as unique: if in-place
+    // mutation of the same list fired, it would corrupt the iterator's view AND
+    // lower the allocation count (the gate would go greener on a miscompile).
+    // Here `it` holds `xs`, so `List.map(xs, ...)` must not mutate `xs` in
+    // place; the fold over `it` must observe the original elements. a = sum(xs)
+    // = 15, b = sum(2*xs) = 30, result = a*1000 + b = 15030. A wrong `a` (e.g.
+    // 30030) means the shared buffer was mutated under the live iterator. This
+    // is a correctness assertion, not an allocation one.
+    .{
+        .name = "iter alloc guard: list held by a live iterator is not mutated in place",
+        .source_kind = .module,
+        .source =
+        \\main : I64
+        \\main = {
+        \\    xs = [1.I64, 2, 3, 4, 5]
+        \\    it = List.iter(xs)
+        \\    doubled = List.map(xs, |n| n * 2)
+        \\    a = Iter.fold(it, 0.I64, |s, n| s + n)
+        \\    b = List.fold(doubled, 0.I64, |s, n| s + n)
+        \\    a * 1000 + b
+        \\}
+        ,
+        .expected = .{ .inspect_str = "15030" },
+    },
 };
