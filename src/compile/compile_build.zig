@@ -194,6 +194,19 @@ pub const BuildEnv = struct {
     /// declarations that are not part of a valid executable program.
     post_check_publication_mode: PostCheckPublicationMode = .executable_artifacts,
 
+    /// When true and `post_check_publication_mode` is `.executable_artifacts`,
+    /// user errors do not block executable finalization as long as every
+    /// erroring module still permits lowering (checked runtime-error nodes).
+    /// Used by run paths that execute programs containing recoverable errors.
+    allow_user_errors: bool = false,
+
+    /// Outcome of the most recent `compileDiscovered`: true when executable
+    /// artifacts were finalized and every accumulated error (if any) permits
+    /// lowering. Consumers must read this rather than re-querying the
+    /// Coordinator, whose per-module reports are drained into the ordered sink
+    /// during result transfer.
+    executable_lowering_ready: bool = false,
+
     /// Compiler role to assign to the root module of this build.
     root_module_role: ModuleEnv.ModuleRole = .user,
 
@@ -465,6 +478,23 @@ pub const BuildEnv = struct {
 
     pub fn setPostCheckPublicationMode(self: *BuildEnv, mode: PostCheckPublicationMode) void {
         self.post_check_publication_mode = mode;
+    }
+
+    pub fn setAllowUserErrors(self: *BuildEnv, allow: bool) void {
+        self.allow_user_errors = allow;
+    }
+
+    /// Whether the last `compileDiscovered` finalized executable artifacts and
+    /// every error (if any) permits lowering; see `executable_lowering_ready`.
+    pub fn executableLoweringReady(self: *const BuildEnv) bool {
+        return self.executable_lowering_ready;
+    }
+
+    /// The header kind of the discovered root package, if discovery ran.
+    pub fn discoveredRootKind(self: *const BuildEnv) ?PackageKind {
+        const pkg_name = self.discovered_pkg_name orelse return null;
+        const pkg = self.packages.get(pkg_name) orelse return null;
+        return pkg.kind;
     }
 
     pub fn setRootModuleRole(self: *BuildEnv, role: ModuleEnv.ModuleRole) void {
@@ -810,15 +840,48 @@ pub const BuildEnv = struct {
             }
         }
 
-        // Run coordinator loop
-        try coord.coordinatorLoop();
+        // Run coordinator loop. On failure, still move whatever reports have
+        // accumulated into the ordered sink so callers can drain and render
+        // them before propagating the error.
+        self.executable_lowering_ready = false;
+        coord.coordinatorLoop() catch |err| {
+            self.emitAccumulatedReportsForError();
+            return err;
+        };
+        var finalized_executable = false;
         if (!coord.hasUserErrors()) {
             switch (self.post_check_publication_mode) {
                 .none => {},
-                .platform_relations => try coord.validatePlatformAppRelationsForCheck(),
-                .executable_artifacts => try coord.finalizeExecutableArtifacts(),
+                .platform_relations => coord.validatePlatformAppRelationsForCheck() catch |err| {
+                    self.emitAccumulatedReportsForError();
+                    return err;
+                },
+                .executable_artifacts => {
+                    coord.finalizeExecutableArtifacts() catch |err| {
+                        self.emitAccumulatedReportsForError();
+                        return err;
+                    };
+                    finalized_executable = true;
+                },
             }
+        } else if (self.allow_user_errors and
+            self.post_check_publication_mode == .executable_artifacts and
+            coord.userErrorsAllowExecutableLowering())
+        {
+            coord.finalizeExecutableArtifactsAllowUserErrors() catch |err| {
+                self.emitAccumulatedReportsForError();
+                return err;
+            };
+            finalized_executable = true;
         }
+
+        // Finalization may append new reports (unresolved dispatch,
+        // non-lowerable defs, relation mismatches). Decide whether executable
+        // lowering may proceed now, before result transfer drains the
+        // Coordinator's per-module reports.
+        self.executable_lowering_ready = finalized_executable and
+            (!coord.hasUserErrors() or
+                (self.allow_user_errors and coord.userErrorsAllowExecutableLowering()));
 
         if (comptime trace_build) {
             std.debug.print("[BUILD] Coordinator loop complete, transferring results...\n", .{});
@@ -1158,7 +1221,7 @@ pub const BuildEnv = struct {
         };
     }
 
-    const PackageKind = enum { app, package, platform, module, hosted, type_module, default_app };
+    pub const PackageKind = enum { app, package, platform, module, hosted, type_module, default_app };
 
     /// A mapping from a Roc identifier to an FFI symbol name, extracted from
     /// a platform's `provides { "roc_ffi_symbol": roc_ident }` clause.
@@ -1994,6 +2057,14 @@ pub const BuildEnv = struct {
                 .import_name = try self.gpa.dupe(u8, qualified_name),
             });
         }
+    }
+
+    /// Move accumulated Coordinator reports into the ordered sink so callers
+    /// can still drain and render them after a hard compilation error.
+    /// Emission problems are ignored here — the original error propagates.
+    fn emitAccumulatedReportsForError(self: *BuildEnv) void {
+        self.transferCoordinatorResults() catch return;
+        self.emitDeterministic() catch return;
     }
 
     fn emitWorkspaceReport(self: *BuildEnv, title: []const u8, msg: []const u8) Allocator.Error!void {
@@ -2849,13 +2920,28 @@ pub const BuildEnv = struct {
 
     /// Drain reports and render them to a writer. Returns error/warning counts.
     /// Replaces the repeated drain → iterate → render boilerplate pattern.
-    pub fn renderDiagnostics(self: *BuildEnv, writer: anytype) Allocator.Error!RenderDiagnosticsResult {
+    ///
+    /// Draining makes rendering structurally idempotent: reports are moved out
+    /// of the sink, so the same report can never be rendered twice no matter
+    /// how many times this is called.
+    pub fn renderDiagnostics(self: *BuildEnv, writer: *std.Io.Writer) Allocator.Error!RenderDiagnosticsResult {
+        return self.renderDiagnosticsWithConfig(writer, reporting.ReportingConfig.initColorTerminal());
+    }
+
+    /// Like `renderDiagnostics`, with an explicit reporting config. Passing a
+    /// null writer drains and counts without rendering (used by test builds).
+    pub fn renderDiagnosticsWithConfig(
+        self: *BuildEnv,
+        maybe_writer: ?*std.Io.Writer,
+        config: reporting.ReportingConfig,
+    ) Allocator.Error!RenderDiagnosticsResult {
         const drained = try self.drainReports();
         defer self.freeDrainedReports(drained);
 
         var total_error_count: usize = 0;
         var total_warning_count: usize = 0;
 
+        const palette = reporting.ColorUtils.getPaletteForConfig(config);
         for (drained) |mod| {
             for (mod.reports) |*report| {
                 switch (report.severity) {
@@ -2863,9 +2949,9 @@ pub const BuildEnv = struct {
                     .runtime_error, .fatal => total_error_count += 1,
                     .warning => total_warning_count += 1,
                 }
-                const palette = reporting.ColorUtils.getPaletteForConfig(reporting.ReportingConfig.initColorTerminal());
-                const config = reporting.ReportingConfig.initColorTerminal();
-                reporting.renderReportToTerminal(report, writer, palette, config) catch {};
+                if (maybe_writer) |writer| {
+                    reporting.renderReportToTerminal(report, writer, palette, config) catch {};
+                }
             }
         }
 

@@ -234,6 +234,7 @@ pub const GlueArgs = struct {
     output_dir: []const u8, // path to the output directory for generated glue files (REQUIRED)
     platform_path: []const u8, // path to the platform .roc file (default: main.roc)
     opt: OptLevel = .dev,
+    no_cache: bool = false, // disable compilation caching
 };
 
 /// Parse a list of arguments.
@@ -830,6 +831,7 @@ fn parseGlue(args: []const []const u8) CliArgs {
     var output_dir: ?[]const u8 = null;
     var platform_path: ?[]const u8 = null;
     var opt: OptLevel = .dev;
+    var no_cache: bool = false;
 
     for (args) |arg| {
         if (isHelpFlag(arg)) {
@@ -845,9 +847,12 @@ fn parseGlue(args: []const []const u8) CliArgs {
             \\
             \\Options:
             \\  --opt=<level>  Run the glue spec with dev or interpreter [default: dev]
+            \\  --no-cache     Disable compilation caching
             \\  -h, --help     Print help
             \\
             };
+        } else if (mem.eql(u8, arg, "--no-cache")) {
+            no_cache = true;
         } else if (mem.startsWith(u8, arg, "--opt")) {
             if (getFlagValue(arg)) |value| {
                 if (OptLevel.from_str(value)) |level| {
@@ -921,6 +926,7 @@ fn parseGlue(args: []const []const u8) CliArgs {
         .output_dir = output_dir.?,
         .platform_path = platform_path orelse "main.roc",
         .opt = opt,
+        .no_cache = no_cache,
     } };
 }
 

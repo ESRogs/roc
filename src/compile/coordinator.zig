@@ -949,11 +949,6 @@ pub const Coordinator = struct {
     /// Whether to retain exact source byte states for watch-mode refreshes.
     track_watch_inputs: bool,
 
-    /// Package name -> note for packages compiled against a dependency
-    /// version they did not declare. Rendered alongside errors from those
-    /// packages. Keys and values are gpa-owned.
-    version_notes: std.StringHashMap([]const u8),
-
     /// Timing accumulators
     total_parse_ns: u64,
     total_canonicalize_ns: u64,
@@ -1030,7 +1025,6 @@ pub const Coordinator = struct {
             .retired_checked_artifacts = std.ArrayList(RetiredCheckedArtifact).empty,
             .enable_hosted_transform = false,
             .track_watch_inputs = false,
-            .version_notes = std.StringHashMap([]const u8).init(gpa),
             .total_parse_ns = 0,
             .total_canonicalize_ns = 0,
             .total_canonicalize_diag_ns = 0,
@@ -1051,15 +1045,6 @@ pub const Coordinator = struct {
         }
         // Stop workers
         self.shutdown();
-
-        {
-            var note_it = self.version_notes.iterator();
-            while (note_it.next()) |entry| {
-                self.gpa.free(@constCast(entry.key_ptr.*));
-                self.gpa.free(@constCast(entry.value_ptr.*));
-            }
-            self.version_notes.deinit();
-        }
 
         if (comptime trace_build) {
             std.debug.print("[COORD DEINIT] shutdown done, freeing packages...\n", .{});

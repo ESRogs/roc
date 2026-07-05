@@ -26,6 +26,7 @@ const lir = @import("lir");
 
 const ModuleEnv = can.ModuleEnv;
 const BuildEnv = compile.BuildEnv;
+const CacheManager = compile.CacheManager;
 const RocTarget = roc_target.RocTarget;
 const CheckedArtifact = check.CheckedArtifact;
 const CanonicalNameStore = check.CanonicalNames.CanonicalNameStore;
@@ -49,6 +50,7 @@ pub const GlueArgs = struct {
     output_dir: []const u8,
     platform_path: []const u8,
     opt: GlueOpt = .dev,
+    no_cache: bool = false,
 };
 
 /// Error types for glue generation operations.
@@ -67,6 +69,23 @@ pub const GlueError = error{
     OutOfMemory,
     WriteFailed,
 };
+
+/// Attach the checked-module cache to a glue build env. Glue caches by
+/// default like every other pipeline; `--no-cache` is the only opt-out.
+fn attachGlueCacheManager(build_env: *BuildEnv, gpa: Allocator, no_cache: bool) error{OutOfMemory}!void {
+    if (no_cache) return;
+    // The build env's CoreCtx is the one the cache manager must share: it
+    // carries the I/O used for every cache read and write.
+    const roc_ctx = build_env.filesystem;
+    const cache_manager = try gpa.create(CacheManager);
+    cache_manager.* = CacheManager.init(gpa, .{
+        .enabled = true,
+        .verbose = false,
+        .roc_ctx = roc_ctx,
+    }, roc_ctx);
+    // BuildEnv.deinit releases the cache manager.
+    build_env.setCacheManager(cache_manager);
+}
 
 /// Print platform glue information for a platform's main.roc file using the checked-artifact pipeline.
 /// Hosted function ordering comes from published `HostedProcTable` records.
@@ -184,6 +203,7 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
     };
     defer build_env.deinit();
     build_env.setSyntheticRootPackageIdentity();
+    try attachGlueCacheManager(&build_env, gpa, args.no_cache);
 
     build_env.build(synthetic_app_path) catch {
         _ = try build_env.renderDiagnostics(stderr);
@@ -305,6 +325,7 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         return error.BuildEnvInit;
     };
     defer glue_build_env.deinit();
+    try attachGlueCacheManager(&glue_build_env, gpa, args.no_cache);
 
     glue_build_env.build(glue_spec_abs) catch {
         _ = try glue_build_env.renderDiagnostics(stderr);

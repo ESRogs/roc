@@ -376,6 +376,9 @@ const CustomCase = enum {
     non_verbose_caches_verbose_reports,
     verbose_and_non_verbose_failure_format_match,
     build_warning_interpreter,
+    pipeline_warning_exit_parity,
+    run_reuses_checked_module_cache,
+    transitive_package_pipeline_parity,
     issue_9392_deterministic_no_cache,
     build_issue_9435_hosted_nominal_return,
     bundle_complex_package,
@@ -975,6 +978,10 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc --opt=dev rejects non executable targets", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--target=wasm32" }, .roc_file = "test/wasm/app.roc", .exit = .failure, .contains_any = &.{.{ .needles = &.{ .{ .stream = .stderr, .text = "only produces static libraries" }, .{ .stream = .stderr, .text = "TARGET NOT SUPPORTED" }, .{ .stream = .stderr, .text = "unsupported target" } } }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc build returns exit code 2 for warnings (interpreter)", .backend = .interpreter, .body = .{ .custom = .build_warning_interpreter } },
     .{ .id = 0, .suite = .subcommands, .name = "roc build returns exit code 2 for warnings (dev)", .backend = .dev, .skip = .{ .always = "TODO: dev backend compilation fails for test/fx/run_warning_only.roc" }, .body = .{ .custom = .noop } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test returns exit code 2 for warnings", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/fx/run_warning_only.roc", .exit = .{ .code = 2 }, .contains = &.{.{ .stream = .stdout, .text = "tests passed" }}, .contains_any = &.{.{ .needles = &warning_needles }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "pipeline parity: check, build, run, and test exit 2 on the same warning", .backend = .interpreter, .body = .{ .custom = .pipeline_warning_exit_parity } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9788: second roc run reuses the checked-module cache", .backend = .interpreter, .body = .{ .custom = .run_reuses_checked_module_cache } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9509: transitive package dependency runs exactly when it builds", .backend = .interpreter, .body = .{ .custom = .transitive_package_pipeline_parity } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check with -j1 succeeds on valid file", .body = .{ .command = .{ .args = &.{ "check", "--no-cache", "-j1" }, .roc_file = "test/cli/simple_success.roc" } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check with --jobs=1 succeeds on valid file", .body = .{ .command = .{ .args = &.{ "check", "--no-cache", "--jobs=1" }, .roc_file = "test/cli/simple_success.roc" } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check with --jobs=2 succeeds on valid file", .body = .{ .command = .{ .args = &.{ "check", "--no-cache", "--jobs=2" }, .roc_file = "test/cli/simple_success.roc" } } },
@@ -1922,6 +1929,9 @@ fn runCustomCase(
         .non_verbose_caches_verbose_reports => customNonVerboseCachesVerboseReports(io, allocator, &env, &timer, timeout_ms, spec.backend orelse .interpreter),
         .verbose_and_non_verbose_failure_format_match => customVerboseAndNonVerboseFailureFormatMatch(io, allocator, &timer, timeout_ms, spec.backend orelse .interpreter),
         .build_warning_interpreter => customBuildWarningInterpreter(io, allocator, &env, &timer, timeout_ms),
+        .pipeline_warning_exit_parity => customPipelineWarningExitParity(io, allocator, &env, &timer, timeout_ms),
+        .run_reuses_checked_module_cache => customRunReusesCheckedModuleCache(io, allocator, &env, &timer, timeout_ms),
+        .transitive_package_pipeline_parity => customTransitivePackagePipelineParity(io, allocator, &env, &timer, timeout_ms),
         .issue_9392_deterministic_no_cache => customIssue9392Deterministic(io, allocator, &env, &timer, timeout_ms),
         .build_issue_9435_hosted_nominal_return => customBuildIssue9435(io, allocator, &env, &timer, timeout_ms),
         .bundle_complex_package => customBundleComplexPackage(io, allocator, &env, &timer, timeout_ms),
@@ -4417,6 +4427,107 @@ fn customBuildWarningInterpreter(io: std.Io, allocator: Allocator, env: *const C
     const size = fileExistsWithSize(io, output_path) catch |err|
         return customFailure(allocator, timer, "failed to stat warning output file: {}", .{err});
     if (size == 0) return customFailure(allocator, timer, "warning output file was empty", .{});
+    return null;
+}
+
+fn customPipelineWarningExitParity(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    // One warning fixture through every entry path: a divergence in warning
+    // exit codes between two pipelines is a test failure, not a user bug
+    // report. Every command must exit 2 and render the same warning.
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "check", "--no-cache" },
+        .roc_file = "test/fx/run_warning_only.roc",
+        .exit = .{ .code = 2 },
+        .occurrences = &.{.{ .stream = .stderr, .text = "UNUSED VARIABLE", .count = 1 }},
+    })) |failure| return failure;
+
+    const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "warning_parity_build" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate output path: {}", .{err});
+    const out_arg = outputArg(allocator, output_path) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate output arg: {}", .{err});
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "build", "--opt=interpreter", "--no-cache", out_arg },
+        .roc_file = "test/fx/run_warning_only.roc",
+        .exit = .{ .code = 2 },
+        .occurrences = &.{.{ .stream = .stderr, .text = "UNUSED VARIABLE", .count = 1 }},
+    })) |failure| return failure;
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "--opt=interpreter", "--no-cache" },
+        .roc_file = "test/fx/run_warning_only.roc",
+        .exit = .{ .code = 2 },
+        .occurrences = &.{.{ .stream = .stderr, .text = "UNUSED VARIABLE", .count = 1 }},
+    })) |failure| return failure;
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--no-cache" },
+        .roc_file = "test/fx/run_warning_only.roc",
+        .exit = .{ .code = 2 },
+        .occurrences = &.{.{ .stream = .stderr, .text = "UNUSED VARIABLE", .count = 1 }},
+    })) |failure| return failure;
+
+    return null;
+}
+
+fn customRunReusesCheckedModuleCache(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    // Issue 9788: the run pipeline silently opted out of the checked-module
+    // cache. Two identical runs must populate the cache once and reuse it.
+    const command = CommandCase{
+        .args = &.{"--opt=interpreter"},
+        .roc_file = "test/fx/run_warning_only.roc",
+        .exit = .{ .code = 2 },
+        .contains = &.{.{ .stream = .stdout, .text = "Hello, World!" }},
+    };
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
+    const after_first = countModuleCacheFiles(io, allocator, env.dirs.roc_cache_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to count module cache files: {}", .{err});
+    if (after_first == 0) {
+        return customFailure(allocator, timer, "expected the first run to populate checked module cache entries, found 0", .{});
+    }
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
+    const after_second = countModuleCacheFiles(io, allocator, env.dirs.roc_cache_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to count module cache files after second run: {}", .{err});
+    if (after_second != after_first) {
+        return customFailure(allocator, timer, "expected the second run to reuse {d} checked module cache entries, found {d}", .{ after_first, after_second });
+    }
+    return null;
+}
+
+fn customTransitivePackagePipelineParity(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    // Issue 9509: transitive dependencies must resolve identically on every
+    // pipeline — an app that checks and builds must also run and test.
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "check", "--no-cache" },
+        .roc_file = "test/fx/transitive_pkg/app.roc",
+        .contains = &.{.{ .stream = .stdout, .text = "No errors found" }},
+    })) |failure| return failure;
+
+    const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "transitive_pkg_build" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate output path: {}", .{err});
+    const out_arg = outputArg(allocator, output_path) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate output arg: {}", .{err});
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "build", "--opt=interpreter", "--no-cache", out_arg },
+        .roc_file = "test/fx/transitive_pkg/app.roc",
+    })) |failure| return failure;
+    const size = fileExistsWithSize(io, output_path) catch |err|
+        return customFailure(allocator, timer, "failed to stat transitive build output: {}", .{err});
+    if (size == 0) return customFailure(allocator, timer, "transitive build output was empty", .{});
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "--opt=interpreter", "--no-cache" },
+        .roc_file = "test/fx/transitive_pkg/app.roc",
+        .contains = &.{.{ .stream = .stdout, .text = "alpha beta" }},
+    })) |failure| return failure;
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--no-cache" },
+        .roc_file = "test/fx/transitive_pkg/app.roc",
+        .contains = &.{.{ .stream = .stdout, .text = "tests passed" }},
+    })) |failure| return failure;
+
     return null;
 }
 
