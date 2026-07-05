@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const check = @import("check");
+const collections = @import("collections");
 
 const Common = @import("../common.zig");
 const MonoType = @import("../monotype/type.zig");
@@ -13,6 +14,11 @@ const MonoType = @import("../monotype/type.zig");
 /// Checked boundary name module used by Lambda Mono types.
 pub const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
+const GuardedList = collections.GuardedList;
+
+fn StoreList(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.List(T, "lambda_mono.Type.Store." ++ field_name);
+}
 
 /// Identifier for a Lambda Mono type in this store.
 pub const TypeId = enum(u32) { _ };
@@ -102,13 +108,13 @@ pub const Content = union(enum) {
 /// Store for Lambda Mono types and their shared spans.
 pub const Store = struct {
     allocator: std.mem.Allocator,
-    types: std.ArrayList(Content),
-    spans: std.ArrayList(TypeId),
-    fields: std.ArrayList(Field),
-    capture_fields: std.ArrayList(CaptureField),
-    tags: std.ArrayList(Tag),
-    fn_variants: std.ArrayList(FnVariant),
-    declared_fields: std.ArrayList(DeclaredField),
+    types: StoreList(Content, "types"),
+    spans: StoreList(TypeId, "spans"),
+    fields: StoreList(Field, "fields"),
+    capture_fields: StoreList(CaptureField, "capture_fields"),
+    tags: StoreList(Tag, "tags"),
+    fn_variants: StoreList(FnVariant, "fn_variants"),
+    declared_fields: StoreList(DeclaredField, "declared_fields"),
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{
@@ -134,50 +140,54 @@ pub const Store = struct {
     }
 
     pub fn add(self: *Store, content: Content) std.mem.Allocator.Error!TypeId {
-        const id: TypeId = @enumFromInt(@as(u32, @intCast(self.types.items.len)));
+        const id: TypeId = @enumFromInt(@as(u32, @intCast(self.types.len())));
         try self.types.append(self.allocator, content);
         return id;
     }
 
     pub fn set(self: *Store, id: TypeId, content: Content) void {
-        self.types.items[@intFromEnum(id)] = content;
+        self.types.set(@intFromEnum(id), content);
     }
 
     pub fn get(self: *const Store, id: TypeId) Content {
-        return self.types.items[@intFromEnum(id)];
+        return self.types.unsafeRawItemsForView()[@intFromEnum(id)];
+    }
+
+    pub fn typeCount(self: *const Store) usize {
+        return self.types.len();
     }
 
     pub fn addSpan(self: *Store, values: []const TypeId) std.mem.Allocator.Error!Span {
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.spans.items.len);
+        const start: u32 = @intCast(self.spans.len());
         try self.spans.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
     pub fn addFields(self: *Store, values: []const Field) std.mem.Allocator.Error!Span {
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.fields.items.len);
+        const start: u32 = @intCast(self.fields.len());
         try self.fields.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
     pub fn addCaptureFields(self: *Store, values: []const CaptureField) std.mem.Allocator.Error!Span {
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.capture_fields.items.len);
+        const start: u32 = @intCast(self.capture_fields.len());
         try self.capture_fields.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
     pub fn addTags(self: *Store, values: []const Tag) std.mem.Allocator.Error!Span {
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.tags.items.len);
+        const start: u32 = @intCast(self.tags.len());
         try self.tags.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
     pub fn addFnVariants(self: *Store, values: []const FnVariant) std.mem.Allocator.Error!Span {
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.fn_variants.items.len);
+        const start: u32 = @intCast(self.fn_variants.len());
         for (values, 0..) |variant, i| {
             var stored = variant;
             stored.id = @enumFromInt(@as(u32, @intCast(start + i)));
@@ -187,34 +197,56 @@ pub const Store = struct {
     }
 
     pub fn span(self: *const Store, span_: Span) []const TypeId {
-        return self.spans.items[span_.start..][0..span_.len];
+        return self.spans.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn fieldSpan(self: *const Store, span_: Span) []const Field {
-        return self.fields.items[span_.start..][0..span_.len];
+        return self.fields.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn captureFieldSpan(self: *const Store, span_: Span) []const CaptureField {
-        return self.capture_fields.items[span_.start..][0..span_.len];
+        return self.capture_fields.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn tagSpan(self: *const Store, span_: Span) []const Tag {
-        return self.tags.items[span_.start..][0..span_.len];
+        return self.tags.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn addDeclaredFields(self: *Store, values: []const DeclaredField) std.mem.Allocator.Error!Span {
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.declared_fields.items.len);
+        const start: u32 = @intCast(self.declared_fields.len());
         try self.declared_fields.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
     pub fn declaredFieldSpan(self: *const Store, span_: Span) []const DeclaredField {
-        return self.declared_fields.items[span_.start..][0..span_.len];
+        return self.declared_fields.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn fnVariantSpan(self: *const Store, span_: Span) []const FnVariant {
-        return self.fn_variants.items[span_.start..][0..span_.len];
+        return self.fn_variants.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    }
+
+    pub const View = struct {
+        types: []const Content,
+        spans: []const TypeId,
+        fields: []const Field,
+        capture_fields: []const CaptureField,
+        tags: []const Tag,
+        fn_variants: []const FnVariant,
+        declared_fields: []const DeclaredField,
+    };
+
+    pub fn view(self: *const Store) View {
+        return .{
+            .types = self.types.unsafeRawItemsForView(),
+            .spans = self.spans.unsafeRawItemsForView(),
+            .fields = self.fields.unsafeRawItemsForView(),
+            .capture_fields = self.capture_fields.unsafeRawItemsForView(),
+            .tags = self.tags.unsafeRawItemsForView(),
+            .fn_variants = self.fn_variants.unsafeRawItemsForView(),
+            .declared_fields = self.declared_fields.unsafeRawItemsForView(),
+        };
     }
 
     pub fn typeDigest(self: *const Store, name_store: *const names.NameStore, ty: TypeId) names.TypeDigest {

@@ -343,12 +343,12 @@ const FinalBodyOutputCounts = struct {
 
     fn fromProgram(program: *const Ast.Program) FinalBodyOutputCounts {
         return .{
-            .exprs = program.exprs.items.len,
-            .pats = program.pats.items.len,
-            .locals = program.locals.items.len,
-            .typed_locals = program.typed_locals.items.len,
-            .layout_requests = program.layout_requests.items.len,
-            .runtime_schema_requests = program.runtime_schema_requests.items.len,
+            .exprs = program.exprCount(),
+            .pats = program.patCount(),
+            .locals = program.localCount(),
+            .typed_locals = program.typedLocalCount(),
+            .layout_requests = program.layoutRequestCount(),
+            .runtime_schema_requests = program.runtimeSchemaRequestCount(),
         };
     }
 
@@ -922,12 +922,12 @@ const Builder = struct {
         else
             Common.invariant("root request reached Monotype without a checked procedure template or procedure source");
         try self.appendRuntimeSchemaRequestsForDef(def);
-        try self.program.roots.append(self.allocator, .{ .def = def, .request = request });
+        try self.program.addRoot(.{ .def = def, .request = request });
     }
 
     fn lowerLayoutRequest(self: *Builder, checked_ty: checked.CheckedTypeId) Allocator.Error!void {
         const ty = try self.lowerType(moduleView(self.root_view), checked_ty);
-        try self.program.layout_requests.append(self.allocator, .{
+        try self.program.addLayoutRequest(.{
             .checked_type = checked_ty,
             .ty = ty,
         });
@@ -939,15 +939,14 @@ const Builder = struct {
         const ret_ty = try self.lowerType(type_view, request.data.checked_type);
         const const_node = self.providedConstNode(request.data);
         const body = try self.restoreConstNodeAtType(const_node.module, type_view, const_node.id, ret_ty);
-        const def: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, .{
+        const def = try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = Ast.Span(Ast.TypedLocal).empty(),
             .body = .{ .roc = body },
             .ret = ret_ty,
         });
-        try self.program.layout_requests.append(self.allocator, .{
+        try self.program.addLayoutRequest(.{
             .checked_type = request.data.checked_type,
             .ty = ret_ty,
             .def = def,
@@ -956,7 +955,7 @@ const Builder = struct {
     }
 
     fn appendRuntimeSchemaRequestsForDef(self: *Builder, def: Ast.DefId) Allocator.Error!void {
-        const fn_ = self.program.defs.items[@intFromEnum(def)];
+        const fn_ = self.program.getDef(def);
         for (self.program.typedLocalSpan(fn_.args)) |arg| {
             try self.appendRuntimeSchemaRequestsForType(arg.ty);
         }
@@ -1035,12 +1034,12 @@ const Builder = struct {
     }
 
     fn appendRuntimeSchemaRequest(self: *Builder, request: Ast.RuntimeSchemaRequest) Allocator.Error!void {
-        for (self.program.runtime_schema_requests.items) |existing| {
+        for (self.program.runtimeSchemaRequestsView()) |existing| {
             if (existing.def.module == request.def.module and existing.def.type_name == request.def.type_name) {
                 return;
             }
         }
-        try self.program.runtime_schema_requests.append(self.allocator, request);
+        try self.program.addRuntimeSchemaRequest(request);
     }
 
     fn lowerProcedureUseRoot(
@@ -1072,15 +1071,13 @@ const Builder = struct {
             } },
         });
 
-        const def: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, .{
+        return try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = try self.program.addTypedLocalSpan(args),
             .body = .{ .roc = body },
             .ret = fn_data.ret,
         });
-        return def;
     }
 
     fn lowerProcedureBindingRoot(
@@ -1113,15 +1110,13 @@ const Builder = struct {
             } },
         });
 
-        const def: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, .{
+        return try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = try self.program.addTypedLocalSpan(args),
             .body = .{ .roc = body },
             .ret = fn_data.ret,
         });
-        return def;
     }
 
     fn lowerProcedureBindingValue(
@@ -1271,7 +1266,7 @@ const Builder = struct {
                     reserved_def = existing.def;
                     lower_fn_ty = existing.request_fn_ty;
                     existing.status = .lowering;
-                    self.program.specs.items[@intFromEnum(existing.spec)].status = .lowering;
+                    self.program.setSpecStatus(existing.spec, .lowering);
                 },
             }
         } else {
@@ -1297,7 +1292,7 @@ const Builder = struct {
                         reserved_def = existing.def;
                         lower_fn_ty = existing.request_fn_ty;
                         existing.status = .lowering;
-                        self.program.specs.items[@intFromEnum(existing.spec)].status = .lowering;
+                        self.program.setSpecStatus(existing.spec, .lowering);
                     },
                 }
             } else {
@@ -1315,11 +1310,12 @@ const Builder = struct {
             symbol: Common.Symbol,
         };
         const reservation: Reservation = if (reserved_def) |def_id| blk: {
-            const def = &self.program.defs.items[@intFromEnum(def_id)];
+            var def = self.program.getDef(def_id);
             const fn_id = def.fn_id orelse
                 Common.invariant("reserved Monotype procedure template definition had no function id");
             def.fn_def = fn_template;
-            self.program.fns.items[@intFromEnum(fn_id)].source = fn_template;
+            self.program.setDef(def_id, def);
+            self.program.setFnSource(fn_id, fn_template);
             break :blk .{
                 .def = def_id,
                 .fn_id = fn_id,
@@ -1329,11 +1325,10 @@ const Builder = struct {
             const symbol = self.symbols.fresh();
             try self.registerProcDebugNameForTemplate(symbol, view, template_ref);
             const fn_id = try self.program.addFn(fn_template);
-            const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
             // The definition fills once its body lowers; a recursive request
             // that reuses this entry meanwhile reads the requested template,
             // which is the same specialization by construction.
-            try self.program.defs.append(self.allocator, .{
+            const def_id = try self.program.addDef(.{
                 .symbol = symbol,
                 .fn_def = fn_template,
                 .fn_id = fn_id,
@@ -1368,15 +1363,15 @@ const Builder = struct {
             .hosted => {
                 const fn_data = self.functionShape(lower_fn_ty, "hosted procedure template root type was not a function");
                 const args = try self.typedLocalsForArgs(self.program.types.span(fn_data.args));
-                self.program.defs.items[@intFromEnum(reservation.def)] = .{
+                self.program.setDef(reservation.def, .{
                     .symbol = reservation.symbol,
                     .fn_def = fn_template,
                     .fn_id = reservation.fn_id,
                     .args = args,
                     .body = .hosted,
                     .ret = fn_data.ret,
-                };
-                self.program.fns.items[@intFromEnum(reservation.fn_id)].source = fn_template;
+                });
+                self.program.setFnSource(reservation.fn_id, fn_template);
                 try self.markTemplateReady(family, reservation.def, lower_fn_ty);
                 return reservation.def;
             },
@@ -1452,16 +1447,16 @@ const Builder = struct {
         // adopt this recorded template directly.
         var def_template = fn_template;
         def_template.mono_fn_ty = final_fn_ty;
-        self.program.fns.items[@intFromEnum(reservation.fn_id)].source = def_template;
+        self.program.setFnSource(reservation.fn_id, def_template);
         const sealed_fn_data = self.functionShape(final_fn_ty, "checked procedure template root type was not a function");
-        self.program.defs.items[@intFromEnum(reservation.def)] = .{
+        self.program.setDef(reservation.def, .{
             .symbol = reservation.symbol,
             .fn_def = def_template,
             .fn_id = reservation.fn_id,
             .args = body_ids.typedLocalSpan(lowered.args),
             .body = .{ .roc = body_ids.expr(lowered.body) },
             .ret = sealed_fn_data.ret,
-        };
+        });
         try self.markTemplateReady(family, reservation.def, final_fn_ty);
         return reservation.def;
     }
@@ -1492,7 +1487,7 @@ const Builder = struct {
                 try requester.unify(try requester.importMono(fn_ty), try requester.importMono(existing.solved_fn_ty));
             }
             try requester.drainDirty();
-            const def = self.program.defs.items[@intFromEnum(existing.def)];
+            const def = self.program.getDef(existing.def);
             return .{
                 .target = .{ .local = def.fn_id orelse
                     Common.invariant("reserved Monotype procedure template definition had no function id") },
@@ -1516,10 +1511,9 @@ const Builder = struct {
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, fn_ty);
         const fn_id = try self.program.addFn(fn_template);
-        const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
         const symbol = self.symbols.fresh();
         try self.registerProcDebugNameForTemplate(symbol, view, template_ref);
-        try self.program.defs.append(self.allocator, .{
+        const def_id = try self.program.addDef(.{
             .symbol = symbol,
             .fn_def = fn_template,
             .fn_id = fn_id,
@@ -1554,7 +1548,7 @@ const Builder = struct {
         const entry = &self.lowered_templates.items[index];
         entry.solved_fn_ty = fn_ty;
         entry.solved_digest = self.specializationTypeDigest(fn_ty);
-        var identity = self.program.specs.items[@intFromEnum(entry.spec)].identity;
+        var identity = self.program.getSpec(entry.spec).identity;
         identity.mono_fn_ty = fn_ty;
         identity.mono_fn_ty_digest = entry.solved_digest;
         try self.spec_store.updateLocalIdentity(entry.spec, identity);
@@ -2698,7 +2692,7 @@ const Builder = struct {
     }
 
     fn defFnId(self: *Builder, def: Ast.DefId) Ast.FnId {
-        return self.program.defs.items[@intFromEnum(def)].fn_id orelse
+        return self.program.getDef(def).fn_id orelse
             Common.invariant("Monotype procedure template definition had no function id");
     }
 
@@ -2841,7 +2835,7 @@ const Builder = struct {
         const lowered = try request.ctx.lowerNestedFunction(request.expr_id, body_fn_ty);
         var def_template = fn_template;
         def_template.mono_fn_ty = body_fn_ty;
-        self.program.fns.items[@intFromEnum(fn_id)].source = def_template;
+        self.program.setFnSource(fn_id, def_template);
         _ = try request.ctx.draft.addNestedDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = .{
@@ -2864,7 +2858,7 @@ const Builder = struct {
         const entry = &self.lowered_nested_fns.items[index];
         entry.solved_fn_ty = fn_ty;
         entry.solved_digest = self.specializationTypeDigest(fn_ty);
-        var identity = self.program.specs.items[@intFromEnum(entry.spec)].identity;
+        var identity = self.program.getSpec(entry.spec).identity;
         identity.mono_fn_ty = fn_ty;
         identity.mono_fn_ty_digest = entry.solved_digest;
         try self.spec_store.updateLocalIdentity(entry.spec, identity);
@@ -2972,20 +2966,23 @@ const Builder = struct {
         entry.solved_digest = digest;
         try self.appendTemplateLookup(family, .request, digest, @intCast(index));
 
-        var identity = self.program.specs.items[@intFromEnum(entry.spec)].identity;
+        var identity = self.program.getSpec(entry.spec).identity;
         identity.mono_fn_ty = fn_ty;
         identity.mono_fn_ty_digest = digest;
         try self.spec_store.updateLocalIdentity(entry.spec, identity);
 
-        const fn_template = &self.program.fns.items[@intFromEnum(fn_id)].source;
-        fn_template.mono_fn_ty = fn_ty;
-        const def = &self.program.defs.items[@intFromEnum(entry.def)];
+        var fn_ = self.program.getFn(fn_id);
+        fn_.source.mono_fn_ty = fn_ty;
+        self.program.setFn(fn_id, fn_);
+
+        var def = self.program.getDef(entry.def);
         if (def.fn_def) |*def_template| {
             def_template.mono_fn_ty = fn_ty;
         } else {
             Common.invariant("reserved Monotype procedure template definition had no function template");
         }
         def.ret = self.functionShape(fn_ty, "deferred procedure template root type was not a function").ret;
+        self.program.setDef(entry.def, def);
     }
 
     /// Process the specialization body requests this specialization enqueued
@@ -3066,7 +3063,7 @@ const Builder = struct {
     ) Allocator.Error!void {
         for (body_draft.nested_defs.items) |def| {
             const fn_id = ids.fnTarget(def.fn_id);
-            const fn_template = self.program.fns.items[@intFromEnum(fn_id)].source;
+            const fn_template = self.program.getFn(fn_id).source;
             const nested = switch (fn_template.fn_def) {
                 .nested => |nested| nested,
                 else => Common.invariant("nested draft definition did not reference a nested function"),
@@ -3300,7 +3297,7 @@ const Builder = struct {
         bound: *std.AutoHashMap(Ast.LocalId, void),
         active_fns: *std.AutoHashMap(Ast.FnId, void),
     ) Allocator.Error!bool {
-        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        const expr = self.program.getExpr(expr_id);
         switch (expr.data) {
             .local => |local| return self.localDependsOnTarget(local, target, bound),
             .unit,
@@ -3497,11 +3494,11 @@ const Builder = struct {
         local: Ast.LocalId,
     ) bool {
         if (bound.contains(local)) return true;
-        const local_data = self.program.locals.items[@intFromEnum(local)];
+        const local_data = self.program.getLocal(local);
         const binder = local_data.binder orelse return false;
         var iter = bound.keyIterator();
         while (iter.next()) |active| {
-            const active_data = self.program.locals.items[@intFromEnum(active.*)];
+            const active_data = self.program.getLocal(active.*);
             if (active_data.binder == null or active_data.binder.? != binder) continue;
             if (self.sameMonotype(active_data.ty, local_data.ty)) return true;
         }
@@ -3510,8 +3507,8 @@ const Builder = struct {
 
     fn sameLocalIdentity(self: *Builder, lhs: Ast.LocalId, rhs: Ast.LocalId) bool {
         if (lhs == rhs) return true;
-        const lhs_data = self.program.locals.items[@intFromEnum(lhs)];
-        const rhs_data = self.program.locals.items[@intFromEnum(rhs)];
+        const lhs_data = self.program.getLocal(lhs);
+        const rhs_data = self.program.getLocal(rhs);
         if (lhs_data.binder == null or rhs_data.binder == null or lhs_data.binder.? != rhs_data.binder.?) {
             return false;
         }
@@ -3533,7 +3530,7 @@ const Builder = struct {
         active_fns: *std.AutoHashMap(Ast.FnId, void),
         added: *std.ArrayList(Ast.LocalId),
     ) Allocator.Error!bool {
-        const stmt = self.program.stmts.items[@intFromEnum(stmt_id)];
+        const stmt = self.program.getStmt(stmt_id);
         switch (stmt) {
             .uninitialized => |pat| {
                 try self.bindPatLocals(pat, bound, added);
@@ -3569,11 +3566,11 @@ const Builder = struct {
         try active_fns.put(fn_id, {});
         defer _ = active_fns.remove(fn_id);
 
-        for (self.program.defs.items) |def| {
+        for (self.program.defsView()) |def| {
             if (def.fn_id == null or def.fn_id.? != fn_id) continue;
             return try self.fnBodyDependsOnFreeLocal(def.args, def.body, target, caller_bound, active_fns);
         }
-        for (self.program.nested_defs.items) |def| {
+        for (self.program.nestedDefsView()) |def| {
             if (def.fn_id != fn_id) continue;
             return try self.fnBodyDependsOnFreeLocal(def.args, .{ .roc = def.body }, target, caller_bound, active_fns);
         }
@@ -3617,7 +3614,7 @@ const Builder = struct {
         bound: *std.AutoHashMap(Ast.LocalId, void),
         added: *std.ArrayList(Ast.LocalId),
     ) Allocator.Error!void {
-        const pat = self.program.pats.items[@intFromEnum(pat_id)];
+        const pat = self.program.getPat(pat_id);
         switch (pat.data) {
             .bind => |local| {
                 try bound.put(local, {});
@@ -4246,8 +4243,7 @@ const Builder = struct {
         };
         if (self.inspect_defs.get(address)) |entry| return entry.id();
 
-        const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, undefined);
+        const def_id = try self.program.addDef(undefined);
         try self.inspect_defs.put(address, .{ .reserved = def_id });
 
         const arg_local = try self.program.addLocal(self.symbols.fresh(), value_ty);
@@ -4255,13 +4251,13 @@ const Builder = struct {
         const body = try self.inspectBody(arg_expr, value_ty, value_ty, str_ty);
 
         const args = try self.program.addTypedLocalSpan(&.{.{ .local = arg_local, .ty = value_ty }});
-        self.program.defs.items[@intFromEnum(def_id)] = .{
+        self.program.setDef(def_id, .{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = args,
             .body = .{ .roc = body },
             .ret = str_ty,
-        };
+        });
         try self.inspect_defs.put(address, .{ .ready = def_id });
         return def_id;
     }
@@ -5439,26 +5435,26 @@ const BodyDraftStore = struct {
 
     fn finalIdOffsets(program: *const Ast.Program) FinalIdOffsets {
         return .{
-            .fn_start = @intCast(program.fns.items.len),
-            .def_start = @intCast(program.defs.items.len),
-            .nested_def_start = @intCast(program.nested_defs.items.len),
-            .expr_start = @intCast(program.exprs.items.len),
-            .pat_start = @intCast(program.pats.items.len),
-            .stmt_start = @intCast(program.stmts.items.len),
-            .local_start = @intCast(program.locals.items.len),
-            .string_literal_start = @intCast(program.string_literals.items.len),
-            .comptime_site_start = @intCast(program.comptime_sites.items.len),
-            .expr_ids_start = @intCast(program.expr_ids.items.len),
-            .pat_ids_start = @intCast(program.pat_ids.items.len),
-            .typed_locals_start = @intCast(program.typed_locals.items.len),
-            .stmt_ids_start = @intCast(program.stmt_ids.items.len),
-            .field_expr_start = @intCast(program.field_exprs.items.len),
-            .fn_def_capture_start = @intCast(program.fn_def_captures.items.len),
-            .record_destruct_start = @intCast(program.record_destructs.items.len),
-            .str_pattern_step_start = @intCast(program.str_pattern_steps.items.len),
-            .branch_start = @intCast(program.branches.items.len),
-            .if_branch_start = @intCast(program.if_branches.items.len),
-            .source_file_start = @intCast(program.source_files.items.len),
+            .fn_start = @intCast(program.fnCount()),
+            .def_start = @intCast(program.defCount()),
+            .nested_def_start = @intCast(program.nestedDefCount()),
+            .expr_start = @intCast(program.exprCount()),
+            .pat_start = @intCast(program.patCount()),
+            .stmt_start = @intCast(program.stmtCount()),
+            .local_start = @intCast(program.localCount()),
+            .string_literal_start = @intCast(program.stringLiteralCount()),
+            .comptime_site_start = @intCast(program.comptimeSiteCount()),
+            .expr_ids_start = @intCast(program.exprIdCount()),
+            .pat_ids_start = @intCast(program.patIdCount()),
+            .typed_locals_start = @intCast(program.typedLocalCount()),
+            .stmt_ids_start = @intCast(program.stmtIdCount()),
+            .field_expr_start = @intCast(program.fieldExprCount()),
+            .fn_def_capture_start = @intCast(program.fnDefCaptureCount()),
+            .record_destruct_start = @intCast(program.recordDestructCount()),
+            .str_pattern_step_start = @intCast(program.strPatternStepCount()),
+            .branch_start = @intCast(program.branchCount()),
+            .if_branch_start = @intCast(program.ifBranchCount()),
+            .source_file_start = @intCast(program.sourceFileCount()),
         };
     }
 
@@ -5615,7 +5611,7 @@ const BodyDraftStore = struct {
             const sealed_fn_id = if (def.fn_id) |fn_id| ids.fnTarget(fn_id) else null;
             if (sealed_fn_def) |template| {
                 if (sealed_fn_id) |fn_id| {
-                    program.fns.items[@intFromEnum(fn_id)].source = template;
+                    program.setFnSource(fn_id, template);
                 }
             }
             program.defs.appendAssumeCapacity(.{
@@ -5632,7 +5628,7 @@ const BodyDraftStore = struct {
         for (self.nested_defs.items) |def| {
             const sealed_fn_def = try BodyDraftStore.sealFnTemplate(graph, sealer, def.fn_def);
             const sealed_fn_id = ids.fnTarget(def.fn_id);
-            program.fns.items[@intFromEnum(sealed_fn_id)].source = sealed_fn_def;
+            program.setFnSource(sealed_fn_id, sealed_fn_def);
             program.nested_defs.appendAssumeCapacity(.{
                 .symbol = def.symbol,
                 .fn_def = sealed_fn_def,
@@ -24060,44 +24056,44 @@ test "body draft store appends draft-local ids spans and type cells" {
     const sealed_literal: Ast.StringLiteralId = @enumFromInt(@intFromEnum(literal));
     const sealed_site: Ast.ComptimeSiteId = @enumFromInt(@intFromEnum(site));
 
-    try std.testing.expectEqual(@as(usize, 1), program.locals.items.len);
-    try std.testing.expectEqual(@as(usize, 3), program.pats.items.len);
-    try std.testing.expectEqual(@as(usize, 4), program.exprs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.stmts.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.source_files.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.string_literals.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.comptime_sites.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.field_exprs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.record_destructs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.str_pattern_steps.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.branches.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.if_branches.items.len);
+    try std.testing.expectEqual(@as(usize, 1), program.localCount());
+    try std.testing.expectEqual(@as(usize, 3), program.patCount());
+    try std.testing.expectEqual(@as(usize, 4), program.exprCount());
+    try std.testing.expectEqual(@as(usize, 1), program.stmtCount());
+    try std.testing.expectEqual(@as(usize, 1), program.sourceFileCount());
+    try std.testing.expectEqual(@as(usize, 1), program.stringLiteralCount());
+    try std.testing.expectEqual(@as(usize, 1), program.comptimeSiteCount());
+    try std.testing.expectEqual(@as(usize, 1), program.fieldExprCount());
+    try std.testing.expectEqual(@as(usize, 1), program.recordDestructCount());
+    try std.testing.expectEqual(@as(usize, 1), program.strPatternStepCount());
+    try std.testing.expectEqual(@as(usize, 1), program.branchCount());
+    try std.testing.expectEqual(@as(usize, 1), program.ifBranchCount());
     try std.testing.expectEqualStrings("literal", program.stringLiteralText(sealed_literal));
     try std.testing.expectEqual(Ast.ComptimeSiteKind.if_, program.comptimeSite(sealed_site).kind);
     try std.testing.expectEqual(@as(usize, 1), program.comptimeSite(sealed_site).branch_regions.len);
     try std.testing.expectEqualStrings("value", program.localName(sealed_local));
-    try std.testing.expectEqual(field_name, program.field_exprs.items[0].name);
-    try std.testing.expectEqual(sealed_expr, program.field_exprs.items[0].value);
-    try std.testing.expectEqual(field_name, program.record_destructs.items[0].name);
-    try std.testing.expectEqual(sealed_pat, program.record_destructs.items[0].pattern);
-    try std.testing.expectEqual(@as(?Ast.PatId, sealed_pat), program.str_pattern_steps.items[0].capture);
-    try std.testing.expectEqual(sealed_literal, program.str_pattern_steps.items[0].delimiter);
-    try std.testing.expectEqual(sealed_pat, program.branches.items[0].pat);
-    try std.testing.expectEqual(sealed_expr, program.branches.items[0].body);
-    try std.testing.expectEqual(sealed_expr, program.if_branches.items[0].cond);
-    try std.testing.expectEqual(sealed_expr, program.if_branches.items[0].body);
-    switch (program.pats.items[0].data) {
+    try std.testing.expectEqual(field_name, program.getFieldExprAt(0).name);
+    try std.testing.expectEqual(sealed_expr, program.getFieldExprAt(0).value);
+    try std.testing.expectEqual(field_name, program.getRecordDestructAt(0).name);
+    try std.testing.expectEqual(sealed_pat, program.getRecordDestructAt(0).pattern);
+    try std.testing.expectEqual(@as(?Ast.PatId, sealed_pat), program.getStrPatternStepAt(0).capture);
+    try std.testing.expectEqual(sealed_literal, program.getStrPatternStepAt(0).delimiter);
+    try std.testing.expectEqual(sealed_pat, program.getBranchAt(0).pat);
+    try std.testing.expectEqual(sealed_expr, program.getBranchAt(0).body);
+    try std.testing.expectEqual(sealed_expr, program.getIfBranchAt(0).cond);
+    try std.testing.expectEqual(sealed_expr, program.getIfBranchAt(0).body);
+    switch (program.getPatAt(0).data) {
         .bind => |bind_local| try std.testing.expectEqual(sealed_local, bind_local),
         else => return error.TestExpectedEqual,
     }
-    switch (program.pats.items[@intFromEnum(record_pat)].data) {
+    switch (program.getPat(record_pat).data) {
         .record => |span| {
             try std.testing.expectEqual(@as(u32, 0), span.start);
             try std.testing.expectEqual(@as(u32, 1), span.len);
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.pats.items[@intFromEnum(str_pat)].data) {
+    switch (program.getPat(str_pat).data) {
         .str_pattern => |pattern| {
             try std.testing.expectEqual(sealed_literal, pattern.prefix);
             try std.testing.expectEqual(@as(u32, 0), pattern.steps.start);
@@ -24106,18 +24102,18 @@ test "body draft store appends draft-local ids spans and type cells" {
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[0].data) {
+    switch (program.getExprAt(0).data) {
         .local => |expr_local| try std.testing.expectEqual(sealed_local, expr_local),
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[@intFromEnum(record_expr)].data) {
+    switch (program.getExpr(record_expr).data) {
         .record => |span| {
             try std.testing.expectEqual(@as(u32, 0), span.start);
             try std.testing.expectEqual(@as(u32, 1), span.len);
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[@intFromEnum(match_expr)].data) {
+    switch (program.getExpr(match_expr).data) {
         .match_ => |match_| {
             try std.testing.expectEqual(sealed_expr, match_.scrutinee);
             try std.testing.expectEqual(@as(u32, 0), match_.branches.start);
@@ -24126,7 +24122,7 @@ test "body draft store appends draft-local ids spans and type cells" {
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[@intFromEnum(if_expr)].data) {
+    switch (program.getExpr(if_expr).data) {
         .if_ => |if_| {
             try std.testing.expectEqual(@as(u32, 0), if_.branches.start);
             try std.testing.expectEqual(@as(u32, 1), if_.branches.len);
@@ -24134,7 +24130,7 @@ test "body draft store appends draft-local ids spans and type cells" {
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.stmts.items[0]) {
+    switch (program.getStmtAt(0)) {
         .let_ => |let_| {
             try std.testing.expectEqual(sealed_pat, let_.pat);
             try std.testing.expectEqual(sealed_expr, let_.value);

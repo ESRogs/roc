@@ -191,15 +191,15 @@ const Pass = struct {
 
     fn init(result: *LirProgram.Result) Allocator.Error!Pass {
         const allocator = result.store.allocator;
-        const local_info = try allocator.alloc(ValueInfo, result.store.locals.items.len);
+        const local_info = try allocator.alloc(ValueInfo, result.store.localCount());
         errdefer allocator.free(local_info);
         @memset(local_info, .{});
 
-        const proc_returns = try allocator.alloc(ValueInfo, result.store.proc_specs.items.len);
+        const proc_returns = try allocator.alloc(ValueInfo, result.store.procSpecCount());
         errdefer allocator.free(proc_returns);
         @memset(proc_returns, .{});
 
-        const use_counts = try allocator.alloc(u32, result.store.locals.items.len);
+        const use_counts = try allocator.alloc(u32, result.store.localCount());
         errdefer allocator.free(use_counts);
         @memset(use_counts, 0);
 
@@ -237,7 +237,8 @@ const Pass = struct {
     }
 
     fn seedBoundaries(self: *Pass) Allocator.Error!void {
-        for (self.store.proc_specs.items, 0..) |proc, proc_index| {
+        for (0..self.store.procSpecCount()) |proc_index| {
+            const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (proc.body == null or proc.hosted != null) {
                 _ = self.proc_returns[proc_index].markAll(self.allocator);
             }
@@ -251,7 +252,8 @@ const Pass = struct {
         var changed = true;
         while (changed) {
             changed = false;
-            for (self.store.proc_specs.items, 0..) |proc, proc_index| {
+            for (0..self.store.procSpecCount()) |proc_index| {
+                const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
                 const body = proc.body orelse continue;
                 if (try self.analyzeProc(@enumFromInt(@as(u32, @intCast(proc_index))), body)) {
                     changed = true;
@@ -420,7 +422,8 @@ const Pass = struct {
 
     fn collectUseCounts(self: *Pass) Allocator.Error!void {
         @memset(self.use_counts, 0);
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             try self.countStmtUses(stmt);
         }
     }
@@ -483,7 +486,7 @@ const Pass = struct {
 
     fn rewriteSwitches(self: *Pass) Allocator.Error!void {
         var stmt_index: usize = 0;
-        while (stmt_index < self.store.cf_stmts.items.len) : (stmt_index += 1) {
+        while (stmt_index < self.store.cfStmtCount()) : (stmt_index += 1) {
             const stmt_id: LIR.CFStmtId = @enumFromInt(@as(u32, @intCast(stmt_index)));
             const stmt = self.store.getCFStmt(stmt_id);
             const switch_stmt = switch (stmt) {
@@ -530,7 +533,7 @@ const Pass = struct {
 
     fn removeDeadDiscriminantReads(self: *Pass) Allocator.Error!void {
         var stmt_index: usize = 0;
-        while (stmt_index < self.store.cf_stmts.items.len) : (stmt_index += 1) {
+        while (stmt_index < self.store.cfStmtCount()) : (stmt_index += 1) {
             const stmt_id: LIR.CFStmtId = @enumFromInt(@as(u32, @intCast(stmt_index)));
             const stmt = self.store.getCFStmt(stmt_id);
             const assign = switch (stmt) {
@@ -555,7 +558,8 @@ const Pass = struct {
     fn patchRedirects(self: *Pass) Allocator.Error!void {
         if (self.redirects.count() == 0) return;
 
-        for (self.store.proc_specs.items) |*proc| {
+        for (0..self.store.procSpecCount()) |proc_index| {
+            const proc = self.store.getProcSpecPtr(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (proc.body) |body| proc.body = self.resolveRedirect(body);
             for (self.store.getJoinPointSpanMut(proc.join_points)) |*join_point| {
                 join_point.body = self.resolveRedirect(join_point.body);
@@ -563,7 +567,7 @@ const Pass = struct {
         }
 
         var stmt_index: usize = 0;
-        while (stmt_index < self.store.cf_stmts.items.len) : (stmt_index += 1) {
+        while (stmt_index < self.store.cfStmtCount()) : (stmt_index += 1) {
             const stmt_id: LIR.CFStmtId = @enumFromInt(@as(u32, @intCast(stmt_index)));
             const stmt = self.store.getCFStmtPtr(stmt_id);
             switch (stmt.*) {

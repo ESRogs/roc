@@ -79,10 +79,10 @@ pub fn run(store: *LirStore, layouts: *layout_mod.Store) ResourceError!void {
     // Every statement a proc's walk can reach exists before the pass runs;
     // statements appended by earlier transforms belong to already-processed
     // procs, so sizing the stamp array once up front is safe.
-    var scratch = try Scratch.init(store.allocator, store.cf_stmts.items.len);
+    var scratch = try Scratch.init(store.allocator, store.cfStmtCount());
     defer scratch.deinit();
 
-    const proc_count = store.proc_specs.items.len;
+    const proc_count = store.procSpecCount();
     var proc_index: usize = 0;
     while (proc_index < proc_count) : (proc_index += 1) {
         const proc_id: LIR.LirProcSpecId = @enumFromInt(proc_index);

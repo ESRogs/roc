@@ -5,11 +5,17 @@
 
 const std = @import("std");
 const check = @import("check");
+const collections = @import("collections");
 
 const Common = @import("../common.zig");
 const names = check.CheckedNames;
 const checked = check.CheckedModule;
 const static_dispatch = check.StaticDispatchRegistry;
+const GuardedList = collections.GuardedList;
+
+fn StoreList(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.List(T, "monotype.Type.Store." ++ field_name);
+}
 
 /// Identifier for a monomorphic type in this store.
 pub const TypeId = enum(u32) { _ };
@@ -146,13 +152,13 @@ pub const NamedContent = std.meta.fieldInfo(MonoTypeNode, .named).type;
 /// Store for monomorphic types and their shared spans.
 pub const Store = struct {
     allocator: std.mem.Allocator,
-    types: std.ArrayList(Content),
-    type_digests: std.ArrayList(?names.TypeDigest),
-    specialization_digests: std.ArrayList(?names.TypeDigest),
-    spans: std.ArrayList(TypeId),
-    fields: std.ArrayList(Field),
-    tags: std.ArrayList(Tag),
-    declared_fields: std.ArrayList(DeclaredField),
+    types: StoreList(Content, "types"),
+    type_digests: StoreList(?names.TypeDigest, "type_digests"),
+    specialization_digests: StoreList(?names.TypeDigest, "specialization_digests"),
+    spans: StoreList(TypeId, "spans"),
+    fields: StoreList(Field, "fields"),
+    tags: StoreList(Tag, "tags"),
+    declared_fields: StoreList(DeclaredField, "declared_fields"),
     frozen: bool,
 
     pub fn init(allocator: std.mem.Allocator) Store {
@@ -190,7 +196,7 @@ pub const Store = struct {
     pub fn addSpan(self: *Store, values: []const TypeId) std.mem.Allocator.Error!Span {
         self.assertMutable();
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.spans.items.len);
+        const start: u32 = @intCast(self.spans.len());
         try self.spans.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
@@ -198,7 +204,7 @@ pub const Store = struct {
     pub fn addFields(self: *Store, values: []const Field) std.mem.Allocator.Error!Span {
         self.assertMutable();
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.fields.items.len);
+        const start: u32 = @intCast(self.fields.len());
         try self.fields.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
@@ -216,7 +222,7 @@ pub const Store = struct {
     pub fn addTags(self: *Store, values: []const Tag) std.mem.Allocator.Error!Span {
         self.assertMutable();
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.tags.items.len);
+        const start: u32 = @intCast(self.tags.len());
         try self.tags.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
@@ -233,7 +239,7 @@ pub const Store = struct {
 
     pub fn add(self: *Store, content: Content) std.mem.Allocator.Error!TypeId {
         self.assertMutable();
-        const index = self.types.items.len;
+        const index = self.types.len();
         try self.types.append(self.allocator, content);
         errdefer _ = self.types.pop();
         try self.type_digests.append(self.allocator, null);
@@ -272,36 +278,36 @@ pub const Store = struct {
 
     fn fillReservedSlot(self: *Store, ty: TypeId, content: Content) void {
         self.assertMutable();
-        self.types.items[@intFromEnum(ty)] = content;
+        self.types.set(@intFromEnum(ty), content);
         self.clearTypeDigestCache();
     }
 
     pub fn get(self: *const Store, ty: TypeId) Content {
-        return self.types.items[@intFromEnum(ty)];
+        return self.types.unsafeRawItemsForView()[@intFromEnum(ty)];
     }
 
     pub fn span(self: *const Store, span_: Span) []const TypeId {
-        return self.spans.items[span_.start..][0..span_.len];
+        return self.spans.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn fieldSpan(self: *const Store, span_: Span) []const Field {
-        return self.fields.items[span_.start..][0..span_.len];
+        return self.fields.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn tagSpan(self: *const Store, span_: Span) []const Tag {
-        return self.tags.items[span_.start..][0..span_.len];
+        return self.tags.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     pub fn addDeclaredFields(self: *Store, values: []const DeclaredField) std.mem.Allocator.Error!Span {
         self.assertMutable();
         if (values.len == 0) return .empty();
-        const start: u32 = @intCast(self.declared_fields.items.len);
+        const start: u32 = @intCast(self.declared_fields.len());
         try self.declared_fields.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
     pub fn declaredFieldSpan(self: *const Store, span_: Span) []const DeclaredField {
-        return self.declared_fields.items[span_.start..][0..span_.len];
+        return self.declared_fields.unsafeRawItemsForView()[span_.start..][0..span_.len];
     }
 
     const Mark = struct {
@@ -316,25 +322,25 @@ pub const Store = struct {
 
     fn mark(self: *const Store) Mark {
         return .{
-            .types_len = self.types.items.len,
-            .type_digests_len = self.type_digests.items.len,
-            .specialization_digests_len = self.specialization_digests.items.len,
-            .spans_len = self.spans.items.len,
-            .fields_len = self.fields.items.len,
-            .tags_len = self.tags.items.len,
-            .declared_fields_len = self.declared_fields.items.len,
+            .types_len = self.types.len(),
+            .type_digests_len = self.type_digests.len(),
+            .specialization_digests_len = self.specialization_digests.len(),
+            .spans_len = self.spans.len(),
+            .fields_len = self.fields.len(),
+            .tags_len = self.tags.len(),
+            .declared_fields_len = self.declared_fields.len(),
         };
     }
 
     fn restore(self: *Store, mark_: Mark) void {
         self.assertMutable();
-        self.types.items.len = mark_.types_len;
-        self.type_digests.items.len = mark_.type_digests_len;
-        self.specialization_digests.items.len = mark_.specialization_digests_len;
-        self.spans.items.len = mark_.spans_len;
-        self.fields.items.len = mark_.fields_len;
-        self.tags.items.len = mark_.tags_len;
-        self.declared_fields.items.len = mark_.declared_fields_len;
+        self.types.restoreLen(mark_.types_len);
+        self.type_digests.restoreLen(mark_.type_digests_len);
+        self.specialization_digests.restoreLen(mark_.specialization_digests_len);
+        self.spans.restoreLen(mark_.spans_len);
+        self.fields.restoreLen(mark_.fields_len);
+        self.tags.restoreLen(mark_.tags_len);
+        self.declared_fields.restoreLen(mark_.declared_fields_len);
     }
 
     pub fn ownerHead(self: *const Store, ty: TypeId) OwnerHead {
@@ -539,18 +545,22 @@ pub const Store = struct {
 
     pub fn view(self: *const Store) View {
         return .{
-            .types = self.types.items,
-            .type_digests = self.type_digests.items,
-            .spans = self.spans.items,
-            .fields = self.fields.items,
-            .tags = self.tags.items,
-            .declared_fields = self.declared_fields.items,
+            .types = self.types.unsafeRawItemsForView(),
+            .type_digests = self.type_digests.unsafeRawItemsForView(),
+            .spans = self.spans.unsafeRawItemsForView(),
+            .fields = self.fields.unsafeRawItemsForView(),
+            .tags = self.tags.unsafeRawItemsForView(),
+            .declared_fields = self.declared_fields.unsafeRawItemsForView(),
             .frozen = self.frozen,
         };
     }
 
     pub fn verify(self: *const Store, name_store: *const names.NameStore) ?VerifyError {
         return self.view().verify(name_store);
+    }
+
+    pub fn specializationDigestsView(self: *const Store) []const ?names.TypeDigest {
+        return self.specialization_digests.unsafeRawItemsForView();
     }
 
     pub fn typeDigestCached(
@@ -611,8 +621,8 @@ pub const Store = struct {
     };
 
     fn clearTypeDigestCache(self: *Store) void {
-        @memset(self.type_digests.items, null);
-        @memset(self.specialization_digests.items, null);
+        @memset(self.type_digests.unsafeRawItemsMutForStore(), null);
+        @memset(self.specialization_digests.unsafeRawItemsMutForStore(), null);
     }
 
     fn assertMutable(self: *const Store) void {
@@ -620,7 +630,7 @@ pub const Store = struct {
     }
 
     fn typeRefInBounds(self: *const Store, ty: TypeId) bool {
-        return @intFromEnum(ty) < self.types.items.len;
+        return @intFromEnum(ty) < self.types.len();
     }
 
     fn spanInBounds(_: *const Store, len: usize, span_: Span) bool {
@@ -630,7 +640,7 @@ pub const Store = struct {
     }
 
     fn verifyTypeSpan(self: *const Store, span_: Span) ?VerifyError {
-        if (!self.spanInBounds(self.spans.items.len, span_)) return .type_span_out_of_bounds;
+        if (!self.spanInBounds(self.spans.len(), span_)) return .type_span_out_of_bounds;
         for (self.span(span_)) |ty| {
             if (!self.typeRefInBounds(ty)) return .type_ref_out_of_bounds;
         }
@@ -638,7 +648,7 @@ pub const Store = struct {
     }
 
     fn verifyFieldSpan(self: *const Store, name_store: *const names.NameStore, span_: Span) ?VerifyError {
-        if (!self.spanInBounds(self.fields.items.len, span_)) return .field_span_out_of_bounds;
+        if (!self.spanInBounds(self.fields.len(), span_)) return .field_span_out_of_bounds;
         const fields_ = self.fieldSpan(span_);
         for (fields_) |field| {
             if (!self.typeRefInBounds(field.ty)) return .type_ref_out_of_bounds;
@@ -654,7 +664,7 @@ pub const Store = struct {
     }
 
     fn verifyTagSpan(self: *const Store, name_store: *const names.NameStore, span_: Span) ?VerifyError {
-        if (!self.spanInBounds(self.tags.items.len, span_)) return .tag_span_out_of_bounds;
+        if (!self.spanInBounds(self.tags.len(), span_)) return .tag_span_out_of_bounds;
         const tags_ = self.tagSpan(span_);
         for (tags_) |tag| {
             if (self.verifyTypeSpan(tag.payloads)) |err| return err;
@@ -670,7 +680,7 @@ pub const Store = struct {
     }
 
     fn verifyDeclaredFieldSpan(self: *const Store, span_: Span) ?VerifyError {
-        if (!self.spanInBounds(self.declared_fields.items.len, span_)) return .declared_field_span_out_of_bounds;
+        if (!self.spanInBounds(self.declared_fields.len(), span_)) return .declared_field_span_out_of_bounds;
         for (self.declaredFieldSpan(span_)) |field| {
             switch (field) {
                 .named => {},
@@ -696,8 +706,8 @@ pub const Store = struct {
         }
 
         const cached = switch (named_mode) {
-            .full => self.type_digests.items[@intFromEnum(ty)],
-            .identity_only => self.specialization_digests.items[@intFromEnum(ty)],
+            .full => self.type_digests.unsafeRawItemsForView()[@intFromEnum(ty)],
+            .identity_only => self.specialization_digests.unsafeRawItemsForView()[@intFromEnum(ty)],
         };
         if (cached) |digest| {
             if (stats) |s| s.cache_hits += 1;
@@ -724,8 +734,8 @@ pub const Store = struct {
         const digest: names.TypeDigest = .{ .bytes = hasher.finalResult() };
         if (ctx.saw_cycle == saw_cycle_before) {
             switch (named_mode) {
-                .full => self.type_digests.items[@intFromEnum(ty)] = digest,
-                .identity_only => self.specialization_digests.items[@intFromEnum(ty)] = digest,
+                .full => self.type_digests.set(@intFromEnum(ty), digest),
+                .identity_only => self.specialization_digests.set(@intFromEnum(ty), digest),
             }
         }
         return digest;

@@ -751,7 +751,7 @@ fn argLayoutsForProc(
     errdefer allocator.free(arg_layouts);
 
     for (arg_ids, 0..) |local_id, i| {
-        arg_layouts[i] = store.locals.items[@intFromEnum(local_id)].layout_idx;
+        arg_layouts[i] = store.getLocal(local_id).layout_idx;
     }
 
     return arg_layouts;

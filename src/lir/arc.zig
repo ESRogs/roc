@@ -44,9 +44,10 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         .store = store,
         .layouts = layouts,
     };
-    var local_contains_refcounted = try store.allocator.alloc(bool, store.locals.items.len);
+    var local_contains_refcounted = try store.allocator.alloc(bool, store.localCount());
     defer store.allocator.free(local_contains_refcounted);
-    for (store.locals.items, 0..) |local, index| {
+    for (0..store.localCount()) |index| {
+        const local = store.getLocal(@enumFromInt(@as(u32, @intCast(index))));
         local_contains_refcounted[index] = layouts.layoutContainsRefcounted(layouts.getLayout(local.layout_idx));
     }
     inserter.local_contains_refcounted = local_contains_refcounted;
@@ -55,7 +56,7 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     defer solution.deinit();
     inserter.solution = &solution;
 
-    var scan_needles = try OwnedSet.init(store.allocator, store.locals.items.len);
+    var scan_needles = try OwnedSet.init(store.allocator, store.localCount());
     defer scan_needles.deinit();
     inserter.scan_needles = &scan_needles;
     var scan_visited = std.AutoHashMap(LIR.CFStmtId, void).init(store.allocator);
@@ -78,10 +79,11 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     // Original (ownership-neutral) bodies stay valid after each proc's base
     // emission because rewriting clones statements; specialized variants
     // re-emit from these.
-    const base_proc_count = store.proc_specs.items.len;
+    const base_proc_count = store.procSpecCount();
     var original_bodies = try store.allocator.alloc(?LIR.CFStmtId, base_proc_count);
     defer store.allocator.free(original_bodies);
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..base_proc_count) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         original_bodies[proc_index] = proc.body;
     }
 
@@ -102,11 +104,11 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     }
     inserter.variants = &variants;
 
-    var owned_param_override = try OwnedSet.init(store.allocator, store.locals.items.len);
+    var owned_param_override = try OwnedSet.init(store.allocator, store.localCount());
     defer owned_param_override.deinit();
     inserter.owned_param_override = &owned_param_override;
 
-    var unique_param_override = try OwnedSet.init(store.allocator, store.locals.items.len);
+    var unique_param_override = try OwnedSet.init(store.allocator, store.localCount());
     defer unique_param_override.deinit();
     inserter.unique_param_override = &unique_param_override;
 
@@ -182,7 +184,7 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         defer inserter.deinitJoinBodyMemo(&join_body_memo);
         inserter.join_body_memo = &join_body_memo;
         defer inserter.join_body_memo = null;
-        var owned = try OwnedSet.init(store.allocator, store.locals.items.len);
+        var owned = try OwnedSet.init(store.allocator, store.localCount());
         defer owned.deinit();
         for (store.getLocalSpan(emit_args), 0..) |param, position| {
             if (emit_sig.paramMode(position) == .owned) {
@@ -201,7 +203,7 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     }
 
     if (builtin.mode == .Debug) {
-        const all_sigs = try store.allocator.alloc(arc_sig.RcSig, store.proc_specs.items.len);
+        const all_sigs = try store.allocator.alloc(arc_sig.RcSig, store.procSpecCount());
         defer store.allocator.free(all_sigs);
         for (all_sigs, 0..) |*sig, proc_index| {
             sig.* = if (proc_index < solution.sigs.len)
@@ -2861,7 +2863,7 @@ const Inserter = struct {
         if (params.len == 0) return 0;
 
         var mask: u64 = 0;
-        var visited = try self.store.allocator.alloc(bool, self.store.cf_stmts.items.len);
+        var visited = try self.store.allocator.alloc(bool, self.store.cfStmtCount());
         defer self.store.allocator.free(visited);
         @memset(visited, false);
 
@@ -3351,9 +3353,9 @@ const Inserter = struct {
     ) ResourceError!void {
         if (graph.indices.contains(stmt)) return;
 
-        var reads = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.locals.items.len);
+        var reads = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.localCount());
         errdefer reads.deinit(graph.allocator);
-        var exposed = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.locals.items.len);
+        var exposed = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.localCount());
         errdefer exposed.deinit(graph.allocator);
 
         const index = graph.nodes.items.len;
@@ -3615,7 +3617,7 @@ const Inserter = struct {
             }
         }
 
-        var scratch = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, self.store.locals.items.len);
+        var scratch = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, self.store.localCount());
         var in_work = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, node_count);
         var node_work = std.ArrayList(usize).empty;
         try node_work.ensureTotalCapacity(graph_allocator, node_count);
@@ -4558,7 +4560,8 @@ const ArcTest = struct {
     }
 
     fn procBody(self: *const ArcTest) LIR.CFStmtId {
-        for (self.store.proc_specs.items) |proc| {
+        for (0..self.store.procSpecCount()) |proc_index| {
+            const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (proc.body) |body| return body;
         }
         arcInvariant("ARC test fixture has no procedure body");
@@ -4566,7 +4569,8 @@ const ArcTest = struct {
 
     fn joinBody(self: *const ArcTest, join_id: LIR.JoinPointId) LIR.CFStmtId {
         var found: ?LIR.CFStmtId = null;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .join => |join_stmt| {
                     if (join_stmt.id == join_id) found = join_stmt.body;
@@ -4579,7 +4583,8 @@ const ArcTest = struct {
 
     fn countRc(self: *const ArcTest, local_id: LIR.LocalId, kind: RcKind) usize {
         var count: usize = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .incref => |rc| {
                     if (kind == .incref and rc.value == local_id) count += 1;
@@ -4603,7 +4608,8 @@ const ArcTest = struct {
 
     fn expectRcAtomicity(self: *const ArcTest, local_id: LIR.LocalId, expected: LIR.RcAtomicity) ExpectError!void {
         var seen: usize = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             const found: LIR.RcAtomicity = switch (stmt) {
                 .incref => |rc| if (rc.value == local_id) rc.atomicity else continue,
                 .decref => |rc| if (rc.value == local_id) rc.atomicity else continue,
@@ -4619,7 +4625,8 @@ const ArcTest = struct {
 
     fn uniqueArgsFor(self: *const ArcTest, target: LIR.LocalId) u64 {
         var mask: u64 = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .assign_low_level => |assign| {
                     if (assign.target == target) mask |= assign.unique_args;
@@ -4687,7 +4694,8 @@ const ArcTest = struct {
 
     fn countAllRc(self: *const ArcTest) usize {
         var count: usize = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .incref, .decref, .decref_if_initialized, .free => count += 1,
                 else => {},
@@ -4704,7 +4712,7 @@ const ArcTest = struct {
 
     fn expectReachableRcBefore(self: *const ArcTest, start: LIR.CFStmtId, kind: RcKind, local_id: LIR.LocalId, before: RcStopKind) error{ ExpectedRcBeforeStop, NonLinearPath, CyclicPath }!void {
         var cursor = start;
-        var remaining: usize = self.store.cf_stmts.items.len + 1;
+        var remaining: usize = self.store.cfStmtCount() + 1;
         while (remaining > 0) : (remaining -= 1) {
             const stmt = self.store.getCFStmt(cursor);
             switch (stmt) {
@@ -4761,7 +4769,7 @@ const ArcTest = struct {
         set_target: LIR.LocalId,
     ) error{ ExpectedConditionalDecref, SetBeforeConditionalDecref, NonLinearPath, CyclicPath }!void {
         var cursor = start;
-        var remaining: usize = self.store.cf_stmts.items.len + 1;
+        var remaining: usize = self.store.cfStmtCount() + 1;
         while (remaining > 0) : (remaining -= 1) {
             const stmt = self.store.getCFStmt(cursor);
             switch (stmt) {
@@ -6136,12 +6144,12 @@ test "uniqueness: specialized variant elides the check on a unique dying argumen
     const caller_body = try f.assignList(list, &.{}, call);
     _ = try f.addProc(&.{}, caller_body, f.list_i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
     // One unique-seeded variant exists; its op runs check-free while the
     // base proc keeps the runtime check.
-    try testing.expectEqual(base_proc_count + 1, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count + 1, f.store.procSpecCount());
     try testing.expectEqual(@as(u64, 0), try f.uniqueArgsInProc(callee, appended));
     const variant: LIR.LirProcSpecId = @enumFromInt(@as(u32, @intCast(base_proc_count)));
     try testing.expectEqual(@as(u64, 1), try f.uniqueArgsInProc(variant, appended));
@@ -6171,12 +6179,12 @@ test "uniqueness: without specialization the dying unique argument keeps the cal
     const caller_body = try f.assignList(list, &.{}, call);
     _ = try f.addProc(&.{}, caller_body, f.list_i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try f.run();
 
     // Single-variant emission never sees unique parameters: no variant is
     // cloned and the callee keeps its runtime check.
-    try testing.expectEqual(base_proc_count, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count, f.store.procSpecCount());
     try testing.expectEqual(@as(u64, 0), f.uniqueArgsFor(appended));
 }
 
@@ -6380,7 +6388,7 @@ test "dev lowering: mutable list reassignment releases only the replaced value" 
 
 fn expectDecrefBeforeStmt(f: *const ArcTest, start: LIR.CFStmtId, local: LIR.LocalId, comptime stop_tag: std.meta.Tag(LIR.CFStmt)) error{ DecrefNotBeforeStop, NonLinearPath, CyclicPath }!void {
     var cursor = start;
-    var remaining: usize = f.store.cf_stmts.items.len + 1;
+    var remaining: usize = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         const stmt = f.store.getCFStmt(cursor);
         if (stmt == stop_tag) return error.DecrefNotBeforeStop;
@@ -6676,13 +6684,13 @@ test "RC specialization: borrowed final argument does not clone for release-only
     const body = try f.assignStr(value, "arg", call);
     _ = try f.addProc(&.{}, body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
     // Moving this argument into a variant would only relocate the release
     // from caller to callee. Keep the borrowed signature and avoid cloning
     // live code for no runtime RC reduction.
-    try testing.expectEqual(base_proc_count, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count, f.store.procSpecCount());
     try f.expectRc(value, 0, 1, 0);
     try f.expectRc(param, 0, 0, 0);
 }
@@ -6718,15 +6726,15 @@ test "RC specialization: caller body survives variant proc append" {
     const caller_body = try f.assignStr(source, "arg", flag_assign);
     const caller = try f.addProc(&.{}, caller_body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
-    f.store.proc_specs.shrinkAndFree(f.allocator, f.store.proc_specs.items.len);
+    const base_proc_count = f.store.procSpecCount();
+    f.store.proc_specs.shrinkAndFree(f.allocator, f.store.procSpecCount());
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
-    try testing.expectEqual(base_proc_count + 1, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count + 1, f.store.procSpecCount());
     const variant: LIR.LirProcSpecId = @enumFromInt(@as(u32, @intCast(base_proc_count)));
 
     var cursor = f.store.getProcSpec(caller).body orelse return error.MissingCallerBody;
-    var remaining = f.store.cf_stmts.items.len + 1;
+    var remaining = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         switch (f.store.getCFStmt(cursor)) {
             .assign_call => |assign| {
@@ -6768,12 +6776,12 @@ test "RC without specialization: owned final argument drops after the call" {
     const body = try f.assignStr(value, "arg", call);
     _ = try f.addProc(&.{}, body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try f.run();
 
     // The single-variant build keeps the borrowed signature: the caller
     // retains ownership across the call and releases right after it.
-    try testing.expectEqual(base_proc_count, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count, f.store.procSpecCount());
     try f.expectRc(value, 0, 1, 0);
     try f.expectRc(param, 0, 0, 0);
 }
@@ -6810,10 +6818,10 @@ test "RC specialization: identical demand vectors share one variant" {
     const body = try f.assignStr(value_a, "a", call_a);
     _ = try f.addProc(&.{}, body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
-    try testing.expectEqual(base_proc_count + 1, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count + 1, f.store.procSpecCount());
     try f.expectRc(value_a, 0, 0, 0);
     try f.expectRc(value_b, 0, 0, 0);
 }

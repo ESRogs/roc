@@ -2194,7 +2194,7 @@ test "issue 9647: row refills do not duplicate dependencies or materialized span
     const parents = graph.row_parents.get(graph.find(ext)) orelse
         return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 1), parents.items.len);
-    try std.testing.expectEqual(@as(usize, 1), type_store.fields.items.len);
+    try std.testing.expectEqual(@as(usize, 1), type_store.view().fields.len);
 }
 
 test "alias unification does not make the alias its own backing" {

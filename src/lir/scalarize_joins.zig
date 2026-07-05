@@ -69,7 +69,8 @@ pub fn run(store: *LirStore, layouts: *const layout_mod.Store) ScalarizeError!vo
     var rounds: usize = 0;
     while (rounds < max_rounds) : (rounds += 1) {
         var changed = false;
-        for (store.proc_specs.items, 0..) |proc, proc_index| {
+        for (0..store.procSpecCount()) |proc_index| {
+            const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             const body = proc.body orelse continue;
             if (try pass.scalarizeProc(@enumFromInt(@as(u32, @intCast(proc_index))), body)) {
                 changed = true;

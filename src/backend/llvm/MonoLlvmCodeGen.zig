@@ -1375,9 +1375,9 @@ pub const MonoLlvmCodeGen = struct {
         }
         self.current_ret_layout = proc.ret_layout;
 
-        self.local_slots = try self.allocator.alloc(LocalSlot, self.store.locals.items.len);
+        self.local_slots = try self.allocator.alloc(LocalSlot, self.store.localCount());
         defer self.allocator.free(self.local_slots);
-        self.deferred_str_captures = try self.allocator.alloc(?DeferredStrCapture, self.store.locals.items.len);
+        self.deferred_str_captures = try self.allocator.alloc(?DeferredStrCapture, self.store.localCount());
         defer self.allocator.free(self.deferred_str_captures);
         self.clearDeferredStrCaptures();
         try self.allocProcLocalSlots(proc);

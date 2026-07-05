@@ -76,7 +76,7 @@ const WrapperAnalyzer = struct {
         allocator: std.mem.Allocator,
         solved: *const Solved.Program,
     ) std.mem.Allocator.Error!OwnedPlan {
-        const decisions = try allocator.alloc(Decision, solved.lifted.fns.items.len);
+        const decisions = try allocator.alloc(Decision, solved.lifted.fnCount());
         errdefer allocator.free(decisions);
         @memset(decisions, .unknown);
 
@@ -88,7 +88,7 @@ const WrapperAnalyzer = struct {
         };
         defer analyzer.stack.deinit(allocator);
 
-        for (solved.lifted.fns.items, 0..) |_, index| {
+        for (0..solved.lifted.fnCount()) |index| {
             const fn_id: Lifted.FnId = @enumFromInt(@as(u32, @intCast(index)));
             _ = try analyzer.inlineBody(fn_id);
         }
@@ -158,7 +158,7 @@ const WrapperAnalyzer = struct {
     }
 
     fn wrapperCandidate(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) ?Lifted.ExprId {
-        const source_fn = self.solved.lifted.fns.items[@intFromEnum(fn_id)];
+        const source_fn = self.solved.lifted.getFn(fn_id);
         if (self.solved.lifted.typedLocalSpan(source_fn.captures).len != 0) return null;
         if (self.solvedCaptureCount(fn_id) != 0) return null;
 
@@ -178,7 +178,7 @@ const WrapperAnalyzer = struct {
     }
 
     fn solvedCapturesForFn(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) SolvedType.Span {
-        const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
+        const fn_symbol = self.solved.lifted.getFn(fn_id).symbol;
         const func = switch (self.solved.types.rootContent(self.solved.fn_tys.items[@intFromEnum(fn_id)])) {
             .func => |func| func,
             else => Common.invariant("direct Lambda Mono function table contains a non-function type"),
@@ -195,12 +195,12 @@ const WrapperAnalyzer = struct {
     }
 
     fn bodyReadsOnlyArgs(self: *const WrapperAnalyzer, fn_id: Lifted.FnId, body: Lifted.ExprId) bool {
-        const source_fn = self.solved.lifted.fns.items[@intFromEnum(fn_id)];
+        const source_fn = self.solved.lifted.getFn(fn_id);
         return self.exprReadsOnlyArgs(body, self.solved.lifted.typedLocalSpan(source_fn.args));
     }
 
     fn exprReadsOnlyArgs(self: *const WrapperAnalyzer, expr_id: Lifted.ExprId, args: []const Lifted.TypedLocal) bool {
-        const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
+        const expr = self.solved.lifted.getExpr(expr_id);
         return switch (expr.data) {
             .local => |local| localIsArg(local, args),
             .unit,
@@ -281,7 +281,7 @@ const WrapperAnalyzer = struct {
     }
 
     fn isInlineableWrapperBody(self: *const WrapperAnalyzer, expr_id: Lifted.ExprId) bool {
-        const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
+        const expr = self.solved.lifted.getExpr(expr_id);
         return switch (expr.data) {
             .call_proc, .low_level => true,
             .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
@@ -295,7 +295,7 @@ const WrapperAnalyzer = struct {
     /// operands or other call arguments, mirroring the shapes accepted by
     /// `exprReadsOnlyArgs`.
     fn visitBodyCallees(self: *WrapperAnalyzer, expr_id: Lifted.ExprId) std.mem.Allocator.Error!void {
-        const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
+        const expr = self.solved.lifted.getExpr(expr_id);
         switch (expr.data) {
             .local,
             .unit,

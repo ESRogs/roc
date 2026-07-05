@@ -34,15 +34,13 @@ pub fn run(
     var owned = solved;
     errdefer owned.deinit();
 
-    var string_literals = owned.lifted.string_literals;
-    owned.lifted.string_literals = .empty;
+    var string_literals = owned.lifted.takeStringLiterals();
     var name_store = owned.lifted.names;
     owned.lifted.names = @import("check").CheckedNames.NameStore.init(allocator);
     var program = Ast.Program.init(allocator, name_store, string_literals);
     name_store = undefined;
     string_literals = undefined;
-    program.source_files = owned.lifted.source_files;
-    owned.lifted.source_files = .empty;
+    program.source_files = Ast.ProgramList([]const u8, "source_files").fromArrayList(owned.lifted.takeSourceFiles());
     errdefer program.deinit();
 
     const solved_view = movedSolvedView(&owned, &program);
@@ -60,39 +58,41 @@ pub fn run(
 }
 
 fn movedSolvedView(source: *const Solved.Program, moved: *const Ast.Program) Solved.ProgramView {
+    const lifted = source.lifted.view();
     return .{
         .lifted = .{
             .names = &moved.names,
-            .next_symbol = source.lifted.next_symbol,
-            .types = source.lifted.types.view(),
-            .imported_fns = source.lifted.imported_fns.items,
-            .fns = source.lifted.fns.items,
-            .exprs = source.lifted.exprs.items,
-            .pats = source.lifted.pats.items,
-            .stmts = source.lifted.stmts.items,
-            .locals = source.lifted.locals.items,
-            .expr_ids = source.lifted.expr_ids.items,
-            .pat_ids = source.lifted.pat_ids.items,
-            .typed_locals = source.lifted.typed_locals.items,
-            .stmt_ids = source.lifted.stmt_ids.items,
-            .field_exprs = source.lifted.field_exprs.items,
-            .capture_operands = source.lifted.capture_operands.items,
-            .record_destructs = source.lifted.record_destructs.items,
-            .str_pattern_steps = source.lifted.str_pattern_steps.items,
-            .branches = source.lifted.branches.items,
-            .if_branches = source.lifted.if_branches.items,
-            .string_literals = moved.string_literals.items,
-            .proc_debug_names = &source.lifted.proc_debug_names,
-            .roots = source.lifted.roots.items,
-            .layout_requests = source.lifted.layout_requests.items,
-            .runtime_schema_requests = source.lifted.runtime_schema_requests.items,
-            .comptime_sites = source.lifted.comptime_sites.items,
-            .source_files = moved.source_files.items,
-            .expr_locs = source.lifted.expr_locs.items,
-            .expr_regions = source.lifted.expr_regions.items,
-            .stmt_locs = source.lifted.stmt_locs.items,
-            .stmt_regions = source.lifted.stmt_regions.items,
-            .local_names = source.lifted.local_names.items,
+            .next_symbol = lifted.next_symbol,
+            .types = lifted.types,
+            .imported_fns = lifted.imported_fns,
+            .fns = lifted.fns,
+            .exprs = lifted.exprs,
+            .pats = lifted.pats,
+            .stmts = lifted.stmts,
+            .locals = lifted.locals,
+            .expr_ids = lifted.expr_ids,
+            .pat_ids = lifted.pat_ids,
+            .typed_locals = lifted.typed_locals,
+            .stmt_ids = lifted.stmt_ids,
+            .field_exprs = lifted.field_exprs,
+            .fn_def_captures = lifted.fn_def_captures,
+            .capture_operands = lifted.capture_operands,
+            .record_destructs = lifted.record_destructs,
+            .str_pattern_steps = lifted.str_pattern_steps,
+            .branches = lifted.branches,
+            .if_branches = lifted.if_branches,
+            .string_literals = moved.string_literals.unsafeRawItemsForView(),
+            .proc_debug_names = lifted.proc_debug_names,
+            .roots = lifted.roots,
+            .layout_requests = lifted.layout_requests,
+            .runtime_schema_requests = lifted.runtime_schema_requests,
+            .comptime_sites = lifted.comptime_sites,
+            .source_files = moved.source_files.unsafeRawItemsForView(),
+            .expr_locs = lifted.expr_locs,
+            .expr_regions = lifted.expr_regions,
+            .stmt_locs = lifted.stmt_locs,
+            .stmt_regions = lifted.stmt_regions,
+            .local_names = lifted.local_names,
         },
         .types = source.types.view(),
         .defs = source.defs.items,
@@ -395,14 +395,14 @@ const Lowerer = struct {
         const ret = try self.lowerType(func.ret);
 
         const args_span = try self.program.addTypedLocalSpan(args.items);
-        const symbol = self.program.fns.items[@intFromEnum(out_id)].symbol;
-        self.program.fns.items[@intFromEnum(out_id)] = .{
+        const symbol = self.program.getFn(out_id).symbol;
+        self.program.setFn(out_id, .{
             .symbol = symbol,
             .source = fn_.source,
             .args = args_span,
             .body = body,
             .ret = ret,
-        };
+        });
         self.fn_written.items[@intFromEnum(out_id)] = true;
     }
 
@@ -452,7 +452,7 @@ const Lowerer = struct {
         const result = try self.fn_spec_map.getOrPut(spec);
         if (result.found_existing) return result.value_ptr.*;
 
-        const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(self.program.fns.items.len)));
+        const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(self.program.fnCount())));
         const source_fn = self.solved.lifted.fns[@intFromEnum(source)];
         const symbol = self.symbols.fresh();
         try self.program.fns.append(self.allocator, undefined);
@@ -468,13 +468,13 @@ const Lowerer = struct {
             else => Common.invariant("Lambda Mono function table contains a non-function type"),
         });
 
-        self.program.fns.items[@intFromEnum(fn_id)] = .{
+        self.program.setFn(fn_id, .{
             .symbol = symbol,
             .source = source_fn.source,
             .args = .empty(),
             .body = .hosted,
             .ret = ret_ty,
-        };
+        });
         return fn_id;
     }
 
@@ -801,7 +801,7 @@ const Lowerer = struct {
 
     fn lowerValueCall(self: *Lowerer, ty: Type.TypeId, call: anytype) Allocator.Error!Ast.ExprData {
         const callee = try self.lowerExpr(call.callee);
-        const callee_ty = self.program.exprs.items[@intFromEnum(callee)].ty;
+        const callee_ty = self.program.getExpr(callee).ty;
         const args = try self.lowerExprSlice(self.solved.lifted.exprSpan(call.args));
         defer self.allocator.free(args);
 
@@ -827,7 +827,7 @@ const Lowerer = struct {
                     defer self.allocator.free(call_args);
                     @memcpy(call_args[0..args.len], args);
                     if (payload_pat) |pat_id| {
-                        const bind_local = switch (self.program.pats.items[@intFromEnum(pat_id)].data) {
+                        const bind_local = switch (self.program.getPat(pat_id).data) {
                             .bind => |local| local,
                             else => unreachable,
                         };
@@ -1260,7 +1260,7 @@ const Lowerer = struct {
         const mapped = self.local_map[@intFromEnum(local)] orelse {
             return try self.lowerType(self.solved.local_tys[@intFromEnum(local)]);
         };
-        return self.program.locals.items[@intFromEnum(mapped)].ty;
+        return self.program.getLocal(mapped).ty;
     }
 
     fn lowerFieldExprSpan(self: *Lowerer, span: Lifted.Span(Lifted.FieldExpr)) Allocator.Error!Ast.Span(Ast.FieldExpr) {

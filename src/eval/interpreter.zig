@@ -913,7 +913,7 @@ pub const Interpreter = struct {
         const arg_layouts = try self.allocator.alloc(layout_mod.Idx, arg_ids.len);
         defer self.allocator.free(arg_layouts);
         for (arg_ids, 0..) |local_id, i| {
-            arg_layouts[i] = view.store.locals.items[@intFromEnum(local_id)].layout_idx;
+            arg_layouts[i] = view.store.getLocal(local_id).layout_idx;
         }
 
         return self.eval(.{
@@ -1345,7 +1345,7 @@ pub const Interpreter = struct {
         } else {
             if (stmt_id) |id| {
                 const center = @as(usize, @intFromEnum(id));
-                const stmt_count = self.store.cf_stmts.items.len;
+                const stmt_count = self.store.cfStmtCount();
                 const start = center -| 20;
                 const end = @min(stmt_count, center + 21);
                 debugPrint("LIR/interpreter stmt window around failing stmt {d}:\n", .{@intFromEnum(id)});
@@ -2158,10 +2158,11 @@ pub const Interpreter = struct {
             }
             debugPrint("\n", .{});
         }
-        const local_count = self.store.locals.items.len;
+        const local_count = self.store.localCount();
         if (local_count > 0) {
             debugPrint("  locals:\n", .{});
-            for (self.store.locals.items, 0..) |local, idx| {
+            for (0..local_count) |idx| {
+                const local = self.store.getLocal(@enumFromInt(@as(u32, @intCast(idx))));
                 const layout_idx = local.layout_idx;
                 const layout_val = self.layout_store.getLayout(layout_idx);
                 debugPrint(

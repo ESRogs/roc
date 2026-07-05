@@ -140,7 +140,7 @@ pub fn run(
     var lowerer = try Lowerer.init(allocator, target_usize, &owned, options);
     errdefer lowerer.deinit();
 
-    try lowerer.result.store.setSourceFiles(owned.lifted.source_files.items);
+    try lowerer.result.store.setSourceFiles(owned.lifted.sourceFileNames());
     try lowerer.lower();
     try lowerer.bindRoots();
     try lowerer.lowerReachableFns();
@@ -341,11 +341,11 @@ const Lowerer = struct {
         solved: *const Solved.Program,
         options: Options,
     ) Common.LowerError!Lowerer {
-        const local_map = try allocator.alloc(?LIR.LocalId, solved.lifted.locals.items.len);
+        const local_map = try allocator.alloc(?LIR.LocalId, solved.lifted.localCount());
         errdefer allocator.free(local_map);
         @memset(local_map, null);
 
-        const comptime_site_map = try allocator.alloc(?LIR.ComptimeSiteId, solved.lifted.comptime_sites.items.len);
+        const comptime_site_map = try allocator.alloc(?LIR.ComptimeSiteId, solved.lifted.comptimeSiteCount());
         errdefer allocator.free(comptime_site_map);
         @memset(comptime_site_map, null);
 
@@ -464,8 +464,8 @@ const Lowerer = struct {
     fn lower(self: *Lowerer) Common.LowerError!void {
         try self.indexSourceFns();
 
-        try self.roots.ensureTotalCapacity(self.allocator, self.solved.lifted.roots.items.len);
-        for (self.solved.lifted.roots.items) |root| {
+        try self.roots.ensureTotalCapacity(self.allocator, self.solved.lifted.rootCount());
+        for (self.solved.lifted.rootsView()) |root| {
             const fn_id = try self.ensureOwnFnSpec(root.fn_id, .finite);
             try self.roots.append(self.allocator, .{
                 .fn_id = fn_id,
@@ -494,8 +494,9 @@ const Lowerer = struct {
     }
 
     fn indexSourceFns(self: *Lowerer) Common.LowerError!void {
-        for (self.solved.lifted.fns.items, 0..) |fn_, index| {
+        for (0..self.solved.lifted.fnCount()) |index| {
             const fn_id: Lifted.FnId = @enumFromInt(@as(u32, @intCast(index)));
+            const fn_ = self.solved.lifted.getFn(fn_id);
             const result = try self.source_symbols.getOrPut(fn_.symbol);
             if (result.found_existing) Common.invariant("two lifted functions had the same symbol");
             result.value_ptr.* = fn_id;
@@ -515,7 +516,7 @@ const Lowerer = struct {
     fn lowerFnSpec(self: *Lowerer, fn_id: Type.FnId, spec: FnSpec) Common.LowerError!void {
         const proc_id = try self.procPlaceholder(fn_id);
         const entry = self.fn_entries.items[@intFromEnum(fn_id)];
-        const source_fn = self.solved.lifted.fns.items[@intFromEnum(spec.source)];
+        const source_fn = self.solved.lifted.getFn(spec.source);
 
         self.captures.clearRetainingCapacity();
         @memset(self.local_map, null);
@@ -619,7 +620,7 @@ const Lowerer = struct {
     }
 
     fn ensureOwnFnSpec(self: *Lowerer, fn_id: Lifted.FnId, abi: CaptureAbi) Common.LowerError!Type.FnId {
-        const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
+        const fn_symbol = self.solved.lifted.getFn(fn_id).symbol;
         const solved_fn_ty = self.solved.types.root(self.solved.fn_tys.items[@intFromEnum(fn_id)]);
         const func = switch (self.solved.types.rootContent(solved_fn_ty)) {
             .func => |func| func,
@@ -670,7 +671,7 @@ const Lowerer = struct {
         try self.fn_written.append(self.allocator, false);
         try self.fn_reachable.append(self.allocator, false);
         try self.fn_entries.append(self.allocator, undefined);
-        const source_fn = self.solved.lifted.fns.items[@intFromEnum(source)];
+        const source_fn = self.solved.lifted.getFn(source);
         const symbol = self.symbols.fresh();
         const func = switch (self.solved.types.rootContent(spec.solved_fn_ty)) {
             .func => |func| func,
@@ -725,7 +726,7 @@ const Lowerer = struct {
         const index = @intFromEnum(fn_id);
         var entry = self.fn_entries.items[index];
         const spec = entry.spec;
-        const source_fn = self.solved.lifted.fns.items[@intFromEnum(spec.source)];
+        const source_fn = self.solved.lifted.getFn(spec.source);
         const arg_tys = self.types.span(entry.args);
         const lifted_args = self.solved.lifted.typedLocalSpan(source_fn.args);
         if (arg_tys.len != lifted_args.len) Common.invariant("direct Lambda Mono function arity changed after Lambda Solved");
@@ -832,8 +833,8 @@ const Lowerer = struct {
         // iff they carry the same CaptureId (the exact join key that
         // survives specialization/cloning). This is only used to search a
         // function's own capture set, where CaptureIds are unique.
-        const local = self.solved.lifted.locals.items[@intFromEnum(local_id)];
-        const capture = self.solved.lifted.locals.items[@intFromEnum(capture_local)];
+        const local = self.solved.lifted.getLocal(local_id);
+        const capture = self.solved.lifted.getLocal(capture_local);
         return local.capture_id != null and capture.capture_id != null and local.capture_id.? == capture.capture_id.?;
     }
 
@@ -845,8 +846,8 @@ const Lowerer = struct {
     /// captured-binder CaptureId yet are distinct lowered bindings).
     fn aliasedLocalMatches(self: *Lowerer, local_id: Lifted.LocalId, other: Lifted.LocalId) bool {
         if (local_id == other) return true;
-        const local = self.solved.lifted.locals.items[@intFromEnum(local_id)];
-        const alias = self.solved.lifted.locals.items[@intFromEnum(other)];
+        const local = self.solved.lifted.getLocal(local_id);
+        const alias = self.solved.lifted.getLocal(other);
         return local.symbol == alias.symbol;
     }
 
@@ -883,7 +884,7 @@ const Lowerer = struct {
     }
 
     fn memberCapturesForExpr(self: *Lowerer, expr_id: Lifted.ExprId, fn_id: Lifted.FnId) SolvedType.Span {
-        const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
+        const fn_symbol = self.solved.lifted.getFn(fn_id).symbol;
         const expr_ty = self.solved.expr_tys.items[@intFromEnum(expr_id)];
         const callable = switch (self.solved.types.rootContent(expr_ty)) {
             .func => |func| func.callable,
@@ -902,7 +903,7 @@ const Lowerer = struct {
     }
 
     fn capturesForFn(self: *Lowerer, fn_id: Lifted.FnId) SolvedType.Span {
-        const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
+        const fn_symbol = self.solved.lifted.getFn(fn_id).symbol;
         const func = switch (self.solved.types.rootContent(self.solved.fn_tys.items[@intFromEnum(fn_id)])) {
             .func => |func| func,
             else => Common.invariant("direct Lambda Mono function table contains a non-function type"),
@@ -954,7 +955,7 @@ const Lowerer = struct {
     }
 
     fn lowerExprContextTy(self: *Lowerer, expr_id: Lifted.ExprId) Common.LowerError!Type.TypeId {
-        const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
+        const expr = self.solved.lifted.getExpr(expr_id);
         return switch (expr.data) {
             .field_access => |field| self.recordFieldType(
                 try self.lowerExprContextTy(field.receiver),
@@ -1154,7 +1155,7 @@ const Lowerer = struct {
     }
 
     fn stringLiteral(self: *const Lowerer, id: Lifted.StringLiteralId) Mono.StringLiteral {
-        return self.solved.lifted.string_literals.items[@intFromEnum(id)];
+        return self.solved.lifted.getStringLiteral(id);
     }
 
     fn lirStrLiteral(self: *Lowerer, id: Lifted.StringLiteralId) Common.LowerError!LIR.StrLiteral {
@@ -1855,10 +1856,11 @@ const Lowerer = struct {
         for (self.fn_reachable.items) |reachable| {
             if (reachable) reachable_count += 1;
         }
-        if (reachable_count > materialized.fns.items.len) {
+        if (reachable_count > materialized.fnCount()) {
             Common.invariant("debug Lambda Mono verifier saw too many direct function specs");
         }
-        const used = try self.allocator.alloc(bool, materialized.fns.items.len);
+        const materialized_fns = materialized.fnsView();
+        const used = try self.allocator.alloc(bool, materialized_fns.len);
         defer self.allocator.free(used);
         @memset(used, false);
 
@@ -1867,7 +1869,7 @@ const Lowerer = struct {
             // ConstStore metadata can refer to source templates without forcing
             // every queued Lambda Mono function into a LIR proc.
             if (!self.fn_reachable.items[entry_index]) continue;
-            for (materialized.fns.items, 0..) |fn_, index| {
+            for (materialized_fns, 0..) |fn_, index| {
                 if (used[index]) continue;
                 if (try self.fnEntryMatchesMaterialized(entry, fn_, materialized)) {
                     used[index] = true;
@@ -1905,14 +1907,15 @@ const Lowerer = struct {
     }
 
     fn verifyRootsMatch(self: *Lowerer, materialized: *const LambdaMono.Program) Common.LowerError!void {
-        if (self.roots.items.len != materialized.roots.items.len) {
+        const roots = materialized.rootsView();
+        if (self.roots.items.len != roots.len) {
             Common.invariant("debug Lambda Mono verifier saw a root count mismatch");
         }
-        for (self.roots.items, materialized.roots.items) |direct, expected| {
+        for (self.roots.items, roots) |direct, expected| {
             if (!std.meta.eql(direct.request, expected.request)) {
                 Common.invariant("debug Lambda Mono verifier saw a root mismatch");
             }
-            const expected_fn = materialized.fns.items[@intFromEnum(expected.fn_id)];
+            const expected_fn = materialized.getFn(expected.fn_id);
             if (!try self.fnEntryMatchesMaterialized(self.fn_entries.items[@intFromEnum(direct.fn_id)], expected_fn, materialized)) {
                 Common.invariant("debug Lambda Mono verifier saw a root mismatch");
             }
@@ -1920,10 +1923,11 @@ const Lowerer = struct {
     }
 
     fn verifyLayoutRequestsMatch(self: *Lowerer, materialized: *const LambdaMono.Program, type_equivalence: *TypeEquivalence) Common.LowerError!void {
-        if (self.layout_requests.items.len != materialized.layout_requests.items.len) {
+        const requests = materialized.layoutRequestsView();
+        if (self.layout_requests.items.len != requests.len) {
             Common.invariant("debug Lambda Mono verifier saw a layout request count mismatch");
         }
-        for (self.layout_requests.items, materialized.layout_requests.items) |direct, expected| {
+        for (self.layout_requests.items, requests) |direct, expected| {
             if (direct.checked_type != expected.checked_type or !try type_equivalence.equivalent(direct.ty, expected.ty)) {
                 Common.invariant("debug Lambda Mono verifier saw a layout request mismatch");
             }
@@ -1931,10 +1935,11 @@ const Lowerer = struct {
     }
 
     fn verifyRuntimeSchemaRequestsMatch(self: *Lowerer, materialized: *const LambdaMono.Program, type_equivalence: *TypeEquivalence) Common.LowerError!void {
-        if (self.runtime_schema_requests.items.len != materialized.runtime_schema_requests.items.len) {
+        const requests = materialized.runtimeSchemaRequestsView();
+        if (self.runtime_schema_requests.items.len != requests.len) {
             Common.invariant("debug Lambda Mono verifier saw a runtime schema request count mismatch");
         }
-        for (self.runtime_schema_requests.items, materialized.runtime_schema_requests.items) |direct, expected| {
+        for (self.runtime_schema_requests.items, requests) |direct, expected| {
             if (!std.meta.eql(direct.def, expected.def) or !try type_equivalence.equivalent(direct.ty, expected.ty)) {
                 Common.invariant("debug Lambda Mono verifier saw a runtime schema request mismatch");
             }
@@ -1953,7 +1958,7 @@ const Lowerer = struct {
         expr_id: Lifted.ExprId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
-        const expr_data = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
+        const expr_data = self.solved.lifted.getExpr(expr_id);
         const expr_ty = try self.lowerExprTy(expr_id);
         const saved_loc = self.result.store.current_loc;
         defer self.result.store.current_loc = saved_loc;
@@ -2088,7 +2093,7 @@ const Lowerer = struct {
         ty: Type.TypeId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
-        const expr_data = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
+        const expr_data = self.solved.lifted.getExpr(expr_id);
         const saved_loc = self.result.store.current_loc;
         defer self.result.store.current_loc = saved_loc;
         const saved_region = self.result.store.current_region;
@@ -2995,10 +3000,10 @@ const Lowerer = struct {
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         const captures = self.memberCapturesForExpr(expr_id, fn_id);
-        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(fn_id)].captures).len != capture_operands.len) {
+        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.getFn(fn_id).captures).len != capture_operands.len) {
             Common.invariant("function reference capture operand count differed from lifted function captures");
         }
-        const fn_symbol = self.solved.lifted.fns.items[@intFromEnum(fn_id)].symbol;
+        const fn_symbol = self.solved.lifted.getFn(fn_id).symbol;
         return switch (self.types.get(ty)) {
             .callable => |variants_span| blk: {
                 const variants = self.types.fnVariantSpan(variants_span);
@@ -3030,7 +3035,7 @@ const Lowerer = struct {
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         if (capture_ty) |payload_ty| {
-            if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(lifted_fn_id)].captures).len != capture_operands.len) {
+            if (self.solved.lifted.typedLocalSpan(self.solved.lifted.getFn(lifted_fn_id).captures).len != capture_operands.len) {
                 Common.invariant("finite callable capture operand count differed from lifted function captures");
             }
             const payload = try self.addTemp(payload_ty);
@@ -3070,7 +3075,7 @@ const Lowerer = struct {
         capture_ty: ?Type.TypeId,
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
-        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns.items[@intFromEnum(lifted_fn_id)].captures).len != capture_operands.len) {
+        if (self.solved.lifted.typedLocalSpan(self.solved.lifted.getFn(lifted_fn_id).captures).len != capture_operands.len) {
             Common.invariant("erased callable capture operand count differed from lifted function captures");
         }
         const capture = if (capture_ty) |ty| try self.addTemp(ty) else null;
@@ -3216,7 +3221,7 @@ const Lowerer = struct {
         if (spec.abi != .finite) Common.invariant("attempted to inline a non-finite function spec");
         if (spec.capture_ty != null) Common.invariant("attempted to inline a capturing function spec");
 
-        const source_fn = self.solved.lifted.fns.items[@intFromEnum(spec.source)];
+        const source_fn = self.solved.lifted.getFn(spec.source);
         const func = switch (self.solved.types.rootContent(spec.solved_fn_ty)) {
             .func => |func| func,
             else => Common.invariant("direct Lambda Mono function table contains a non-function type"),
@@ -4106,7 +4111,7 @@ const Lowerer = struct {
             initialized_body = try self.lowerExprInto(target, payload_switch.initialized, branch_done);
             uninitialized_body = try self.lowerExprInto(target, payload_switch.uninitialized, branch_done);
         }
-        const cond_data = self.solved.lifted.exprs.items[@intFromEnum(payload_switch.cond)];
+        const cond_data = self.solved.lifted.getExpr(payload_switch.cond);
         const cond_local = switch (cond_data.data) {
             .local => |local| try self.localFor(local),
             else => try self.addTemp(try self.lowerExprTy(payload_switch.cond)),
@@ -4316,7 +4321,7 @@ const Lowerer = struct {
         if (!stmt_region.isEmpty()) {
             self.result.store.current_region = stmt_region;
         }
-        return switch (self.solved.lifted.stmts.items[@intFromEnum(stmt_id)]) {
+        return switch (self.solved.lifted.getStmt(stmt_id)) {
             .uninitialized => |pat_id| try self.initUninitializedPattern(pat_id, next),
             .let_ => |let_| blk: {
                 const value = try self.addTemp(try self.lowerExprTy(let_.value));
@@ -4452,7 +4457,7 @@ const Lowerer = struct {
         var maybe_uninitialized_condition_masks: std.ArrayList(u64) = .empty;
         defer maybe_uninitialized_condition_masks.deinit(self.allocator);
         for (initial_values, param_locals) |initial, param_local| {
-            switch (self.solved.lifted.exprs.items[@intFromEnum(initial)].data) {
+            switch (self.solved.lifted.getExpr(initial).data) {
                 .uninitialized_payload => |payload| {
                     try maybe_uninitialized_params.append(self.allocator, param_local);
                     try maybe_uninitialized_conditions.append(self.allocator, try self.localFor(payload.condition));
@@ -5707,7 +5712,7 @@ const Lowerer = struct {
     }
 
     fn joinArgNeedsWriteAtType(self: *Lowerer, param: LIR.LocalId, ty: Type.TypeId, expr_id: Lifted.ExprId) Common.LowerError!bool {
-        return switch (self.solved.lifted.exprs.items[@intFromEnum(expr_id)].data) {
+        return switch (self.solved.lifted.getExpr(expr_id).data) {
             .uninitialized, .uninitialized_payload => false,
             .local => |local| (self.existingLocalForTyped(local, ty) orelse return true) != param,
             else => true,
@@ -5848,8 +5853,8 @@ const Lowerer = struct {
     }
 
     fn liftedLocalTypesMatch(self: *Lowerer, left_id: Lifted.LocalId, right_id: Lifted.LocalId) Common.LowerError!bool {
-        const left = self.solved.lifted.locals.items[@intFromEnum(left_id)];
-        const right = self.solved.lifted.locals.items[@intFromEnum(right_id)];
+        const left = self.solved.lifted.getLocal(left_id);
+        const right = self.solved.lifted.getLocal(right_id);
         return try self.solved.lifted.types.typeEql(&self.solved.lifted.names, left.ty, right.ty);
     }
 
@@ -6797,7 +6802,7 @@ const Lowerer = struct {
         var graph = layout.Graph{};
         defer graph.deinit(self.allocator);
 
-        const local_nodes = try self.allocator.alloc(?layout.GraphNodeId, self.types.types.items.len);
+        const local_nodes = try self.allocator.alloc(?layout.GraphNodeId, self.types.typeCount());
         defer self.allocator.free(local_nodes);
         @memset(local_nodes, null);
         var builder = LayoutGraphBuilder{
@@ -7260,7 +7265,7 @@ const Lowerer = struct {
     }
 
     fn pat(self: *const Lowerer, id: Lifted.PatId) Lifted.Pat {
-        return self.solved.lifted.pats.items[@intFromEnum(id)];
+        return self.solved.lifted.getPat(id);
     }
 };
 
@@ -7398,13 +7403,15 @@ fn cloneSolvedProgram(allocator: std.mem.Allocator, solved: *const Solved.Progra
 }
 
 fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Program) std.mem.Allocator.Error!Lifted.Program {
+    const view = program.view();
+
     var name_store = try cloneNameStore(allocator, &program.names);
     errdefer name_store.deinit();
 
     var types = try cloneMonoTypeStore(allocator, &program.types);
     errdefer types.deinit();
 
-    var string_literals = try cloneStringLiterals(allocator, &program.string_literals);
+    var string_literals = try cloneStringLiterals(allocator, program.stringLiteralsView());
     errdefer deinitStringLiterals(allocator, &string_literals);
 
     var source_files: std.ArrayList([]const u8) = .empty;
@@ -7412,8 +7419,8 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
         for (source_files.items) |file| allocator.free(file);
         source_files.deinit(allocator);
     }
-    try source_files.ensureTotalCapacityPrecise(allocator, program.source_files.items.len);
-    for (program.source_files.items) |file| {
+    try source_files.ensureTotalCapacityPrecise(allocator, program.sourceFileNames().len);
+    for (program.sourceFileNames()) |file| {
         source_files.appendAssumeCapacity(try allocator.dupe(u8, file));
     }
 
@@ -7422,35 +7429,35 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
         .names = name_store,
         .next_symbol = program.next_symbol,
         .types = types,
-        .imported_fns = try cloneArrayList(Lifted.ImportedFn, allocator, &program.imported_fns),
-        .fns = try cloneArrayList(Lifted.Fn, allocator, &program.fns),
-        .exprs = try cloneArrayList(Lifted.Expr, allocator, &program.exprs),
-        .pats = try cloneArrayList(Lifted.Pat, allocator, &program.pats),
-        .stmts = try cloneArrayList(Lifted.Stmt, allocator, &program.stmts),
-        .locals = try cloneArrayList(Lifted.Local, allocator, &program.locals),
-        .expr_ids = try cloneArrayList(Lifted.ExprId, allocator, &program.expr_ids),
-        .pat_ids = try cloneArrayList(Lifted.PatId, allocator, &program.pat_ids),
-        .typed_locals = try cloneArrayList(Lifted.TypedLocal, allocator, &program.typed_locals),
-        .stmt_ids = try cloneArrayList(Lifted.StmtId, allocator, &program.stmt_ids),
-        .field_exprs = try cloneArrayList(Lifted.FieldExpr, allocator, &program.field_exprs),
-        .fn_def_captures = try cloneArrayList(Lifted.FnDefCapture, allocator, &program.fn_def_captures),
-        .capture_operands = try cloneArrayList(Lifted.CaptureOperand, allocator, &program.capture_operands),
-        .record_destructs = try cloneArrayList(Lifted.RecordDestruct, allocator, &program.record_destructs),
-        .str_pattern_steps = try cloneArrayList(Lifted.StrPatternStep, allocator, &program.str_pattern_steps),
-        .branches = try cloneArrayList(Lifted.Branch, allocator, &program.branches),
-        .if_branches = try cloneArrayList(Lifted.IfBranch, allocator, &program.if_branches),
-        .string_literals = string_literals,
+        .imported_fns = try clonedLiftedProgramList(Lifted.ImportedFn, "imported_fns", allocator, view.imported_fns),
+        .fns = try clonedLiftedProgramList(Lifted.Fn, "fns", allocator, view.fns),
+        .exprs = try clonedLiftedProgramList(Lifted.Expr, "exprs", allocator, view.exprs),
+        .pats = try clonedLiftedProgramList(Lifted.Pat, "pats", allocator, view.pats),
+        .stmts = try clonedLiftedProgramList(Lifted.Stmt, "stmts", allocator, view.stmts),
+        .locals = try clonedLiftedProgramList(Lifted.Local, "locals", allocator, view.locals),
+        .expr_ids = try clonedLiftedProgramList(Lifted.ExprId, "expr_ids", allocator, view.expr_ids),
+        .pat_ids = try clonedLiftedProgramList(Lifted.PatId, "pat_ids", allocator, view.pat_ids),
+        .typed_locals = try clonedLiftedProgramList(Lifted.TypedLocal, "typed_locals", allocator, view.typed_locals),
+        .stmt_ids = try clonedLiftedProgramList(Lifted.StmtId, "stmt_ids", allocator, view.stmt_ids),
+        .field_exprs = try clonedLiftedProgramList(Lifted.FieldExpr, "field_exprs", allocator, view.field_exprs),
+        .fn_def_captures = try clonedLiftedProgramList(Lifted.FnDefCapture, "fn_def_captures", allocator, view.fn_def_captures),
+        .capture_operands = try clonedLiftedProgramList(Lifted.CaptureOperand, "capture_operands", allocator, view.capture_operands),
+        .record_destructs = try clonedLiftedProgramList(Lifted.RecordDestruct, "record_destructs", allocator, view.record_destructs),
+        .str_pattern_steps = try clonedLiftedProgramList(Lifted.StrPatternStep, "str_pattern_steps", allocator, view.str_pattern_steps),
+        .branches = try clonedLiftedProgramList(Lifted.Branch, "branches", allocator, view.branches),
+        .if_branches = try clonedLiftedProgramList(Lifted.IfBranch, "if_branches", allocator, view.if_branches),
+        .string_literals = Lifted.ProgramList(Mono.StringLiteral, "string_literals").fromArrayList(string_literals),
         .next_lift_capture_id = program.next_lift_capture_id,
         .proc_debug_names = try cloneProcDebugNameMap(allocator, &program.proc_debug_names),
-        .roots = try cloneArrayList(Lifted.Root, allocator, &program.roots),
-        .layout_requests = try cloneArrayList(Lifted.LayoutRequest, allocator, &program.layout_requests),
-        .runtime_schema_requests = try cloneArrayList(Lifted.RuntimeSchemaRequest, allocator, &program.runtime_schema_requests),
-        .comptime_sites = try cloneComptimeSites(allocator, &program.comptime_sites),
-        .source_files = source_files,
-        .expr_locs = try cloneArrayList(base.SourceLoc, allocator, &program.expr_locs),
-        .expr_regions = try cloneArrayList(base.Region, allocator, &program.expr_regions),
-        .stmt_locs = try cloneArrayList(base.SourceLoc, allocator, &program.stmt_locs),
-        .stmt_regions = try cloneArrayList(base.Region, allocator, &program.stmt_regions),
+        .roots = try clonedLiftedProgramList(Lifted.Root, "roots", allocator, view.roots),
+        .layout_requests = try clonedLiftedProgramList(Lifted.LayoutRequest, "layout_requests", allocator, view.layout_requests),
+        .runtime_schema_requests = try clonedLiftedProgramList(Lifted.RuntimeSchemaRequest, "runtime_schema_requests", allocator, view.runtime_schema_requests),
+        .comptime_sites = Lifted.ProgramList(Lifted.ComptimeSite, "comptime_sites").fromArrayList(try cloneComptimeSites(allocator, view.comptime_sites)),
+        .source_files = Lifted.ProgramList([]const u8, "source_files").fromArrayList(source_files),
+        .expr_locs = try clonedLiftedProgramList(base.SourceLoc, "expr_locs", allocator, view.expr_locs),
+        .expr_regions = try clonedLiftedProgramList(base.Region, "expr_regions", allocator, view.expr_regions),
+        .stmt_locs = try clonedLiftedProgramList(base.SourceLoc, "stmt_locs", allocator, view.stmt_locs),
+        .stmt_regions = try clonedLiftedProgramList(base.Region, "stmt_regions", allocator, view.stmt_regions),
         .local_names = blk: {
             var names: std.ArrayList([]const u8) = .empty;
             errdefer {
@@ -7459,25 +7466,34 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
                 }
                 names.deinit(allocator);
             }
-            try names.ensureTotalCapacityPrecise(allocator, program.local_names.items.len);
-            for (program.local_names.items) |name| {
+            try names.ensureTotalCapacityPrecise(allocator, view.local_names.len);
+            for (view.local_names) |name| {
                 names.appendAssumeCapacity(if (name.len == 0) "" else try allocator.dupe(u8, name));
             }
-            break :blk names;
+            break :blk Lifted.ProgramList([]const u8, "local_names").fromArrayList(names);
         },
         .current_loc = program.current_loc,
         .current_region = program.current_region,
     };
 }
 
-fn cloneComptimeSites(allocator: std.mem.Allocator, source: *const std.ArrayList(Lifted.ComptimeSite)) std.mem.Allocator.Error!std.ArrayList(Lifted.ComptimeSite) {
+fn clonedLiftedProgramList(
+    comptime T: type,
+    comptime field_name: []const u8,
+    allocator: std.mem.Allocator,
+    source: []const T,
+) std.mem.Allocator.Error!Lifted.ProgramList(T, field_name) {
+    return Lifted.ProgramList(T, field_name).fromArrayList(try cloneSlice(T, allocator, source));
+}
+
+fn cloneComptimeSites(allocator: std.mem.Allocator, source: []const Lifted.ComptimeSite) std.mem.Allocator.Error!std.ArrayList(Lifted.ComptimeSite) {
     var cloned: std.ArrayList(Lifted.ComptimeSite) = .empty;
     errdefer {
         for (cloned.items) |site| allocator.free(site.branch_regions);
         cloned.deinit(allocator);
     }
-    try cloned.ensureTotalCapacityPrecise(allocator, source.items.len);
-    for (source.items) |site| {
+    try cloned.ensureTotalCapacityPrecise(allocator, source.len);
+    for (source) |site| {
         cloned.appendAssumeCapacity(.{
             .kind = site.kind,
             .region = site.region,
@@ -7542,15 +7558,16 @@ fn reinternNames(
 }
 
 fn cloneMonoTypeStore(allocator: std.mem.Allocator, source: *const MonoType.Store) std.mem.Allocator.Error!MonoType.Store {
+    const view = source.view();
     return .{
         .allocator = allocator,
-        .types = try cloneArrayList(MonoType.Content, allocator, &source.types),
-        .type_digests = try cloneArrayList(?check.CheckedNames.TypeDigest, allocator, &source.type_digests),
-        .specialization_digests = try cloneArrayList(?check.CheckedNames.TypeDigest, allocator, &source.specialization_digests),
-        .spans = try cloneArrayList(MonoType.TypeId, allocator, &source.spans),
-        .fields = try cloneArrayList(MonoType.Field, allocator, &source.fields),
-        .tags = try cloneArrayList(MonoType.Tag, allocator, &source.tags),
-        .declared_fields = try cloneArrayList(MonoType.DeclaredField, allocator, &source.declared_fields),
+        .types = @TypeOf(source.types).fromArrayList(try cloneSlice(MonoType.Content, allocator, view.types)),
+        .type_digests = @TypeOf(source.type_digests).fromArrayList(try cloneSlice(?check.CheckedNames.TypeDigest, allocator, view.type_digests)),
+        .specialization_digests = @TypeOf(source.specialization_digests).fromArrayList(try cloneSlice(?check.CheckedNames.TypeDigest, allocator, source.specializationDigestsView())),
+        .spans = @TypeOf(source.spans).fromArrayList(try cloneSlice(MonoType.TypeId, allocator, view.spans)),
+        .fields = @TypeOf(source.fields).fromArrayList(try cloneSlice(MonoType.Field, allocator, view.fields)),
+        .tags = @TypeOf(source.tags).fromArrayList(try cloneSlice(MonoType.Tag, allocator, view.tags)),
+        .declared_fields = @TypeOf(source.declared_fields).fromArrayList(try cloneSlice(MonoType.DeclaredField, allocator, view.declared_fields)),
         .frozen = source.isFrozen(),
     };
 }
@@ -7568,11 +7585,11 @@ fn cloneSolvedTypeStore(allocator: std.mem.Allocator, source: *const SolvedType.
     };
 }
 
-fn cloneStringLiterals(allocator: std.mem.Allocator, source: *const std.ArrayList(Mono.StringLiteral)) std.mem.Allocator.Error!std.ArrayList(Mono.StringLiteral) {
+fn cloneStringLiterals(allocator: std.mem.Allocator, source: []const Mono.StringLiteral) std.mem.Allocator.Error!std.ArrayList(Mono.StringLiteral) {
     var cloned: std.ArrayList(Mono.StringLiteral) = .empty;
     errdefer deinitStringLiterals(allocator, &cloned);
-    try cloned.ensureTotalCapacity(allocator, source.items.len);
-    for (source.items) |literal| {
+    try cloned.ensureTotalCapacity(allocator, source.len);
+    for (source) |literal| {
         const backing = try allocator.dupe(u8, literal.backing);
         cloned.appendAssumeCapacity(.{
             .backing = backing,
@@ -7589,9 +7606,13 @@ fn deinitStringLiterals(allocator: std.mem.Allocator, literals: *std.ArrayList(M
 }
 
 fn cloneArrayList(comptime T: type, allocator: std.mem.Allocator, source: *const std.ArrayList(T)) std.mem.Allocator.Error!std.ArrayList(T) {
+    return cloneSlice(T, allocator, source.items);
+}
+
+fn cloneSlice(comptime T: type, allocator: std.mem.Allocator, source: []const T) std.mem.Allocator.Error!std.ArrayList(T) {
     var cloned: std.ArrayList(T) = .empty;
     errdefer cloned.deinit(allocator);
-    try cloned.appendSlice(allocator, source.items);
+    try cloned.appendSlice(allocator, source);
     return cloned;
 }
 

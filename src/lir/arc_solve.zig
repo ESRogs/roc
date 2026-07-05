@@ -276,8 +276,8 @@ pub fn solve(
     rc_local: []const bool,
     roots: []const LIR.LirProcSpecId,
 ) SolveError!Solution {
-    const local_count = store.locals.items.len;
-    const proc_count = store.proc_specs.items.len;
+    const local_count = store.localCount();
+    const proc_count = store.procSpecCount();
 
     var solver = Solver{
         .allocator = allocator,
@@ -336,7 +336,8 @@ pub fn solve(
     // Phase A: parameter-mode fixpoint with returns pessimistically owned.
     // Start non-pinned refcounted parameter positions borrowed; demands can
     // only flip positions to owned, so the borrowed set shrinks each round.
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..store.procSpecCount()) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         var sig = arc_sig.RcSig.all_owned;
         if (!solver.pinned.isSet(proc_index)) {
             for (store.getLocalSpan(proc.args), 0..) |param, position| {
@@ -359,7 +360,8 @@ pub fn solve(
         try collectAll(&solver, .returns_owned);
 
         var changed = false;
-        for (store.proc_specs.items, 0..) |proc, proc_index| {
+        for (0..store.procSpecCount()) |proc_index| {
+            const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (solver.pinned.isSet(proc_index)) continue;
             var sig = solver.sigs[proc_index];
             for (store.getLocalSpan(proc.args), 0..) |param, position| {
@@ -385,7 +387,8 @@ pub fn solve(
         var binding = try resolveBindings(&solver, local_count);
         defer binding.deinit(allocator);
 
-        for (store.proc_specs.items, 0..) |proc, proc_index| {
+        for (0..store.procSpecCount()) |proc_index| {
+            const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (solver.pinned.isSet(proc_index)) continue;
             const body = proc.body orelse continue;
             if (try retLenders(&solver, &binding, proc_index, body)) |lenders| {
@@ -421,7 +424,8 @@ pub fn solve(
                 solveInvariant("ARC unique-return solving did not converge");
             }
             var changed = false;
-            for (store.proc_specs.items, 0..) |proc, proc_index| {
+            for (0..store.procSpecCount()) |proc_index| {
+                const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
                 if (solver.pinned.isSet(proc_index)) continue;
                 if (solver.sigs[proc_index].ret_unique) continue;
                 const body = proc.body orelse continue;
@@ -761,7 +765,8 @@ fn collectAll(solver: *Solver, ret_treatment: RetTreatment) SolveError!void {
     @memset(solver.alias_source, no_local);
 
     const store = solver.store;
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..store.procSpecCount()) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         const body = proc.body orelse continue;
         for (store.getLocalSpan(proc.args)) |param| {
             noteDef(solver.defs, param, .fresh);
@@ -1086,7 +1091,7 @@ pub fn computePinnedProcs(
     store: *const LirStore,
     roots: []const LIR.LirProcSpecId,
 ) SolveError!std.bit_set.DynamicBitSetUnmanaged {
-    var pinned = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, store.proc_specs.items.len);
+    var pinned = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
     errdefer pinned.deinit(allocator);
     fillPinnedProcs(store, roots, &pinned);
     return pinned;
@@ -1100,14 +1105,16 @@ fn fillPinnedProcs(
     for (roots) |root| {
         pinned.set(@intFromEnum(root));
     }
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..store.procSpecCount()) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         if (proc.body == null or proc.hosted != null or proc.abi == .erased_callable) {
             pinned.set(proc_index);
         }
     }
     // Procs whose address escapes are callable through paths the solver
     // cannot see; they keep the all-owned ABI.
-    for (store.cf_stmts.items) |stmt| {
+    for (0..store.cfStmtCount()) |stmt_index| {
+        const stmt = store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
         switch (stmt) {
             .assign_literal => |assign| switch (assign.value) {
                 .proc_ref => |proc| pinned.set(@intFromEnum(proc)),
@@ -1131,8 +1138,8 @@ pub fn computeVisibility(
     rc_local: []const bool,
     pinned: *const std.bit_set.DynamicBitSetUnmanaged,
 ) SolveError!std.bit_set.DynamicBitSetUnmanaged {
-    const local_count = store.locals.items.len;
-    const proc_count = store.proc_specs.items.len;
+    const local_count = store.localCount();
+    const proc_count = store.procSpecCount();
 
     var visited = std.AutoHashMap(LIR.CFStmtId, void).init(allocator);
     defer visited.deinit();
@@ -1151,7 +1158,8 @@ pub fn computeVisibility(
         allocator.free(ret_values);
     }
     @memset(ret_values, .empty);
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..store.procSpecCount()) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         const body = proc.body orelse continue;
         visited.clearRetainingCapacity();
         stack.clearRetainingCapacity();
@@ -1213,7 +1221,8 @@ pub fn computeVisibility(
 
     // Seeds: every pinned proc's parameters and returned values reach the
     // host or a caller the solver cannot see.
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..store.procSpecCount()) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         if (!pinned.isSet(proc_index)) continue;
         for (store.getLocalSpan(proc.args)) |param| {
             try seedLocal(&visible, &work, allocator, rc_local, @intFromEnum(param));
@@ -1243,7 +1252,8 @@ pub fn computeVisibility(
         }
     }.go;
 
-    for (store.cf_stmts.items) |stmt| {
+    for (0..store.cfStmtCount()) |stmt_index| {
+        const stmt = store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
         switch (stmt) {
             .assign_ref => |assign| {
                 const target = @intFromEnum(assign.target);
@@ -1299,7 +1309,7 @@ pub fn computeVisibility(
                 try addEdge(&edges, allocator, rc_local, @intFromEnum(assign.target), @intFromEnum(assign.value));
             },
             .assign_call => |assign| {
-                const callee = store.proc_specs.items[@intFromEnum(assign.proc)];
+                const callee = store.getProcSpec(assign.proc);
                 const args = store.getLocalSpan(assign.args);
                 if (callee.body == null) {
                     // No body to flow through: everything at the boundary is
@@ -1457,7 +1467,7 @@ pub fn computeUniqueness(
     rc_local: []const bool,
     sigs: arc_sig.SigTable,
 ) SolveError!Uniqueness {
-    const local_count = store.locals.items.len;
+    const local_count = store.localCount();
 
     var born = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, local_count);
     errdefer born.deinit(allocator);
@@ -1576,14 +1586,16 @@ pub fn computeUniqueness(
         }
     };
 
-    for (store.proc_specs.items) |proc| {
+    for (0..store.procSpecCount()) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         for (store.getLocalSpan(proc.args)) |param| {
             marks.trackDef(&has_def, &multi_def, param);
             marks.destroy(&foreign_def, param);
         }
     }
 
-    for (store.cf_stmts.items) |stmt| {
+    for (0..store.cfStmtCount()) |stmt_index| {
+        const stmt = store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
         switch (stmt) {
             .assign_ref => |assign| {
                 marks.trackDef(&has_def, &multi_def, assign.target);
@@ -1816,12 +1828,13 @@ pub fn computeUniqueness(
 fn computeSccs(solver: *Solver) SolveError!void {
     const allocator = solver.allocator;
     const store = solver.store;
-    const proc_count = store.proc_specs.items.len;
+    const proc_count = store.procSpecCount();
 
     // Collect direct-call edges.
     var edges = std.ArrayList([2]u32).empty;
     defer edges.deinit(allocator);
-    for (store.proc_specs.items, 0..) |proc, caller| {
+    for (0..store.procSpecCount()) |caller| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(caller))));
         const body = proc.body orelse continue;
         solver.visited.clearRetainingCapacity();
         solver.stack.clearRetainingCapacity();

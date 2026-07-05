@@ -108,7 +108,7 @@ pub fn run(
     var lowerer = try Lowerer.init(allocator, target_usize, &owned);
     errdefer lowerer.deinit();
 
-    try lowerer.result.store.setSourceFiles(owned.source_files.items);
+    try lowerer.result.store.setSourceFiles(owned.sourceFileNames());
     try lowerer.registerProcPlaceholders();
     try lowerer.lowerAllFns();
     try lowerer.bindRoots();
@@ -149,26 +149,26 @@ const Lowerer = struct {
         target_usize: base.target.TargetUsize,
         program: *const LambdaMono.Program,
     ) Common.LowerError!Lowerer {
-        const fn_map = try allocator.alloc(LIR.LirProcSpecId, program.fns.items.len);
+        const fn_map = try allocator.alloc(LIR.LirProcSpecId, program.fnCount());
         errdefer allocator.free(fn_map);
 
-        const local_map = try allocator.alloc(?LIR.LocalId, program.locals.items.len);
+        const local_map = try allocator.alloc(?LIR.LocalId, program.localCount());
         errdefer allocator.free(local_map);
         @memset(local_map, null);
 
-        const comptime_site_map = try allocator.alloc(?LIR.ComptimeSiteId, program.comptime_sites.items.len);
+        const comptime_site_map = try allocator.alloc(?LIR.ComptimeSiteId, program.comptimeSiteCount());
         errdefer allocator.free(comptime_site_map);
         @memset(comptime_site_map, null);
 
-        const type_layouts = try allocator.alloc(?layout.Idx, program.types.types.items.len);
+        const type_layouts = try allocator.alloc(?layout.Idx, program.types.typeCount());
         errdefer allocator.free(type_layouts);
         @memset(type_layouts, null);
 
-        const const_plan_map = try allocator.alloc(?LirProgram.ConstPlanId, program.types.types.items.len);
+        const const_plan_map = try allocator.alloc(?LirProgram.ConstPlanId, program.types.typeCount());
         errdefer allocator.free(const_plan_map);
         @memset(const_plan_map, null);
 
-        const const_type_map = try allocator.alloc(?check.ConstStore.ConstTypeId, program.types.types.items.len);
+        const const_type_map = try allocator.alloc(?check.ConstStore.ConstTypeId, program.types.typeCount());
         errdefer allocator.free(const_type_map);
         @memset(const_type_map, null);
 
@@ -222,7 +222,7 @@ const Lowerer = struct {
     }
 
     fn registerProcPlaceholders(self: *Lowerer) Common.LowerError!void {
-        for (self.program.fns.items, 0..) |fn_, index| {
+        for (self.program.fnsView(), 0..) |fn_, index| {
             const args = self.program.typedLocalSpan(fn_.args);
             const arg_locals = try self.allocator.alloc(LIR.LocalId, args.len);
             defer self.allocator.free(arg_locals);
@@ -332,7 +332,7 @@ const Lowerer = struct {
     }
 
     fn lowerAllFns(self: *Lowerer) Common.LowerError!void {
-        for (self.program.fns.items, 0..) |fn_, index| {
+        for (self.program.fnsView(), 0..) |fn_, index| {
             const proc_id = self.fn_map[index];
             switch (fn_.body) {
                 .roc => |body_expr| {
@@ -370,11 +370,11 @@ const Lowerer = struct {
     }
 
     fn bindRoots(self: *Lowerer) Common.LowerError!void {
-        for (self.program.roots.items) |root| {
+        for (self.program.rootsView()) |root| {
             try self.result.root_procs.append(self.allocator, self.fn_map[@intFromEnum(root.fn_id)]);
             try self.result.root_metadata.append(self.allocator, RootMetadata.fromCheckedRoot(root.request));
             if (root.request.abi == .compile_time) {
-                const fn_ = self.program.fns.items[@intFromEnum(root.fn_id)];
+                const fn_ = self.program.getFn(root.fn_id);
                 try self.result.const_roots.append(self.allocator, .{
                     .root_order = root.request.order,
                     .request = root.request,
@@ -385,7 +385,7 @@ const Lowerer = struct {
             }
         }
 
-        for (self.program.layout_requests.items) |request| {
+        for (self.program.layoutRequestsView()) |request| {
             try self.result.requested_layouts.append(self.allocator, .{
                 .ty = self.program.types.typeDigest(&self.program.names, request.ty),
                 .checked_type = request.checked_type,
@@ -748,13 +748,13 @@ const Lowerer = struct {
 
     fn fnTemplateForFn(self: *Lowerer, fn_id: LambdaMono.FnId) Mono.FnTemplate {
         const raw = @intFromEnum(fn_id);
-        if (raw >= self.program.fns.items.len) Common.invariant("function result referenced a missing function");
-        return self.program.fns.items[raw].source orelse
+        if (raw >= self.program.fnCount()) Common.invariant("function result referenced a missing function");
+        return self.program.getFn(fn_id).source orelse
             Common.invariant("function result referenced a generated function without checked source identity");
     }
 
     fn writeRuntimeSchemas(self: *Lowerer) Common.LowerError!void {
-        for (self.program.runtime_schema_requests.items) |request| {
+        for (self.program.runtimeSchemaRequestsView()) |request| {
             try self.writeRuntimeSchema(request);
         }
     }
@@ -2227,7 +2227,7 @@ const Lowerer = struct {
         if (!stmt_region.isEmpty()) {
             self.result.store.current_region = stmt_region;
         }
-        return switch (self.program.stmts.items[@intFromEnum(stmt_id)]) {
+        return switch (self.program.getStmt(stmt_id)) {
             .uninitialized => |pat_id| try self.initUninitializedPattern(pat_id, next),
             .let_ => |let_| blk: {
                 const value = try self.addTemp(self.expr(let_.value).ty);
@@ -3631,7 +3631,7 @@ const Lowerer = struct {
             try self.noteLocal(existing);
             return existing;
         }
-        const program_local = self.program.locals.items[index];
+        const program_local = self.program.getLocal(@enumFromInt(@as(u32, @intCast(index))));
         const lir_local = try self.addTemp(program_local.ty);
         try self.result.store.setLocalName(lir_local, self.program.localName(local));
         self.local_map[index] = lir_local;
@@ -3687,7 +3687,7 @@ const Lowerer = struct {
         var graph = layout.Graph{};
         defer graph.deinit(self.allocator);
 
-        const local_nodes = try self.allocator.alloc(?layout.GraphNodeId, self.program.types.types.items.len);
+        const local_nodes = try self.allocator.alloc(?layout.GraphNodeId, self.program.types.typeCount());
         defer self.allocator.free(local_nodes);
         @memset(local_nodes, null);
         var builder = LayoutGraphBuilder{
@@ -4115,11 +4115,11 @@ const Lowerer = struct {
     }
 
     fn expr(self: *const Lowerer, id: LambdaMono.ExprId) LambdaMono.Expr {
-        return self.program.exprs.items[@intFromEnum(id)];
+        return self.program.getExpr(id);
     }
 
     fn pat(self: *const Lowerer, id: LambdaMono.PatId) LambdaMono.Pat {
-        return self.program.pats.items[@intFromEnum(id)];
+        return self.program.getPat(id);
     }
 };
 

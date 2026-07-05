@@ -135,9 +135,10 @@ fn certifyStoreWithOptions(
     diag: *Diagnostic,
     options: CertifyOptions,
 ) CertifyError!void {
-    var rc_local = try allocator.alloc(bool, store.locals.items.len);
+    var rc_local = try allocator.alloc(bool, store.localCount());
     defer allocator.free(rc_local);
-    for (store.locals.items, 0..) |local, index| {
+    for (0..store.localCount()) |index| {
+        const local = store.getLocal(@enumFromInt(@as(u32, @intCast(index))));
         rc_local[index] = layouts.layoutContainsRefcounted(layouts.getLayout(local.layout_idx));
     }
 
@@ -160,8 +161,9 @@ fn certifyStoreWithOptions(
     };
     defer certifier.deinit();
 
-    for (store.proc_specs.items, 0..) |proc, index| {
+    for (0..store.procSpecCount()) |index| {
         const proc_id: LIR.LirProcSpecId = @enumFromInt(@as(u32, @intCast(index)));
+        const proc = store.getProcSpec(proc_id);
         const body = proc.body orelse continue;
         certifier.certifyProc(proc_id, proc, body) catch |err| switch (err) {
             // Incompleteness, not a finding: this procedure's join-state space exceeded the
@@ -194,7 +196,8 @@ fn certifyRcAtomicity(
     var visible = try arc_solve.computeVisibility(allocator, store, rc_local, &pinned);
     defer visible.deinit(allocator);
 
-    for (store.cf_stmts.items, 0..) |stmt, stmt_index| {
+    for (0..store.cfStmtCount()) |stmt_index| {
+        const stmt = store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
         const checked: struct { value: LIR.LocalId, atomicity: LIR.RcAtomicity } = switch (stmt) {
             .incref => |rc| .{ .value = rc.value, .atomicity = rc.atomicity },
             .decref => |rc| .{ .value = rc.value, .atomicity = rc.atomicity },
@@ -236,7 +239,8 @@ fn certifyUniqueArgs(
     var stack = std.ArrayList(LIR.CFStmtId).empty;
     defer stack.deinit(allocator);
 
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..store.procSpecCount()) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         const body = proc.body orelse continue;
         const sig = sigs.get(@enumFromInt(@as(u32, @intCast(proc_index))));
         const params = store.getLocalSpan(proc.args);
@@ -487,8 +491,9 @@ fn writeFailureContext(
         }
     }
 
-    for (store.cf_stmts.items, 0..) |stmt, index| {
+    for (0..store.cfStmtCount()) |index| {
         if (!reachable.contains(@enumFromInt(@as(u32, @intCast(index))))) continue;
+        const stmt = store.getCFStmt(@enumFromInt(@as(u32, @intCast(index))));
         var mentions = if (local) |l| stmtMentionsLocal(store, stmt, l) else false;
         for (extra_locals) |extra| {
             mentions = mentions or stmtMentionsLocal(store, stmt, extra);
@@ -1200,7 +1205,7 @@ const Certifier = struct {
     /// share one fresh value; borrows are re-linked to the fresh value of the
     /// local their liveness anchored on.
     fn stateFromSummary(self: *Certifier, summary: []const LocalSummary) CertifyError!State {
-        var state = try State.init(self.allocator, self.store.locals.items.len);
+        var state = try State.init(self.allocator, self.store.localCount());
         errdefer state.deinit();
 
         for (summary, 0..) |entry, dense| {
@@ -1257,8 +1262,8 @@ const Certifier = struct {
     fn collectProcLocals(self: *Certifier, proc: LIR.LirProcSpec, body: LIR.CFStmtId) Allocator.Error!void {
         self.proc_locals.clearRetainingCapacity();
         self.local_dense.clearRetainingCapacity();
-        try self.local_dense.ensureTotalCapacity(self.allocator, self.store.locals.items.len);
-        self.local_dense.items.len = self.store.locals.items.len;
+        try self.local_dense.ensureTotalCapacity(self.allocator, self.store.localCount());
+        self.local_dense.items.len = self.store.localCount();
         @memset(self.local_dense.items, no_dense);
 
         for (self.store.getLocalSpan(proc.args)) |param| {
@@ -1787,7 +1792,7 @@ const Certifier = struct {
         self: *Certifier,
         body: LIR.CFStmtId,
     ) CertifyError!std.bit_set.DynamicBitSetUnmanaged {
-        var relevant = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.store.locals.items.len);
+        var relevant = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.store.localCount());
         errdefer relevant.deinit(self.allocator);
         const reads = try self.computeReadsBeforeRebind(body);
         for (self.proc_locals.items, 0..) |local, dense| {
@@ -1996,9 +2001,9 @@ const Certifier = struct {
         self.join_bodies.clearRetainingCapacity();
         self.clearReadsBeforeRebindCache();
         try self.collectProcLocals(proc, body);
-        try self.relevant_scratch.resize(self.allocator, self.store.locals.items.len, false);
+        try self.relevant_scratch.resize(self.allocator, self.store.localCount(), false);
 
-        var state = try State.init(self.allocator, self.store.locals.items.len);
+        var state = try State.init(self.allocator, self.store.localCount());
         {
             errdefer state.deinit();
             for (self.store.getLocalSpan(proc.args), 0..) |param, index| {

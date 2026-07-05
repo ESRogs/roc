@@ -37,8 +37,8 @@ const Pass = struct {
 
     fn init(result: *LirProgram.Result) Allocator.Error!Pass {
         const allocator = result.store.allocator;
-        const proc_count = result.store.proc_specs.items.len;
-        const stmt_count = result.store.cf_stmts.items.len;
+        const proc_count = result.store.procSpecCount();
+        const stmt_count = result.store.cfStmtCount();
         const plan_count = result.const_plans.items.len;
 
         const reachable = try allocator.alloc(bool, proc_count);
@@ -279,8 +279,9 @@ const Pass = struct {
 
     fn remapReachableProcBodies(self: *Pass) Allocator.Error!void {
         @memset(self.visited_stmts, false);
-        for (self.store.proc_specs.items, 0..) |proc, index| {
+        for (0..self.store.procSpecCount()) |index| {
             if (!self.reachable[index]) continue;
+            const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(index))));
             const body = proc.body orelse continue;
             try self.remapStmtProcRefs(body);
         }
@@ -395,8 +396,9 @@ const Pass = struct {
     }
 
     fn remapReachableProcStmtRefs(self: *Pass) void {
-        for (self.store.proc_specs.items, 0..) |*proc, index| {
+        for (0..self.store.procSpecCount()) |index| {
             if (!self.reachable[index]) continue;
+            const proc = self.store.getProcSpecPtr(@enumFromInt(@as(u32, @intCast(index))));
             if (proc.body) |body| proc.body = self.remapStmt(body);
             for (self.store.getJoinPointSpanMut(proc.join_points)) |*join_point| {
                 join_point.body = self.remapStmt(join_point.body);
@@ -458,60 +460,39 @@ const Pass = struct {
     }
 
     fn remapProcDebugNames(self: *Pass) void {
-        var write: usize = 0;
-        for (self.store.proc_debug_names.items) |entry| {
-            const old_proc: LIR.LirProcSpecId = @enumFromInt(entry.proc);
-            const new_proc = self.maybeRemapProc(old_proc) orelse continue;
-            self.store.proc_debug_names.items[write] = .{
-                .proc = @intFromEnum(new_proc),
-                .string = entry.string,
-            };
-            write += 1;
-        }
-        self.store.proc_debug_names.shrinkRetainingCapacity(write);
+        self.store.compactProcDebugNames(self.old_to_new);
     }
 
     fn compactProcSpecs(self: *Pass) void {
-        var write: usize = 0;
-        for (self.store.proc_specs.items, self.store.proc_locs.items, 0..) |proc, loc, index| {
-            if (!self.reachable[index]) continue;
-            self.store.proc_specs.items[write] = proc;
-            self.store.proc_locs.items[write] = loc;
-            write += 1;
-        }
-        self.store.proc_specs.shrinkRetainingCapacity(write);
-        self.store.proc_locs.shrinkRetainingCapacity(write);
+        self.store.compactProcSpecs(self.reachable);
     }
 
     fn compactCFStmts(self: *Pass) void {
-        var write: usize = 0;
-        for (self.store.cf_stmts.items, 0..) |stmt, index| {
-            if (!self.reachable_stmts[index]) continue;
-            self.store.cf_stmts.items[write] = stmt;
-            write += 1;
-        }
-        self.store.cf_stmts.shrinkRetainingCapacity(write);
+        self.store.compactCFStmts(self.reachable_stmts);
     }
 
     fn verifyReachableProcRefs(self: *Pass) void {
-        const proc_count = self.store.proc_specs.items.len;
-        const stmt_count = self.store.cf_stmts.items.len;
+        const proc_count = self.store.procSpecCount();
+        const stmt_count = self.store.cfStmtCount();
         for (self.result.root_procs.items) |proc| {
             if (@intFromEnum(proc) >= proc_count) reachableProcInvariant("root proc exceeds compact proc_specs len");
         }
         for (self.result.const_roots.items) |root| {
             if (@intFromEnum(root.proc) >= proc_count) reachableProcInvariant("const root proc exceeds compact proc_specs len");
         }
-        for (self.store.proc_debug_names.items) |entry| {
+        for (0..self.store.procDebugNameCount()) |index| {
+            const entry = self.store.getProcDebugName(index);
             if (entry.proc >= proc_count) reachableProcInvariant("proc debug name exceeds compact proc_specs len");
         }
-        for (self.store.proc_specs.items) |proc| {
+        for (0..self.store.procSpecCount()) |proc_index| {
+            const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (proc.body) |body| self.verifyStmtRef(body, stmt_count);
             for (self.store.getJoinPointSpan(proc.join_points)) |join_point| {
                 self.verifyStmtRef(join_point.body, stmt_count);
             }
         }
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             self.verifyStmtRefs(stmt, proc_count, stmt_count);
         }
     }
@@ -666,8 +647,8 @@ test "reachable proc pass compacts proc specs and remaps root ids" {
 
     try run(&result);
 
-    try std.testing.expectEqual(@as(usize, 2), result.store.proc_specs.items.len);
-    try std.testing.expectEqual(@as(usize, 3), result.store.cf_stmts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), result.store.procSpecCount());
+    try std.testing.expectEqual(@as(usize, 3), result.store.cfStmtCount());
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(result.root_procs.items[0]));
     const compact_root = result.store.getProcSpec(result.root_procs.items[0]);
     const call = result.store.getCFStmt(compact_root.body.?).assign_call;
