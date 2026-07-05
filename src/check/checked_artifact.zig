@@ -6702,6 +6702,14 @@ pub const CheckedExhaustivenessSiteTable = struct {
         allocator.free(self.sites);
         self.* = .{};
     }
+
+    pub const Serialized = extern struct {
+        sites: SerializedSlice(CheckedExhaustivenessSite) = .{},
+
+        const Serde = artifact_serialize.SliceStoreSerde(CheckedExhaustivenessSiteTable, @This());
+        pub const serialize = Serde.serialize;
+        pub const deserialize = Serde.deserialize;
+    };
 };
 
 /// Public `CheckedCapture` declaration.
@@ -23289,6 +23297,7 @@ pub const CheckedModuleArtifact = struct {
         checked_types: CheckedTypeStore.Serialized,
         checked_bodies: CheckedBodyStore.Serialized,
         checked_const_bodies: CheckedConstBodyTable.Serialized,
+        exhaustiveness_sites: CheckedExhaustivenessSiteTable.Serialized,
         exported_procedure_templates: ExportedProcedureTemplateTable.Serialized,
         exported_procedure_bindings: ExportedProcedureBindingTable.Serialized,
         exported_const_templates: ExportedConstTemplateTable.Serialized,
@@ -23322,7 +23331,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 184);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 185);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -23344,6 +23353,7 @@ pub const CheckedModuleArtifact = struct {
             try self.checked_types.serialize(&artifact.checked_types, gpa, writer);
             try self.checked_bodies.serialize(&artifact.checked_bodies, gpa, writer);
             try self.checked_const_bodies.serialize(&artifact.checked_const_bodies, gpa, writer);
+            try self.exhaustiveness_sites.serialize(&artifact.exhaustiveness_sites, gpa, writer);
             try self.exported_procedure_templates.serialize(&artifact.exported_procedure_templates, gpa, writer);
             try self.exported_procedure_bindings.serialize(&artifact.exported_procedure_bindings, gpa, writer);
             try self.exported_const_templates.serialize(&artifact.exported_const_templates, gpa, writer);
@@ -23430,6 +23440,7 @@ pub const CheckedModuleArtifact = struct {
                 .checked_types = self.checked_types.deserialize(base_addr),
                 .checked_bodies = self.checked_bodies.deserialize(base_addr),
                 .checked_const_bodies = self.checked_const_bodies.deserialize(base_addr),
+                .exhaustiveness_sites = self.exhaustiveness_sites.deserialize(base_addr),
                 .exported_procedure_templates = self.exported_procedure_templates.deserialize(base_addr),
                 .exported_procedure_bindings = self.exported_procedure_bindings.deserialize(base_addr),
                 .exported_const_templates = self.exported_const_templates.deserialize(base_addr),
@@ -23462,7 +23473,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 7;
+    const serialized_layout_version: u32 = 8;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -27233,6 +27244,29 @@ test "CheckedModuleArtifact.Serialized: round-trip preserves POD identity and su
     var canonical_names_src = canonical.CanonicalNameStore.init(gpa);
     defer canonical_names_src.deinit();
 
+    var exhaustiveness_site_entries = std.ArrayList(CheckedExhaustivenessSite).empty;
+    defer exhaustiveness_site_entries.deinit(gpa);
+    const match_site_id: CheckedExhaustivenessSiteId = @enumFromInt(@as(u32, @intCast(exhaustiveness_site_entries.items.len)));
+    try exhaustiveness_site_entries.append(gpa, .{
+        .id = match_site_id,
+        .kind = .match,
+        .region = base.Region.from_raw_offsets(11, 22),
+        .owner = .{ .root = @enumFromInt(4) },
+        .checked_expr = @enumFromInt(3),
+        .policy = .{ .compile_time_replaced_by_root = @enumFromInt(4) },
+    });
+    const destructure_site_id: CheckedExhaustivenessSiteId = @enumFromInt(@as(u32, @intCast(exhaustiveness_site_entries.items.len)));
+    try exhaustiveness_site_entries.append(gpa, .{
+        .id = destructure_site_id,
+        .kind = .destructure,
+        .region = base.Region.from_raw_offsets(33, 44),
+        .checked_pattern = @enumFromInt(7),
+        .policy = .compile_time_only,
+    });
+    const exhaustiveness_sites_src = CheckedExhaustivenessSiteTable{
+        .sites = exhaustiveness_site_entries.items,
+    };
+
     const identity = ModuleIdentity{
         .stable_hash = [_]u8{0x42} ** 32,
         .module_idx = 9,
@@ -27267,6 +27301,7 @@ test "CheckedModuleArtifact.Serialized: round-trip preserves POD identity and su
         .hoisted_constants = .{},
         .const_templates = .{},
         .checked_types = checked_types_src,
+        .exhaustiveness_sites = exhaustiveness_sites_src,
         .const_store = const_store_src,
     };
 
@@ -27307,6 +27342,38 @@ test "CheckedModuleArtifact.Serialized: round-trip preserves POD identity and su
     try std.testing.expectEqualSlices(u8, &ty1_key.bytes, &loaded.checked_types.roots.items[1].key.bytes);
     try std.testing.expectEqual(StoredCheckedTypePayload.empty_record, loaded.checked_types.payloads.items[0]);
     try std.testing.expectEqual(StoredCheckedTypePayload.empty_tag_union, loaded.checked_types.payloads.items[1]);
+
+    // exhaustiveness_sites survive, including lookup indexes used by compile-time
+    // finalization.
+    try std.testing.expectEqual(@as(usize, 2), loaded.exhaustiveness_sites.sites.len);
+    const match_site = loaded.exhaustiveness_sites.sites[0];
+    try std.testing.expectEqual(match_site_id, match_site.id);
+    try std.testing.expectEqual(CheckedComptimeSiteKind.match, match_site.kind);
+    try std.testing.expect(match_site.region.eq(base.Region.from_raw_offsets(11, 22)));
+    try std.testing.expectEqual(@as(?CheckedExprId, @enumFromInt(3)), match_site.checked_expr);
+    try std.testing.expectEqual(@as(?CheckedPatternId, null), match_site.checked_pattern);
+    try std.testing.expectEqual(@as(?CheckedExhaustivenessSiteId, match_site_id), loaded.exhaustiveness_sites.lookupByMatchExpr(@enumFromInt(3)));
+    switch (match_site.owner.?) {
+        .root => |root| try std.testing.expectEqual(@as(ComptimeRootId, @enumFromInt(4)), root),
+        else => return error.TestExpectedEqual,
+    }
+    switch (match_site.policy) {
+        .compile_time_replaced_by_root => |root| try std.testing.expectEqual(@as(ComptimeRootId, @enumFromInt(4)), root),
+        else => return error.TestExpectedEqual,
+    }
+
+    const destructure_site = loaded.exhaustiveness_sites.sites[1];
+    try std.testing.expectEqual(destructure_site_id, destructure_site.id);
+    try std.testing.expectEqual(CheckedComptimeSiteKind.destructure, destructure_site.kind);
+    try std.testing.expect(destructure_site.region.eq(base.Region.from_raw_offsets(33, 44)));
+    try std.testing.expectEqual(@as(?CheckedExprId, null), destructure_site.checked_expr);
+    try std.testing.expectEqual(@as(?CheckedPatternId, @enumFromInt(7)), destructure_site.checked_pattern);
+    try std.testing.expectEqual(@as(?CheckedExhaustivenessSiteId, destructure_site_id), loaded.exhaustiveness_sites.lookupByDestructurePattern(@enumFromInt(7)));
+    try std.testing.expectEqual(@as(?CheckedExhaustivenessSiteOwner, null), destructure_site.owner);
+    switch (destructure_site.policy) {
+        .compile_time_only => {},
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "module source input hash uses explicit file dependency state" {
@@ -27353,8 +27420,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xA3, 0x20, 0xAD, 0x3D, 0xFB, 0x97, 0x4B, 0x2A, 0x7A, 0x02, 0xE0, 0x5B, 0x55, 0x1A, 0x72, 0x65,
-        0x37, 0xB4, 0xA9, 0xBE, 0xB4, 0x6F, 0x33, 0xA1, 0x11, 0xE3, 0x81, 0xEA, 0x0A, 0x72, 0x66, 0x04,
+        0xF4, 0x64, 0x5B, 0xB0, 0xE2, 0x8A, 0x53, 0xF5, 0xD3, 0xCC, 0xB2, 0x09, 0xCB, 0xEC, 0x58, 0x20,
+        0x98, 0xA7, 0x19, 0x1E, 0xE0, 0x95, 0x57, 0x39, 0x08, 0x4C, 0x78, 0x9C, 0x43, 0x08, 0xBF, 0xE4,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
