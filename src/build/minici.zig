@@ -8,6 +8,14 @@ const logs_dir = out_dir ++ "/logs";
 const heartbeat_env = "MINICI_HEARTBEAT_INTERVAL_MS";
 const default_heartbeat_interval_ms: u64 = 30_000;
 
+/// How many bytes from the start and end of a failing step's log to echo to
+/// the console. Compiler and test errors land near the top of the output, while
+/// `--summary all` prints a large build tree that pushes the terminating error
+/// line to the very bottom, so surfacing both ends (and eliding the noisy
+/// middle) keeps the failure actionable without a re-run.
+const failure_log_head_bytes: usize = 12 * 1024;
+const failure_log_tail_bytes: usize = 4 * 1024;
+
 const JobKind = enum {
     single,
     harness,
@@ -161,6 +169,52 @@ fn printRerunHint(result: CommandResult) void {
     }
     std.debug.print("`\n", .{});
     std.debug.print("  Log: `{s}`\n", .{result.log_path});
+}
+
+/// Prints each line of `bytes` indented so the echoed output is visually set
+/// apart from the orchestrator's own progress lines.
+fn printIndentedLines(bytes: []const u8) void {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        std.debug.print("  | {s}\n", .{line});
+    }
+}
+
+/// Echoes a failing step's captured output to the console so the failure is
+/// actionable without re-running the step. Errors land near the top while
+/// `--summary all` pushes the terminating line to the bottom, so for large logs
+/// both the head and tail are shown and the middle is elided. The full output
+/// remains in `result.log_path`, which `printRerunHint` points at.
+fn printFailureLog(allocator: std.mem.Allocator, io: std.Io, result: CommandResult) void {
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, result.log_path, allocator, .limited(256 * 1024 * 1024)) catch |err| {
+        std.debug.print("  (could not read log `{s}`: {s})\n", .{ result.log_path, @errorName(err) });
+        return;
+    };
+    defer allocator.free(contents);
+
+    const trimmed = std.mem.trimEnd(u8, contents, "\n");
+    if (trimmed.len == 0) {
+        std.debug.print("  (`{s}` produced no output)\n", .{commandStepName(result.command)});
+        return;
+    }
+
+    std.debug.print("  --- output from `{s}` ---\n", .{commandStepName(result.command)});
+    if (trimmed.len <= failure_log_head_bytes + failure_log_tail_bytes) {
+        printIndentedLines(trimmed);
+    } else {
+        // Trim the head back to a line boundary so it does not end mid-line.
+        var head: []const u8 = trimmed[0..failure_log_head_bytes];
+        if (std.mem.findScalarLast(u8, head, '\n')) |nl| head = head[0..nl];
+        // Advance the tail to the next line boundary so it does not start mid-line.
+        var tail: []const u8 = trimmed[trimmed.len - failure_log_tail_bytes ..];
+        if (std.mem.findScalar(u8, tail, '\n')) |nl| tail = tail[nl + 1 ..];
+
+        const omitted = trimmed.len - head.len - tail.len;
+        printIndentedLines(head);
+        std.debug.print("  ... {d} KiB omitted (full log: `{s}`) ...\n", .{ omitted / 1024, result.log_path });
+        printIndentedLines(tail);
+    }
+    std.debug.print("  --- end output ---\n", .{});
 }
 
 fn heartbeatIntervalMs(env: *const std.process.Environ.Map) u64 {
@@ -807,6 +861,7 @@ pub fn main(init: std.process.Init) !void {
     defer results.deinit(allocator);
 
     if (!isPass(build_result)) {
+        printFailureLog(allocator, io, build_result);
         printRerunHint(build_result);
         try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
         try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
@@ -831,6 +886,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s} in {d:.3}s\n", .{ runStatusText(result), seconds(result.duration_ns) });
 
         if (!isSuccessful(result)) {
+            printFailureLog(allocator, io, result);
             printRerunHint(result);
         }
 
