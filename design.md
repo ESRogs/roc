@@ -1168,7 +1168,7 @@ concrete monomorphic dispatcher type has already determined the owner.
 Some method registry targets are generated structural targets rather than
 procedure bodies. A nominal or opaque type can opt in to a compiler-derived
 structural codec with an annotation-only associated method such as
-`parser_for : _` or `encode_to : _`. Canonicalization may represent this marker
+`parser_for : _` or `encoder_for : _`. Canonicalization may represent this marker
 as `e_anno_only` or, for hosted/type-module processing, as a zero-argument
 `e_hosted_lambda`; `CheckedModule.method_registry` records it explicitly as a
 generated parser or generated encoder target. Post-check lowering must consume
@@ -1217,10 +1217,10 @@ The underlying parse method is public and callable. It is deliberately curried:
 
 ```roc
 a.parser_for : encoding -> (state -> Try({ value : a, rest : state }, err))
-a.encode_to : a, encoding -> (state -> Try(state, err))
+a.encoder_for : a, encoding -> (state -> Try(state, err))
 ```
 
-`parser_for` is a method on the value type being produced. `encode_to` is a method
+`parser_for` is a method on the value type being produced. `encoder_for` is a method
 on the value being serialized. Structural types get these methods from the
 compiler. Nominal types may define them explicitly, and structural derivation
 uses those explicit nominal methods when a field, payload, list element, nested
@@ -1869,7 +1869,7 @@ parse_token = |input| {
 }
 ```
 
-Encoding is symmetric. Structural `encode_to` methods call the format's output
+Encoding is symmetric. Structural `encoder_for` methods call the format's output
 methods for strings, records, tag unions, lists, and other shapes. A format's
 output state owns whatever builder it needs. JSON encoding to `Str` allocates
 the final string in the ordinary way, and JSON UTF-8 encoding produces
@@ -1879,7 +1879,7 @@ inferred `Try` error type as parsing.
 The public structural encode method has this exact shape:
 
 ```roc
-value.encode_to : value, encoding -> (state -> Try(state, err))
+value.encoder_for : value, encoding -> (state -> Try(state, err))
 ```
 
 Generated encoders compose child error rows. JSON helpers that cannot fail use a
@@ -1895,7 +1895,7 @@ For a concrete record, the compiler can derive:
 {
 	count : U64,
 	foo_bar : Str,
-}.encode_to : { count : U64, foo_bar : Str }, MyEncoding -> (MyEncoding -> Try(MyEncoding, MyErr))
+}.encoder_for : { count : U64, foo_bar : Str }, MyEncoding -> (MyEncoding -> Try(MyEncoding, MyErr))
 ```
 
 The encoding type owns the output methods required by that shape:

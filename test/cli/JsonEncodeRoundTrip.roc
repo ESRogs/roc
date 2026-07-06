@@ -6,12 +6,12 @@ Token := { raw : Str }.{
 		Ok({ value: Token.{ raw: parsed.value }, rest: parsed.rest })
 	}
 
-	encode_to = |token, encoding| |state| Json.encode_str(encoding, token.raw, state)
+	encoder_for = |encoding| |token, state| Json.encode_str(encoding, token.raw, state)
 }
 
 AutoToken := { raw : Str, count : U64 }.{
 	parser_for : _
-	encode_to : _
+	encoder_for : _
 }
 
 Shape : {

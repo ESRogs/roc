@@ -2,7 +2,7 @@ JsonEncodeOpaqueDerivation :: [].{}
 
 OpaqueAutoToken :: { raw : Str, count : U64 }.{
 	parser_for : _
-	encode_to : _
+	encoder_for : _
 }
 
 opaque_auto_token_encodes : Str -> Bool

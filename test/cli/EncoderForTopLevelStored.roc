@@ -1,4 +1,4 @@
-EncodeToStructuralRecord :: [].{}
+EncoderForTopLevelStored :: [].{}
 
 Format := [Default].{
 	rename_field : Format, Str -> Str
@@ -25,33 +25,21 @@ Format := [Default].{
 	encode_u64 = |value, state| Ok(state + value)
 }
 
-Token := { raw : Str }.{
-	encode_to : Token, Format -> (U64 -> Try(U64, []))
-	encode_to = |token, _| |state| Format.encode_str(token.raw, state)
-}
+Value : { count : U64, foo_bar : Str }
 
-encode : value -> Try(U64, [])
+value : Value
+value = { count: 7, foo_bar: "abc" }
+
+encoder_for_value : value -> (value, U64 -> Try(U64, []))
 	where [
-		value.encode_to : value, Format -> (U64 -> Try(U64, [])),
+		value.encoder_for : Format -> (value, U64 -> Try(U64, [])),
 	]
-encode = |value| {
-	encode_value = value.encode_to(Format.Default)
-	encode_value(0)
+encoder_for_value = |_| {
+	Shape : value
+	Shape.encoder_for(Format.Default)
 }
 
-expect {
-	value : {
-		count : U64,
-		foo_bar : Str,
-		nested : { token : Token },
-	}
-	value = {
-		count: 7,
-		foo_bar: "abc",
-		nested: {
-			token: Token.{ raw: "zz" },
-		},
-	}
+encode_stored : Value, U64 -> Try(U64, [])
+encode_stored = encoder_for_value(value)
 
-	encode(value) == Ok(41)
-}
+expect encode_stored(value, 0) == Ok(25)

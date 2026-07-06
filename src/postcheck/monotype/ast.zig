@@ -82,7 +82,7 @@ pub const FnDef = union(enum(u8)) {
         owner: names.ProcTemplate,
         expr: checked.CheckedExprId,
     },
-    encode_to_runtime: struct {
+    encoder_for_runtime: struct {
         owner: names.ProcTemplate,
         expr: checked.CheckedExprId,
     },
@@ -222,8 +222,8 @@ fn writeFnDef(hasher: *std.crypto.hash.sha2.Sha256, fn_def: FnDef) void {
             writeProcTemplate(hasher, runtime.owner);
             writeU32(hasher, @intFromEnum(runtime.expr));
         },
-        .encode_to_runtime => |runtime| {
-            writeBytes(hasher, "encode_to_runtime");
+        .encoder_for_runtime => |runtime| {
+            writeBytes(hasher, "encoder_for_runtime");
             writeProcTemplate(hasher, runtime.owner);
             writeU32(hasher, @intFromEnum(runtime.expr));
         },

@@ -668,11 +668,12 @@ Builtin :: [].{
 
 			encode : a -> Try(Str, err)
 				where [
-					a.encode_to : a, JsonEncoding -> (JsonEncodeState -> Try(JsonEncodeState, err)),
+					a.encoder_for : JsonEncoding -> (a, JsonEncodeState -> Try(JsonEncodeState, err)),
 				]
 			encode = |value| {
-				encode_shape = value.encode_to(JsonEncoding.Default)
-				encoded = encode_shape(JsonEncodeState.{ output: u8_list_with_capacity(64), container_commas: [] })?
+				Shape : a
+				encode_shape = Shape.encoder_for(JsonEncoding.Default)
+				encoded = encode_shape(value, JsonEncodeState.{ output: u8_list_with_capacity(64), container_commas: [] })?
 
 				Ok(Str.from_utf8_lossy(encoded.output))
 			}
@@ -4136,14 +4137,39 @@ Builtin :: [].{
 					Err(ListWasEmpty)
 				}
 
-		## Encode a list using a format that provides encode_list
-		encode : List(item), fmt -> Try(encoded, err)
+		## Build an encoder for a list using a format that provides array encoding methods.
+		encoder_for : encoding -> (List(item), state -> Try(state, err))
 			where [
-				fmt.encode_list : fmt, List(item), (item, fmt -> Try(encoded, err)) -> Try(encoded, err),
-				item.encode : item, fmt -> Try(encoded, err),
+				encoding.begin_array : state -> Try(state, err),
+				encoding.encode_array_element : state -> Try(state, err),
+				encoding.end_array : state -> Try(state, err),
+				item.encoder_for : encoding -> (item, state -> Try(state, err)),
 			]
-		encode = |self, format| {
-			format.encode_list(self, |elem, f| elem.encode(f))
+		encoder_for = |encoding| {
+			Encoding : encoding
+			Item : item
+			encode_item = Item.encoder_for(encoding)
+
+			|self, state| {
+				started = Encoding.begin_array(state)?
+				encoded_items =
+					List.fold(
+						self,
+						Ok(started),
+						|state_result, elem|
+							match state_result {
+								Ok(current) => {
+									element_state = Encoding.encode_array_element(current)?
+									encode_item(elem, element_state)
+								}
+
+								Err(err) => Err(err)
+							},
+					)
+
+				finished = encoded_items?
+				Encoding.end_array(finished)
+			}
 		}
 
 		## Decode a list using a format that provides decode_list

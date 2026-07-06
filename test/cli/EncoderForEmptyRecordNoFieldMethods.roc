@@ -1,4 +1,4 @@
-EncodeToEmptyRecordNoFieldMethods :: [].{}
+EncoderForEmptyRecordNoFieldMethods :: [].{}
 
 Format := [Default].{
 	begin_record : U64 -> Try(U64, [])
@@ -10,11 +10,12 @@ Format := [Default].{
 
 encode : value -> Try(U64, [])
 	where [
-		value.encode_to : value, Format -> (U64 -> Try(U64, [])),
+		value.encoder_for : Format -> (value, U64 -> Try(U64, [])),
 	]
 encode = |value| {
-	encode_value = value.encode_to(Format.Default)
-	encode_value(0)
+	Shape : value
+	encode_value = Shape.encoder_for(Format.Default)
+	encode_value(value, 0)
 }
 
 expect encode({}) == Ok(3)
