@@ -13703,8 +13703,8 @@ const EvidencePass = struct {
 
         switch (resolved.desc.content) {
             .err => return .checked_error,
-            .flex => |flex| return self.resolveVarObligation(resolved.var_, flex.constraints, method, structural_kind, chain, commit_unpinned),
-            .rigid => |rigid| return self.resolveVarObligation(resolved.var_, rigid.constraints, method, structural_kind, chain, commit_unpinned),
+            .flex => |flex| return self.resolveVarObligation(resolved.var_, flex.constraints, method, structural_kind, constraint_fn_var, chain, commit_unpinned),
+            .rigid => |rigid| return self.resolveVarObligation(resolved.var_, rigid.constraints, method, structural_kind, constraint_fn_var, chain, commit_unpinned),
             .alias, .structure => {
                 if (self.methodOwnerForSourceContent(resolved.var_)) |owner| {
                     if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
@@ -13736,10 +13736,25 @@ const EvidencePass = struct {
         constraints: types.StaticDispatchConstraint.SafeList.Range,
         method: canonical.MethodNameId,
         structural_kind: ?static_dispatch.StructuralKind,
+        constraint_fn_var: ?Var,
         chain: []const []const EvidenceParam,
         commit_unpinned: bool,
     ) Allocator.Error!?static_dispatch.StaticDispatchResolution {
         if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
+            // A constraint(k) resolution consumes evidence entry k, whose
+            // callable is the scheme's pristine constraint fn type. The
+            // obligation's own callable must be that same type: same-named
+            // constraints on a shared dispatcher var unify their fn vars, so
+            // a mismatched root here means the site's callable was pinned to
+            // one instantiation's concrete type.
+            if (builtin.mode == .Debug) {
+                if (constraint_fn_var) |fn_var| {
+                    const chain_fn_var = chain[ref.depth][ref.index].constraint.fn_var;
+                    if (self.types.resolveVar(fn_var).var_ != self.types.resolveVar(chain_fn_var).var_) {
+                        checkedArtifactInvariant("constraint-resolved dispatch callable was not the scheme-pristine constraint fn type", .{});
+                    }
+                }
+            }
             return .{ .constraint = ref };
         }
 
