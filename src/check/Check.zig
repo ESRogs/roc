@@ -465,6 +465,10 @@ bench_probe_refuted: usize = 0,
 /// Union-find roots resolve at consumption time (eager roots would go stale).
 /// Duplicates are harmless — the consumer inserts into a set.
 checked_lambda_params: std.ArrayListUnmanaged(CIR.Pattern.Span),
+/// Lambdas whose bodies actually perform effects. This records direct checker
+/// output so binding-name diagnostics do not infer effectfulness from
+/// annotations that only make a pure body have an effectful function type.
+effectful_lambda_bodies: std.AutoHashMap(CIR.Expr.Idx, void),
 /// Scratch for `beginCommitProbe`: the caller env's var-pool length per rank
 /// at probe start, restored on a failed probe's rollback. One buffer suffices
 /// because commit-probes never nest — but the type store's trail-based
@@ -1387,6 +1391,7 @@ fn initAssumePrepared(
         .known_empty_payload_vars_destructure = .empty,
         .known_empty_payload_vars_match = .empty,
         .checked_lambda_params = .empty,
+        .effectful_lambda_bodies = std.AutoHashMap(CIR.Expr.Idx, void).init(gpa),
         .probe_var_pool_lens = .empty,
     };
 
@@ -1501,6 +1506,7 @@ pub fn deinit(self: *Self) void {
     self.known_empty_payload_vars_destructure.deinit(self.gpa);
     self.known_empty_payload_vars_match.deinit(self.gpa);
     self.checked_lambda_params.deinit(self.gpa);
+    self.effectful_lambda_bodies.deinit();
     self.probe_var_pool_lens.deinit(self.gpa);
 }
 
@@ -7538,6 +7544,25 @@ fn varIsEffectfulFunction(self: *Self, var_: Var) bool {
     }
 }
 
+fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool {
+    return switch (self.cir.store.getExpr(expr_idx)) {
+        .e_lambda => self.effectful_lambda_bodies.contains(expr_idx),
+        .e_closure => |closure| self.effectful_lambda_bodies.contains(closure.lambda_idx),
+        .e_hosted_lambda => true,
+        else => false,
+    };
+}
+
+fn checkEffectfulFunctionName(self: *Self, pattern_idx: CIR.Pattern.Idx, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
+    const ident = self.getPatternIdent(pattern_idx) orelse return;
+    if (ident.attributes.effectful) return;
+    if (!self.exprHasEffectfulFunctionBody(expr_idx)) return;
+
+    _ = try self.problems.appendProblem(self.gpa, .{ .effectful_function_name = .{
+        .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(pattern_idx)),
+    } });
+}
+
 fn varHasUnresolvedContent(
     self: *Self,
     var_: Var,
@@ -8516,6 +8541,9 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         try self.erroneous_value_patterns.put(self.gpa, def.pattern, {});
     }
     try self.closeAbsentConstructedPayloadVars(def.expr, expr_var);
+    if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr))) {
+        try self.checkEffectfulFunctionName(def.pattern, def.expr);
+    }
 
     if (self.defer_generalize) {
         // defer_generalize is only set when a cycle root has been identified.
@@ -11877,6 +11905,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Create the function type
             if (body_does_fx) {
+                try self.effectful_lambda_bodies.put(expr_idx, {});
                 try self.unifyWith(expr_var, try self.types.mkFuncEffectful(arg_vars, body_var), env);
             } else {
                 try self.unifyWith(expr_var, try self.types.mkFuncUnbound(arg_vars, body_var), env);
@@ -13651,6 +13680,9 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     try self.erroneous_value_patterns.put(self.gpa, decl_stmt.pattern, {});
                 }
                 try self.closeAbsentConstructedPayloadVars(decl_stmt.expr, decl_expr_var);
+                if (decl_is_fn) {
+                    try self.checkEffectfulFunctionName(decl_stmt.pattern, decl_stmt.expr);
+                }
 
                 // A record-destructure binding gets a dedicated context so the
                 // report can suggest `field: _` or `..` when the pattern is too
