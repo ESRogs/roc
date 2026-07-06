@@ -118,5 +118,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_9884_test.zig"));
     std.testing.refAllDecls(@import("test/tce_capture_test.zig"));
     std.testing.refAllDecls(@import("test/list_map_target_independent_lir_test.zig"));
+    std.testing.refAllDecls(@import("test/match_lowering_test.zig"));
+    std.testing.refAllDecls(@import("test/match_differential_test.zig"));
     std.testing.refAllDecls(@import("test/url_package_test.zig"));
 }
