@@ -12678,10 +12678,10 @@ fn rocBump(ctx: *CliCtx, args: cli_args.BumpArgs) CliMainError!void {
                 .message = try std.fmt.allocPrint(ctx.arena, "`{s}` is not a valid version. Versions are MAJOR.MINOR.PATCH, e.g. 1.2.3.", .{raw}),
             } });
         };
-        if (version.major == 0) {
+        if (!version.isPresent()) {
             return ctx.fail(.{ .bump_failed = .{
                 .title = "Invalid Old Version",
-                .message = "Roc package versions start at 1.0.0, so there is no published version below 1.0.0 to compare against.",
+                .message = "The version 0.0.0 is reserved to mean \"no version\". The lowest publishable version is 0.0.1.",
             } });
         }
         old_version = version;
@@ -12766,6 +12766,9 @@ fn rocBump(ctx: *CliCtx, args: cli_args.BumpArgs) CliMainError!void {
     const next = bump.diff.nextVersion(old_version_value, result.magnitude);
     stdout.print("\nThis is a {s} change.\n", .{result.magnitude.name()}) catch {};
     stdout.print("\n{f} -> {f}\n", .{ old_version_value, next }) catch {};
+    if (old_version_value.major == 0) {
+        stdout.print("\n(Pre-1.0.0 versions are 0.X.Y: breaking changes bump X, everything else bumps Y.)\n", .{}) catch {};
+    }
 }
 
 /// Check one side of a bump comparison, keeping its BuildEnv alive so the

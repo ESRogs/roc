@@ -377,3 +377,22 @@ test "nextVersion follows Elm bump arithmetic" {
         diff_mod.nextVersion(v, .patch),
     );
 }
+
+test "nextVersion uses 0.X.Y convention rules before 1.0.0" {
+    const v = base.url.Version{ .major = 0, .minor = 5, .patch = 2 };
+
+    // Breaking changes bump the minor slot; compatible changes (additions
+    // and patches alike) bump the patch slot.
+    try std.testing.expectEqual(
+        base.url.Version{ .major = 0, .minor = 6, .patch = 0 },
+        diff_mod.nextVersion(v, .major),
+    );
+    try std.testing.expectEqual(
+        base.url.Version{ .major = 0, .minor = 5, .patch = 3 },
+        diff_mod.nextVersion(v, .minor),
+    );
+    try std.testing.expectEqual(
+        base.url.Version{ .major = 0, .minor = 5, .patch = 3 },
+        diff_mod.nextVersion(v, .patch),
+    );
+}

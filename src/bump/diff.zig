@@ -34,7 +34,18 @@ pub const Magnitude = enum(u8) {
 };
 
 /// Compute the next version from the old version and the required magnitude.
+///
+/// Pre-1.0.0 versions use 0.X.Y convention rules: X carries major (breaking)
+/// semantics and Y carries minor semantics, so breaking changes bump the
+/// minor slot and everything else bumps the patch slot. Crossing to 1.0.0 is
+/// the author's call, never suggested automatically.
 pub fn nextVersion(old: base.url.Version, magnitude: Magnitude) base.url.Version {
+    if (old.major == 0) {
+        return switch (magnitude) {
+            .major => old.bumpMinor(),
+            .minor, .patch => old.bumpPatch(),
+        };
+    }
     return switch (magnitude) {
         .major => old.bumpMajor(),
         .minor => old.bumpMinor(),
