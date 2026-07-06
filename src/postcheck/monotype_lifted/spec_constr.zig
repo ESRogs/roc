@@ -3510,7 +3510,9 @@ fn exprSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.ExprId
 }
 
 fn captureOperandSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.CaptureOperand)) bool {
-    for (program.captureOperandSpan(span)) |operand| {
+    const operands = program.captureOperandSpan(span);
+    for (0..GuardedList.borrowLen(operands)) |index| {
+        const operand = GuardedList.at(operands, index);
         if (exprContainsReturn(program, operand.value)) return true;
     }
     return false;
@@ -3635,7 +3637,11 @@ fn localUseCountInExprSpan(program: *const Ast.Program, local: Ast.LocalId, span
 
 fn localUseCountInCaptureOperandSpan(program: *const Ast.Program, local: Ast.LocalId, span: Ast.Span(Ast.CaptureOperand)) usize {
     var count: usize = 0;
-    for (program.captureOperandSpan(span)) |operand| count += localUseCountInExpr(program, local, operand.value);
+    const operands = program.captureOperandSpan(span);
+    for (0..GuardedList.borrowLen(operands)) |index| {
+        const operand = GuardedList.at(operands, index);
+        count += localUseCountInExpr(program, local, operand.value);
+    }
     return count;
 }
 
@@ -3851,7 +3857,11 @@ fn scanLocalUseInCaptureOperandSpan(
     span: Ast.Span(Ast.CaptureOperand),
     scan: *LocalUseScan,
 ) void {
-    for (program.captureOperandSpan(span)) |operand| scanLocalUseInExpr(program, local, operand.value, scan);
+    const operands = program.captureOperandSpan(span);
+    for (0..GuardedList.borrowLen(operands)) |index| {
+        const operand = GuardedList.at(operands, index);
+        scanLocalUseInExpr(program, local, operand.value, scan);
+    }
 }
 
 fn scanLocalUseInStmt(program: *const Ast.Program, local: Ast.LocalId, stmt_id: Ast.StmtId, scan: *LocalUseScan) void {
