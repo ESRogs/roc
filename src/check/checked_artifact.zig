@@ -13211,7 +13211,7 @@ const EvidencePass = struct {
             .equality => |eq| if (eq.structural_allowed) .equality else null,
             .hash => |hash| if (hash.structural_allowed) .hash else null,
             .parser_for => |parser_for| if (parser_for.structural_allowed) .parser else null,
-            .encode_to => |encode_to| if (encode_to.structural_allowed) .encoder else null,
+            .encoder_for => |encoder_for| if (encoder_for.structural_allowed) .encoder else null,
         };
         // Nested evidence built for this plan's target forwards enclosing
         // where-vars against the same chain.
@@ -13530,7 +13530,7 @@ const EvidencePass = struct {
         if (fn_name.eql(common.is_eq)) return .equality;
         if (fn_name.eql(common.to_hash)) return .hash;
         if (fn_name.eql(common.parser_for)) return .parser;
-        if (fn_name.eql(common.encode_to)) return .encoder;
+        if (fn_name.eql(common.encoder_for)) return .encoder;
         return null;
     }
 
@@ -29507,8 +29507,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x58, 0xBB, 0x36, 0xDB, 0xDC, 0x67, 0xBC, 0xA4, 0x98, 0x0C, 0x8D, 0x17, 0xF9, 0x3F, 0x41, 0x48,
-        0xD9, 0x42, 0x28, 0x59, 0x0C, 0x0D, 0x44, 0x06, 0xDD, 0x19, 0x2C, 0x10, 0xC1, 0x27, 0xFE, 0x12,
+        0x53, 0x6C, 0x81, 0xD8, 0xE9, 0x70, 0x9A, 0x09, 0x06, 0x72, 0x9E, 0xC7, 0x6C, 0xA0, 0xED, 0x25,
+        0x1D, 0xD4, 0xC9, 0x03, 0xBC, 0xD1, 0xD3, 0x05, 0xFF, 0xC4, 0xD1, 0x13, 0x72, 0x09, 0xBB, 0xC8,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
