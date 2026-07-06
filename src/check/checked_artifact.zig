@@ -7,7 +7,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const base = @import("base");
-const builtins = @import("builtins");
 const can = @import("can");
 const collections = @import("collections");
 const types = @import("types");
@@ -1662,15 +1661,7 @@ fn exprDependsOnUnboundPlatformRequirement(
             exprDependsOnUnboundPlatformRequirement(checked_bodies, resolved_value_refs, for_.body, relation_blocked_exprs),
         .run_low_level => |run| exprSpanDependsOnUnboundPlatformRequirement(checked_bodies, resolved_value_refs, run.args, relation_blocked_exprs),
         .pending,
-        .num,
-        .frac_f32,
-        .frac_f64,
-        .dec,
-        .dec_small,
-        .num_from_numeral,
-        .typed_int,
-        .typed_frac,
-        .typed_num_from_numeral,
+        .numeral,
         .str_from_quote,
         .str_segment,
         .bytes_literal,
@@ -2559,16 +2550,17 @@ pub const CheckedStaticDispatchConstraint = struct {
     }
 };
 
-/// Public `NumericDefaultPhase` declaration.
-pub const NumericDefaultPhase = enum {
-    checking_finalized,
-    /// Defaults to Dec when still unresolved at monomorphic specialization.
-    mono_specialization,
-    /// Defaults to Str when still unresolved at monomorphic specialization
-    /// (string literals carrying a from_quote constraint, and interpolated
-    /// string literals carrying a from_interpolation constraint).
-    mono_specialization_str,
-};
+/// The defaulting oracle (src/types/literal_defaulting.zig), re-exported for
+/// consumers reached through the checked artifact (monotype solving/lowering).
+pub const literal_defaulting = types.literal_defaulting;
+
+/// The exact-numeral value authority (src/types/numeral.zig), re-exported for
+/// consumers reached through the checked artifact (monotype lowering).
+pub const exact_numeral = types.numeral;
+
+/// Public `NumericDefaultPhase` declaration; the defaulting oracle owns the
+/// enum and the target each phase materializes.
+pub const NumericDefaultPhase = literal_defaulting.NumericDefaultPhase;
 
 /// Public `RowDefault` declaration.
 pub const RowDefault = enum {
@@ -6090,10 +6082,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
             const maybe_num_literal = constraint.numeralInfo();
             self.writeBool(maybe_num_literal != null);
             if (maybe_num_literal) |num_literal| {
-                self.hasher.update(&num_literal.bytes);
-                self.writeBool(num_literal.is_u128);
-                self.writeBool(num_literal.is_negative);
-                self.writeBool(num_literal.is_fractional);
+                self.hasher.update(&num_literal.keyBytes());
             }
         }
     }
@@ -6411,37 +6400,16 @@ fn numericDefaultPhaseForConstraints(
     constraints_range: types.StaticDispatchConstraint.SafeList.Range,
 ) ?NumericDefaultPhase {
     const constraints = module.typeStoreConst().sliceStaticDispatchConstraints(constraints_range);
-    const kind = types.StaticDispatchConstraint.dominantLiteralKind(constraints);
-    var has_arith = false;
-    for (constraints) |constraint| {
-        if (isDefaultableArithmeticConstraint(module, constraint)) {
-            has_arith = true;
-            break;
-        }
-    }
-    if (kind == .numeral or has_arith) return .mono_specialization;
-    if (kind == .quote or kind == .interpolation) return .mono_specialization_str;
-    return null;
-}
-
-fn isDefaultableArithmeticConstraint(
-    module: TypedCIR.Module,
-    constraint: types.StaticDispatchConstraint,
-) bool {
     const idents = module.commonIdents();
-    return switch (constraint.origin) {
-        .desugared_binop => constraint.fn_name.eql(idents.plus) or
-            constraint.fn_name.eql(idents.minus) or
-            constraint.fn_name.eql(idents.times) or
-            constraint.fn_name.eql(idents.div_by) or
-            constraint.fn_name.eql(idents.div_trunc_by) or
-            constraint.fn_name.eql(idents.rem_by),
-        .desugared_unaryop => constraint.fn_name.eql(idents.negate),
-        .from_literal,
-        .method_call,
-        .where_clause,
-        => false,
-    };
+    return types.literal_defaulting.numericDefaultPhase(.{
+        .plus = idents.plus,
+        .minus = idents.minus,
+        .times = idents.times,
+        .div_by = idents.div_by,
+        .div_trunc_by = idents.div_trunc_by,
+        .rem_by = idents.rem_by,
+        .negate = idents.negate,
+    }, constraints);
 }
 
 fn copyCheckedFlatType(
@@ -7204,25 +7172,15 @@ pub const CheckedPatternData = union(enum) {
         rest: ?CheckedListRestPattern,
     },
     tuple: []const CheckedPatternId,
-    num_literal: struct {
-        value: CIR.IntValue,
-        kind: CIR.NumKind,
-        /// Synthesized `.num_from_numeral` checked expression for matching this
-        /// literal against a non-builtin number type; null on the builtin fast path.
+    /// Any numeric literal pattern: exact digit facts; bits are produced at
+    /// monotype lowering for the pattern's concrete type.
+    numeral_literal: struct {
+        literal: ModuleEnv.NumeralLiteral,
+        /// Synthesized `.numeral` checked conversion expression for matching
+        /// this literal against a non-builtin number type; null on the
+        /// builtin fast path.
         conversion: ?CheckedExprId = null,
     },
-    small_dec_literal: struct {
-        value: CIR.SmallDecValue,
-        has_suffix: bool,
-        conversion: ?CheckedExprId = null,
-    },
-    dec_literal: struct {
-        value: builtins.dec.RocDec,
-        has_suffix: bool,
-        conversion: ?CheckedExprId = null,
-    },
-    frac_f32_literal: f32,
-    frac_f64_literal: f64,
     str_literal: struct {
         literal: CheckedStringLiteralId,
         /// Synthesized `.str_from_quote` checked expression for matching this
@@ -7238,39 +7196,24 @@ pub const CheckedPatternData = union(enum) {
     runtime_error,
 };
 
+/// Public `CheckedNumeralData` declaration: a numeric literal's exact digit
+/// facts, carried through the checked artifact unchanged. The checked stage
+/// stores NO concrete bit pattern for a literal — monotype lowering produces
+/// bits exactly once, for the instantiated primitive, from these facts.
+pub const CheckedNumeralData = struct {
+    /// The parser-recorded exact digits (offsets into the module env's
+    /// numeral digit pool, which serializes with the module).
+    literal: ModuleEnv.NumeralLiteral,
+    /// The checked `from_numeral` dispatch plan, when the literal's target is
+    /// a non-builtin type (or is still polymorphic at publication).
+    plan: ?StaticDispatchPlanId,
+};
+
 /// Public `CheckedExprData` declaration.
 pub const CheckedExprData = union(enum) {
     pending,
-    num: struct {
-        value: CIR.IntValue,
-        kind: CIR.NumKind,
-    },
-    frac_f32: struct {
-        value: f32,
-        has_suffix: bool,
-    },
-    frac_f64: struct {
-        value: f64,
-        has_suffix: bool,
-    },
-    dec: struct {
-        value: builtins.dec.RocDec,
-        has_suffix: bool,
-    },
-    dec_small: struct {
-        value: CIR.SmallDecValue,
-        has_suffix: bool,
-    },
-    num_from_numeral: ?StaticDispatchPlanId,
-    typed_int: struct {
-        value: CIR.IntValue,
-        type_name: canonical.TypeNameId,
-    },
-    typed_frac: struct {
-        value: CIR.IntValue,
-        type_name: canonical.TypeNameId,
-    },
-    typed_num_from_numeral: ?StaticDispatchPlanId,
+    /// Any numeric literal: exact digit facts plus an optional dispatch plan.
+    numeral: CheckedNumeralData,
     /// A string literal whose target is a non-builtin nominal type, converted
     /// through the type's `from_quote` method. `literal` holds the complete
     /// post-escape string contents.
@@ -7437,36 +7380,7 @@ pub const StoredCheckedInterpolation = struct {
 /// (with slices) is reconstructed on demand by `expr`/`reconstructCheckedExprData`.
 pub const StoredCheckedExprData = union(enum) {
     pending,
-    num: struct {
-        value: CIR.IntValue,
-        kind: CIR.NumKind,
-    },
-    frac_f32: struct {
-        value: f32,
-        has_suffix: bool,
-    },
-    frac_f64: struct {
-        value: f64,
-        has_suffix: bool,
-    },
-    dec: struct {
-        value: builtins.dec.RocDec,
-        has_suffix: bool,
-    },
-    dec_small: struct {
-        value: CIR.SmallDecValue,
-        has_suffix: bool,
-    },
-    num_from_numeral: ?StaticDispatchPlanId,
-    typed_int: struct {
-        value: CIR.IntValue,
-        type_name: canonical.TypeNameId,
-    },
-    typed_frac: struct {
-        value: CIR.IntValue,
-        type_name: canonical.TypeNameId,
-    },
-    typed_num_from_numeral: ?StaticDispatchPlanId,
+    numeral: CheckedNumeralData,
     str_from_quote: struct {
         plan: ?StaticDispatchPlanId,
         literal: CheckedStringLiteralId,
@@ -7614,23 +7528,10 @@ pub const StoredCheckedPatternData = union(enum) {
         rest: ?CheckedListRestPattern,
     },
     tuple: CheckedBodyRange,
-    num_literal: struct {
-        value: CIR.IntValue,
-        kind: CIR.NumKind,
+    numeral_literal: struct {
+        literal: ModuleEnv.NumeralLiteral,
         conversion: ?CheckedExprId = null,
     },
-    small_dec_literal: struct {
-        value: CIR.SmallDecValue,
-        has_suffix: bool,
-        conversion: ?CheckedExprId = null,
-    },
-    dec_literal: struct {
-        value: builtins.dec.RocDec,
-        has_suffix: bool,
-        conversion: ?CheckedExprId = null,
-    },
-    frac_f32_literal: f32,
-    frac_f64_literal: f64,
     str_literal: struct {
         literal: CheckedStringLiteralId,
         conversion: ?CheckedExprId = null,
@@ -7716,15 +7617,7 @@ fn reconstructCheckedExprData(pool_owner: anytype, stored: StoredCheckedExprData
         .runtime_error => .runtime_error,
         .ellipsis => .ellipsis,
         .anno_only => .anno_only,
-        .num => |v| .{ .num = .{ .value = v.value, .kind = v.kind } },
-        .frac_f32 => |v| .{ .frac_f32 = .{ .value = v.value, .has_suffix = v.has_suffix } },
-        .frac_f64 => |v| .{ .frac_f64 = .{ .value = v.value, .has_suffix = v.has_suffix } },
-        .dec => |v| .{ .dec = .{ .value = v.value, .has_suffix = v.has_suffix } },
-        .dec_small => |v| .{ .dec_small = .{ .value = v.value, .has_suffix = v.has_suffix } },
-        .num_from_numeral => |p| .{ .num_from_numeral = p },
-        .typed_int => |v| .{ .typed_int = .{ .value = v.value, .type_name = v.type_name } },
-        .typed_frac => |v| .{ .typed_frac = .{ .value = v.value, .type_name = v.type_name } },
-        .typed_num_from_numeral => |p| .{ .typed_num_from_numeral = p },
+        .numeral => |v| .{ .numeral = v },
         .str_from_quote => |v| .{ .str_from_quote = .{ .plan = v.plan, .literal = v.literal } },
         .str_segment => |l| .{ .str_segment = l },
         .str => |r| .{ .str = pool_owner.exprIdPool()[r.start .. r.start + r.len] },
@@ -7835,11 +7728,7 @@ fn reconstructCheckedPatternData(pool_owner: anytype, stored: StoredCheckedPatte
             .rest = l.rest,
         } },
         .tuple => |r| .{ .tuple = pool_owner.patternIdPool()[r.start .. r.start + r.len] },
-        .num_literal => |v| .{ .num_literal = .{ .value = v.value, .kind = v.kind, .conversion = v.conversion } },
-        .small_dec_literal => |v| .{ .small_dec_literal = .{ .value = v.value, .has_suffix = v.has_suffix, .conversion = v.conversion } },
-        .dec_literal => |v| .{ .dec_literal = .{ .value = v.value, .has_suffix = v.has_suffix, .conversion = v.conversion } },
-        .frac_f32_literal => |v| .{ .frac_f32_literal = v },
-        .frac_f64_literal => |v| .{ .frac_f64_literal = v },
+        .numeral_literal => |v| .{ .numeral_literal = .{ .literal = v.literal, .conversion = v.conversion } },
         .str_literal => |v| .{ .str_literal = .{ .literal = v.literal, .conversion = v.conversion } },
         .str_interpolation => |s| .{ .str_interpolation = .{
             .prefix = s.prefix,
@@ -8477,6 +8366,7 @@ const CheckedSourceNodes = struct {
             },
             .assign,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -8947,15 +8837,7 @@ pub const CheckedBodyStore = struct {
             .runtime_error => .runtime_error,
             .ellipsis => .ellipsis,
             .anno_only => .anno_only,
-            .num => |v| .{ .num = .{ .value = v.value, .kind = v.kind } },
-            .frac_f32 => |v| .{ .frac_f32 = .{ .value = v.value, .has_suffix = v.has_suffix } },
-            .frac_f64 => |v| .{ .frac_f64 = .{ .value = v.value, .has_suffix = v.has_suffix } },
-            .dec => |v| .{ .dec = .{ .value = v.value, .has_suffix = v.has_suffix } },
-            .dec_small => |v| .{ .dec_small = .{ .value = v.value, .has_suffix = v.has_suffix } },
-            .num_from_numeral => |p| .{ .num_from_numeral = p },
-            .typed_int => |v| .{ .typed_int = .{ .value = v.value, .type_name = v.type_name } },
-            .typed_frac => |v| .{ .typed_frac = .{ .value = v.value, .type_name = v.type_name } },
-            .typed_num_from_numeral => |p| .{ .typed_num_from_numeral = p },
+            .numeral => |v| .{ .numeral = v },
             .str_from_quote => |v| .{ .str_from_quote = .{ .plan = v.plan, .literal = v.literal } },
             .str_segment => |l| .{ .str_segment = l },
             .str => |items| .{ .str = try self.appendExprIds(allocator, items) },
@@ -9047,11 +8929,7 @@ pub const CheckedBodyStore = struct {
             .record_destructure => |destructs| .{ .record_destructure = try self.appendRecordDestructs(allocator, destructs) },
             .list => |l| .{ .list = .{ .patterns = try self.appendPatternIds(allocator, l.patterns), .rest = l.rest } },
             .tuple => |patterns| .{ .tuple = try self.appendPatternIds(allocator, patterns) },
-            .num_literal => |v| .{ .num_literal = .{ .value = v.value, .kind = v.kind, .conversion = v.conversion } },
-            .small_dec_literal => |v| .{ .small_dec_literal = .{ .value = v.value, .has_suffix = v.has_suffix, .conversion = v.conversion } },
-            .dec_literal => |v| .{ .dec_literal = .{ .value = v.value, .has_suffix = v.has_suffix, .conversion = v.conversion } },
-            .frac_f32_literal => |v| .{ .frac_f32_literal = v },
-            .frac_f64_literal => |v| .{ .frac_f64_literal = v },
+            .numeral_literal => |v| .{ .numeral_literal = .{ .literal = v.literal, .conversion = v.conversion } },
             .str_literal => |v| .{ .str_literal = .{ .literal = v.literal, .conversion = v.conversion } },
             .str_interpolation => |s| .{ .str_interpolation = .{
                 .prefix = s.prefix,
@@ -9331,16 +9209,7 @@ pub const CheckedBodyStore = struct {
                 };
             const data = &self.stored_exprs.items[@intFromEnum(checked_expr)].data;
             switch (data.*) {
-                .num_from_numeral => data.* = .{ .num_from_numeral = plan_id },
-                .typed_num_from_numeral => data.* = .{ .typed_num_from_numeral = plan_id },
-                .num,
-                .typed_int,
-                .frac_f32,
-                .frac_f64,
-                .dec,
-                .dec_small,
-                .typed_frac,
-                => {},
+                .numeral => |*numeral| numeral.plan = plan_id,
                 else => checkedArtifactInvariant(
                     "from_numeral plan {d} points at non-numeral checked expression {d}",
                     .{ @intFromEnum(plan_id), @intFromEnum(checked_expr) },
@@ -9767,15 +9636,7 @@ fn checkedExprDataDiverges(
         .hosted_lambda => false,
         .run_low_level => |run| checkedAnyExprDiverges(exprs, statements, expr_diverges, statement_diverges, run.args, expr_states, statement_states),
         .pending,
-        .num,
-        .frac_f32,
-        .frac_f64,
-        .dec,
-        .dec_small,
-        .num_from_numeral,
-        .typed_int,
-        .typed_frac,
-        .typed_num_from_numeral,
+        .numeral,
         .str_from_quote,
         .str_segment,
         .bytes_literal,
@@ -10067,15 +9928,14 @@ const CheckedBodyPayloadCopier = struct {
     fn copyExprData(self: *@This(), expr_idx: CIR.Expr.Idx) Allocator.Error!CheckedExprData {
         const expr = self.module.expr(expr_idx).data;
         return switch (expr) {
-            .e_num => |num| self.copyIntLiteral(expr_idx, num.value, num.kind),
-            .e_frac_f32 => |frac| self.copyFracLiteral(expr_idx, .{ .f32 = frac.value }, frac.has_suffix),
-            .e_frac_f64 => |frac| self.copyFracLiteral(expr_idx, .{ .f64 = frac.value }, frac.has_suffix),
-            .e_dec => |dec| self.copyFracLiteral(expr_idx, .{ .dec = dec.value }, dec.has_suffix),
-            .e_dec_small => |dec| self.copyFracLiteral(expr_idx, .{ .small = dec.value }, dec.has_suffix),
-            .e_num_from_numeral => try self.copyNumFromNumeralLiteral(expr_idx, false),
-            .e_typed_int => |typed| try self.copyTypedIntLiteral(expr_idx, typed.value, typed.type_name),
-            .e_typed_frac => |typed| try self.copyTypedFracLiteral(expr_idx, typed.value, typed.type_name),
-            .e_typed_num_from_numeral => try self.copyTypedNumFromNumeralLiteral(expr_idx),
+            .e_num => self.copyNumeralLiteral(expr_idx),
+            .e_frac_f32, .e_frac_f64 => checkedArtifactInvariant("float-valued CIR literal (no exact digits) reached artifact publication", .{}),
+            .e_dec => self.copyNumeralLiteral(expr_idx),
+            .e_dec_small => self.copyNumeralLiteral(expr_idx),
+            .e_num_from_numeral => self.copyNumeralLiteral(expr_idx),
+            .e_typed_int => self.copyNumeralLiteral(expr_idx),
+            .e_typed_frac => self.copyNumeralLiteral(expr_idx),
+            .e_typed_num_from_numeral => self.copyNumeralLiteral(expr_idx),
             .e_str_segment => |str| .{ .str_segment = try self.string_builder.intern(str.literal) },
             .e_str => |str| try self.copyStrExpr(expr_idx, str.span),
             .e_bytes_literal => |bytes| .{ .bytes_literal = try self.string_builder.intern(bytes.literal) },
@@ -10325,20 +10185,15 @@ const CheckedBodyPayloadCopier = struct {
         return id;
     }
 
-    fn copyNumFromNumeralLiteral(
-        self: *@This(),
-        expr_idx: CIR.Expr.Idx,
-        has_suffix: bool,
-    ) Allocator.Error!CheckedExprData {
-        const builtin_nominal = self.checkedBuiltinForExpr(expr_idx) orelse return .{ .num_from_numeral = null };
-        const literal = self.exactNumeralLiteral(expr_idx);
-        return (try exactNumeralForBuiltin(self.allocator, self.module.moduleEnvConst(), literal, builtin_nominal, has_suffix)) orelse .{ .num_from_numeral = null };
-    }
-
-    fn copyTypedNumFromNumeralLiteral(self: *@This(), expr_idx: CIR.Expr.Idx) Allocator.Error!CheckedExprData {
-        const builtin_nominal = self.checkedBuiltinForExpr(expr_idx) orelse return .{ .typed_num_from_numeral = null };
-        const literal = self.exactNumeralLiteral(expr_idx);
-        return (try exactNumeralForBuiltin(self.allocator, self.module.moduleEnvConst(), literal, builtin_nominal, true)) orelse .{ .typed_num_from_numeral = null };
+    /// Copy a numeric literal into the artifact as its exact digit facts.
+    /// No concrete representation is chosen here: monotype lowering produces
+    /// the bits for the instantiated primitive, and a dispatch plan is
+    /// attached later when the target is a non-builtin type.
+    fn copyNumeralLiteral(self: *@This(), expr_idx: CIR.Expr.Idx) CheckedExprData {
+        return .{ .numeral = .{
+            .literal = self.exactNumeralLiteral(expr_idx),
+            .plan = null,
+        } };
     }
 
     fn exactNumeralLiteral(self: *@This(), expr_idx: CIR.Expr.Idx) ModuleEnv.NumeralLiteral {
@@ -10347,254 +10202,10 @@ const CheckedBodyPayloadCopier = struct {
         };
     }
 
-    fn exactNumeralForBuiltin(
-        allocator: Allocator,
-        module_env: *const ModuleEnv,
-        literal: ModuleEnv.NumeralLiteral,
-        builtin_nominal: CheckedBuiltinNominal,
-        has_suffix: bool,
-    ) Allocator.Error!?CheckedExprData {
-        return switch (builtin_nominal) {
-            .u8 => exactUnsignedIntLiteral(u8, module_env, literal, .u8),
-            .u16 => exactUnsignedIntLiteral(u16, module_env, literal, .u16),
-            .u32 => exactUnsignedIntLiteral(u32, module_env, literal, .u32),
-            .u64 => exactUnsignedIntLiteral(u64, module_env, literal, .u64),
-            .u128 => exactUnsignedIntLiteral(u128, module_env, literal, .u128),
-            .i8 => exactSignedIntLiteral(i8, module_env, literal, .i8),
-            .i16 => exactSignedIntLiteral(i16, module_env, literal, .i16),
-            .i32 => exactSignedIntLiteral(i32, module_env, literal, .i32),
-            .i64 => exactSignedIntLiteral(i64, module_env, literal, .i64),
-            .i128 => exactSignedIntLiteral(i128, module_env, literal, .i128),
-            .f32 => blk: {
-                const text = try numeralLiteralDecimalText(allocator, module_env, literal);
-                defer allocator.free(text);
-                break :blk if (std.fmt.parseFloat(f32, text)) |value|
-                    .{ .frac_f32 = .{ .value = value, .has_suffix = has_suffix } }
-                else |_|
-                    null;
-            },
-            .f64 => blk: {
-                const text = try numeralLiteralDecimalText(allocator, module_env, literal);
-                defer allocator.free(text);
-                break :blk if (std.fmt.parseFloat(f64, text)) |value|
-                    .{ .frac_f64 = .{ .value = value, .has_suffix = has_suffix } }
-                else |_|
-                    null;
-            },
-            .dec => if (exactDecLiteral(module_env, literal)) |value|
-                .{ .dec = .{ .value = value, .has_suffix = has_suffix } }
-            else if (!has_suffix)
-                .{ .dec = .{ .value = if (literal.isNegative()) builtins.dec.RocDec.min else builtins.dec.RocDec.max, .has_suffix = has_suffix } }
-            else
-                null,
-            .bool,
-            .str,
-            .list,
-            .box,
-            .dict,
-            .set,
-            .parse_tag_union_spec,
-            .fields,
-            .field,
-            .crypto_sha256_digest,
-            .crypto_sha256_hasher,
-            .crypto_blake3_digest,
-            .crypto_blake3_hasher,
-            => null,
+    fn exactNumeralLiteralForPattern(self: *@This(), pattern_idx: CIR.Pattern.Idx) ModuleEnv.NumeralLiteral {
+        return self.module.moduleEnvConst().numeralLiteralForNode(ModuleEnv.nodeIdxFrom(pattern_idx)) orelse {
+            checkedArtifactInvariant("checked literal pattern had no parser-owned numeral facts", .{});
         };
-    }
-
-    fn exactUnsignedIntLiteral(comptime T: type, module_env: *const ModuleEnv, literal: ModuleEnv.NumeralLiteral, kind: CIR.NumKind) ?CheckedExprData {
-        const magnitude = exactIntegerMagnitude(module_env, literal) orelse return null;
-        if (literal.isNegative() and magnitude != 0) return null;
-        if (magnitude > @as(u128, @intCast(std.math.maxInt(T)))) return null;
-        const value = CIR.IntValue{
-            .bytes = @bitCast(magnitude),
-            .kind = .u128,
-        };
-        return .{ .num = .{ .value = value, .kind = kind } };
-    }
-
-    fn exactSignedIntLiteral(comptime T: type, module_env: *const ModuleEnv, literal: ModuleEnv.NumeralLiteral, kind: CIR.NumKind) ?CheckedExprData {
-        const magnitude = exactIntegerMagnitude(module_env, literal) orelse return null;
-        const max_positive: u128 = @intCast(std.math.maxInt(T));
-        const max_negative = max_positive + 1;
-        const parsed: i128 = if (literal.isNegative()) blk: {
-            if (magnitude > max_negative) return null;
-            break :blk if (magnitude == max_negative)
-                @as(i128, std.math.minInt(T))
-            else
-                -@as(i128, @intCast(magnitude));
-        } else blk: {
-            if (magnitude > max_positive) return null;
-            break :blk @intCast(magnitude);
-        };
-        const value = CIR.IntValue{
-            .bytes = @bitCast(parsed),
-            .kind = .i128,
-        };
-        return .{ .num = .{ .value = value, .kind = kind } };
-    }
-
-    fn exactIntegerMagnitude(module_env: *const ModuleEnv, literal: ModuleEnv.NumeralLiteral) ?u128 {
-        if (literal.after_decimal_digit_count != 0) return null;
-        return base256BytesToU128(module_env.numeralDigitsBefore(literal));
-    }
-
-    fn exactDecLiteral(module_env: *const ModuleEnv, literal: ModuleEnv.NumeralLiteral) ?builtins.dec.RocDec {
-        const decimal_places = builtins.dec.RocDec.decimal_places;
-        const after_count = literal.after_decimal_digit_count;
-        if (after_count > decimal_places) return null;
-
-        const before = base256BytesToU128(module_env.numeralDigitsBefore(literal)) orelse return null;
-        const after = base256BytesToU128(module_env.numeralDigitsAfter(literal)) orelse return null;
-
-        const before_scaled = checkedMulU128(before, @intCast(builtins.dec.RocDec.one_point_zero_i128)) orelse return null;
-        const after_scale = pow10U128(decimal_places - after_count);
-        const after_scaled = checkedMulU128(after, after_scale) orelse return null;
-        const magnitude = checkedAddU128(before_scaled, after_scaled) orelse return null;
-
-        const max_positive: u128 = @intCast(std.math.maxInt(i128));
-        const max_negative = max_positive + 1;
-        if (literal.isNegative()) {
-            if (magnitude > max_negative) return null;
-            return .{ .num = if (magnitude == max_negative)
-                std.math.minInt(i128)
-            else
-                -@as(i128, @intCast(magnitude)) };
-        }
-
-        if (magnitude > max_positive) return null;
-        return .{ .num = @intCast(magnitude) };
-    }
-
-    fn base256BytesToU128(bytes_be: []const u8) ?u128 {
-        var value: u128 = 0;
-        for (bytes_be) |byte| {
-            const shifted = @mulWithOverflow(value, 256);
-            if (shifted[1] != 0) return null;
-            const added = @addWithOverflow(shifted[0], byte);
-            if (added[1] != 0) return null;
-            value = added[0];
-        }
-        return value;
-    }
-
-    fn checkedMulU128(lhs: u128, rhs: u128) ?u128 {
-        const multiplied = @mulWithOverflow(lhs, rhs);
-        if (multiplied[1] != 0) return null;
-        return multiplied[0];
-    }
-
-    fn checkedAddU128(lhs: u128, rhs: u128) ?u128 {
-        const added = @addWithOverflow(lhs, rhs);
-        if (added[1] != 0) return null;
-        return added[0];
-    }
-
-    fn pow10U128(exponent: u32) u128 {
-        var value: u128 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) {
-            value *= 10;
-        }
-        return value;
-    }
-
-    fn copyTypedIntLiteral(
-        self: *@This(),
-        expr_idx: CIR.Expr.Idx,
-        value: CIR.IntValue,
-        type_name: Ident.Idx,
-    ) Allocator.Error!CheckedExprData {
-        if (self.checkedBuiltinForExpr(expr_idx) == null) return .{ .typed_num_from_numeral = null };
-        return .{ .typed_int = .{
-            .value = value,
-            .type_name = try self.names.internTypeIdent(self.module.identStoreConst(), type_name),
-        } };
-    }
-
-    fn copyTypedFracLiteral(
-        self: *@This(),
-        expr_idx: CIR.Expr.Idx,
-        value: CIR.IntValue,
-        type_name: Ident.Idx,
-    ) Allocator.Error!CheckedExprData {
-        if (self.checkedBuiltinForExpr(expr_idx) == null) return .{ .typed_num_from_numeral = null };
-        const builtin_nominal = self.checkedBuiltinForExpr(expr_idx) orelse return .{ .typed_frac = .{
-            .value = value,
-            .type_name = try self.names.internTypeIdent(self.module.identStoreConst(), type_name),
-        } };
-        switch (builtin_nominal) {
-            .f32 => return .{ .frac_f32 = .{ .value = try self.floatLiteralForExpr(f32, expr_idx), .has_suffix = true } },
-            .f64 => return .{ .frac_f64 = .{ .value = try self.floatLiteralForExpr(f64, expr_idx), .has_suffix = true } },
-            .bool,
-            .str,
-            .u8,
-            .i8,
-            .u16,
-            .i16,
-            .u32,
-            .i32,
-            .u64,
-            .i64,
-            .u128,
-            .i128,
-            .dec,
-            .list,
-            .box,
-            .dict,
-            .set,
-            .parse_tag_union_spec,
-            .fields,
-            .field,
-            .crypto_sha256_digest,
-            .crypto_sha256_hasher,
-            .crypto_blake3_digest,
-            .crypto_blake3_hasher,
-            => {},
-        }
-        if (integerBuiltinNumKind(builtin_nominal) != null) {
-            if (integralFracLitToIntValue(.{ .scaled_dec = value })) |int_value| {
-                return .{ .typed_int = .{
-                    .value = int_value,
-                    .type_name = try self.names.internTypeIdent(self.module.identStoreConst(), type_name),
-                } };
-            }
-            return .{ .typed_num_from_numeral = null };
-        }
-        return fracLiteralForBuiltin(.{ .scaled_dec = value }, builtin_nominal, true) orelse .{ .typed_frac = .{
-            .value = value,
-            .type_name = try self.names.internTypeIdent(self.module.identStoreConst(), type_name),
-        } };
-    }
-
-    fn copyIntLiteral(
-        self: *@This(),
-        expr_idx: CIR.Expr.Idx,
-        value: CIR.IntValue,
-        kind: CIR.NumKind,
-    ) CheckedExprData {
-        const literal_builtin = self.checkedBuiltinForExpr(expr_idx);
-        if (literal_builtin == null) return .{ .num_from_numeral = null };
-        return .{ .num = .{ .value = value, .kind = kind } };
-    }
-
-    fn copyFracLiteral(
-        self: *@This(),
-        expr_idx: CIR.Expr.Idx,
-        literal: FracLit,
-        has_suffix: bool,
-    ) CheckedExprData {
-        if (self.checkedBuiltinForExpr(expr_idx) == null) return .{ .num_from_numeral = null };
-        const builtin_nominal = self.checkedBuiltinForExpr(expr_idx) orelse return originalFracLiteral(literal, has_suffix);
-        if (integerBuiltinNumKind(builtin_nominal) != null) {
-            if (integralFracLitToIntValue(literal)) |int_value| {
-                return .{ .num = .{ .value = int_value, .kind = .num_unbound } };
-            }
-            return .{ .num_from_numeral = null };
-        }
-        return fracLiteralForBuiltin(literal, builtin_nominal, has_suffix) orelse originalFracLiteral(literal, has_suffix);
     }
 
     fn checkedBuiltinForExpr(self: *@This(), expr_idx: CIR.Expr.Idx) ?CheckedBuiltinNominal {
@@ -10610,39 +10221,31 @@ const CheckedBodyPayloadCopier = struct {
         };
     }
 
-    /// Synthesize the `.num_from_numeral` checked expression a literal pattern
-    /// converts through when its type is a non-builtin number type. The
-    /// expression is registered at the pattern's source node so dispatch-plan
-    /// attachment and compile-time root creation find it the same way they
-    /// find literal expressions.
+    /// Synthesize the `.numeral` checked conversion expression a literal
+    /// pattern converts through when its type is a non-builtin number type.
+    /// The expression is registered at the pattern's source node so
+    /// dispatch-plan attachment and compile-time root creation find it the
+    /// same way they find literal expressions.
     fn numeralConversionExprForPattern(self: *@This(), pattern_idx: CIR.Pattern.Idx) Allocator.Error!?CheckedExprId {
         const node = ModuleEnv.nodeIdxFrom(pattern_idx);
         if (self.module.moduleEnvConst().numeralDispatchPlanForNode(node) == null) return null;
         const checked_ty = self.checkedPatternTypeRoot(pattern_idx);
         if (checkedBuiltinForLiteralTarget(self.checked_types.store.view(), checked_ty) != null) return null;
+        const literal = self.module.moduleEnvConst().numeralLiteralForNode(node) orelse {
+            checkedArtifactInvariant("checked literal pattern had no parser-owned numeral facts", .{});
+        };
         const id: CheckedExprId = @enumFromInt(try checkedSourceNodeIdFromLen(self.exprs.items.len));
         try self.exprs.append(self.allocator, .{
             .id = id,
             .ty = checked_ty,
             .source_region = self.module.regionAt(node),
-            .data = .{ .num_from_numeral = null },
+            .data = .{ .numeral = .{ .literal = literal, .plan = null } },
         });
         try self.numeral_conversion_exprs.append(self.allocator, .{
             .raw_node = @intFromEnum(node),
             .expr = id,
         });
         return id;
-    }
-
-    fn floatLiteralForExpr(self: *@This(), comptime Float: type, expr_idx: CIR.Expr.Idx) Allocator.Error!Float {
-        const literal = self.module.moduleEnvConst().numeralLiteralForNode(ModuleEnv.nodeIdxFrom(expr_idx)) orelse {
-            checkedArtifactInvariant("checked typed float literal had no parser-owned numeral facts", .{});
-        };
-        const text = try numeralLiteralDecimalText(self.allocator, self.module.moduleEnvConst(), literal);
-        defer self.allocator.free(text);
-        return std.fmt.parseFloat(Float, text) catch {
-            checkedArtifactInvariant("checked typed float literal could not be converted from parser-owned numeral facts", .{});
-        };
     }
 
     fn copyPatternData(self: *@This(), pattern_idx: CIR.Pattern.Idx) Allocator.Error!CheckedPatternData {
@@ -10674,23 +10277,23 @@ const CheckedBodyPayloadCopier = struct {
                 } else null,
             } },
             .tuple => |tuple| .{ .tuple = try self.copyPatternSpan(tuple.patterns) },
-            .num_literal => |num| .{ .num_literal = .{
-                .value = num.value,
-                .kind = num.kind,
+            .num_literal => .{ .numeral_literal = .{
+                .literal = self.exactNumeralLiteralForPattern(pattern_idx),
                 .conversion = try self.numeralConversionExprForPattern(pattern_idx),
             } },
-            .small_dec_literal => |dec| .{ .small_dec_literal = .{
-                .value = dec.value,
-                .has_suffix = dec.has_suffix,
+            .num_from_numeral_literal => .{ .numeral_literal = .{
+                .literal = self.exactNumeralLiteralForPattern(pattern_idx),
+                .conversion = try self.numeralConversionExprForPattern(pattern_idx),
+            } },
+            .small_dec_literal => |dec| .{ .numeral_literal = .{
+                .literal = self.exactNumeralLiteralForPattern(pattern_idx),
                 .conversion = if (dec.has_suffix) null else try self.numeralConversionExprForPattern(pattern_idx),
             } },
-            .dec_literal => |dec| .{ .dec_literal = .{
-                .value = dec.value,
-                .has_suffix = dec.has_suffix,
+            .dec_literal => |dec| .{ .numeral_literal = .{
+                .literal = self.exactNumeralLiteralForPattern(pattern_idx),
                 .conversion = if (dec.has_suffix) null else try self.numeralConversionExprForPattern(pattern_idx),
             } },
-            .frac_f32_literal => |frac| .{ .frac_f32_literal = frac.value },
-            .frac_f64_literal => |frac| .{ .frac_f64_literal = frac.value },
+            .frac_f32_literal, .frac_f64_literal => checkedArtifactInvariant("float-valued CIR literal pattern (no exact digits) reached artifact publication", .{}),
             .str_literal => |str| .{ .str_literal = .{
                 .literal = try self.string_builder.intern(str.literal),
                 .conversion = try self.quoteConversionExprForPattern(pattern_idx, str.literal),
@@ -10987,6 +10590,7 @@ const CheckedBodyPayloadCopier = struct {
                 }
             },
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11070,6 +10674,7 @@ const CheckedBodyPayloadCopier = struct {
                 }
             },
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11127,6 +10732,7 @@ const CheckedBodyPayloadCopier = struct {
                 }
             },
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11210,112 +10816,27 @@ const CheckedBodyPayloadCopier = struct {
     }
 };
 
-const FracLit = union(enum) {
-    f32: f32,
-    f64: f64,
-    dec: builtins.dec.RocDec,
-    small: CIR.SmallDecValue,
-    scaled_dec: CIR.IntValue,
+/// Duck-typed predicate handed to the static-dispatch registry: whether a
+/// checked literal expression's target type is a builtin numeric (in which
+/// case monotype lowering produces its bits and no runtime `from_numeral`
+/// dispatch plan is needed).
+pub const NumeralTargetProbe = struct {
+    view: CheckedTypeStoreView,
+    bodies: *const CheckedBodyStore,
+
+    pub fn literalTargetIsBuiltin(self: @This(), checked_expr: CheckedExprId) bool {
+        return checkedBuiltinForLiteralTarget(self.view, self.bodies.expr(checked_expr).ty) != null;
+    }
+
+    /// Like `literalTargetIsBuiltin`, but a still-open (defaultable) flex or
+    /// rigid variable answers false: a generalized literal can be
+    /// instantiated at a custom `from_numeral` type, so it MUST keep a
+    /// dispatch plan. If every instantiation lands on a builtin primitive,
+    /// lowering takes the bits path and never consults the plan.
+    pub fn literalTargetIsConcreteBuiltin(self: @This(), checked_expr: CheckedExprId) bool {
+        return checkedConcreteBuiltinForLiteralTarget(self.view, self.bodies.expr(checked_expr).ty) != null;
+    }
 };
-
-fn fracLiteralForBuiltin(literal: FracLit, builtin_nominal: CheckedBuiltinNominal, has_suffix: bool) ?CheckedExprData {
-    return switch (builtin_nominal) {
-        .f32 => .{ .frac_f32 = .{ .value = @floatCast(fracLitToF64(literal)), .has_suffix = has_suffix } },
-        .f64 => .{ .frac_f64 = .{ .value = fracLitToF64(literal), .has_suffix = has_suffix } },
-        .dec => .{ .dec = .{ .value = fracLitToDec(literal), .has_suffix = has_suffix } },
-        .bool,
-        .str,
-        .u8,
-        .i8,
-        .u16,
-        .i16,
-        .u32,
-        .i32,
-        .u64,
-        .i64,
-        .u128,
-        .i128,
-        .list,
-        .box,
-        .dict,
-        .set,
-        .parse_tag_union_spec,
-        .fields,
-        .field,
-        .crypto_sha256_digest,
-        .crypto_sha256_hasher,
-        .crypto_blake3_digest,
-        .crypto_blake3_hasher,
-        => null,
-    };
-}
-
-fn originalFracLiteral(literal: FracLit, has_suffix: bool) CheckedExprData {
-    return switch (literal) {
-        .f32 => |value| .{ .frac_f32 = .{ .value = value, .has_suffix = has_suffix } },
-        .f64 => |value| .{ .frac_f64 = .{ .value = value, .has_suffix = has_suffix } },
-        .dec => |value| .{ .dec = .{ .value = value, .has_suffix = has_suffix } },
-        .small => |value| .{ .dec_small = .{ .value = value, .has_suffix = has_suffix } },
-        .scaled_dec => |value| .{ .dec = .{ .value = scaledDecToDec(value), .has_suffix = has_suffix } },
-    };
-}
-
-fn integerBuiltinNumKind(builtin_nominal: CheckedBuiltinNominal) ?CIR.NumKind {
-    return switch (builtin_nominal) {
-        .u8 => .u8,
-        .i8 => .i8,
-        .u16 => .u16,
-        .i16 => .i16,
-        .u32 => .u32,
-        .i32 => .i32,
-        .u64 => .u64,
-        .i64 => .i64,
-        .u128 => .u128,
-        .i128 => .i128,
-        .bool,
-        .str,
-        .f32,
-        .f64,
-        .dec,
-        .list,
-        .box,
-        .dict,
-        .set,
-        .parse_tag_union_spec,
-        .fields,
-        .field,
-        .crypto_sha256_digest,
-        .crypto_sha256_hasher,
-        .crypto_blake3_digest,
-        .crypto_blake3_hasher,
-        => null,
-    };
-}
-
-fn integralFracLitToIntValue(literal: FracLit) ?CIR.IntValue {
-    const int_value: i128 = switch (literal) {
-        .small => |value| blk: {
-            if (value.denominator_power_of_ten != 0) return null;
-            break :blk value.numerator;
-        },
-        .dec => |value| scaledDecBitsToInt(value.num) orelse return null,
-        .scaled_dec => |value| scaledDecBitsToInt(value.toI128()) orelse return null,
-        .f32,
-        .f64,
-        => return null,
-    };
-
-    return .{
-        .bytes = @bitCast(int_value),
-        .kind = .i128,
-    };
-}
-
-fn scaledDecBitsToInt(bits: i128) ?i128 {
-    const scale = builtins.dec.RocDec.one_point_zero_i128;
-    if (@rem(bits, scale) != 0) return null;
-    return @divTrunc(bits, scale);
-}
 
 fn checkedBuiltinForLiteralTarget(view: CheckedTypeStoreView, root: CheckedTypeId) ?CheckedBuiltinNominal {
     var current = root;
@@ -11335,129 +10856,35 @@ fn checkedBuiltinForLiteralTarget(view: CheckedTypeStoreView, root: CheckedTypeI
     }
 }
 
-fn checkedBuiltinForDefaultedNumericVariable(variable: CheckedTypeVariable) ?CheckedBuiltinNominal {
-    return switch (variable.numeric_default_phase orelse return null) {
-        .mono_specialization => .dec,
-        .mono_specialization_str => .str,
-        .checking_finalized => checkedArtifactInvariant("checking-finalized numeric variable reached checked literal publication", .{}),
-    };
-}
-
-/// Render a recorded numeral literal as its canonical decimal text (sign,
-/// integer digits, optional `.` and fractional digits). Monotype lowering reuses
-/// this to fold a monomorphized `from_numeral` literal into a constant at the
-/// concrete target type, so the produced text must stay byte-for-byte identical
-/// to what compile-time finalization feeds the interpreter.
-pub fn numeralLiteralDecimalText(
-    allocator: Allocator,
-    module_env: *const ModuleEnv,
-    literal: ModuleEnv.NumeralLiteral,
-) Allocator.Error![]const u8 {
-    const before = try base256DecimalText(allocator, module_env.numeralDigitsBefore(literal), 1);
-    defer allocator.free(before);
-
-    const after_min_digits: usize = std.math.cast(usize, literal.after_decimal_digit_count) orelse {
-        checkedArtifactInvariant("checked numeral literal decimal digit count exceeded host usize", .{});
-    };
-    const after = if (after_min_digits == 0)
-        try allocator.alloc(u8, 0)
-    else
-        try base256DecimalText(allocator, module_env.numeralDigitsAfter(literal), after_min_digits);
-    defer allocator.free(after);
-
-    const sign_len: usize = @intFromBool(literal.isNegative());
-    const dot_len: usize = @intFromBool(after_min_digits > 0);
-    const total_len = sign_len + before.len + dot_len + after.len;
-    const text = try allocator.alloc(u8, total_len);
-    var offset: usize = 0;
-    if (literal.isNegative()) {
-        text[offset] = '-';
-        offset += 1;
-    }
-    @memcpy(text[offset..][0..before.len], before);
-    offset += before.len;
-    if (after_min_digits > 0) {
-        text[offset] = '.';
-        offset += 1;
-        @memcpy(text[offset..][0..after.len], after);
-    }
-    return text;
-}
-
-fn base256DecimalText(allocator: Allocator, bytes_be: []const u8, min_digits: usize) Allocator.Error![]const u8 {
-    var first_nonzero: usize = 0;
-    while (first_nonzero < bytes_be.len and bytes_be[first_nonzero] == 0) : (first_nonzero += 1) {}
-
-    if (first_nonzero == bytes_be.len) {
-        const len = @max(min_digits, 1);
-        const out = try allocator.alloc(u8, len);
-        @memset(out, '0');
-        return out;
-    }
-
-    var current_buf = try allocator.dupe(u8, bytes_be[first_nonzero..]);
-    defer allocator.free(current_buf);
-    var current_len = current_buf.len;
-    var digits_rev = std.ArrayList(u8).empty;
-    defer digits_rev.deinit(allocator);
-
-    while (current_len > 0) {
-        const current = current_buf[0..current_len];
-        var quotient = try allocator.alloc(u8, current.len);
-        var quotient_len: usize = 0;
-        var remainder: u16 = 0;
-        for (current) |byte| {
-            const value = remainder * 256 + byte;
-            const digit: u8 = @intCast(value / 10);
-            remainder = value % 10;
-            if (digit != 0 or quotient_len != 0) {
-                quotient[quotient_len] = digit;
-                quotient_len += 1;
-            }
+/// The alias-chased builtin nominal of a literal's target type, treating a
+/// still-open flex/rigid variable as NOT builtin (unlike
+/// `checkedBuiltinForLiteralTarget`, which answers with the variable's
+/// default target): an open variable's instantiations are not known yet.
+fn checkedConcreteBuiltinForLiteralTarget(view: CheckedTypeStoreView, root: CheckedTypeId) ?CheckedBuiltinNominal {
+    var current = root;
+    while (true) {
+        const index: usize = @intFromEnum(current);
+        if (index >= view.payloadCount()) {
+            checkedArtifactInvariant("checked builtin lookup referenced a missing type root", .{});
         }
-        try digits_rev.append(allocator, '0' + @as(u8, @intCast(remainder)));
-        allocator.free(current_buf);
-        current_buf = quotient;
-        current_len = quotient_len;
+        switch (view.payload(@enumFromInt(index))) {
+            .alias => |alias| current = alias.backing,
+            .nominal => |nominal| return nominal.builtin,
+            .flex, .rigid => return null,
+            .pending => checkedArtifactInvariant("checked builtin lookup reached a pending type payload", .{}),
+            else => return null,
+        }
     }
-
-    const digit_count = digits_rev.items.len;
-    const total_len = @max(digit_count, min_digits);
-    const out = try allocator.alloc(u8, total_len);
-    const pad = total_len - digit_count;
-    @memset(out[0..pad], '0');
-    for (digits_rev.items, 0..) |digit, i| {
-        out[pad + digit_count - 1 - i] = digit;
-    }
-    return out;
 }
-
-fn fracLitToF64(literal: FracLit) f64 {
-    return switch (literal) {
-        .f32 => |value| @floatCast(value),
-        .f64 => |value| value,
-        .dec => |value| value.toF64(),
-        .small => |value| value.toF64(),
-        .scaled_dec => |value| scaledDecToDec(value).toF64(),
+fn checkedBuiltinForDefaultedNumericVariable(variable: CheckedTypeVariable) ?CheckedBuiltinNominal {
+    const phase = variable.numeric_default_phase orelse return null;
+    const target = literal_defaulting.defaultTargetForPhase(phase) orelse {
+        checkedArtifactInvariant("checking-finalized numeric variable reached checked literal publication", .{});
     };
-}
-
-fn fracLitToDec(literal: FracLit) builtins.dec.RocDec {
-    return switch (literal) {
-        .f32 => |value| builtins.dec.RocDec.fromF64(@as(f64, @floatCast(value))) orelse {
-            checkedArtifactInvariant("F32 literal solved as Dec exceeded Dec range", .{});
-        },
-        .f64 => |value| builtins.dec.RocDec.fromF64(value) orelse {
-            checkedArtifactInvariant("F64 literal solved as Dec exceeded Dec range", .{});
-        },
-        .dec => |value| value,
-        .small => |value| value.toRocDec(),
-        .scaled_dec => |value| scaledDecToDec(value),
+    return switch (target) {
+        .dec => .dec,
+        .str => .str,
     };
-}
-
-fn scaledDecToDec(value: CIR.IntValue) builtins.dec.RocDec {
-    return .{ .num = value.toI128() };
 }
 
 fn deinitCheckedExprList(allocator: Allocator, exprs: []CheckedExpr) void {
@@ -11475,15 +10902,7 @@ fn deinitCheckedStatementList(allocator: Allocator, statements: []CheckedStateme
 fn deinitCheckedExprData(allocator: Allocator, data: *CheckedExprData) void {
     switch (data.*) {
         .pending,
-        .num,
-        .frac_f32,
-        .frac_f64,
-        .dec,
-        .dec_small,
-        .num_from_numeral,
-        .typed_int,
-        .typed_frac,
-        .typed_num_from_numeral,
+        .numeral,
         .str_from_quote,
         .str_segment,
         .bytes_literal,
@@ -11542,11 +10961,7 @@ fn deinitCheckedPatternData(allocator: Allocator, data: *CheckedPatternData) voi
         .assign,
         .as,
         .nominal,
-        .num_literal,
-        .small_dec_literal,
-        .dec_literal,
-        .frac_f32_literal,
-        .frac_f64_literal,
+        .numeral_literal,
         .str_literal,
         .underscore,
         .runtime_error,
@@ -11578,8 +10993,6 @@ fn verifyCheckedExprDataComplete(data: StoredCheckedExprData) void {
         .interpolation => |interpolation| std.debug.assert(interpolation.plan != null),
         .method_eq => |plan| std.debug.assert(plan != null),
         .type_dispatch_call => |plan| std.debug.assert(plan != null),
-        .num_from_numeral => |plan| std.debug.assert(plan != null),
-        .typed_num_from_numeral => |plan| std.debug.assert(plan != null),
         .for_ => |for_| std.debug.assert(for_.plan != null),
         else => {},
     }
@@ -12202,15 +11615,7 @@ fn checkedExprDataCategory(tag: std.meta.Tag(CheckedExprData)) CheckedExprDataCa
         .lookup_required => .required_lookup,
         .match_ => .match_expr,
         .pending,
-        .num,
-        .frac_f32,
-        .frac_f64,
-        .dec,
-        .dec_small,
-        .num_from_numeral,
-        .typed_int,
-        .typed_frac,
-        .typed_num_from_numeral,
+        .numeral,
         .str_from_quote,
         .str_segment,
         .str,
@@ -14223,12 +13628,13 @@ const CheckedTemplateRefCollector = struct {
                 try self.appendDispatchRef(id);
                 try self.collectStaticDispatchPlanArgs(id);
             },
-            .num_from_numeral,
-            .typed_num_from_numeral,
-            => |plan_id| {
-                const id = plan_id orelse checkedArtifactInvariant("checked from_numeral expression reached template closure collection without a dispatch plan", .{});
-                try self.appendDispatchRef(id);
-                try self.collectStaticDispatchPlanArgs(id);
+            .numeral => |numeral| {
+                // Builtin-targeted literals carry no plan (their bits are
+                // produced at monotype lowering); only custom conversions do.
+                if (numeral.plan) |id| {
+                    try self.appendDispatchRef(id);
+                    try self.collectStaticDispatchPlanArgs(id);
+                }
             },
             .str_from_quote => |quote| {
                 const id = quote.plan orelse checkedArtifactInvariant("checked from_quote expression reached template closure collection without a dispatch plan", .{});
@@ -14316,13 +13722,6 @@ const CheckedTemplateRefCollector = struct {
             .run_low_level => |run| {
                 for (run.args) |arg| try self.collectExpr(arg);
             },
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .typed_int,
-            .typed_frac,
             .str_segment,
             .bytes_literal,
             .empty_list,
@@ -14424,11 +13823,7 @@ const CheckedTemplateRefCollector = struct {
             },
             .pending,
             .assign,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -15057,9 +14452,7 @@ const NestedProcSiteBuilder = struct {
             .type_dispatch_call,
             => |plan_id| try self.scanStaticDispatchPlanArgs(plan_id orelse checkedArtifactInvariant("checked dispatch expression reached nested procedure site collection without a static-dispatch plan", .{}), owner),
             .interpolation => |interpolation| try self.scanStaticDispatchPlanArgs(interpolation.plan orelse checkedArtifactInvariant("checked interpolation expression reached nested procedure site collection without a static-dispatch plan", .{}), owner),
-            .num_from_numeral,
-            .typed_num_from_numeral,
-            => |plan_id| try self.scanStaticDispatchPlanArgs(plan_id orelse checkedArtifactInvariant("checked from_numeral expression reached nested procedure site collection without a dispatch plan", .{}), owner),
+            .numeral => |numeral| if (numeral.plan) |plan_id| try self.scanStaticDispatchPlanArgs(plan_id, owner),
             .str_from_quote => |quote| try self.scanStaticDispatchPlanArgs(quote.plan orelse checkedArtifactInvariant("checked from_quote expression reached nested procedure site collection without a dispatch plan", .{}), owner),
             .structural_eq => |eq| {
                 try self.scanExpr(eq.lhs, owner, false);
@@ -15084,13 +14477,6 @@ const NestedProcSiteBuilder = struct {
             .run_low_level => |run| {
                 for (run.args) |arg| try self.scanExpr(arg, owner, false);
             },
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .typed_int,
-            .typed_frac,
             .str_segment,
             .bytes_literal,
             .lookup_local,
@@ -15179,11 +14565,7 @@ const NestedProcSiteBuilder = struct {
             },
             .pending,
             .assign,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -20396,10 +19778,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             const maybe_num_literal = constraint.numeralInfo();
             self.writeBool(maybe_num_literal != null);
             if (maybe_num_literal) |num_literal| {
-                self.hasher.update(&num_literal.bytes);
-                self.writeBool(num_literal.is_u128);
-                self.writeBool(num_literal.is_negative);
-                self.writeBool(num_literal.is_fractional);
+                self.hasher.update(&num_literal.keyBytes());
             }
         }
     }
@@ -21403,9 +20782,13 @@ pub const CompileTimeRootTable = struct {
                 checked_bodies.numeralConversionExprAtRawNode(numeral_plan.node_idx) orelse
                 continue;
             switch (checked_bodies.expr(checked_expr).data) {
-                .num_from_numeral, .typed_num_from_numeral => {},
+                .numeral => {},
                 else => continue,
             }
+            // Builtin-targeted literals convert at monotype lowering; only a
+            // non-builtin (custom `from_numeral`) target is a compile-time
+            // evaluation root.
+            if (checkedBuiltinForLiteralTarget(checked_types.store.view(), checked_bodies.expr(checked_expr).ty) != null) continue;
             const fn_ty = try checkedTypeIdForVar(allocator, module, checked_types, @enumFromInt(numeral_plan.fn_var));
             const try_ty = switch (checked_types.store.payload(fn_ty)) {
                 .function => |function| function.ret,
@@ -22133,15 +21516,7 @@ fn checkedExprContainsExpr(
         .for_ => |for_| checkedExprContainsExpr(checked_bodies, for_.expr, needle) or
             checkedExprContainsExpr(checked_bodies, for_.body, needle),
         .run_low_level => |run| checkedExprSpanContainsExpr(checked_bodies, run.args, needle),
-        .num,
-        .frac_f32,
-        .frac_f64,
-        .dec,
-        .dec_small,
-        .num_from_numeral,
-        .typed_int,
-        .typed_frac,
-        .typed_num_from_numeral,
+        .numeral,
         .str_from_quote,
         .str_segment,
         .bytes_literal,
@@ -22281,15 +21656,7 @@ fn checkedExprContainsPattern(
         .return_ => |ret| checkedExprContainsPattern(checked_bodies, ret.expr, needle),
         .run_low_level => |run| checkedExprSpanContainsPattern(checked_bodies, run.args, needle),
         .hosted_lambda => |hosted| checkedPatternSpanContainsPattern(checked_bodies, hosted.args, needle),
-        .num,
-        .frac_f32,
-        .frac_f64,
-        .dec,
-        .dec_small,
-        .num_from_numeral,
-        .typed_int,
-        .typed_frac,
-        .typed_num_from_numeral,
+        .numeral,
         .str_from_quote,
         .str_segment,
         .bytes_literal,
@@ -22403,11 +21770,7 @@ fn checkedPatternContainsPattern(
         },
         .pending,
         .assign,
-        .num_literal,
-        .small_dec_literal,
-        .dec_literal,
-        .frac_f32_literal,
-        .frac_f64_literal,
+        .numeral_literal,
         .str_literal,
         .underscore,
         .runtime_error,
@@ -26025,7 +25388,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 13;
+    const serialized_layout_version: u32 = 14;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -28148,6 +27511,7 @@ pub fn publishFromTypedModule(
         &checked_type_publication,
         checked_bodies,
         &plan_build_data,
+        NumeralTargetProbe{ .view = checked_type_publication.store.view(), .bodies = checked_bodies },
     );
     errdefer static_dispatch_plans.deinit(allocator);
     checked_bodies.attachStaticDispatchPlans(&static_dispatch_plans);
@@ -28751,6 +28115,7 @@ fn expectProvidedExportKind(
         &checked_type_publication,
         checked_bodies,
         &plan_build_data,
+        NumeralTargetProbe{ .view = checked_type_publication.store.view(), .bodies = checked_bodies },
     );
     defer static_dispatch_plans.deinit(allocator);
     checked_bodies.attachStaticDispatchPlans(&static_dispatch_plans);
@@ -30109,8 +29474,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x53, 0x6C, 0x81, 0xD8, 0xE9, 0x70, 0x9A, 0x09, 0x06, 0x72, 0x9E, 0xC7, 0x6C, 0xA0, 0xED, 0x25,
-        0x1D, 0xD4, 0xC9, 0x03, 0xBC, 0xD1, 0xD3, 0x05, 0xFF, 0xC4, 0xD1, 0x13, 0x72, 0x09, 0xBB, 0xC8,
+        0x66, 0xE7, 0x6D, 0xB6, 0xD4, 0xE6, 0xCE, 0x35, 0xBA, 0x92, 0x12, 0xA1, 0xEB, 0x9B, 0xB1, 0xB7,
+        0x3F, 0x73, 0x57, 0xDF, 0x9D, 0x9B, 0x70, 0x5B, 0x0E, 0x98, 0x0A, 0x52, 0xD1, 0x14, 0xAB, 0x6A,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

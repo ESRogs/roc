@@ -170,7 +170,6 @@ pub const LowLevel = enum(u16) {
     num_bitwise_not,
 
     // Numeric parsing operations
-    num_from_numeral,
     u8_from_str,
     i8_from_str,
     u16_from_str,
@@ -859,7 +858,6 @@ pub const LowLevel = enum(u16) {
             .num_bitwise_or,
             .num_bitwise_xor,
             .num_bitwise_not,
-            .num_from_numeral,
             .u8_from_str,
             .i8_from_str,
             .u16_from_str,

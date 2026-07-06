@@ -415,6 +415,10 @@ const CliCase = struct {
     /// Execution mode when the case has one.
     backend: ?OptMode = null,
     skip: Skip = .never,
+    /// Optional per-case wall-clock bound. It can only TIGHTEN the runner's
+    /// timeout (`@min` with the global/--timeout value), so perf-regression
+    /// cases can fail fast without ever loosening a user's shorter budget.
+    timeout_ms: ?u64 = null,
     body: Body,
 
     const Body = union(enum) {
@@ -989,11 +993,26 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc check reports comptime division by zero without panicking", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/comptime_div_zero.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "COMPILE TIME CRASH" }, .{ .stream = .stderr, .text = "I64 division by zero" } }, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check reports comptime remainder by zero without panicking", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/comptime_mod_zero.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "COMPILE TIME CRASH" }, .{ .stream = .stderr, .text = "I64 remainder by zero" } }, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check reports large default Dec scientific literal without panicking", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/large_scientific_default_dec.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID NUMBER" }, .{ .stream = .stderr, .text = "Dec" }, .{ .stream = .stderr, .text = "large_scientific_default_dec.roc:1:" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "panic:" }, .{ .stream = .stderr, .text = ".zig-cache/tmp" } } } } },
-    .{ .id = 0, .suite = .subcommands, .name = "roc check accepts huge integral scientific literal without slow conversion", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/huge_scientific_default_dec.roc", .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
+    // The 30s bounds below are the 9760 perf regression guards: a healthy
+    // check is <2s, and the 9567 text-reconstruction regression took 42s.
+    .{ .id = 0, .suite = .subcommands, .name = "roc check reports huge integral scientific literal without slow conversion", .timeout_ms = 30_000, .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/huge_scientific_default_dec.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID NUMBER" }, .{ .stream = .stderr, .text = "Dec" } }, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc check reports unpinned integer literal beyond Dec range", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/dec_default_int_overflow.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID NUMBER" }, .{ .stream = .stderr, .text = "Dec" } }, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check preserves numeric literal constraints before reporting large default Dec scientific literal", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/large_scientific_list_default_dec.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID NUMBER" }, .{ .stream = .stderr, .text = "Dec" } }, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9565: resolved open numeral literal cannot overflow I8", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9565_i8_overflow.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID NUMBER" }, .{ .stream = .stderr, .text = "I8" } }, .not_contains = &.{.{ .stream = .stderr, .text = "No errors found" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9565: default platform Exit I8 validates loop bound", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9565_default_platform_exit_overflow.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID NUMBER" }, .{ .stream = .stderr, .text = "I8" }, .{ .stream = .stderr, .text = "issue_9565_default_platform_exit_overflow.roc:4:" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "No errors found" }, .{ .stream = .stderr, .text = ".zig-cache/tmp" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9565: default platform Exit I8 validates match pattern literal", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9565_i8_overflow_pattern.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID NUMBER" }, .{ .stream = .stderr, .text = "I8" } }, .not_contains = &.{.{ .stream = .stderr, .text = "No errors found" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9565: out-of-range match pattern literal lowers without panicking", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9565_i8_overflow_pattern.roc", .exit = .not_panic, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check treats integral scientific notation as integer syntax sugar", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/scientific_integer_u8.roc", .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc check accepts huge fractional literal at F64 without slow conversion", .timeout_ms = 30_000, .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/huge_fractional_f64.roc", .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "generic literal instantiated at custom from_numeral type gets a dispatch plan", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/generic_literal_custom_from_numeral.roc", .exit = .success, .contains = &.{ .{ .stream = .stdout, .text = "6" }, .{ .stream = .stdout, .text = "4" } }, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "exact numeral cross-engine conformance (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "test", "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/exact_numeral_conformance.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "exact numeral cross-engine conformance (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "test", "--opt=dev", "--no-cache" }, .roc_file = "test/cli/exact_numeral_conformance.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "exact numeral cross-engine conformance (llvm speed)", .backend = .speed, .body = .{ .command = .{ .args = &.{ "test", "--opt=speed", "--no-cache" }, .roc_file = "test/cli/exact_numeral_conformance.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "exact numeral cross-engine conformance (llvm size)", .backend = .size, .body = .{ .command = .{ .args = &.{ "test", "--opt=size", "--no-cache" }, .roc_file = "test/cli/exact_numeral_conformance.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
+    // Build-only: wasm has no execution path (roc emits static archives for a
+    // host to link); execution coverage on the fifth executor awaits a wasm
+    // run harness.
+    .{ .id = 0, .suite = .subcommands, .name = "exact numeral conformance program builds for wasm32", .backend = .size, .body = .{ .command = .{ .args = &.{ "build", "--target=wasm32", "--opt=size", "--no-cache" }, .roc_file = "test/cli/exact_numeral_conformance.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "successfully building" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic:" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc returns exit code 2 for warnings (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/fx/run_warning_only.roc", .exit = .{ .code = 2 }, .contains_any = &.{.{ .needles = &warning_needles }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc --opt=dev returns exit code 2 for warnings", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/fx/run_warning_only.roc", .exit = .{ .code = 2 }, .contains_any = &.{.{ .needles = &warning_needles }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc returns exit code 1 for old platform download", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/old_hello_world.roc", .exit = .{ .code = 1 }, .contains = &.{.{ .stream = .stderr, .text = "platform was built with the old Roc" }} } } },
@@ -1322,12 +1341,24 @@ fn runSingleTest(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: u6
         return .{ .status = .skip, .phase = .setup, .duration_ns = timer.read(), .message = reason };
     }
 
+    const case_timeout_ms = effectiveCaseTimeoutMs(spec.timeout_ms, timeout_ms);
     return switch (spec.body) {
-        .platform => runPlatformCase(io, allocator, spec, timeout_ms),
-        .command => |command| runCommandCase(io, allocator, command, timeout_ms),
-        .custom => |custom| runCustomCase(io, allocator, spec, custom, timeout_ms),
-        .glue_matrix => |matrix| runGlueMatrixCase(io, allocator, matrix, timeout_ms),
+        .platform => runPlatformCase(io, allocator, spec, case_timeout_ms),
+        .command => |command| runCommandCase(io, allocator, command, case_timeout_ms),
+        .custom => |custom| runCustomCase(io, allocator, spec, custom, case_timeout_ms),
+        .glue_matrix => |matrix| runGlueMatrixCase(io, allocator, matrix, case_timeout_ms),
     };
+}
+
+/// A case's own bound only tightens the runner-wide timeout, never loosens it.
+fn effectiveCaseTimeoutMs(case_timeout_ms: ?u64, runner_timeout_ms: u64) u64 {
+    return @min(case_timeout_ms orelse runner_timeout_ms, runner_timeout_ms);
+}
+
+test "effectiveCaseTimeoutMs tightens but never loosens the runner timeout" {
+    try std.testing.expectEqual(@as(u64, 120_000), effectiveCaseTimeoutMs(null, 120_000));
+    try std.testing.expectEqual(@as(u64, 30_000), effectiveCaseTimeoutMs(30_000, 120_000));
+    try std.testing.expectEqual(@as(u64, 10_000), effectiveCaseTimeoutMs(300_000, 10_000));
 }
 
 fn runPlatformCase(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: u64) TestResult {

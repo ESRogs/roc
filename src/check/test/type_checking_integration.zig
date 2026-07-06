@@ -1903,8 +1903,8 @@ test "check type - if else - different branch types 3" {
 // unification merges a numeral-origin and a quote-origin constraint onto one var.
 // No type satisfies both, so the program is always
 // rejected — but the diagnostic must not depend on which unify side each literal
-// arrived on. `varLiteralKind` tie-breaks dual-kind vars to `.numeral` (matching
-// `numericDefaultPhaseForConstraints` and `flexLiteralDefaultKind`), so BOTH
+// arrived on. The defaulting oracle (src/types/literal_defaulting.zig)
+// tie-breaks dual-kind vars to `.numeral` for every stage that asks, so BOTH
 // orders default the var toward the numeral head (Dec) and report the quote
 // constraint against it: mirror-image programs get the SAME diagnostic (same
 // title, same prose; only the source region differs).

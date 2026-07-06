@@ -1978,11 +1978,14 @@ pub const GraphTypeFinals = struct {
 };
 
 fn materializeUnresolved(variable: InstVariable) Type.Content {
-    if (variable.numeric_default_phase) |phase| switch (phase) {
-        .mono_specialization => return .{ .primitive = .dec },
-        .mono_specialization_str => return .{ .primitive = .str },
-        .checking_finalized => Common.invariant("checking-finalized numeric variable reached Monotype unresolved"),
-    };
+    if (variable.numeric_default_phase) |phase| {
+        const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
+            Common.invariant("checking-finalized numeric variable reached Monotype unresolved");
+        return switch (target) {
+            .dec => .{ .primitive = .dec },
+            .str => .{ .primitive = .str },
+        };
+    }
     if (variable.row_default) |row_default| switch (row_default) {
         .empty_record => return .{ .record = Type.Span.empty() },
         .empty_tag_union => return .{ .tag_union = Type.Span.empty() },

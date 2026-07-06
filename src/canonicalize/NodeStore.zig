@@ -425,7 +425,7 @@ pub const MODULEENV_STATEMENT_NODE_COUNT = 20;
 /// Count of the type annotation nodes in the ModuleEnv
 pub const MODULEENV_TYPE_ANNO_NODE_COUNT = 12;
 /// Count of the pattern nodes in the ModuleEnv
-pub const MODULEENV_PATTERN_NODE_COUNT = 17;
+pub const MODULEENV_PATTERN_NODE_COUNT = 18;
 
 comptime {
     // Check the number of CIR.Diagnostic nodes
@@ -1671,6 +1671,7 @@ fn isPatternTag(tag: Node.Tag) bool {
         .pattern_list,
         .pattern_tuple,
         .pattern_num_literal,
+        .pattern_num_from_numeral_literal,
         .pattern_dec_literal,
         .pattern_f32_literal,
         .pattern_f64_literal,
@@ -1812,6 +1813,9 @@ pub fn getPattern(store: *const NodeStore, pattern_idx: CIR.Pattern.Idx) CIR.Pat
             return CIR.Pattern{
                 .frac_f64_literal = .{ .value = @bitCast(raw) },
             };
+        },
+        .pattern_num_from_numeral_literal => {
+            return CIR.Pattern{ .num_from_numeral_literal = .{} };
         },
         .pattern_dec_literal => {
             const p = payload.pattern_dec_literal;
@@ -3052,6 +3056,10 @@ pub fn addPattern(store: *NodeStore, pattern: CIR.Pattern, region: base.Region) 
                 .int128_idx = int128_idx,
                 .has_suffix = p.has_suffix,
             } });
+        },
+        .num_from_numeral_literal => {
+            node.tag = .pattern_num_from_numeral_literal;
+            node.setPayload(.{ .pattern_num_from_numeral_literal = .{} });
         },
         .str_literal => |p| {
             node.tag = .pattern_str_literal;

@@ -3575,6 +3575,11 @@ pub fn forLoopDispatchPlanForNode(self: *const Self, node_idx: Node.Idx) ?ForLoo
 }
 
 /// Record exact base-256 digits for a numeric source node.
+///
+/// The table is kept sorted by `node_idx` so lookups are O(log n).
+/// Canonicalization records each literal right after allocating its node, so
+/// appends arrive in increasing node order and the sort costs nothing; an
+/// out-of-order record shifts the tail to keep the order invariant.
 pub fn recordNumeralLiteral(
     self: *Self,
     node_idx: Node.Idx,
@@ -3600,21 +3605,53 @@ pub fn recordNumeralLiteral(
             (if (is_fractional) NumeralLiteral.fractional_flag else 0) |
             (if (had_decimal_point) NumeralLiteral.decimal_point_flag else 0),
     };
-    for (self.numeral_literals.items.items) |*existing| {
-        if (existing.node_idx == raw_node) {
-            existing.* = literal;
-            return;
-        }
-    }
-    _ = try self.numeral_literals.append(self.gpa, literal);
+    try upsertSortedByNode(NumeralLiteral, &self.numeral_literals, self.gpa, literal);
 }
 
 /// Return exact base-256 digits for a numeric source node.
 pub fn numeralLiteralForNode(self: *const Self, node_idx: Node.Idx) ?NumeralLiteral {
-    const raw_node: u32 = @intFromEnum(node_idx);
-    for (self.numeral_literals.items.items) |literal| {
-        if (literal.node_idx == raw_node) return literal;
+    return findSortedByNode(NumeralLiteral, self.numeral_literals.items.items, @intFromEnum(node_idx));
+}
+
+/// First index whose `node_idx` is >= `raw_node` in a node-sorted table.
+fn sortedNodeSlot(comptime T: type, entries: []const T, raw_node: u32) usize {
+    var low: usize = 0;
+    var high: usize = entries.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (entries[mid].node_idx < raw_node) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
     }
+    return low;
+}
+
+/// Insert or replace `entry` in a node-sorted SafeList. Appends are O(1) when
+/// entries arrive in increasing node order (the common case — recording
+/// follows node allocation); out-of-order inserts shift the tail.
+fn upsertSortedByNode(comptime T: type, list: *collections.SafeList(T), gpa: std.mem.Allocator, entry: T) std.mem.Allocator.Error!void {
+    const entries = list.items.items;
+    if (entries.len == 0 or entries[entries.len - 1].node_idx < entry.node_idx) {
+        _ = try list.append(gpa, entry);
+        return;
+    }
+    const slot = sortedNodeSlot(T, entries, entry.node_idx);
+    if (slot < entries.len and entries[slot].node_idx == entry.node_idx) {
+        entries[slot] = entry;
+        return;
+    }
+    _ = try list.append(gpa, entry);
+    const grown = list.items.items;
+    std.mem.copyBackwards(T, grown[slot + 1 ..], grown[slot .. grown.len - 1]);
+    grown[slot] = entry;
+}
+
+/// Binary-search a node-sorted table for `raw_node`.
+fn findSortedByNode(comptime T: type, entries: []const T, raw_node: u32) ?T {
+    const slot = sortedNodeSlot(T, entries, raw_node);
+    if (slot < entries.len and entries[slot].node_idx == raw_node) return entries[slot];
     return null;
 }
 
@@ -3629,6 +3666,19 @@ pub fn numeralDigitsAfter(self: *const Self, literal: NumeralLiteral) []const u8
     return self.numeral_digit_bytes.items.items[start..][0..literal.after_len];
 }
 
+/// The exact-digit view of a recorded numeral — the input every literal fit
+/// and bit computation consumes (src/types/numeral.zig). Borrowed from this
+/// env's digit pool.
+pub fn exactNumeral(self: *const Self, literal: NumeralLiteral) types_mod.numeral.Exact {
+    return .{
+        .before = self.numeralDigitsBefore(literal),
+        .after = self.numeralDigitsAfter(literal),
+        .scale = literal.after_decimal_digit_count,
+        .is_negative = literal.isNegative(),
+        .is_fractional = literal.after_decimal_digit_count != 0 or literal.hadDecimalPoint(),
+    };
+}
+
 /// Record the checked `from_numeral` function for a numeric expression.
 pub fn recordNumeralDispatchPlan(
     self: *Self,
@@ -3636,18 +3686,8 @@ pub fn recordNumeralDispatchPlan(
     target_var: TypeVar,
     fn_var: TypeVar,
 ) std.mem.Allocator.Error!void {
-    const raw_node: u32 = @intFromEnum(node_idx);
-    for (self.numeral_dispatch_plans.items.items) |*plan| {
-        if (plan.node_idx != raw_node) continue;
-        plan.* = .{
-            .node_idx = raw_node,
-            .target_var = @intFromEnum(target_var),
-            .fn_var = @intFromEnum(fn_var),
-        };
-        return;
-    }
-    _ = try self.numeral_dispatch_plans.append(self.gpa, .{
-        .node_idx = raw_node,
+    try upsertSortedByNode(NumeralDispatchPlan, &self.numeral_dispatch_plans, self.gpa, .{
+        .node_idx = @intFromEnum(node_idx),
         .target_var = @intFromEnum(target_var),
         .fn_var = @intFromEnum(fn_var),
     });
@@ -3655,11 +3695,7 @@ pub fn recordNumeralDispatchPlan(
 
 /// Return the checked `from_numeral` function for a numeric expression.
 pub fn numeralDispatchPlanForNode(self: *const Self, node_idx: Node.Idx) ?NumeralDispatchPlan {
-    const raw_node: u32 = @intFromEnum(node_idx);
-    for (self.numeral_dispatch_plans.items.items) |plan| {
-        if (plan.node_idx == raw_node) return plan;
-    }
-    return null;
+    return findSortedByNode(NumeralDispatchPlan, self.numeral_dispatch_plans.items.items, @intFromEnum(node_idx));
 }
 
 /// Record the checked `from_quote` function for a string literal node.
@@ -3669,18 +3705,8 @@ pub fn recordQuoteDispatchPlan(
     target_var: TypeVar,
     fn_var: TypeVar,
 ) std.mem.Allocator.Error!void {
-    const raw_node: u32 = @intFromEnum(node_idx);
-    for (self.quote_dispatch_plans.items.items) |*plan| {
-        if (plan.node_idx != raw_node) continue;
-        plan.* = .{
-            .node_idx = raw_node,
-            .target_var = @intFromEnum(target_var),
-            .fn_var = @intFromEnum(fn_var),
-        };
-        return;
-    }
-    _ = try self.quote_dispatch_plans.append(self.gpa, .{
-        .node_idx = raw_node,
+    try upsertSortedByNode(NumeralDispatchPlan, &self.quote_dispatch_plans, self.gpa, .{
+        .node_idx = @intFromEnum(node_idx),
         .target_var = @intFromEnum(target_var),
         .fn_var = @intFromEnum(fn_var),
     });
@@ -3713,11 +3739,7 @@ pub fn recordSchemeInstantiation(
 
 /// Return the checked `from_quote` function for a string literal node.
 pub fn quoteDispatchPlanForNode(self: *const Self, node_idx: Node.Idx) ?NumeralDispatchPlan {
-    const raw_node: u32 = @intFromEnum(node_idx);
-    for (self.quote_dispatch_plans.items.items) |plan| {
-        if (plan.node_idx == raw_node) return plan;
-    }
-    return null;
+    return findSortedByNode(NumeralDispatchPlan, self.quote_dispatch_plans.items.items, @intFromEnum(node_idx));
 }
 
 /// Record the scope-resolved type target for an explicit numeric suffix.
@@ -3754,21 +3776,12 @@ pub fn recordNumericSuffixTarget(
         },
     };
 
-    for (self.numeric_suffix_targets.items.items) |*existing| {
-        if (existing.node_idx != raw_node) continue;
-        existing.* = suffix_target;
-        return;
-    }
-    _ = try self.numeric_suffix_targets.append(self.gpa, suffix_target);
+    try upsertSortedByNode(NumericSuffixTarget, &self.numeric_suffix_targets, self.gpa, suffix_target);
 }
 
 /// Return the scope-resolved type target for an explicit numeric suffix.
 pub fn numericSuffixTargetForNode(self: *const Self, node_idx: Node.Idx) ?NumericSuffixTarget {
-    const raw_node: u32 = @intFromEnum(node_idx);
-    for (self.numeric_suffix_targets.items.items) |suffix_target| {
-        if (suffix_target.node_idx == raw_node) return suffix_target;
-    }
-    return null;
+    return findSortedByNode(NumericSuffixTarget, self.numeric_suffix_targets.items.items, @intFromEnum(node_idx));
 }
 
 /// Adds an identifier to the list of exposed items by its identifier index.
