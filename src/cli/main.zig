@@ -17,7 +17,7 @@
 //! - Embeds the viewable LIR image directly in the output binary
 //! - The interpreter shim receives only the LIR image pointer and length
 //!
-//! For detailed documentation, see `src/interpreter_shim/README.md`.
+//! For detailed  documentation, see `src/interpreter_shim/README.md`.
 
 const std = @import("std");
 const builtin = @import("builtin");
