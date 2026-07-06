@@ -45,8 +45,7 @@ const six_tag_match_app =
 var counted_multiway_switches: usize = 0;
 var counted_total_stmts: usize = 0;
 
-fn countShapes(store: *const lir.LirStore, layouts: *const layout.Store) harness.LowerToLirHarnessError!void {
-    _ = layouts;
+fn countShapes(store: *const lir.LirStore, _: *const layout.Store) harness.LowerToLirHarnessError!void {
     counted_multiway_switches = 0;
     counted_total_stmts = store.cf_stmts.items.len;
     for (store.cf_stmts.items) |stmt| {

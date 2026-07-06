@@ -19,7 +19,10 @@ const helpers = eval.test_helpers;
 
 const Buf = std.ArrayList(u8);
 
-fn appendf(buf: *Buf, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+/// Error set for corpus generation and execution helpers.
+const CorpusError = std.mem.Allocator.Error || error{TestUnexpectedResult};
+
+fn appendf(buf: *Buf, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
     const piece = try std.fmt.allocPrint(alloc, fmt, args);
     defer alloc.free(piece);
     try buf.appendSlice(alloc, piece);
@@ -30,7 +33,7 @@ fn appendf(buf: *Buf, alloc: std.mem.Allocator, comptime fmt: []const u8, args: 
 /// strings. A rare COMPILE_ERROR (e.g. a generated redundant branch the
 /// checker rejects) is an acceptable outcome; a RUN_ERROR is not — every
 /// generated match ends in a wildcard branch and its bodies cannot crash.
-fn runProgram(alloc: std.mem.Allocator, source: []const u8) ![]u8 {
+fn runProgram(alloc: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error![]u8 {
     var compiled = helpers.compileInspectedProgram(alloc, std.testing.io, .module, source, &.{}) catch |err| {
         return try std.fmt.allocPrint(alloc, "COMPILE_ERROR:{s}", .{@errorName(err)});
     };
@@ -40,7 +43,7 @@ fn runProgram(alloc: std.mem.Allocator, source: []const u8) ![]u8 {
     };
 }
 
-fn expectRunsCleanly(alloc: std.mem.Allocator, source: []const u8) !void {
+fn expectRunsCleanly(alloc: std.mem.Allocator, source: []const u8) CorpusError!void {
     const out = try runProgram(alloc, source);
     defer alloc.free(out);
     std.testing.expect(!std.mem.startsWith(u8, out, "RUN_ERROR")) catch |err| {
@@ -61,7 +64,7 @@ const Gen = struct {
     last_int_bind: ?[]const u8 = null,
     last_any_bind: ?[]const u8 = null,
 
-    fn freshBind(self: *Gen, buf: *Buf, is_int: bool) ![]const u8 {
+    fn freshBind(self: *Gen, buf: *Buf, is_int: bool) std.mem.Allocator.Error![]const u8 {
         const name = try std.fmt.allocPrint(self.alloc, "v{d}", .{self.binds});
         self.binds += 1;
         try buf.appendSlice(self.alloc, name);
@@ -79,7 +82,7 @@ const Gen = struct {
     }
 
     /// A pattern for an I64 position: literal, bind, or wildcard.
-    fn intPattern(self: *Gen, buf: *Buf) !void {
+    fn intPattern(self: *Gen, buf: *Buf) std.mem.Allocator.Error!void {
         switch (self.random.uintLessThan(u8, 4)) {
             0, 1 => try appendf(buf, self.alloc, "{d}", .{self.intValue()}),
             2 => _ = try self.freshBind(buf, true),
@@ -88,7 +91,7 @@ const Gen = struct {
     }
 
     /// A pattern for a Bool position.
-    fn boolPattern(self: *Gen, buf: *Buf) !void {
+    fn boolPattern(self: *Gen, buf: *Buf) std.mem.Allocator.Error!void {
         switch (self.random.uintLessThan(u8, 3)) {
             0 => try buf.appendSlice(self.alloc, "True"),
             1 => try buf.appendSlice(self.alloc, "False"),
@@ -97,7 +100,7 @@ const Gen = struct {
     }
 
     /// A pattern for a Str position: literal, interpolation, bind, wildcard.
-    fn strPattern(self: *Gen, buf: *Buf) !void {
+    fn strPattern(self: *Gen, buf: *Buf) std.mem.Allocator.Error!void {
         switch (self.random.uintLessThan(u8, 6)) {
             0 => try appendf(buf, self.alloc, "\"{s}\"", .{self.strValue()}),
             1 => try buf.appendSlice(self.alloc, "\"pre${r}\""),
@@ -109,7 +112,7 @@ const Gen = struct {
     }
 
     /// Body observing the branch index and (sometimes) a bound variable.
-    fn body(self: *Gen, buf: *Buf, index: usize) !void {
+    fn body(self: *Gen, buf: *Buf, index: usize) std.mem.Allocator.Error!void {
         if (self.last_int_bind) |name| {
             if (self.random.boolean()) {
                 try appendf(buf, self.alloc, "Str.concat(\"b{d}:\", Str.inspect({s}))", .{ index, name });
@@ -120,7 +123,7 @@ const Gen = struct {
     }
 
     /// Optional guard using a bound int or the salt parameter.
-    fn guard(self: *Gen, buf: *Buf) !void {
+    fn guard(self: *Gen, buf: *Buf) std.mem.Allocator.Error!void {
         if (self.random.uintLessThan(u8, 4) != 0) return; // 25% guarded
         const rhs = self.intValue();
         if (self.last_int_bind) |name| {
@@ -166,7 +169,7 @@ fn familyHeader(family: Family) []const u8 {
     };
 }
 
-fn genScrutineePattern(gen: *Gen, buf: *Buf, family: Family) !void {
+fn genScrutineePattern(gen: *Gen, buf: *Buf, family: Family) std.mem.Allocator.Error!void {
     const alloc = gen.alloc;
     switch (family) {
         .tags => switch (gen.random.uintLessThan(u8, 5)) {
@@ -247,7 +250,7 @@ fn genScrutineePattern(gen: *Gen, buf: *Buf, family: Family) !void {
     }
 }
 
-fn genUnionPQPattern(gen: *Gen, buf: *Buf) !void {
+fn genUnionPQPattern(gen: *Gen, buf: *Buf) std.mem.Allocator.Error!void {
     switch (gen.random.uintLessThan(u8, 4)) {
         0 => try buf.appendSlice(gen.alloc, "P"),
         1, 2 => {
@@ -259,7 +262,7 @@ fn genUnionPQPattern(gen: *Gen, buf: *Buf) !void {
     }
 }
 
-fn genScrutineeValue(gen: *Gen, buf: *Buf, family: Family) !void {
+fn genScrutineeValue(gen: *Gen, buf: *Buf, family: Family) std.mem.Allocator.Error!void {
     const alloc = gen.alloc;
     switch (family) {
         .tags => switch (gen.random.uintLessThan(u8, 4)) {
@@ -295,7 +298,7 @@ fn genScrutineeValue(gen: *Gen, buf: *Buf, family: Family) !void {
     }
 }
 
-fn genProgram(alloc: std.mem.Allocator, family: Family, seed: u64) ![]u8 {
+fn genProgram(alloc: std.mem.Allocator, family: Family, seed: u64) std.mem.Allocator.Error![]u8 {
     var prng = std.Random.DefaultPrng.init(seed);
     var gen = Gen{ .alloc = alloc, .random = prng.random() };
     var buf: Buf = .empty;
@@ -326,7 +329,7 @@ fn genProgram(alloc: std.mem.Allocator, family: Family, seed: u64) ![]u8 {
     return buf.items;
 }
 
-fn runFamily(family: Family, program_count: usize, seed_base: u64) !void {
+fn runFamily(family: Family, program_count: usize, seed_base: u64) CorpusError!void {
     const alloc = std.testing.allocator;
     for (0..program_count) |i| {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
