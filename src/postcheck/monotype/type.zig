@@ -50,6 +50,9 @@ pub const TypeDef = struct {
     /// Declaring statement in the (content-identified) module: the
     /// within-module discriminator for same-named block-local declarations.
     source_decl: ?u32 = null,
+    /// Compiler-generated specialization identity for internal nominals minted
+    /// from a public source nominal. Null means this is the source nominal.
+    generated: ?names.TypeDigest = null,
 };
 
 /// Named checked type instance.
@@ -791,6 +794,7 @@ pub const Store = struct {
                 if (named.def.source_decl == null) {
                     writeBytes(hasher, name_store.typeNameText(named.def.type_name));
                 }
+                writeOptionalDigest(hasher, named.def.generated);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
                     writeBytes(hasher, "builtin");
@@ -946,6 +950,7 @@ pub const Store = struct {
                 if (named.def.source_decl == null) {
                     writeBytes(hasher, name_store.typeNameText(named.def.type_name));
                 }
+                writeOptionalDigest(hasher, named.def.generated);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
                     writeBytes(hasher, "builtin");
@@ -1166,6 +1171,7 @@ fn namedTypeViewEql(
     {
         return false;
     }
+    if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanViewEql(type_view, name_store, lhs.args, rhs.args, visited)) return false;
 
@@ -1482,6 +1488,7 @@ fn namedTypeEqlAcrossStores(
     {
         return false;
     }
+    if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanEqlAcrossStores(name_store, lhs_view, lhs.args, rhs_view, rhs.args, visited)) return false;
 
@@ -2064,6 +2071,18 @@ fn writeOptionalU32(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
     const present: u8 = if (value == null) 0 else 1;
     hasher.update(std.mem.asBytes(&present));
     if (value) |v| writeU32(hasher, v);
+}
+
+fn writeOptionalDigest(hasher: *std.crypto.hash.sha2.Sha256, value: ?names.TypeDigest) void {
+    const present: u8 = if (value == null) 0 else 1;
+    hasher.update(std.mem.asBytes(&present));
+    if (value) |v| hasher.update(&v.bytes);
+}
+
+fn optionalDigestEql(lhs: ?names.TypeDigest, rhs: ?names.TypeDigest) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?.bytes[0..], rhs.?.bytes[0..]);
 }
 
 fn builtinOwner(primitive: Primitive) static_dispatch.BuiltinOwner {

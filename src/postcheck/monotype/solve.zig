@@ -616,7 +616,10 @@ pub const InstGraph = struct {
                         for (left_named.args, right_named.args) |left_arg, right_arg| {
                             try pending.append(self.allocator, .{ .left = left_arg, .right = right_arg });
                         }
-                        if (!sameBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .fields)) {
+                        if (!sameBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .fields) and
+                            !eitherBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .iter) and
+                            !eitherBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .stream))
+                        {
                             if (left_named.backing) |left_backing| {
                                 if (right_named.backing) |right_backing| {
                                     try pending.append(self.allocator, .{ .left = left_backing.node, .right = right_backing.node });
@@ -780,7 +783,15 @@ pub const InstGraph = struct {
 
     fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
         return left.module == right.module and
-            left.type_name == right.type_name;
+            left.type_name == right.type_name and
+            left.source_decl == right.source_decl and
+            optionalDigestEql(left.generated, right.generated);
+    }
+
+    fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {
+        if (left == null and right == null) return true;
+        if (left == null or right == null) return false;
+        return std.mem.eql(u8, left.?.bytes[0..], right.?.bytes[0..]);
     }
 
     const RowKind = enum {
@@ -1510,10 +1521,10 @@ pub const InstGraph = struct {
     ) Allocator.Error!Type.TypeId {
         const ty = existing orelse return try self.monoFor(node);
         const root = self.find(node);
-        const previous_root = if (self.mono_nodes.get(ty)) |mapped| self.find(mapped) else null;
+        const previous_root = self.monoViewNode(ty) orelse return try self.monoFor(root);
         try self.mono_nodes.put(ty, root);
         try self.registerMonoView(root, ty);
-        if (previous_root == null or previous_root.? != root) {
+        if (previous_root != root) {
             try self.queueDirty(root);
         }
         return ty;
@@ -1524,11 +1535,17 @@ pub const InstGraph = struct {
         nodes_slice: []const NodeId,
         existing: ?[]const Type.TypeId,
     ) Allocator.Error![]Type.TypeId {
+        const existing_copy = if (existing) |old|
+            if (old.len == nodes_slice.len) try self.allocator.dupe(Type.TypeId, old) else null
+        else
+            null;
+        defer if (existing_copy) |old| self.allocator.free(old);
+
         const out = try self.arena().alloc(Type.TypeId, nodes_slice.len);
         for (nodes_slice, 0..) |node, index| {
             out[index] = try self.monoForWithReuse(
                 node,
-                if (existing) |old| old[index] else null,
+                if (existing_copy) |old| old[index] else null,
             );
         }
         return out;
@@ -1683,6 +1700,11 @@ pub const GraphTypeFinals = struct {
     }
 
     pub fn sealType(self: *GraphTypeFinals, ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        if (self.isGeneratedIteratorEvidenceType(ty)) {
+            if (self.graph.monoViewNode(ty) != null) return try self.sealStoreType(ty);
+            if (try self.typeHasGraphViews(ty)) return try self.sealStoreType(ty);
+            return ty;
+        }
         if (self.graph.mono_nodes.get(ty)) |raw_node| {
             const node = self.graph.find(raw_node);
             if (self.graph.node_monos.get(node)) |views| {
@@ -1693,6 +1715,16 @@ pub const GraphTypeFinals = struct {
         }
         if (try self.typeHasGraphViews(ty)) return try self.sealStoreType(ty);
         return ty;
+    }
+
+    fn isGeneratedIteratorEvidenceType(self: *GraphTypeFinals, ty: Type.TypeId) bool {
+        return switch (self.graph.types.get(ty)) {
+            .named => |named| named.def.generated != null and switch (named.builtin_owner orelse return false) {
+                .iter, .stream => true,
+                else => false,
+            },
+            else => false,
+        };
     }
 
     pub fn sealNode(self: *GraphTypeFinals, raw_node: NodeId) Allocator.Error!Type.TypeId {
@@ -2120,6 +2152,16 @@ fn sameBuiltinOwner(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch
     const left_owner = left orelse return false;
     const right_owner = right orelse return false;
     return left_owner == owner and right_owner == owner;
+}
+
+fn eitherBuiltinOwner(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner, owner: static_dispatch.BuiltinOwner) bool {
+    if (left) |left_owner| {
+        if (left_owner == owner) return true;
+    }
+    if (right) |right_owner| {
+        if (right_owner == owner) return true;
+    }
+    return false;
 }
 
 fn testCheckedTypeId(comptime value: u32) checked.CheckedTypeId {

@@ -525,6 +525,7 @@ const Lowerer = struct {
             .module = try self.result.const_type_names.internModuleIdentity(self.program.names.moduleIdentityBytes(def.module)),
             .type_name = try self.result.const_type_names.internTypeName(self.program.names.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
+            .generated = def.generated,
         };
     }
 

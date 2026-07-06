@@ -1650,8 +1650,8 @@ builder-owned data inside optimized lowering, not a stored public IR stage:
 - `DemandFrame` is the transient producer-consumer boundary while cloning a
   value under demand. It owns the checked control scope for locals introduced
   while satisfying that demand.
-- `WorkerKey` is exact compiler data: callee identity, split argument facts,
-  split capture facts, result demand, and relevant type/layout decisions.
+- `WorkerId` is exact compiler data: callee identity, split argument data,
+  split capture data, result demand, and relevant type/layout decisions.
 
 The output contract is equally strict. Optimized lowering emits only ordinary
 scope-closed LIR. LIR does not contain `Demand`, demanded-known values,
@@ -2203,8 +2203,8 @@ Supplier references are explicit optimizer data. They must be produced from
 loop-state provenance: either the loop parameter itself or a generated private
 state local whose provenance records the original loop parameter and path. They
 must not be inferred from source names, debug ids, equality with the current
-sparse value, the incidental contents of a substitution table, or the fact that
-a capture happened to be available while cloning one particular body.
+sparse value, the incidental contents of a substitution table, or because a
+capture happened to be available while cloning one particular body.
 
 A supplier reference may appear only inside optimized demanded/private callable
 state owned by the active loop fixed point. It is illegal at public

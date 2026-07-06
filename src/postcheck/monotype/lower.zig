@@ -438,6 +438,20 @@ const ParseIntrinsic = enum {
     field_name,
 };
 
+const GeneratedIteratorKind = enum {
+    custom,
+    single,
+    range_exclusive,
+    range_inclusive,
+    map,
+    keep_if,
+    drop_if,
+    take_first,
+    drop_first,
+    concat,
+    append,
+};
+
 const FieldNameBound = enum {
     shortest,
     longest,
@@ -546,6 +560,7 @@ const Builder = struct {
     inline_expects: InlineExpectMode,
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
+    generated_iter_types: std.AutoHashMap([32]u8, Type.TypeId),
     spec_store: specialize.SpecBuilder,
     /// Monotypes owned by the builder-global type cache. They are lowered
     /// without body evidence, so empty tag unions inside them are unresolved
@@ -597,6 +612,7 @@ const Builder = struct {
             .counters = options.specialization_counters,
             .inline_expects = options.inline_expects,
             .type_cache = std.AutoHashMap(CheckedTypeAddress, Type.TypeId).init(allocator),
+            .generated_iter_types = std.AutoHashMap([32]u8, Type.TypeId).init(allocator),
             .spec_store = spec_store,
             .unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(allocator),
             .lowered_templates = std.AutoHashMap(Ast.FnId, LoweredTemplate).init(allocator),
@@ -642,6 +658,7 @@ const Builder = struct {
         self.lowered_templates.deinit();
         self.spec_store.deinit();
         self.unsolved_monos.deinit();
+        self.generated_iter_types.deinit();
         self.type_cache.deinit();
         self.evidence_arena.deinit();
     }
@@ -933,14 +950,16 @@ const Builder = struct {
     }
 
     fn lowerRoot(self: *Builder, request: checked.RootRequest) Allocator.Error!void {
-        const def = if (request.procedure_template) |template|
-            try self.lowerTemplate(template, moduleView(self.root_view), request.checked_type)
-        else if (request.procedure_binding) |binding|
-            try self.lowerProcedureBindingRoot(request, binding)
-        else if (request.procedure_use) |procedure|
-            try self.lowerProcedureUseRoot(request, procedure)
-        else
-            Common.invariant("root request reached Monotype without a checked procedure template or procedure source");
+        const def = if (request.procedure_template) |template| blk: {
+            const def = try self.lowerTemplate(template, moduleView(self.root_view), request.checked_type);
+            break :blk def;
+        } else if (request.procedure_binding) |binding| blk: {
+            const def = try self.lowerProcedureBindingRoot(request, binding);
+            break :blk def;
+        } else if (request.procedure_use) |procedure| blk: {
+            const def = try self.lowerProcedureUseRoot(request, procedure);
+            break :blk def;
+        } else Common.invariant("root request reached Monotype without a checked procedure template or procedure source");
         try self.appendRuntimeSchemaRequestsForDef(def);
         try self.program.roots.append(self.allocator, .{ .def = def, .request = request });
     }
@@ -1289,7 +1308,9 @@ const Builder = struct {
             switch (record.status) {
                 .ready,
                 .lowering,
-                => return existing.def,
+                => {
+                    return existing.def;
+                },
                 .reserved => {
                     reserved_def = existing.def;
                     lower_fn_ty = record.request_fn_ty;
@@ -1312,7 +1333,9 @@ const Builder = struct {
                 switch (hit.status) {
                     .ready,
                     .lowering,
-                    => return existing.def,
+                    => {
+                        return existing.def;
+                    },
                     .reserved => {
                         reserved_def = existing.def;
                         // A reserved record can only have matched through its
@@ -1479,7 +1502,7 @@ const Builder = struct {
         // serve many specializations.
         const root_node = try body_ctx.instNode(template.checked_fn_root);
         const body_uses_generated_evidence =
-            !self.unsolved_monos.contains(lower_fn_ty) and body_ctx.functionHasGeneratedOpaqueEvidence(lower_fn_ty);
+            !self.unsolved_monos.contains(lower_fn_ty) and try body_ctx.functionHasGeneratedOpaqueEvidence(lower_fn_ty);
         if (!self.unsolved_monos.contains(lower_fn_ty) and !body_uses_generated_evidence) {
             try graph.addMonoView(root_node, lower_fn_ty);
         }
@@ -2028,6 +2051,11 @@ const Builder = struct {
             .zst,
             => false,
             .named => |named| blk: {
+                if (named.def.generated != null) {
+                    if (named.builtin_owner) |owner| {
+                        if (owner == .iter or owner == .stream) break :blk true;
+                    }
+                }
                 if (self.generatedFieldNamesBackingInfo(ty) or
                     self.generatedParseTagUnionSpecBackingInfo(ty))
                 {
@@ -2759,7 +2787,8 @@ const Builder = struct {
     ) Allocator.Error!Ast.FnId {
         const nested_ctx = try self.allocator.create(BodyContext);
         errdefer self.allocator.destroy(nested_ctx);
-        nested_ctx.* = try source_ctx.nestedInstantiationContext(Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names));
+        const nested_key = Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names);
+        nested_ctx.* = try source_ctx.nestedInstantiationContext(nested_key);
         if (nested_evidence) |vector| {
             // A generalized local function gets its own vector at depth 0; the
             // enclosing chain stays reachable at higher depths (compile-time
@@ -2813,7 +2842,7 @@ const Builder = struct {
 
         const root_node = try request.ctx.instNode(fn_template.source_fn_ty);
         const body_uses_generated_evidence =
-            !self.unsolved_monos.contains(fn_template.mono_fn_ty) and request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
+            !self.unsolved_monos.contains(fn_template.mono_fn_ty) and try request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
         if (!body_uses_generated_evidence) {
             if (request.ctx.graph.monoViewNode(fn_template.mono_fn_ty)) |request_node| {
                 try request.ctx.graph.unify(root_node, request_node);
@@ -6313,7 +6342,7 @@ const BodyContext = struct {
 
     fn addExpr(self: *BodyContext, expr: BodyExpr) Allocator.Error!DraftExprId {
         return try self.draft.addExprWithSource(
-            .{ .ty = try self.draftTypeCell(expr.ty), .data = expr.data },
+            .{ .ty = try self.draftTypeCellPreservingGenerated(expr.ty), .data = expr.data },
             self.builder.program.current_loc,
             self.builder.program.current_region,
         );
@@ -6328,7 +6357,14 @@ const BodyContext = struct {
     }
 
     fn addPat(self: *BodyContext, pat: BodyPat) Allocator.Error!DraftPatId {
-        return try self.draft.addPat(.{ .ty = try self.draftTypeCell(pat.ty), .data = pat.data });
+        return try self.draft.addPat(.{ .ty = try self.draftTypeCellPreservingGenerated(pat.ty), .data = pat.data });
+    }
+
+    fn draftTypeCellPreservingGenerated(self: *BodyContext, ty: Type.TypeId) Allocator.Error!DraftTypeCell {
+        if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) {
+            return DraftTypeCell.fromSealed(ty);
+        }
+        return try self.draftTypeCell(ty);
     }
 
     fn addPatWithTypeCell(self: *BodyContext, ty: DraftTypeCell, data: BodyPatData) Allocator.Error!DraftPatId {
@@ -6345,7 +6381,7 @@ const BodyContext = struct {
         ty: Type.TypeId,
         binder: ?checked.PatternBinderId,
     ) Allocator.Error!DraftLocalId {
-        return try self.addLocalWithBinderCell(symbol, try self.draftTypeCell(ty), binder);
+        return try self.addLocalWithBinderCell(symbol, try self.draftTypeCellPreservingGenerated(ty), binder);
     }
 
     fn addLocalWithBinderCell(
@@ -6363,7 +6399,7 @@ const BodyContext = struct {
                 .fn_def = source.fn_def,
                 .source_fn_ty = source.source_fn_ty,
                 .source_fn_key = source.source_fn_key,
-                .mono_fn_ty = try self.draftTypeCell(source.mono_fn_ty),
+                .mono_fn_ty = try self.draftTypeCellPreservingGenerated(source.mono_fn_ty),
             },
         });
     }
@@ -6382,7 +6418,7 @@ const BodyContext = struct {
         for (values, 0..) |value, index| {
             draft_values[index] = .{
                 .local = value.local,
-                .ty = try self.draftTypeCell(value.ty),
+                .ty = try self.draftTypeCellPreservingGenerated(value.ty),
             };
         }
         return try self.draft.addTypedLocalSpan(draft_values);
@@ -6466,7 +6502,7 @@ const BodyContext = struct {
     }
 
     fn setLocalType(self: *BodyContext, id: DraftLocalId, ty: Type.TypeId) Allocator.Error!void {
-        self.draft.setLocalType(id, try self.draftTypeCell(ty));
+        self.draft.setLocalType(id, try self.draftTypeCellPreservingGenerated(ty));
     }
 
     fn bindLocalName(self: *BodyContext, local: DraftLocalId, binder: checked.PatternBinderId) Allocator.Error!void {
@@ -6873,7 +6909,12 @@ const BodyContext = struct {
         while (binder_iter.next()) |entry| {
             const local = entry.value_ptr.*;
             const local_ty = self.localTypeCell(local);
-            try self.constrainTypeToCell(checkedBinderType(self.view, entry.key_ptr.*), local_ty);
+            const active_local_ty = try self.activeTypeFromCell(local_ty);
+            if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(active_local_ty)) {
+                try self.constrainTypeToMono(checkedBinderType(self.view, entry.key_ptr.*), active_local_ty);
+            } else {
+                try self.constrainTypeToCell(checkedBinderType(self.view, entry.key_ptr.*), local_ty);
+            }
         }
     }
 
@@ -7397,7 +7438,7 @@ const BodyContext = struct {
     ) Allocator.Error!void {
         self.builder.constrain_depth += 1;
         defer self.builder.constrain_depth -= 1;
-        try self.graph.unify(try self.instNode(checked_ty), try self.graph.importMono(mono_ty));
+        try self.graph.unify(try self.instNode(checked_ty), try self.graph.importMono(try self.publicOpaqueUnificationType(mono_ty)));
         if (self.builder.constrain_depth == 1) try self.graph.drainDirty();
     }
 
@@ -7895,10 +7936,10 @@ const BodyContext = struct {
                         };
                     },
                     .hosted_lambda => Common.invariant("hosted lambda template must lower through hosted metadata, not source lambda body"),
-                    else => .{
+                    else => LoweredTemplateBody{
                         .args = .empty(),
                         .body = try self.lowerExprAtType(body.root_expr, ret_ty),
-                        .ret = try self.draftTypeCell(ret_ty),
+                        .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
                     },
                 };
             },
@@ -7923,7 +7964,7 @@ const BodyContext = struct {
                     .numeral_conversion, .quote_conversion => return .{
                         .args = .empty(),
                         .body = try self.lowerNumeralRootBody(wrapper.body_expr, ret_ty),
-                        .ret = try self.draftTypeCell(ret_ty),
+                        .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
                     },
                     .constant,
                     .hoisted_constant,
@@ -7931,10 +7972,10 @@ const BodyContext = struct {
                     .expect,
                     => {},
                 }
-                return .{
+                return LoweredTemplateBody{
                     .args = .empty(),
                     .body = try self.lowerComptimeRootExprAtType(wrapper.body_expr, ret_ty),
-                    .ret = try self.draftTypeCell(ret_ty),
+                    .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
                 };
             },
             .intrinsic_wrapper => |wrapper_id| {
@@ -7960,7 +8001,7 @@ const BodyContext = struct {
         return .{
             .args = try self.addTypedLocalSpan(&.{typed_arg}),
             .body = body,
-            .ret = try self.draftTypeCell(ret_ty),
+            .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
         };
     }
 
@@ -8058,8 +8099,11 @@ const BodyContext = struct {
         const body_ty = try self.exprType(body);
         try self.graph.unify(try self.graph.importMono(ret_ty), try self.graph.importMono(body_ty));
         try self.graph.drainDirty();
-        const solved_ret_ty = try self.activeTypeFromType(ret_ty);
-        self.draft.exprs.items[@intFromEnum(body)].ty = try self.draftTypeCell(solved_ret_ty);
+        const solved_ret_ty = if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ret_ty))
+            ret_ty
+        else
+            try self.activeTypeFromType(ret_ty);
+        self.draft.exprs.items[@intFromEnum(body)].ty = try self.draftTypeCellPreservingGenerated(solved_ret_ty);
 
         for (args) |*arg| {
             arg.ty = try self.localType(arg.local);
@@ -8068,7 +8112,7 @@ const BodyContext = struct {
         return .{
             .args = try self.addTypedLocalSpan(args),
             .body = body,
-            .ret = try self.draftTypeCell(solved_ret_ty),
+            .ret = try self.draftTypeCellPreservingGenerated(solved_ret_ty),
         };
     }
 
@@ -8799,6 +8843,83 @@ const BodyContext = struct {
         }
     }
 
+    fn builtinProcedureTextForResolvedTarget(self: *BodyContext, target: checked.ResolvedValueId) ?[]const u8 {
+        const raw = @intFromEnum(target);
+        if (raw >= self.view.resolved_refs.records.len) {
+            Common.invariant("checked builtin target is outside resolved value table");
+        }
+        const record = self.view.resolved_refs.records[raw];
+        return switch (record.ref) {
+            .top_level_proc,
+            .imported_proc,
+            .hosted_proc,
+            .promoted_top_level_proc,
+            => |proc| self.builtinProcedureTextForUse(proc),
+            .platform_required_proc => |proc| self.builtinProcedureTextForUse(proc.procedure),
+            else => null,
+        };
+    }
+
+    fn builtinProcedureTextForUse(self: *BodyContext, proc: checked.ProcedureUseTemplate) ?[]const u8 {
+        return switch (proc.binding) {
+            .top_level => |top_level| blk: {
+                const view = self.builder.moduleForId(checked.topLevelProcedureModuleId(top_level));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                const binding = view.top_level_procedure_bindings.get(top_level.binding);
+                break :blk builtinProcedureTextForBindingBody(view, binding.body);
+            },
+            .imported => |imported| blk: {
+                const view = self.builder.moduleForId(checked.importedProcedureModuleId(imported));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                for (view.exported_procedure_bindings.bindings) |binding| {
+                    if (binding.binding.def == imported.def and binding.binding.pattern == imported.pattern) {
+                        break :blk builtinProcedureTextForImportedBindingBody(view, binding.body);
+                    }
+                }
+                Common.invariant("imported builtin procedure binding was not exported by its checked module");
+            },
+            .hosted => |hosted| blk: {
+                const view = self.builder.moduleForId(moduleIdFromDigest(names.procTemplateModuleDigest(hosted.template)));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                break :blk builtinProcedureTextForTemplate(view, hosted.template);
+            },
+            .platform_required => |required| blk: {
+                const view = self.builder.moduleForId(checked.requiredProcedureModuleId(required));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                const binding = view.top_level_procedure_bindings.get(required.procedure_binding);
+                break :blk builtinProcedureTextForBindingBody(view, binding.body);
+            },
+        };
+    }
+
+    fn builtinProcedureTextForBindingBody(view: ModuleView, body: checked.ProcedureBindingBody) ?[]const u8 {
+        return switch (body) {
+            .direct_template => |direct| builtinProcedureTextForDirectTemplate(view, direct),
+            .callable_eval_template => null,
+        };
+    }
+
+    fn builtinProcedureTextForImportedBindingBody(view: ModuleView, body: checked.ImportedProcedureBindingBody) ?[]const u8 {
+        return switch (body) {
+            .direct_template => |direct| builtinProcedureTextForDirectTemplate(view, direct),
+            .callable_eval_template => null,
+        };
+    }
+
+    fn builtinProcedureTextForDirectTemplate(view: ModuleView, direct: checked.DirectProcedureBinding) ?[]const u8 {
+        const template = switch (direct.template) {
+            .checked => |template| template,
+            .lifted, .synthetic => return null,
+        };
+        return builtinProcedureTextForTemplate(view, template);
+    }
+
+    fn builtinProcedureTextForTemplate(view: ModuleView, template: names.ProcTemplate) ?[]const u8 {
+        const proc_base = view.names.procBase(template.proc_base);
+        const export_name = proc_base.export_name orelse return null;
+        return view.names.exportNameText(export_name);
+    }
+
     fn parseIntrinsicForBuiltinProcedureUse(self: *BodyContext, proc: checked.ProcedureUseTemplate) ?ParseIntrinsic {
         const top_level = switch (proc.binding) {
             .top_level => |top_level| top_level,
@@ -8840,6 +8961,62 @@ const BodyContext = struct {
         if (Ident.textEql(text, "Builtin.Encoding.FieldName.FieldNames.for_size")) return .fields_for_size;
         if (Ident.textEql(text, "Builtin.Encoding.FieldName.name")) return .field_name;
         return null;
+    }
+
+    fn isBuiltinIterNextText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.next");
+    }
+
+    fn isBuiltinIterCustomText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.custom");
+    }
+
+    fn isBuiltinIterSingleText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.single");
+    }
+
+    fn isBuiltinIterMapText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.map");
+    }
+
+    fn isBuiltinIterKeepIfText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.keep_if");
+    }
+
+    fn isBuiltinIterDropIfText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.drop_if");
+    }
+
+    fn isBuiltinIterTakeFirstText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.take_first");
+    }
+
+    fn isBuiltinIterDropFirstText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.drop_first");
+    }
+
+    fn isBuiltinIterConcatText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.concat");
+    }
+
+    fn isBuiltinIterAppendText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.append");
+    }
+
+    fn isBuiltinExclusiveRangeText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.exclusive_range");
+    }
+
+    fn isBuiltinInclusiveRangeText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.inclusive_range");
+    }
+
+    fn isBuiltinIterFromStepText(text: []const u8) bool {
+        return Ident.textEql(text, "iter_from_step") or Ident.textEql(text, "Builtin.iter_from_step");
+    }
+
+    fn isBuiltinRangeDoneText(text: []const u8) bool {
+        return Ident.textEql(text, "range_done") or Ident.textEql(text, "Builtin.range_done");
     }
 
     fn lowerFieldNamesRenameFieldNames(
@@ -9591,12 +9768,26 @@ const BodyContext = struct {
         return self.generatedParseTagUnionSpecBackingInfo(spec_ty) != null;
     }
 
+    fn isGeneratedIteratorEvidenceType(self: *BodyContext, ty: Type.TypeId) bool {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| named.def.generated != null and switch (named.builtin_owner orelse return false) {
+                .iter, .stream => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
     fn isGeneratedOpaqueEvidenceType(self: *BodyContext, ty: Type.TypeId) bool {
-        return self.isGeneratedFieldNamesEvidenceType(ty) or self.isGeneratedParseTagUnionSpecEvidenceType(ty);
+        return self.isGeneratedFieldNamesEvidenceType(ty) or
+            self.isGeneratedParseTagUnionSpecEvidenceType(ty) or
+            self.isGeneratedIteratorEvidenceType(ty);
     }
 
     fn isGeneratedSpecializationEvidenceType(self: *BodyContext, ty: Type.TypeId) bool {
-        return self.isGeneratedFieldNamesEvidenceType(ty) or self.isGeneratedParseTagUnionSpecEvidenceType(ty);
+        return self.isGeneratedFieldNamesEvidenceType(ty) or
+            self.isGeneratedParseTagUnionSpecEvidenceType(ty) or
+            self.isGeneratedIteratorEvidenceType(ty);
     }
 
     fn sealedGeneratedOpaqueEvidenceType(self: *BodyContext, ty: Type.TypeId) Allocator.Error!Type.TypeId {
@@ -9604,36 +9795,260 @@ const BodyContext = struct {
         return try self.graph.sealType(ty);
     }
 
-    fn functionHasGeneratedOpaqueEvidence(self: *BodyContext, fn_ty: Type.TypeId) bool {
+    fn functionHasGeneratedOpaqueEvidence(self: *BodyContext, fn_ty: Type.TypeId) Allocator.Error!bool {
         const function = self.builder.functionShape(fn_ty, "generated opaque evidence check requested for a non-function type");
         for (self.builder.program.types.span(function.args)) |arg| {
-            if (self.isGeneratedOpaqueEvidenceType(arg)) return true;
+            if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(arg)) return true;
         }
-        return self.isGeneratedOpaqueEvidenceType(function.ret);
+        return try self.builder.monoTypeHasGeneratedOpaqueEvidence(function.ret);
     }
 
     fn publicOpaqueUnificationType(self: *BodyContext, ty: Type.TypeId) Allocator.Error!Type.TypeId {
-        if (!self.isGeneratedOpaqueEvidenceType(ty)) return ty;
+        if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) return ty;
+        var cache = std.AutoHashMap(Type.TypeId, Type.TypeId).init(self.allocator);
+        defer cache.deinit();
+        return try self.publicOpaqueUnificationTypeInner(ty, &cache);
+    }
+
+    fn publicOpaqueUnificationTypeInner(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        if (cache.get(ty)) |cached| return cached;
+        if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) return ty;
+
         return switch (self.builder.program.types.get(ty)) {
-            .named => |named| try self.builder.program.types.add(.{ .named = .{
-                .named_type = named.named_type,
-                .def = named.def,
-                .kind = named.kind,
-                .builtin_owner = named.builtin_owner,
-                .args = named.args,
-                .backing = .{
-                    .ty = try self.builder.program.types.add(.{ .record = .empty() }),
-                    .use = if (named.backing) |backing| backing.use else .runtime_layout_only,
-                },
-                .declared_order = named.declared_order,
-            } }),
-            else => ty,
+            .primitive,
+            .erased,
+            .zst,
+            => ty,
+            .named => |named| blk: {
+                if (self.isGeneratedIteratorEvidenceType(ty)) {
+                    break :blk try self.publicIteratorUnificationType(ty, named, cache);
+                }
+                if (self.isGeneratedOpaqueEvidenceType(ty)) {
+                    break :blk try self.publicOpaqueEvidenceNamedType(named);
+                }
+
+                var changed = false;
+                const args = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(named.args));
+                defer self.allocator.free(args);
+                const public_args = try self.allocator.alloc(Type.TypeId, args.len);
+                defer self.allocator.free(public_args);
+                for (args, 0..) |arg, index| {
+                    public_args[index] = try self.publicOpaqueUnificationTypeInner(arg, cache);
+                    if (public_args[index] != arg) changed = true;
+                }
+
+                const public_backing: ?Type.NamedBacking = if (named.backing) |backing| backing: {
+                    const public_ty = try self.publicOpaqueUnificationTypeInner(backing.ty, cache);
+                    if (public_ty != backing.ty) changed = true;
+                    break :backing .{ .ty = public_ty, .use = backing.use };
+                } else null;
+
+                const declared_order = try self.allocator.dupe(Type.DeclaredField, self.builder.program.types.declaredFieldSpan(named.declared_order));
+                defer self.allocator.free(declared_order);
+                var public_declared = try self.allocator.alloc(Type.DeclaredField, declared_order.len);
+                defer self.allocator.free(public_declared);
+                for (declared_order, 0..) |field, index| {
+                    public_declared[index] = switch (field) {
+                        .named => |name| .{ .named = name },
+                        .padding => |padding| padding: {
+                            const public_padding = try self.publicOpaqueUnificationTypeInner(padding, cache);
+                            if (public_padding != padding) changed = true;
+                            break :padding .{ .padding = public_padding };
+                        },
+                    };
+                }
+
+                if (!changed) break :blk ty;
+                const out = try self.builder.program.types.add(.{ .named = .{
+                    .named_type = named.named_type,
+                    .def = named.def,
+                    .kind = named.kind,
+                    .builtin_owner = named.builtin_owner,
+                    .args = try self.builder.program.types.addSpan(public_args),
+                    .backing = public_backing,
+                    .declared_order = try self.builder.program.types.addDeclaredFields(public_declared),
+                } });
+                try cache.put(ty, out);
+                break :blk out;
+            },
+            .record => |fields_span| blk: {
+                const fields = try self.allocator.dupe(Type.Field, self.builder.program.types.fieldSpan(fields_span));
+                defer self.allocator.free(fields);
+                var changed = false;
+                const public_fields = try self.allocator.alloc(Type.Field, fields.len);
+                defer self.allocator.free(public_fields);
+                for (fields, 0..) |field, index| {
+                    const public_ty = try self.publicOpaqueUnificationTypeInner(field.ty, cache);
+                    public_fields[index] = .{ .name = field.name, .ty = public_ty };
+                    if (public_ty != field.ty) changed = true;
+                }
+                if (!changed) break :blk ty;
+                const out = try self.builder.program.types.add(.{
+                    .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, public_fields),
+                });
+                try cache.put(ty, out);
+                break :blk out;
+            },
+            .tuple => |items_span| blk: {
+                const items = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(items_span));
+                defer self.allocator.free(items);
+                var changed = false;
+                const public_items = try self.allocator.alloc(Type.TypeId, items.len);
+                defer self.allocator.free(public_items);
+                for (items, 0..) |item, index| {
+                    public_items[index] = try self.publicOpaqueUnificationTypeInner(item, cache);
+                    if (public_items[index] != item) changed = true;
+                }
+                if (!changed) break :blk ty;
+                const out = try self.builder.program.types.add(.{
+                    .tuple = try self.builder.program.types.addSpan(public_items),
+                });
+                try cache.put(ty, out);
+                break :blk out;
+            },
+            .tag_union => |tags_span| blk: {
+                const tags = try self.allocator.dupe(Type.Tag, self.builder.program.types.tagSpan(tags_span));
+                defer self.allocator.free(tags);
+                var changed = false;
+                const public_tags = try self.allocator.alloc(Type.Tag, tags.len);
+                defer self.allocator.free(public_tags);
+                for (tags, 0..) |tag, tag_index| {
+                    const payloads = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(tag.payloads));
+                    defer self.allocator.free(payloads);
+                    const public_payloads = try self.allocator.alloc(Type.TypeId, payloads.len);
+                    defer self.allocator.free(public_payloads);
+                    for (payloads, 0..) |payload, payload_index| {
+                        public_payloads[payload_index] = try self.publicOpaqueUnificationTypeInner(payload, cache);
+                        if (public_payloads[payload_index] != payload) changed = true;
+                    }
+                    public_tags[tag_index] = .{
+                        .name = tag.name,
+                        .checked_name = tag.checked_name,
+                        .payloads = try self.builder.program.types.addSpan(public_payloads),
+                    };
+                }
+                if (!changed) break :blk ty;
+                const out = try self.builder.program.types.add(.{
+                    .tag_union = try self.builder.program.types.addTagVariants(&self.builder.program.names, public_tags),
+                });
+                try cache.put(ty, out);
+                break :blk out;
+            },
+            .list => |elem| blk: {
+                const public_elem = try self.publicOpaqueUnificationTypeInner(elem, cache);
+                if (public_elem == elem) break :blk ty;
+                const out = try self.builder.program.types.add(.{ .list = public_elem });
+                try cache.put(ty, out);
+                break :blk out;
+            },
+            .box => |elem| blk: {
+                const public_elem = try self.publicOpaqueUnificationTypeInner(elem, cache);
+                if (public_elem == elem) break :blk ty;
+                const out = try self.builder.program.types.add(.{ .box = public_elem });
+                try cache.put(ty, out);
+                break :blk out;
+            },
+            .func => |function| blk: {
+                const args = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(function.args));
+                defer self.allocator.free(args);
+                var changed = false;
+                const public_args = try self.allocator.alloc(Type.TypeId, args.len);
+                defer self.allocator.free(public_args);
+                for (args, 0..) |arg, index| {
+                    public_args[index] = try self.publicOpaqueUnificationTypeInner(arg, cache);
+                    if (public_args[index] != arg) changed = true;
+                }
+                const public_ret = try self.publicOpaqueUnificationTypeInner(function.ret, cache);
+                if (public_ret != function.ret) changed = true;
+                if (!changed) break :blk ty;
+                const out = try self.builder.program.types.add(.{ .func = .{
+                    .args = try self.builder.program.types.addSpan(public_args),
+                    .ret = public_ret,
+                } });
+                try cache.put(ty, out);
+                break :blk out;
+            },
         };
+    }
+
+    fn publicIteratorUnificationType(
+        self: *BodyContext,
+        generated_ty: Type.TypeId,
+        named: Type.NamedContent,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        if (cache.get(generated_ty)) |cached| return cached;
+
+        const Context = struct {
+            body: *BodyContext,
+            generated_ty: Type.TypeId,
+            named: Type.NamedContent,
+            cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                try ctx.cache.put(ctx.generated_ty, self_ty);
+
+                var public_def = ctx.named.def;
+                public_def.generated = null;
+                const args = ctx.body.builder.program.types.span(ctx.named.args);
+                if (args.len == 0) Common.invariant("generated iterator evidence had no public item argument");
+                const public_item = try ctx.body.publicOpaqueUnificationTypeInner(args[0], ctx.cache);
+                const public_args = [_]Type.TypeId{public_item};
+
+                const public_backing: ?Type.NamedBacking = if (ctx.named.backing) |backing| .{
+                    .ty = try ctx.body.publicOpaqueUnificationTypeInner(backing.ty, ctx.cache),
+                    .use = backing.use,
+                } else null;
+
+                return .{ .named = .{
+                    .named_type = ctx.named.named_type,
+                    .def = public_def,
+                    .kind = ctx.named.kind,
+                    .builtin_owner = ctx.named.builtin_owner,
+                    .args = try ctx.body.builder.program.types.addSpan(&public_args),
+                    .backing = public_backing,
+                    .declared_order = ctx.named.declared_order,
+                } };
+            }
+        };
+
+        return try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .generated_ty = generated_ty,
+            .named = named,
+            .cache = cache,
+        }, Context.fill);
+    }
+
+    fn publicOpaqueEvidenceNamedType(
+        self: *BodyContext,
+        named: Type.NamedContent,
+    ) Allocator.Error!Type.TypeId {
+        var public_def = named.def;
+        public_def.generated = null;
+        return try self.builder.program.types.add(.{ .named = .{
+            .named_type = named.named_type,
+            .def = public_def,
+            .kind = named.kind,
+            .builtin_owner = named.builtin_owner,
+            .args = named.args,
+            .backing = .{
+                .ty = try self.builder.program.types.add(.{ .record = .empty() }),
+                .use = if (named.backing) |backing| backing.use else .runtime_layout_only,
+            },
+            .declared_order = named.declared_order,
+        } });
     }
 
     fn publicOpaqueFunctionUnificationType(self: *BodyContext, fn_ty: Type.TypeId) Allocator.Error!Type.TypeId {
         const function = self.builder.functionShape(fn_ty, "public opaque unification requested for a non-function type");
-        const args = self.builder.program.types.span(function.args);
+        const args = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(function.args));
+        defer self.allocator.free(args);
+        const public_ret = try self.publicOpaqueUnificationType(function.ret);
         var changed = false;
         const public_args = try self.allocator.alloc(Type.TypeId, args.len);
         defer self.allocator.free(public_args);
@@ -9641,11 +10056,742 @@ const BodyContext = struct {
             public_args[index] = try self.publicOpaqueUnificationType(arg);
             if (public_args[index] != arg) changed = true;
         }
+        if (public_ret != function.ret) changed = true;
         if (!changed) return fn_ty;
         return try self.builder.program.types.add(.{ .func = .{
             .args = try self.builder.program.types.addSpan(public_args),
-            .ret = function.ret,
+            .ret = public_ret,
         } });
+    }
+
+    fn generatedIteratorDirectCallFunctionType(
+        self: *BodyContext,
+        target: checked.ResolvedValueId,
+        mono_fn_ty: Type.TypeId,
+        checked_args: []const checked.CheckedExprId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        const text = self.builtinProcedureTextForResolvedTarget(target) orelse return null;
+        return try self.generatedIteratorBuiltinFunctionType(text, mono_fn_ty, checked_args, expected_ret_ty);
+    }
+
+    fn generatedIteratorBuiltinFunctionType(
+        self: *BodyContext,
+        text: []const u8,
+        mono_fn_ty: Type.TypeId,
+        checked_args: []const checked.CheckedExprId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        const fn_data = self.builder.functionShape(mono_fn_ty, "iterator generated call target had a non-function type");
+        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        defer self.allocator.free(arg_tys);
+
+        if (expected_ret_ty) |expected| {
+            if (self.isGeneratedIteratorEvidenceType(expected)) {
+                const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                if (isBuiltinIterFromStepText(text)) {
+                    return try self.generatedIteratorConstructorFunctionType(stable_expected);
+                }
+                if (isBuiltinRangeDoneText(text) or
+                    isBuiltinExclusiveRangeText(text) or
+                    isBuiltinInclusiveRangeText(text))
+                {
+                    return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                }
+            }
+        }
+
+        if (expected_ret_ty) |expected| {
+            if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(expected)) return null;
+        }
+
+        if (isBuiltinIterNextText(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.next reached Monotype with an unexpected arity");
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorStepReturnType(arg_tys[0]));
+            }
+            return null;
+        }
+
+        if (isBuiltinIterCustomText(text)) {
+            if (checked_args.len != 3 or arg_tys.len != 3) Common.invariant("Iter.custom reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_components = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_components);
+                    const stable_args = [_]Type.TypeId{ expected_components[0], arg_tys[1], expected_components[1] };
+                    return try self.functionTypeWithReturn(&stable_args, stable_expected);
+                }
+            }
+            if (expected_ret_ty == null) {
+                const components = [_]Type.TypeId{ arg_tys[0], arg_tys[2] };
+                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.custom, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[2])));
+            }
+        }
+
+        if (isBuiltinIterSingleText(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.single reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (expected_ret_ty == null) {
+                const components = [_]Type.TypeId{arg_tys[0]};
+                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.single, fn_data.ret, &components, null));
+            }
+        }
+
+        if (expected_ret_ty == null and isBuiltinExclusiveRangeText(text)) {
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_exclusive, fn_data.ret, &.{}, null));
+        }
+
+        if (expected_ret_ty == null and isBuiltinInclusiveRangeText(text)) {
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_inclusive, fn_data.ret, &.{}, null));
+        }
+
+        if (isBuiltinIterMapText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.map reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.map, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[1])));
+            }
+        }
+
+        if (isBuiltinIterKeepIfText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.keep_if reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.keep_if, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[1])));
+            }
+        }
+
+        if (isBuiltinIterDropIfText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.drop_if reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.drop_if, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[1])));
+            }
+        }
+
+        if (isBuiltinIterTakeFirstText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.take_first reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.take_first, fn_data.ret, &components, null));
+            }
+        }
+
+        if (isBuiltinIterDropFirstText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.drop_first reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.drop_first, fn_data.ret, &components, null));
+            }
+        }
+
+        if (isBuiltinIterConcatText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.concat reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0]) or self.isGeneratedIteratorEvidenceType(arg_tys[1])) {
+                const stable_first = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_second = try self.stableGeneratedIteratorEvidenceType(arg_tys[1]);
+                const stable_args = [_]Type.TypeId{ stable_first, stable_second };
+                const components = [_]Type.TypeId{ stable_first, stable_second };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.concat, fn_data.ret, &components, null));
+            }
+        }
+
+        if (isBuiltinIterAppendText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.append reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.append, fn_data.ret, &components, null));
+            }
+        }
+
+        return null;
+    }
+
+    fn functionTypeWithReturn(
+        self: *BodyContext,
+        arg_tys: []const Type.TypeId,
+        ret_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const copied_args = try self.allocator.dupe(Type.TypeId, arg_tys);
+        defer self.allocator.free(copied_args);
+        return try self.builder.program.types.add(.{ .func = .{
+            .args = try self.builder.program.types.addSpan(copied_args),
+            .ret = ret_ty,
+        } });
+    }
+
+    fn stableGeneratedIteratorEvidenceType(
+        self: *BodyContext,
+        ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        if (!self.isGeneratedIteratorEvidenceType(ty)) return ty;
+        const original_digest = self.generatedIteratorEvidenceDigest(ty) orelse
+            Common.invariant("generated iterator evidence had no generated digest");
+        const Context = struct {
+            body: *BodyContext,
+            original: Type.TypeId,
+            original_digest: names.TypeDigest,
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                var cache = std.AutoHashMap(Type.TypeId, Type.TypeId).init(ctx.body.allocator);
+                defer cache.deinit();
+                try cache.put(ctx.original, self_ty);
+                return try ctx.body.cloneTypeReplacingGeneratedSelfContent(ctx.original, ctx.original_digest, self_ty, &cache);
+            }
+        };
+        return try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .original = ty,
+            .original_digest = original_digest,
+        }, Context.fill);
+    }
+
+    fn generatedIteratorEvidenceDigest(self: *BodyContext, ty: Type.TypeId) ?names.TypeDigest {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| if (self.isGeneratedIteratorEvidenceType(ty)) named.def.generated else null,
+            else => null,
+        };
+    }
+
+    fn cloneTypeReplacingGeneratedSelf(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        if (cache.get(ty)) |cached| return cached;
+        if (self.generatedIteratorEvidenceDigest(ty)) |digest| {
+            if (optionalDigestEql(digest, original_digest)) {
+                try cache.put(ty, replacement_ty);
+                return replacement_ty;
+            }
+        }
+        if (self.graph.monoViewNode(ty)) |node| {
+            const sealed = try self.graph.sealNode(node);
+            return try self.cloneTypeReplacingGeneratedSelf(sealed, original_digest, replacement_ty, cache);
+        }
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive,
+            .erased,
+            .zst,
+            => ty,
+            else => blk: {
+                const CloneContext = struct {
+                    body: *BodyContext,
+                    original: Type.TypeId,
+                    original_digest: names.TypeDigest,
+                    replacement_ty: Type.TypeId,
+                    cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+
+                    fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                        try ctx.cache.put(ctx.original, self_ty);
+                        return try ctx.body.cloneTypeReplacingGeneratedSelfContent(ctx.original, ctx.original_digest, ctx.replacement_ty, ctx.cache);
+                    }
+                };
+                const cloned = try self.builder.program.types.addRecursive(CloneContext{
+                    .body = self,
+                    .original = ty,
+                    .original_digest = original_digest,
+                    .replacement_ty = replacement_ty,
+                    .cache = cache,
+                }, CloneContext.fill);
+                break :blk cloned;
+            },
+        };
+    }
+
+    fn cloneTypeReplacingGeneratedSelfContent(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Content {
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive => |primitive| .{ .primitive = primitive },
+            .erased => |digest| .{ .erased = digest },
+            .zst => .zst,
+            .list => |elem| .{ .list = try self.cloneTypeReplacingGeneratedSelf(elem, original_digest, replacement_ty, cache) },
+            .box => |elem| .{ .box = try self.cloneTypeReplacingGeneratedSelf(elem, original_digest, replacement_ty, cache) },
+            .tuple => |items| .{ .tuple = try self.cloneTypeSpanReplacingGeneratedSelf(items, original_digest, replacement_ty, cache) },
+            .func => |function| .{ .func = .{
+                .args = try self.cloneTypeSpanReplacingGeneratedSelf(function.args, original_digest, replacement_ty, cache),
+                .ret = try self.cloneTypeReplacingGeneratedSelf(function.ret, original_digest, replacement_ty, cache),
+            } },
+            .record => |fields| .{ .record = try self.cloneFieldSpanReplacingGeneratedSelf(fields, original_digest, replacement_ty, cache) },
+            .tag_union => |tags| .{ .tag_union = try self.cloneTagSpanReplacingGeneratedSelf(tags, original_digest, replacement_ty, cache) },
+            .named => |named| .{ .named = .{
+                .named_type = named.named_type,
+                .def = named.def,
+                .kind = named.kind,
+                .builtin_owner = named.builtin_owner,
+                .args = try self.cloneTypeSpanReplacingGeneratedSelf(named.args, original_digest, replacement_ty, cache),
+                .backing = if (named.backing) |backing| .{
+                    .ty = try self.cloneTypeReplacingGeneratedSelf(backing.ty, original_digest, replacement_ty, cache),
+                    .use = backing.use,
+                } else null,
+                .declared_order = try self.cloneDeclaredFieldSpanReplacingGeneratedSelf(named.declared_order, original_digest, replacement_ty, cache),
+            } },
+        };
+    }
+
+    fn cloneTypeSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const items = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(span));
+        defer self.allocator.free(items);
+        if (items.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.TypeId, items.len);
+        defer self.allocator.free(cloned);
+        for (items, 0..) |item, index| {
+            cloned[index] = try self.cloneTypeReplacingGeneratedSelf(item, original_digest, replacement_ty, cache);
+        }
+        return try self.builder.program.types.addSpan(cloned);
+    }
+
+    fn cloneFieldSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try self.allocator.dupe(Type.Field, self.builder.program.types.fieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.Field, fields.len);
+        defer self.allocator.free(cloned);
+        for (fields, 0..) |field, index| {
+            cloned[index] = .{
+                .name = field.name,
+                .ty = try self.cloneTypeReplacingGeneratedSelf(field.ty, original_digest, replacement_ty, cache),
+            };
+        }
+        return try self.builder.program.types.addRecordFields(&self.builder.program.names, cloned);
+    }
+
+    fn cloneTagSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const tags = try self.allocator.dupe(Type.Tag, self.builder.program.types.tagSpan(span));
+        defer self.allocator.free(tags);
+        if (tags.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.Tag, tags.len);
+        defer self.allocator.free(cloned);
+        for (tags, 0..) |tag, index| {
+            cloned[index] = .{
+                .name = tag.name,
+                .checked_name = tag.checked_name,
+                .payloads = try self.cloneTypeSpanReplacingGeneratedSelf(tag.payloads, original_digest, replacement_ty, cache),
+            };
+        }
+        return try self.builder.program.types.addTagVariants(&self.builder.program.names, cloned);
+    }
+
+    fn cloneDeclaredFieldSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try self.allocator.dupe(Type.DeclaredField, self.builder.program.types.declaredFieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.DeclaredField, fields.len);
+        defer self.allocator.free(cloned);
+        for (fields, 0..) |field, index| {
+            cloned[index] = switch (field) {
+                .named => |name| .{ .named = name },
+                .padding => |padding| .{ .padding = try self.cloneTypeReplacingGeneratedSelf(padding, original_digest, replacement_ty, cache) },
+            };
+        }
+        return try self.builder.program.types.addDeclaredFields(cloned);
+    }
+
+    fn generatedIteratorComponentArgs(
+        self: *BodyContext,
+        generated_iter_ty: Type.TypeId,
+        expected_components: usize,
+    ) Allocator.Error![]Type.TypeId {
+        const named = switch (self.builder.program.types.get(generated_iter_ty)) {
+            .named => |named| named,
+            else => Common.invariant("generated iterator component args requested for a non-named type"),
+        };
+        const args = self.builder.program.types.span(named.args);
+        if (args.len != expected_components + 1) {
+            Common.invariant("generated iterator did not contain the expected component count");
+        }
+        return try self.allocator.dupe(Type.TypeId, args[1..]);
+    }
+
+    fn generatedIteratorConstructorFunctionType(
+        self: *BodyContext,
+        generated_iter_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const backing_ty = self.builder.namedBackingType(generated_iter_ty) orelse
+            Common.invariant("generated iterator constructor requested a type without backing");
+        const len_field = self.recordFieldByText(backing_ty, "len_if_known");
+        const step_field = self.recordFieldByText(backing_ty, "step");
+        const args = [_]Type.TypeId{ len_field.ty, step_field.ty };
+        return try self.functionTypeWithReturn(&args, generated_iter_ty);
+    }
+
+    fn generatedIteratorStepReturnType(
+        self: *BodyContext,
+        iter_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const backing_ty = self.builder.namedBackingType(iter_ty) orelse
+            Common.invariant("generated iterator next requested a type without backing");
+        const step_field = self.recordFieldByText(backing_ty, "step");
+        return self.builder.functionShape(step_field.ty, "generated iterator step field had a non-function type").ret;
+    }
+
+    fn generatedIteratorType(
+        self: *BodyContext,
+        kind: GeneratedIteratorKind,
+        public_iter_ty: Type.TypeId,
+        components: []const Type.TypeId,
+        callable_evidence: ?names.TypeDigest,
+    ) Allocator.Error!Type.TypeId {
+        const public_named = self.publicIteratorNamed(public_iter_ty);
+        const item_ty = self.iterItemType(public_iter_ty);
+        const digest = self.generatedIteratorDigest(kind, item_ty, components, callable_evidence);
+        if (self.builder.generated_iter_types.get(digest.bytes)) |cached| return cached;
+
+        const args = try self.allocator.alloc(Type.TypeId, components.len + 1);
+        defer self.allocator.free(args);
+        args[0] = item_ty;
+        @memcpy(args[1..], components);
+
+        const Context = struct {
+            body: *BodyContext,
+            public_named: Type.NamedContent,
+            item_ty: Type.TypeId,
+            args: []const Type.TypeId,
+            digest: names.TypeDigest,
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, self_ty);
+            }
+        };
+
+        const context = Context{
+            .body = self,
+            .public_named = public_named,
+            .item_ty = item_ty,
+            .args = args,
+            .digest = digest,
+        };
+        const generated = try self.builder.program.types.addRecursive(context, Context.fill);
+        try self.builder.generated_iter_types.put(digest.bytes, generated);
+        return generated;
+    }
+
+    fn generatedIteratorDigest(
+        self: *BodyContext,
+        kind: GeneratedIteratorKind,
+        item_ty: Type.TypeId,
+        components: []const Type.TypeId,
+        callable_evidence: ?names.TypeDigest,
+    ) names.TypeDigest {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.generated_iterator");
+        hasher.update(@tagName(kind));
+        self.updateTypeDigest(&hasher, item_ty);
+        hashU32(&hasher, @intCast(components.len));
+        for (components) |component| {
+            self.updateTypeDigest(&hasher, component);
+        }
+        if (callable_evidence) |evidence| {
+            hasher.update("callable_evidence");
+            hasher.update(&evidence.bytes);
+        }
+        return .{ .bytes = hasher.finalResult() };
+    }
+
+    fn callableArgumentEvidenceDigest(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+    ) Allocator.Error!?names.TypeDigest {
+        const expr = self.view.bodies.expr(expr_id);
+        return switch (expr.data) {
+            .closure => |closure| try self.closureArgumentEvidenceDigest(expr_id, closure),
+            .lambda => |lambda| self.lambdaArgumentEvidenceDigest(expr_id, lambda.args.len),
+            else => null,
+        };
+    }
+
+    fn lambdaArgumentEvidenceDigest(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        arg_count: usize,
+    ) names.TypeDigest {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.generated_iterator.callable.lambda");
+        hasher.update(self.view.key.bytes[0..]);
+        hashU32(&hasher, @intFromEnum(expr_id));
+        hashU32(&hasher, @intCast(arg_count));
+        hashU32(&hasher, 0);
+        return .{ .bytes = hasher.finalResult() };
+    }
+
+    fn closureArgumentEvidenceDigest(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        closure: anytype,
+    ) Allocator.Error!names.TypeDigest {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.generated_iterator.callable.closure");
+        hasher.update(self.view.key.bytes[0..]);
+        hashU32(&hasher, @intFromEnum(expr_id));
+        hashU32(&hasher, @intFromEnum(closure.lambda));
+        hashU32(&hasher, @intCast(closure.captures.len));
+        for (closure.captures) |capture| {
+            hashU32(&hasher, @intFromEnum(capture.capture_id));
+            hashU32(&hasher, capture.scope_depth);
+            const binder = checkedCaptureBinder(self.view, capture.pattern);
+            const capture_ty = try self.lowerTypeView(checkedBinderType(self.view, binder));
+            self.updateTypeDigest(&hasher, capture_ty);
+        }
+        return .{ .bytes = hasher.finalResult() };
+    }
+
+    fn updateTypeDigest(
+        self: *BodyContext,
+        hasher: *std.crypto.hash.sha2.Sha256,
+        ty: Type.TypeId,
+    ) void {
+        const digest = self.builder.program.types.typeDigest(&self.builder.program.names, ty);
+        hasher.update(&digest.bytes);
+    }
+
+    fn publicIteratorNamed(self: *BodyContext, ty: Type.TypeId) Type.NamedContent {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| blk: {
+                if (named.builtin_owner) |owner| {
+                    if (owner != .iter) Common.invariant("generated iterator requested a non-Iter public type");
+                    break :blk named;
+                }
+                const type_name = self.builder.program.names.typeNameText(named.def.type_name);
+                if (!Ident.textEql(type_name, "Builtin.Iter") and !Ident.textEql(type_name, "Iter")) {
+                    Common.invariant("generated iterator requested a non-Iter public type");
+                }
+                var stamped = named;
+                stamped.builtin_owner = .iter;
+                break :blk stamped;
+            },
+            else => Common.invariant("generated iterator requested a non-named public type"),
+        };
+    }
+
+    fn generatedIteratorContent(
+        self: *BodyContext,
+        public_named: Type.NamedContent,
+        item_ty: Type.TypeId,
+        args: []const Type.TypeId,
+        digest: names.TypeDigest,
+        self_ty: Type.TypeId,
+    ) Allocator.Error!Type.Content {
+        const public_backing = public_named.backing orelse
+            Common.invariant("generated iterator requested a public Iter without backing");
+        var def = public_named.def;
+        def.generated = digest;
+        return .{ .named = .{
+            .named_type = public_named.named_type,
+            .def = def,
+            .kind = public_named.kind,
+            .builtin_owner = public_named.builtin_owner,
+            .args = try self.builder.program.types.addSpan(args),
+            .backing = .{
+                .ty = try self.generatedIteratorBackingType(public_backing.ty, self_ty, item_ty),
+                .use = public_backing.use,
+            },
+            .declared_order = public_named.declared_order,
+        } };
+    }
+
+    fn generatedIteratorBackingType(
+        self: *BodyContext,
+        public_backing_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const public_fields = switch (self.builder.shapeContent(public_backing_ty)) {
+            .record => |fields| self.builder.program.types.fieldSpan(fields),
+            else => Common.invariant("public Iter backing was not a record"),
+        };
+        const fields = try self.allocator.alloc(Type.Field, public_fields.len);
+        defer self.allocator.free(fields);
+        for (public_fields, 0..) |field, index| {
+            const field_text = self.builder.program.names.recordFieldLabelText(field.name);
+            fields[index] = .{
+                .name = field.name,
+                .ty = if (Ident.textEql(field_text, "step"))
+                    try self.generatedIteratorStepFunctionType(field.ty, self_ty, item_ty)
+                else
+                    field.ty,
+            };
+        }
+        return try self.builder.program.types.add(.{ .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, fields) });
+    }
+
+    fn generatedIteratorStepFunctionType(
+        self: *BodyContext,
+        public_step_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const step = self.builder.functionShape(public_step_ty, "public Iter step field was not a function");
+        return try self.builder.program.types.add(.{ .func = .{
+            .args = step.args,
+            .ret = try self.generatedIteratorStepResultType(step.ret, self_ty, item_ty),
+        } });
+    }
+
+    fn generatedIteratorStepResultType(
+        self: *BodyContext,
+        public_step_ret_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const public_tags = switch (self.builder.shapeContent(public_step_ret_ty)) {
+            .tag_union => |tags| self.builder.program.types.tagSpan(tags),
+            else => Common.invariant("public Iter step result was not a tag union"),
+        };
+        const tags = try self.allocator.alloc(Type.Tag, public_tags.len);
+        defer self.allocator.free(tags);
+        for (public_tags, 0..) |tag, index| {
+            const payloads = self.builder.program.types.span(tag.payloads);
+            const generated_payloads = try self.allocator.alloc(Type.TypeId, payloads.len);
+            defer self.allocator.free(generated_payloads);
+            for (payloads, 0..) |payload, payload_index| {
+                generated_payloads[payload_index] = try self.generatedIteratorStepPayloadType(tag.name, payload, self_ty, item_ty);
+            }
+            tags[index] = .{
+                .name = tag.name,
+                .checked_name = tag.checked_name,
+                .payloads = try self.builder.program.types.addSpan(generated_payloads),
+            };
+        }
+        return try self.builder.program.types.add(.{ .tag_union = try self.builder.program.types.addTagVariants(&self.builder.program.names, tags) });
+    }
+
+    fn generatedIteratorStepPayloadType(
+        self: *BodyContext,
+        tag_name: names.TagNameId,
+        payload_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const tag_text = self.builder.program.names.tagLabelText(tag_name);
+        if (!Ident.textEql(tag_text, "One") and !Ident.textEql(tag_text, "Skip")) return payload_ty;
+
+        const public_fields = switch (self.builder.shapeContent(payload_ty)) {
+            .record => |fields| self.builder.program.types.fieldSpan(fields),
+            else => Common.invariant("public Iter step payload was not a record"),
+        };
+        const fields = try self.allocator.alloc(Type.Field, public_fields.len);
+        defer self.allocator.free(fields);
+        for (public_fields, 0..) |field, index| {
+            const field_text = self.builder.program.names.recordFieldLabelText(field.name);
+            fields[index] = .{
+                .name = field.name,
+                .ty = if (Ident.textEql(field_text, "rest"))
+                    self_ty
+                else if (Ident.textEql(field_text, "item"))
+                    item_ty
+                else
+                    field.ty,
+            };
+        }
+        return try self.builder.program.types.add(.{ .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, fields) });
     }
 
     fn lowerFieldNamesValueIter(
@@ -13711,18 +14857,22 @@ const BodyContext = struct {
             call_ctx.current_entry_root = self.current_entry_root;
 
             const source_fn_ty = self.directCallInstantiationSourceFnType(target, call.source_fn_ty_payload);
-            const mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
-            const source_fn_key = call_ctx.view.types.rootKey(source_fn_ty);
-            const callee = try self.fnTemplateForDirectCallWithMono(target, source_fn_ty, source_fn_key, mono_fn_ty);
+            var mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
+            if (try self.generatedIteratorDirectCallFunctionType(target, mono_fn_ty, call.args, expected_ret_ty)) |generated_fn_ty| {
+                mono_fn_ty = generated_fn_ty;
+            }
             const fn_data = self.builder.functionShape(mono_fn_ty, "checked direct call target had a non-function type");
             try self.constrainTypeToMono(checked_ret_ty, fn_data.ret);
             if (expected_ret_ty) |expected| {
-                if (!self.sameType(expected, fn_data.ret)) {
+                if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) {
                     Common.invariant("checked direct call result type differed from its expected Monotype type");
                 }
             }
+            if (try self.lowerGeneratedIteratorNextCall(target, call.args, fn_data, checked_ret_ty)) |lowered| return lowered;
+            const source_fn_key = call_ctx.view.types.rootKey(source_fn_ty);
+            const callee = try self.fnTemplateForDirectCallWithMono(target, source_fn_ty, source_fn_key, mono_fn_ty);
             return .{
-                .ret_ty = try self.lowerTypeCell(checked_ret_ty),
+                .ret_ty = try self.callReturnTypeCell(checked_ret_ty, fn_data.ret),
                 .data = .{ .call_proc = .{
                     .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(callee)),
                     .args = try self.lowerExprSpanAtTypes(call.args, self.builder.program.types.span(fn_data.args)),
@@ -13744,17 +14894,79 @@ const BodyContext = struct {
         const fn_data = self.builder.functionShape(fn_ty, "checked call function type was not a function");
         try self.constrainTypeToMono(checked_ret_ty, fn_data.ret);
         if (expected_ret_ty) |expected| {
-            if (!self.sameType(expected, fn_data.ret)) {
+            if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) {
                 Common.invariant("checked indirect call result type differed from its expected Monotype type");
             }
         }
         return .{
-            .ret_ty = try self.lowerTypeCell(checked_ret_ty),
+            .ret_ty = try self.callReturnTypeCell(checked_ret_ty, fn_data.ret),
             .data = .{ .call_value = .{
                 .callee = try self.lowerExprAtType(call.func, fn_ty),
                 .args = try self.lowerExprSpanAtTypes(call.args, self.builder.program.types.span(fn_data.args)),
             } },
         };
+    }
+
+    fn lowerGeneratedIteratorNextCall(
+        self: *BodyContext,
+        target: checked.ResolvedValueId,
+        checked_args: []const checked.CheckedExprId,
+        fn_data: FunctionShape,
+        checked_ret_ty: checked.CheckedTypeId,
+    ) Allocator.Error!?LoweredCall {
+        const text = self.builtinProcedureTextForResolvedTarget(target) orelse return null;
+        if (!isBuiltinIterNextText(text)) return null;
+        const arg_tys = self.builder.program.types.span(fn_data.args);
+        if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.next reached Monotype with an unexpected arity");
+        const iter_ty = arg_tys[0];
+        if (!self.isGeneratedIteratorEvidenceType(iter_ty)) return null;
+
+        const iterator = try self.lowerExprAtType(checked_args[0], iter_ty);
+        return .{
+            .ret_ty = try self.callReturnTypeCell(checked_ret_ty, fn_data.ret),
+            .data = try self.lowerGeneratedIteratorNextData(iterator, iter_ty),
+        };
+    }
+
+    fn lowerGeneratedIteratorNextExpr(
+        self: *BodyContext,
+        iterator: DraftExprId,
+        iter_ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        return try self.addExpr(.{
+            .ty = try self.generatedIteratorStepReturnType(iter_ty),
+            .data = try self.lowerGeneratedIteratorNextData(iterator, iter_ty),
+        });
+    }
+
+    fn lowerGeneratedIteratorNextData(
+        self: *BodyContext,
+        iterator: DraftExprId,
+        iter_ty: Type.TypeId,
+    ) Allocator.Error!BodyExprData {
+        const backing_ty = self.builder.namedBackingType(iter_ty) orelse
+            Common.invariant("generated iterator next requested a type without backing");
+        const step_name = try self.builder.program.names.internRecordFieldLabel("step");
+        const step_ty = self.builder.recordFieldType(backing_ty, step_name);
+        const step = try self.addExpr(.{ .ty = step_ty, .data = .{ .field_access = .{
+            .receiver = iterator,
+            .field = step_name,
+        } } });
+        return .{ .call_value = .{
+            .callee = step,
+            .args = .empty(),
+        } };
+    }
+
+    fn callReturnTypeCell(
+        self: *BodyContext,
+        checked_ret_ty: checked.CheckedTypeId,
+        ret_ty: Type.TypeId,
+    ) Allocator.Error!DraftTypeCell {
+        if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ret_ty)) {
+            return DraftTypeCell.fromSealed(ret_ty);
+        }
+        return try self.lowerTypeCell(checked_ret_ty);
     }
 
     fn indirectCalleeMonoType(
@@ -13777,7 +14989,7 @@ const BodyContext = struct {
                 const field_ty = try self.lowerExprType(checked_func);
                 if (expected_ret_ty) |expected| {
                     const fn_data = self.builder.functionShape(field_ty, "checked field callee type was not a function");
-                    if (!self.sameType(expected, fn_data.ret)) break :blk null;
+                    if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) break :blk null;
                 }
                 break :blk field_ty;
             },
@@ -13805,7 +15017,7 @@ const BodyContext = struct {
         const arg_tys = self.builder.program.types.span(fn_data.args);
         if (arg_tys.len != checked_args.len) Common.invariant("checked local callee arity differed from call arity");
         if (expected_ret_ty) |expected| {
-            if (!self.sameType(expected, fn_data.ret)) return null;
+            if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) return null;
         }
         for (checked_args) |checked_arg| {
             if (try self.callArgumentMonoType(checked_arg, null)) |evidence_ty| {
@@ -13879,6 +15091,7 @@ const BodyContext = struct {
         defer self.allocator.free(generated_arg_overrides);
         @memset(generated_arg_overrides, null);
         var saw_generated_opaque_evidence = false;
+        var generated_ret_override: ?Type.TypeId = null;
         for (function.args, checked_args, 0..) |formal_ty, checked_arg, index| {
             const arg_ty = caller.view.bodies.expr(checked_arg).ty;
             const formal_node = try self.instNode(formal_ty);
@@ -13898,9 +15111,18 @@ const BodyContext = struct {
                 try self.graph.unify(formal_node, try caller.instNode(arg_ty));
             }
         }
-        try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
         if (expected_ret_ty) |expected| {
-            try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            if (self.isGeneratedSpecializationEvidenceType(expected)) {
+                saw_generated_opaque_evidence = true;
+                generated_ret_override = try self.graph.sealType(expected);
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+                try self.graph.unify(try caller.instNode(checked_ret_ty), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+            } else {
+                try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            }
+        } else {
+            try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
         }
         try self.graph.drainDirty();
         if (saw_generated_opaque_evidence) {
@@ -13914,7 +15136,7 @@ const BodyContext = struct {
             }
             const generated_fn_ty = try self.builder.program.types.add(.{ .func = .{
                 .args = try self.builder.program.types.addSpan(args),
-                .ret = try self.graph.sealNode(try self.instNode(function.ret)),
+                .ret = generated_ret_override orelse try self.graph.sealNode(try self.instNode(function.ret)),
             } });
             return generated_fn_ty;
         }
@@ -13929,7 +15151,71 @@ const BodyContext = struct {
         operands: []const static_dispatch.StaticDispatchOperand,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        const fn_node = try self.instantiateDispatchPlanCallNodeFromCaller(source_fn_ty, caller, checked_ret_ty, operands, expected_ret_ty);
+        const function = self.checkedFunctionType(source_fn_ty);
+        if (function.args.len != operands.len) {
+            Common.invariant("checked dispatch plan arity differs from its function type");
+        }
+        const fn_node = try self.instNode(source_fn_ty);
+        const generated_arg_overrides = try self.allocator.alloc(?Type.TypeId, function.args.len);
+        defer self.allocator.free(generated_arg_overrides);
+        @memset(generated_arg_overrides, null);
+        var saw_generated_opaque_evidence = false;
+        var generated_ret_override: ?Type.TypeId = null;
+        for (function.args, operands, 0..) |formal_ty, operand, index| {
+            const formal_node = try self.instNode(formal_ty);
+            switch (operand) {
+                .checked_expr => |checked_arg| {
+                    const arg_ty = caller.view.bodies.expr(checked_arg).ty;
+                    if (try caller.callArgumentMonoType(checked_arg, null)) |evidence_ty| {
+                        if (self.isGeneratedSpecializationEvidenceType(evidence_ty)) {
+                            const evidence_snapshot = try self.graph.sealType(evidence_ty);
+                            saw_generated_opaque_evidence = true;
+                            generated_arg_overrides[index] = evidence_snapshot;
+                            try self.graph.unify(try self.graph.importMono(try self.publicOpaqueUnificationType(evidence_snapshot)), formal_node);
+                        } else if (self.isGeneratedOpaqueEvidenceType(evidence_ty)) {
+                            try self.graph.unify(try self.graph.importMono(try self.publicOpaqueUnificationType(evidence_ty)), formal_node);
+                        } else {
+                            try self.graph.unify(formal_node, try caller.instNode(arg_ty));
+                            try self.graph.unify(formal_node, try self.graph.importMono(evidence_ty));
+                        }
+                    } else {
+                        try self.graph.unify(formal_node, try caller.instNode(arg_ty));
+                    }
+                },
+                .generated_interpolation_iter,
+                .generated_numeral,
+                .generated_quote,
+                => {},
+            }
+        }
+        if (expected_ret_ty) |expected| {
+            if (self.isGeneratedSpecializationEvidenceType(expected)) {
+                saw_generated_opaque_evidence = true;
+                generated_ret_override = try self.graph.sealType(expected);
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+                try self.graph.unify(try caller.instNode(checked_ret_ty), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+            } else {
+                try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            }
+        } else {
+            try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+        }
+        try self.graph.drainDirty();
+        if (saw_generated_opaque_evidence) {
+            const args = try self.allocator.alloc(Type.TypeId, function.args.len);
+            defer self.allocator.free(args);
+            for (function.args, generated_arg_overrides, 0..) |formal_ty, override, index| {
+                args[index] = if (override) |ty|
+                    ty
+                else
+                    try self.graph.sealNode(try self.instNode(formal_ty));
+            }
+            return try self.builder.program.types.add(.{ .func = .{
+                .args = try self.builder.program.types.addSpan(args),
+                .ret = generated_ret_override orelse try self.graph.sealNode(try self.instNode(function.ret)),
+            } });
+        }
         return try self.activeTypeFromNode(fn_node);
     }
 
@@ -14230,7 +15516,7 @@ const BodyContext = struct {
             if (try self.indirectCalleeMonoType(call.func, call.args, expected_ret_ty)) |fn_ty| {
                 const ret_ty = self.functionReturnType(fn_ty);
                 if (expected_ret_ty) |expected| {
-                    if (!self.sameType(expected, ret_ty)) {
+                    if (!try self.sameTypeOrPublicOpaque(expected, ret_ty)) {
                         Common.invariant("checked indirect call result type differed from its expected Monotype type");
                     }
                     try self.constrainTypeToMono(checked_ret_ty, expected);
@@ -14261,7 +15547,10 @@ const BodyContext = struct {
         call_ctx.current_entry_root = self.current_entry_root;
 
         const source_fn_ty = self.directCallInstantiationSourceFnType(call.direct_target.?, call.source_fn_ty_payload);
-        const mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
+        var mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
+        if (try self.generatedIteratorDirectCallFunctionType(call.direct_target.?, mono_fn_ty, call.args, expected_ret_ty)) |generated_fn_ty| {
+            mono_fn_ty = generated_fn_ty;
+        }
         return call_ctx.functionReturnType(mono_fn_ty);
     }
 
@@ -14484,6 +15773,8 @@ const BodyContext = struct {
             const live_ty = try self.lowerTypeView(binder_ty);
             const use_ty = if (self.sameType(ty, local_ty))
                 local_ty
+            else if (try self.generatedLocalUseType(local_ty, ty)) |generated_use_ty|
+                generated_use_ty
             else if (self.sameType(ty, live_ty))
                 live_ty
             else
@@ -15557,7 +16848,7 @@ const BodyContext = struct {
         return switch (self.builder.program.types.get(ty)) {
             .named => |named| blk: {
                 const args = self.builder.program.types.span(named.args);
-                if (args.len != 1) Common.invariant("Iter nominal did not have one type argument");
+                if (args.len == 0) Common.invariant("Iter nominal did not have an item type argument");
                 break :blk args[0];
             },
             else => Common.invariant("generated interpolation iterator expected named Iter type"),
@@ -15583,7 +16874,8 @@ const BodyContext = struct {
                 if (try self.lowerParseIntrinsicCallExpr(checked_expr, expr.ty, call, ty)) |lowered| return lowered;
                 try self.constrainKnownType(expr.ty, ty);
                 const lowered = try self.lowerCallAtType(expr.ty, call, ty);
-                if (!self.sameType(ty, try self.activeTypeFromCell(lowered.ret_ty))) {
+                const actual_ty = try self.activeTypeFromCell(lowered.ret_ty);
+                if (!try self.sameTypeOrPublicOpaque(ty, actual_ty)) {
                     Common.invariant("checked call expression lowered at a type different from its context type");
                 }
                 return try self.addExpr(.{
@@ -15627,10 +16919,193 @@ const BodyContext = struct {
         }
         try self.constrainKnownType(expr.ty, ty);
         const lowered = try self.lowerExprWithType(checked_expr, ty);
-        if (!self.sameType(ty, try self.exprType(lowered))) {
+        if (!try self.sameTypeOrPublicOpaque(ty, try self.exprType(lowered))) {
             Common.invariant("checked expression lowered at a type different from its call operand type");
         }
         return lowered;
+    }
+
+    fn sameTypeOrPublicOpaque(self: *BodyContext, expected: Type.TypeId, actual: Type.TypeId) Allocator.Error!bool {
+        const stable_expected = if (self.isGeneratedIteratorEvidenceType(expected))
+            try self.stableGeneratedIteratorEvidenceType(expected)
+        else
+            expected;
+        const stable_actual = if (self.isGeneratedIteratorEvidenceType(actual))
+            try self.stableGeneratedIteratorEvidenceType(actual)
+        else
+            actual;
+        if (self.sameType(stable_expected, stable_actual)) return true;
+        const public_expected = try self.publicOpaqueUnificationType(stable_expected);
+        const public_actual = try self.publicOpaqueUnificationType(stable_actual);
+        return self.samePublicOpaqueType(public_expected, public_actual);
+    }
+
+    fn generatedLocalUseType(
+        self: *BodyContext,
+        local_ty: Type.TypeId,
+        expected_ty: Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        if (!self.isGeneratedSpecializationEvidenceType(local_ty)) return null;
+        if (self.isGeneratedSpecializationEvidenceType(expected_ty)) {
+            if (self.isGeneratedIteratorEvidenceType(local_ty) and self.isGeneratedIteratorEvidenceType(expected_ty)) {
+                const stable_local = try self.stableGeneratedIteratorEvidenceType(local_ty);
+                const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected_ty);
+                if (self.sameType(stable_expected, stable_local)) return local_ty;
+            }
+            return null;
+        }
+
+        const public_local = try self.publicOpaqueUnificationType(local_ty);
+        const public_expected = try self.publicOpaqueUnificationType(expected_ty);
+        if (self.samePublicOpaqueType(public_expected, public_local)) return local_ty;
+        return null;
+    }
+
+    fn samePublicOpaqueType(self: *BodyContext, expected: Type.TypeId, actual: Type.TypeId) bool {
+        var visiting = std.AutoHashMap(TypePair, void).init(self.allocator);
+        defer visiting.deinit();
+        return self.samePublicOpaqueTypeInner(expected, actual, &visiting);
+    }
+
+    fn samePublicOpaqueTypeInner(
+        self: *BodyContext,
+        expected: Type.TypeId,
+        actual: Type.TypeId,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        if (expected == actual) return true;
+        if (monoAliasBacking(&self.builder.program.types, expected)) |backing| {
+            if (self.samePublicOpaqueTypeInner(backing, actual, visiting)) return true;
+        }
+        if (monoAliasBacking(&self.builder.program.types, actual)) |backing| {
+            if (self.samePublicOpaqueTypeInner(expected, backing, visiting)) return true;
+        }
+
+        const pair = TypePair{ .expected = expected, .actual = actual };
+        if (visiting.contains(pair)) return true;
+        visiting.put(pair, {}) catch Common.invariant("public opaque type equality could not record a recursive type pair");
+        defer _ = visiting.remove(pair);
+
+        const expected_content = self.builder.program.types.get(expected);
+        const actual_content = self.builder.program.types.get(actual);
+        return switch (expected_content) {
+            .primitive => |primitive| switch (actual_content) {
+                .primitive => |actual_primitive| primitive == actual_primitive,
+                else => false,
+            },
+            .named => |named| switch (actual_content) {
+                .named => |actual_named| self.samePublicOpaqueNamedType(named, actual_named, visiting),
+                else => false,
+            },
+            .record => |fields| switch (actual_content) {
+                .record => |actual_fields| self.samePublicOpaqueRecordFieldNames(fields, actual_fields, visiting),
+                else => false,
+            },
+            .tuple => |items| switch (actual_content) {
+                .tuple => |actual_items| self.samePublicOpaqueTypeSpans(items, actual_items, visiting),
+                else => false,
+            },
+            .tag_union => |tags| switch (actual_content) {
+                .tag_union => |actual_tags| self.samePublicOpaqueTags(tags, actual_tags, visiting),
+                else => false,
+            },
+            .list => |elem| switch (actual_content) {
+                .list => |actual_elem| self.samePublicOpaqueTypeInner(elem, actual_elem, visiting),
+                else => false,
+            },
+            .box => |elem| switch (actual_content) {
+                .box => |actual_elem| self.samePublicOpaqueTypeInner(elem, actual_elem, visiting),
+                else => false,
+            },
+            .func => |function| switch (actual_content) {
+                .func => |actual_function| self.samePublicOpaqueTypeSpans(function.args, actual_function.args, visiting) and
+                    self.samePublicOpaqueTypeInner(function.ret, actual_function.ret, visiting),
+                else => false,
+            },
+            .erased => |erased| switch (actual_content) {
+                .erased => |actual_erased| std.mem.eql(u8, erased.bytes[0..], actual_erased.bytes[0..]),
+                else => false,
+            },
+            .zst => switch (actual_content) {
+                .zst => true,
+                else => false,
+            },
+        };
+    }
+
+    fn samePublicOpaqueNamedType(
+        self: *BodyContext,
+        expected: anytype,
+        actual: anytype,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        if (expected.def.module != actual.def.module) return false;
+        if (expected.def.source_decl != actual.def.source_decl) return false;
+        if (expected.def.source_decl == null and expected.def.type_name != actual.def.type_name) return false;
+        if (expected.kind != actual.kind) return false;
+        if (!publicOpaqueBuiltinOwnersCompatible(expected.builtin_owner, actual.builtin_owner)) return false;
+        if (!self.samePublicOpaqueTypeSpans(expected.args, actual.args, visiting)) return false;
+        if (expected.kind == .@"opaque") return true;
+        if (!self.sameNamedBacking(expected.backing, actual.backing, visiting)) return false;
+        return self.sameDeclaredOrder(expected.declared_order, actual.declared_order, visiting);
+    }
+
+    fn samePublicOpaqueTypeSpans(
+        self: *BodyContext,
+        expected: Type.Span,
+        actual: Type.Span,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        const expected_items = self.builder.program.types.span(expected);
+        const actual_items = self.builder.program.types.span(actual);
+        if (expected_items.len != actual_items.len) return false;
+        for (expected_items, actual_items) |expected_item, actual_item| {
+            if (!self.samePublicOpaqueTypeInner(expected_item, actual_item, visiting)) return false;
+        }
+        return true;
+    }
+
+    fn samePublicOpaqueRecordFieldNames(
+        self: *BodyContext,
+        expected: Type.Span,
+        actual: Type.Span,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        const expected_fields = self.builder.program.types.fieldSpan(expected);
+        const actual_fields = self.builder.program.types.fieldSpan(actual);
+        if (expected_fields.len != actual_fields.len) return false;
+        for (expected_fields, actual_fields) |expected_field, actual_field| {
+            if (expected_field.name != actual_field.name) return false;
+            if (!self.samePublicOpaqueTypeInner(expected_field.ty, actual_field.ty, visiting)) return false;
+        }
+        return true;
+    }
+
+    fn samePublicOpaqueTags(
+        self: *BodyContext,
+        expected: Type.Span,
+        actual: Type.Span,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        const expected_tags = self.builder.program.types.tagSpan(expected);
+        const actual_tags = self.builder.program.types.tagSpan(actual);
+        if (expected_tags.len != actual_tags.len) return false;
+        for (expected_tags, actual_tags) |expected_tag, actual_tag| {
+            if (expected_tag.name != actual_tag.name or expected_tag.checked_name != actual_tag.checked_name) return false;
+            if (!self.samePublicOpaqueTypeSpans(expected_tag.payloads, actual_tag.payloads, visiting)) return false;
+        }
+        return true;
+    }
+
+    fn publicOpaqueBuiltinOwnersCompatible(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner) bool {
+        if (left == right) return true;
+        if (left) |left_owner| {
+            if (right == null and static_dispatch.isIteratorOwner(left_owner)) return true;
+        }
+        if (right) |right_owner| {
+            if (left == null and static_dispatch.isIteratorOwner(right_owner)) return true;
+        }
+        return false;
     }
 
     fn sameType(self: *BodyContext, expected: Type.TypeId, actual: Type.TypeId) bool {
@@ -15732,6 +17207,7 @@ const BodyContext = struct {
         if (expected.def.module != actual.def.module) return false;
         if (expected.def.source_decl != actual.def.source_decl) return false;
         if (expected.def.source_decl == null and expected.def.type_name != actual.def.type_name) return false;
+        if (!optionalDigestEql(expected.def.generated, actual.def.generated)) return false;
         if (expected.kind != actual.kind) return false;
         if (expected.builtin_owner != actual.builtin_owner) return false;
         if (!self.sameTypeSpans(expected.args, actual.args, visiting)) return false;
@@ -16092,10 +17568,11 @@ const BodyContext = struct {
                 .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
             };
         }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, expected_ret_ty);
+        const target_mono_ty = (try self.generatedIteratorMethodTargetFunctionType(resolved, callable_mono_ty, plan_args, expected_ret_ty)) orelse
+            try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, expected_ret_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
         const refreshed_target_mono_ty = try self.activeTypeFromType(target_mono_ty);
-        if (!self.sameType(callable_mono_ty, refreshed_target_mono_ty)) {
+        if (!try self.sameTypeOrPublicOpaque(callable_mono_ty, refreshed_target_mono_ty)) {
             Common.invariant("checked dispatch target callable type differed from dispatch plan callable type");
         }
         const fn_data = self.builder.functionShape(refreshed_target_mono_ty, "checked dispatch target had a non-function type");
@@ -16104,7 +17581,7 @@ const BodyContext = struct {
         const ret_ty = try self.activeTypeFromType(fn_data.ret);
         if (expected_ret_ty) |expected| {
             const expected_ty = try self.activeTypeFromType(expected);
-            if (!self.sameType(expected_ty, ret_ty)) Common.invariant("checked dispatch expression lowered at a type different from its call operand type");
+            if (!try self.sameTypeOrPublicOpaque(expected_ty, ret_ty)) Common.invariant("checked dispatch expression lowered at a type different from its call operand type");
         }
         const call_expr = try self.addExpr(.{
             .ty = ret_ty,
@@ -16730,9 +18207,10 @@ const BodyContext = struct {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, null);
+        const target_mono_ty = (try self.generatedIteratorMethodTargetFunctionType(resolved, callable_mono_ty, plan_args, expected_ret_ty)) orelse
+            try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, expected_ret_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
-        if (!self.sameType(callable_mono_ty, target_mono_ty)) {
+        if (!try self.sameTypeOrPublicOpaque(callable_mono_ty, target_mono_ty)) {
             Common.invariant("checked dispatch target callable type differed from dispatch plan callable type");
         }
         const ret_ty = self.functionReturnType(target_mono_ty);
@@ -17009,6 +18487,50 @@ const BodyContext = struct {
         var target_ctx = try self.methodTargetContext(lookup);
         defer target_ctx.deinit();
         return try target_ctx.instantiateTargetFromPlan(lookup.target.callable_ty, plan_ctx, plan_callable_ty, expected_ret_ty);
+    }
+
+    fn generatedIteratorMethodTargetFunctionType(
+        self: *BodyContext,
+        lookup: MethodLookup,
+        mono_fn_ty: Type.TypeId,
+        operands: []const static_dispatch.StaticDispatchOperand,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        const text = self.builtinProcedureTextForMethodLookup(lookup) orelse return null;
+        const checked_args = (try self.checkedExprDispatchOperands(operands)) orelse return null;
+        defer self.allocator.free(checked_args);
+        return try self.generatedIteratorBuiltinFunctionType(text, mono_fn_ty, checked_args, expected_ret_ty);
+    }
+
+    fn checkedExprDispatchOperands(
+        self: *BodyContext,
+        operands: []const static_dispatch.StaticDispatchOperand,
+    ) Allocator.Error!?[]checked.CheckedExprId {
+        const checked_args = try self.allocator.alloc(checked.CheckedExprId, operands.len);
+        errdefer self.allocator.free(checked_args);
+        for (operands, 0..) |operand, index| {
+            checked_args[index] = switch (operand) {
+                .checked_expr => |expr| expr,
+                .generated_interpolation_iter,
+                .generated_numeral,
+                .generated_quote,
+                => {
+                    self.allocator.free(checked_args);
+                    return null;
+                },
+            };
+        }
+        return checked_args;
+    }
+
+    fn builtinProcedureTextForMethodLookup(_: *BodyContext, lookup: MethodLookup) ?[]const u8 {
+        return switch (lookup.target.kind) {
+            .procedure => |procedure| builtinProcedureTextForTemplate(lookup.view, procedure.template),
+            .local_proc,
+            .generated_structural_parser,
+            .generated_structural_encoder,
+            => null,
+        };
     }
 
     fn methodTargetMonoTypePreservingSourceArgsAndRet(
@@ -22369,7 +23891,10 @@ const BodyContext = struct {
         try self.constrainTypeToMono(step.skip_rest.ty, iterator_ty);
         const item_ty = try self.lowerTypeView(step.one_item.ty);
         try self.constrainTypeToMono(plan.item_ty, item_ty);
-        const step_expected_ty = try self.lowerTypeView(plan.step_ty);
+        const step_expected_ty = if (self.isGeneratedIteratorEvidenceType(iterator_ty))
+            try self.generatedIteratorStepReturnType(iterator_ty)
+        else
+            try self.lowerTypeView(plan.step_ty);
         const iterator_local = try self.addLocal(self.builder.symbols.fresh(), iterator_ty);
         const iterator_param = BodyTypedLocal{ .local = iterator_local, .ty = iterator_ty };
 
@@ -22478,6 +24003,10 @@ const BodyContext = struct {
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
         if (plan.dispatcher_arg_index >= plan_args.len) Common.invariant("iterator dispatch plan dispatcher argument index was outside the argument span");
 
+        if (try self.lowerGeneratedIteratorDispatch(plan, plan_args, loop_iterator, expected_ret_ty)) |generated| {
+            return generated;
+        }
+
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
         call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
@@ -22560,6 +24089,39 @@ const BodyContext = struct {
                 .args = try self.addExprSpan(args),
             } },
         });
+    }
+
+    fn lowerGeneratedIteratorDispatch(
+        self: *BodyContext,
+        plan: static_dispatch.IteratorDispatchCall,
+        plan_args: []const static_dispatch.IteratorDispatchOperand,
+        loop_iterator: ?BodyTypedLocal,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?DraftExprId {
+        const method_text = self.view.names.methodNameText(plan.method);
+        if (!Ident.textEql(method_text, "iter") and !Ident.textEql(method_text, "next")) return null;
+
+        const dispatcher_ty = (try self.iteratorOperandMonoType(plan_args[plan.dispatcher_arg_index], loop_iterator, null)) orelse
+            Common.invariant("iterator dispatch plan dispatcher operand did not have a Monotype");
+        if (!self.isGeneratedIteratorEvidenceType(dispatcher_ty)) return null;
+
+        if (Ident.textEql(method_text, "iter")) {
+            if (expected_ret_ty) |expected| {
+                if (!try self.sameTypeOrPublicOpaque(expected, dispatcher_ty)) {
+                    Common.invariant("generated iterator .iter dispatch result differed from expected type");
+                }
+            }
+            return try self.lowerIteratorOperandAtType(plan_args[plan.dispatcher_arg_index], loop_iterator, dispatcher_ty);
+        }
+
+        const step_ret_ty = try self.generatedIteratorStepReturnType(dispatcher_ty);
+        if (expected_ret_ty) |expected| {
+            if (!try self.sameTypeOrPublicOpaque(expected, step_ret_ty)) {
+                Common.invariant("generated iterator .next dispatch result differed from expected type");
+            }
+        }
+        const iterator = try self.lowerIteratorOperandAtType(plan_args[plan.dispatcher_arg_index], loop_iterator, dispatcher_ty);
+        return try self.lowerGeneratedIteratorNextExpr(iterator, dispatcher_ty);
     }
 
     fn instantiateIteratorPlanCallTypeFromCaller(
@@ -23425,7 +24987,7 @@ const BodyContext = struct {
     }
 
     fn lowerPatternAtType(self: *BodyContext, pattern_id: checked.CheckedPatternId, ty: Type.TypeId) Allocator.Error!DraftPatId {
-        return try self.lowerPatternAtTypeCell(pattern_id, try self.draftTypeCell(ty), ty);
+        return try self.lowerPatternAtTypeCell(pattern_id, try self.draftTypeCellPreservingGenerated(ty), ty);
     }
 
     fn lowerPatternAtTypeCell(
@@ -23437,7 +24999,13 @@ const BodyContext = struct {
         const pattern = self.view.bodies.pattern(pattern_id);
         switch (pattern.data) {
             .assign => {},
-            else => try self.constrainTypeToCell(pattern.ty, ty_cell),
+            else => {
+                if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) {
+                    try self.constrainTypeToMono(pattern.ty, try self.publicOpaqueUnificationType(ty));
+                } else {
+                    try self.constrainTypeToCell(pattern.ty, ty_cell);
+                }
+            },
         }
         const data: BodyPatData = switch (pattern.data) {
             .pending,
@@ -23463,7 +25031,7 @@ const BodyContext = struct {
                 const backing_ty = self.builder.namedBackingType(ty) orelse ty;
                 break :blk .{ .nominal = try self.lowerPatternAtTypeCell(
                     nominal.backing_pattern,
-                    try self.draftTypeCell(backing_ty),
+                    try self.draftTypeCellPreservingGenerated(backing_ty),
                     backing_ty,
                 ) };
             },
@@ -24728,7 +26296,14 @@ fn verifyMonotypeCallTargets(program: *const Ast.Program) void {
 fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
     return left.module == right.module and
         left.type_name == right.type_name and
-        left.source_decl == right.source_decl;
+        left.source_decl == right.source_decl and
+        optionalDigestEql(left.generated, right.generated);
+}
+
+fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?.bytes[0..], right.?.bytes[0..]);
 }
 
 const CheckedTypeAddress = struct {

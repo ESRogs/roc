@@ -72,6 +72,9 @@ pub const TypeDef = struct {
     /// Declaring statement: within-module discriminator for same-named
     /// block-local declarations.
     source_decl: ?u32 = null,
+    /// Compiler-generated specialization identity for internal nominals minted
+    /// after checking while preserving the public declaration identity.
+    generated: ?names.TypeDigest = null,
 };
 
 /// How much of a stored named type's backing type later stages may inspect.
@@ -460,6 +463,7 @@ pub const ConstTypeStore = struct {
             .module = try translation.target.internModuleIdentity(translation.source.moduleIdentityBytes(def.module)),
             .type_name = try translation.target.internTypeName(translation.source.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
+            .generated = def.generated,
         };
     }
 

@@ -1365,6 +1365,7 @@ const Lowerer = struct {
             .module = try self.result.const_type_names.internModuleIdentity(self.solved.lifted.names.moduleIdentityBytes(def.module)),
             .type_name = try self.result.const_type_names.internTypeName(self.solved.lifted.names.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
+            .generated = def.generated,
         };
     }
 
@@ -5815,9 +5816,6 @@ const Lowerer = struct {
     ) Common.LowerError!LIR.CFStmtId {
         const source_variants = self.types.fnVariantSpan(source_span);
         const target_variants = self.types.fnVariantSpan(target_span);
-        if (source_variants.len != target_variants.len) {
-            Common.invariant("callable boundary saw different source and target variant counts");
-        }
         if (self.isZstLocal(source)) return try self.assignZst(target, next);
 
         const branches = try self.allocator.alloc(LIR.CFSwitchBranch, source_variants.len);
@@ -6520,62 +6518,6 @@ const Lowerer = struct {
             }
         }
         return true;
-    }
-
-    fn typeContainsCallable(self: *Lowerer, ty: Type.TypeId) Common.LowerError!bool {
-        var visited = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
-        defer visited.deinit();
-        return try self.typeContainsCallableInner(ty, &visited);
-    }
-
-    fn typeContainsCallableInner(
-        self: *Lowerer,
-        ty: Type.TypeId,
-        visited: *std.AutoHashMap(Type.TypeId, void),
-    ) Common.LowerError!bool {
-        if (visited.contains(ty)) return false;
-        try visited.put(ty, {});
-
-        return switch (self.types.get(ty)) {
-            .callable, .erased_fn => true,
-            .primitive, .zst, .erased_capture_ptr => false,
-            .list => |elem| try self.typeContainsCallableInner(elem, visited),
-            .box => |elem| try self.typeContainsCallableInner(elem, visited),
-            .tuple => |items| try self.typeSpanContainsCallable(items, visited),
-            .record => |fields| blk: {
-                for (self.types.fieldSpan(fields)) |field| {
-                    if (try self.typeContainsCallableInner(field.ty, visited)) break :blk true;
-                }
-                break :blk false;
-            },
-            .capture_record => |fields| blk: {
-                for (self.types.captureFieldSpan(fields)) |field| {
-                    if (try self.typeContainsCallableInner(field.ty, visited)) break :blk true;
-                }
-                break :blk false;
-            },
-            .tag_union => |tags| blk: {
-                for (self.types.tagSpan(tags)) |tag| {
-                    if (try self.typeSpanContainsCallable(tag.payloads, visited)) break :blk true;
-                }
-                break :blk false;
-            },
-            .named => |named| if (named.backing) |backing|
-                try self.typeContainsCallableInner(backing.ty, visited)
-            else
-                false,
-        };
-    }
-
-    fn typeSpanContainsCallable(
-        self: *Lowerer,
-        span: Type.Span,
-        visited: *std.AutoHashMap(Type.TypeId, void),
-    ) Common.LowerError!bool {
-        for (self.types.span(span)) |ty| {
-            if (try self.typeContainsCallableInner(ty, visited)) return true;
-        }
-        return false;
     }
 
     fn typeContainsErasedFn(self: *Lowerer, ty: Type.TypeId) Common.LowerError!bool {

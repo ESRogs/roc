@@ -2562,7 +2562,7 @@ fn expectOptimizedHostEvents(
     source: []const u8,
     expected_termination: eval.RuntimeHostEnv.Termination,
     expected: []const ExpectedHostEvent,
-) anyerror!void {
+) TestError!void {
     const allocator = std.testing.allocator;
 
     var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .proc_debug_names = true });
@@ -2589,74 +2589,6 @@ fn expectOptimizedHostEvents(
             },
         }
     }
-}
-
-fn expectInlinePlanDecisions(
-    source: []const u8,
-    fn_name: []const u8,
-    expected_inline: bool,
-    expected_materialize: ?bool,
-) anyerror!void {
-    const allocator = std.testing.allocator;
-    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, source, &.{}, try sharedPrePublishedBuiltin());
-    defer helpers.cleanupParseAndCanonical(allocator, resources);
-
-    const import_count = resources.import_artifacts.len + if (resources.borrowed_builtin_artifact == null) @as(usize, 0) else 1;
-    const import_views = try allocator.alloc(check.CheckedArtifact.ImportedModuleView, import_count);
-    defer allocator.free(import_views);
-
-    var view_index: usize = 0;
-    if (resources.borrowed_builtin_artifact) |builtin_artifact| {
-        import_views[view_index] = check.CheckedArtifact.importedView(builtin_artifact);
-        view_index += 1;
-    }
-    for (resources.import_artifacts) |*artifact| {
-        import_views[view_index] = check.CheckedArtifact.importedView(artifact);
-        view_index += 1;
-    }
-
-    var mono = try postcheck.Monotype.Lower.run(
-        allocator,
-        .{
-            .root = check.CheckedArtifact.loweringView(&resources.checked_artifact),
-            .imports = import_views,
-        },
-        .{ .requests = resources.checked_artifact.root_requests.requests },
-        .{ .proc_debug_names = true },
-    );
-    var mono_owned = true;
-    errdefer if (mono_owned) mono.deinit();
-
-    var lifted = try postcheck.MonotypeLifted.Lift.run(allocator, mono);
-    mono_owned = false;
-    mono = undefined;
-    var lifted_owned = true;
-    errdefer if (lifted_owned) lifted.deinit();
-
-    var solved = try postcheck.LambdaSolved.Solve.run(allocator, lifted);
-    lifted_owned = false;
-    lifted = undefined;
-    defer solved.deinit();
-
-    var inline_plan = try postcheck.SolvedInline.analyze(allocator, .wrappers, &solved);
-    defer inline_plan.deinit();
-    const plan = inline_plan.view();
-
-    var found = false;
-    for (solved.lifted.fns.items, 0..) |fn_, index| {
-        const name_id = solved.lifted.procDebugName(fn_.symbol) orelse continue;
-        const actual_name = solved.lifted.names.exportNameText(name_id);
-        if (!std.mem.eql(u8, actual_name, fn_name)) continue;
-
-        found = true;
-        const fn_id: postcheck.MonotypeLifted.Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
-        try std.testing.expectEqual(expected_inline, plan.bodyForFn(fn_id) != null);
-        if (expected_materialize) |expected| {
-            try std.testing.expectEqual(expected, plan.materializeBodyForFn(fn_id) != null);
-        }
-    }
-
-    try std.testing.expect(found);
 }
 
 fn collectLirResultProcShape(
@@ -2798,7 +2730,7 @@ fn reachableProcDebugName(
     allocator: Allocator,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     expected_name: []const u8,
-) anyerror!bool {
+) TestError!bool {
     var work = std.ArrayList(LIR.LirProcSpecId).empty;
     defer work.deinit(allocator);
     try work.append(allocator, try rootProc(lowered));
@@ -2825,7 +2757,7 @@ fn reachableProcShapeFieldTotal(
     allocator: Allocator,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     comptime field_name: []const u8,
-) anyerror!usize {
+) TestError!usize {
     var work = std.ArrayList(LIR.LirProcSpecId).empty;
     defer work.deinit(allocator);
     try work.append(allocator, try rootProc(lowered));
@@ -2853,7 +2785,7 @@ fn expectReachableProcShapeFieldNoGreater(
     iter_lowered: *const lir.CheckedPipeline.LoweredProgram,
     list_lowered: *const lir.CheckedPipeline.LoweredProgram,
     comptime field_name: []const u8,
-) anyerror!void {
+) TestError!void {
     try expectReachableProcShapeFieldNoGreaterBy(allocator, iter_lowered, list_lowered, field_name, 0);
 }
 
@@ -2863,7 +2795,7 @@ fn expectReachableProcShapeFieldNoGreaterBy(
     list_lowered: *const lir.CheckedPipeline.LoweredProgram,
     comptime field_name: []const u8,
     allowed_extra: usize,
-) anyerror!void {
+) TestError!void {
     const iter_total = try reachableProcShapeFieldTotal(allocator, iter_lowered, field_name);
     const list_total = try reachableProcShapeFieldTotal(allocator, list_lowered, field_name);
     try std.testing.expect(iter_total <= list_total + allowed_extra);
@@ -2874,7 +2806,7 @@ fn expectReachableProcShapeFieldEqual(
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     comptime field_name: []const u8,
     expected: usize,
-) anyerror!void {
+) TestError!void {
     const actual = try reachableProcShapeFieldTotal(allocator, lowered, field_name);
     try std.testing.expectEqual(expected, actual);
 }
@@ -2882,7 +2814,7 @@ fn expectReachableProcShapeFieldEqual(
 fn expectStaticListIterAppendLoopAvoidsListAppendAllocation(
     iter_source: []const u8,
     list_source: []const u8,
-) anyerror!void {
+) TestError!void {
     const allocator = std.testing.allocator;
     var iter_optimized = try lowerModuleWithOptions(allocator, iter_source, .wrappers, .{ .tag_reachability = true });
     defer iter_optimized.deinit(allocator);
@@ -2904,7 +2836,7 @@ fn expectStaticListIterAppendLoopAvoidsListAppendAllocation(
 fn expectNoReachableErasedCallableLowering(
     allocator: Allocator,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
-) anyerror!void {
+) TestError!void {
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, lowered, "erased_call_count"));
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, lowered, "packed_erased_fn_count"));
 }
@@ -2917,7 +2849,7 @@ fn expectNoReachableErasedCallableLowering(
 // allocations_at_most=0 gate in eval_iter_alloc_tests.zig, which cannot express
 // module-level function definitions. RED on the recursive-nominal
 // representation (an escaping iterator boxes its state in its constructor).
-fn expectEscapingIterChainAllocatesNothing(source: []const u8) anyerror!void {
+fn expectEscapingIterChainAllocatesNothing(source: []const u8) TestError!void {
     const allocator = std.testing.allocator;
     var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
     defer optimized.deinit(allocator);
@@ -2992,6 +2924,75 @@ test "iter alloc static: branch-chosen iterator is zero-alloc" {
     );
 }
 
+test "iter alloc static: same adapter with different capture layouts is zero-alloc" {
+    try expectEscapingIterChainAllocatesNothing(
+        \\module [main]
+        \\
+        \\Config : { big : U64, small : U64 }
+        \\
+        \\consume : Iter(U64) -> U64
+        \\consume = |it| {
+        \\    var $sum = 0.U64
+        \\    for x in it {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\choose : Bool -> Iter(U64)
+        \\choose = |flag| {
+        \\    offset = 1.U64
+        \\    config : Config
+        \\    config = { big: 10, small: 3 }
+        \\    if flag {
+        \\        Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + offset)
+        \\    } else {
+        \\        Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + config.big + config.small)
+        \\    }
+        \\}
+        \\
+        \\main : Bool -> U64
+        \\main = |flag| consume(choose(flag))
+    );
+}
+
+test "iter alloc static: runtime-count map wrapping terminates at dynamic boundary" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\consume : Iter(U64) -> U64
+        \\consume = |it| {
+        \\    var $sum = 0.U64
+        \\    for x in it {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\wrap : U64, Iter(U64) -> Iter(U64)
+        \\wrap = |count, iterator| {
+        \\    var $i = 0.U64
+        \\    var $current = iterator
+        \\    while $i < count {
+        \\        offset = $i
+        \\        $current = Iter.map($current, |x| x + offset)
+        \\        $i = $i + 1
+        \\    }
+        \\    $current
+        \\}
+        \\
+        \\main : U64 -> U64
+        \\main = |count| consume(wrap(count, Iter.exclusive_range(0.U64, 5)))
+    ;
+
+    var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
+    defer optimized.deinit(allocator);
+    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "box_box_count") > 0);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "packed_erased_fn_count", 0);
+}
+
 // The base `[list].iter().fold` must lower with no boxed iterator state and no
 // erased callable dispatch: the list literal may allocate its backing store, but
 // the iterator itself must carry its step closure inline by value. This asserts
@@ -3017,7 +3018,7 @@ test "iter alloc static: base list fold is zero-alloc" {
 fn reachableReturnSlotProcCount(
     allocator: Allocator,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
-) anyerror!usize {
+) TestError!usize {
     var work = std.ArrayList(LIR.LirProcSpecId).empty;
     defer work.deinit(allocator);
     try work.append(allocator, try rootProc(lowered));
@@ -3049,17 +3050,6 @@ fn reachableReturnSlotProcCount(
         const calls = try collectAssignCallProcs(allocator, lowered, proc_id);
         defer allocator.free(calls);
         for (calls) |call| try work.append(allocator, call);
-    }
-    return count;
-}
-
-fn countHostedLiftedFns(program: *const postcheck.MonotypeLifted.Ast.Program) usize {
-    var count: usize = 0;
-    for (program.fns.items) |fn_| {
-        switch (fn_.body) {
-            .roc => {},
-            .hosted => count += 1,
-        }
     }
     return count;
 }
@@ -3107,7 +3097,7 @@ fn branchJoinedRecordStateWorkerIsGeneric(shape: ProcShape) bool {
         shape.jump_count >= 2;
 }
 
-fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_unsafe_count: usize) anyerror!void {
+fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_unsafe_count: usize) TestError!void {
     const allocator = std.testing.allocator;
 
     var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .proc_debug_names = true });
@@ -3150,33 +3140,6 @@ test "direct call wrapper is not inlined under ordinary post-check lowering" {
         \\main : U64
         \\main = wrapper(41)
     , .none);
-}
-
-test "user single wrapper can inline to builtin single iterator" {
-    const allocator = std.testing.allocator;
-    var lowered_source = try lowerModule(allocator,
-        \\module [main]
-        \\
-        \\Boxed := [Boxed].{
-        \\    single : I64 -> Iter(I64)
-        \\    single = |item| Iter.single(item)
-        \\}
-        \\
-        \\main : I64
-        \\main = {
-        \\    var $sum = 0.I64
-        \\    for item in Boxed.single(42.I64) {
-        \\        $sum = $sum + item
-        \\    }
-        \\    $sum
-        \\}
-    , .wrappers);
-    defer lowered_source.deinit(allocator);
-
-    const shape = try collectProcShape(allocator, &lowered_source.lowered, try rootProc(&lowered_source.lowered));
-    try std.testing.expectEqual(@as(usize, 0), shape.direct_call_count);
-    try std.testing.expectEqual(@as(usize, 0), shape.tag_assign_count);
-    try std.testing.expectEqual(@as(usize, 0), shape.store_tag_count);
 }
 
 test "user iter method is not recognized as builtin list cursor" {
@@ -4593,17 +4556,14 @@ test "spec constr specializes match-joined record state carried by while loop" {
     try std.testing.expect(try reachableProcShape(allocator, &unoptimized.lowered, branchJoinedRecordStateWorkerIsGeneric));
 }
 
-// ============================================================================
-// Iterator-fusion differential harness (iter_fusion_design.md Phase 0).
+// Iterator lowering differential harness.
 //
 // Each `iterdiff:` test lowers ONE Roc source under two inline modes and runs
 // both through the interpreter against `RuntimeHostEnv`, then asserts the two
 // runs are observationally identical:
 //
 //   * `.wrappers` is the optimized/inlined lowering (the closest proxy the tree
-//     has for "fused" until real stream fusion lands; when fusion is
-//     implemented it composes into this same mode, so these tests keep guarding
-//     it).
+//     has for the lower-all-known-wrappers path).
 //   * `.none` is the naive, un-inlined lowering ("unfused").
 //
 // The two runs must agree on:
@@ -4624,7 +4584,6 @@ test "spec constr specializes match-joined record state carried by while loop" {
 // pre-existing divergence between the optimized and naive lowerings, not a test
 // bug; such cases are committed commented-out with a `// Pre-existing
 // divergence:` marker rather than weakened to pass.
-// ============================================================================
 
 fn expectRecordedRunsEqual(
     expected: eval.RuntimeHostEnv.RecordedRun,

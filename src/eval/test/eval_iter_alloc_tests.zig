@@ -1,4 +1,4 @@
-//! Zero-allocation gate for Iter/Stream.
+//! Zero-allocation gate for Iter.
 //!
 //! Every iterator case asserts `max_allocations = 0`: a statically-known
 //! iterator chain must perform ZERO heap allocations, regardless of how it is
@@ -20,6 +20,8 @@
 
 const TestCase = @import("parallel_runner.zig").TestCase;
 
+/// Eval test cases that require statically-known Iter chains to run without
+/// heap allocation.
 pub const tests = [_]TestCase{
     // --- Canaries: prove the observation pattern (literal + arithmetic +
     // branch) allocates nothing, so a nonzero count is the iterator's fault. ---
@@ -48,6 +50,85 @@ pub const tests = [_]TestCase{
     .{
         .name = "iter alloc: range keep_if fold is zero-alloc",
         .source = "if Iter.fold(Iter.keep_if(Iter.exclusive_range(0.U64, 6), |n| n > 2), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: range drop_if fold is zero-alloc",
+        .source = "if Iter.fold(Iter.drop_if(Iter.exclusive_range(0.U64, 6), |n| n <= 2), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: range take_first fold is zero-alloc",
+        .source = "if Iter.fold(Iter.take_first(Iter.exclusive_range(0.U64, 6), 3), 0.U64, |a, b| a + b) == 3 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: range drop_first fold is zero-alloc",
+        .source = "if Iter.fold(Iter.drop_first(Iter.exclusive_range(0.U64, 6), 3), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: range concat fold is zero-alloc",
+        .source = "if Iter.fold(Iter.concat(Iter.exclusive_range(0.U64, 3), Iter.exclusive_range(3.U64, 6)), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: range append fold is zero-alloc",
+        .source = "if Iter.fold(Iter.append(Iter.exclusive_range(0.U64, 5), 5), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: captured range map folds are zero-alloc",
+        .source =
+        \\{
+        \\    offset = 1.U64
+        \\    record = { big: 10.U64, small: 3.U64 }
+        \\    small = Iter.fold(Iter.map(Iter.exclusive_range(0.U64, 5), |n| n + offset), 0.U64, |a, b| a + b)
+        \\    large = Iter.fold(Iter.map(Iter.exclusive_range(0.U64, 5), |n| n + record.big + record.small), 0.U64, |a, b| a + b)
+        \\    if small == 15 and large == 75 { "ok" } else { "bad" }
+        \\}
+        ,
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: finite deep static map chain is zero-alloc",
+        .source =
+        \\if Iter.fold(
+        \\    Iter.map(
+        \\        Iter.map(
+        \\            Iter.map(
+        \\                Iter.map(
+        \\                    Iter.map(
+        \\                        Iter.map(
+        \\                            Iter.map(
+        \\                                Iter.map(
+        \\                                    Iter.map(
+        \\                                        Iter.map(
+        \\                                            Iter.exclusive_range(0.U64, 5),
+        \\                                            |n| n + 1,
+        \\                                        ),
+        \\                                        |n| n + 1,
+        \\                                    ),
+        \\                                    |n| n + 1,
+        \\                                ),
+        \\                                |n| n + 1,
+        \\                            ),
+        \\                            |n| n + 1,
+        \\                        ),
+        \\                        |n| n + 1,
+        \\                    ),
+        \\                    |n| n + 1,
+        \\                ),
+        \\                |n| n + 1,
+        \\            ),
+        \\            |n| n + 1,
+        \\        ),
+        \\        |n| n + 1,
+        \\    ),
+        \\    0.U64,
+        \\    |a, b| a + b,
+        \\) == 60 { "ok" } else { "bad" }
+        ,
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
 

@@ -1914,12 +1914,10 @@ Builtin :: [].{
 											Ok(Continue({ rest: HttpHeaderState.{ raw: line_parts.after } }))
 										} else {
 											Ok(
-												TryFieldCaseless(
-													{
-														name,
-														rest: HttpHeaderState.{ raw: value_start },
-													},
-												),
+												TryFieldCaseless({
+													name,
+													rest: HttpHeaderState.{ raw: value_start },
+												}),
 											)
 										}
 									}
@@ -2783,7 +2781,12 @@ Builtin :: [].{
 					},
 					||
 						match Iter.next(remaining_first) {
-							Done => Iter.next(remaining_second)
+							Done =>
+								match Iter.next(remaining_second) {
+									Done => Done
+									Skip({ rest }) => Skip({ rest: make(range_done(), rest) })
+									One({ item, rest }) => One({ item, rest: make(range_done(), rest) })
+								}
 							Skip({ rest }) => Skip({ rest: make(rest, remaining_second) })
 							One({ item, rest }) => One({ item, rest: make(rest, remaining_second) })
 						},
@@ -2980,7 +2983,7 @@ Builtin :: [].{
 									} else {
 										Skip({ rest: Iter.drop_first(rest, n - 1) })
 									}
-							},
+								},
 					)
 				}
 
@@ -15194,12 +15197,10 @@ dict_find = |data, key| {
 			Missing({ bucket_index: 0, dist_and_fingerprint: 0 })
 		} else {
 			hash = dict_hash_key(key)
-			Missing(
-				{
-					bucket_index: dict_bucket_index_from_hash(hash, data.shifts),
-					dist_and_fingerprint: dict_dist_and_fingerprint_from_hash(hash),
-				},
-			)
+			Missing({
+				bucket_index: dict_bucket_index_from_hash(hash, data.shifts),
+				dist_and_fingerprint: dict_dist_and_fingerprint_from_hash(hash),
+			})
 		}
 	} else if List.is_empty(data.buckets) {
 		crash "Dict invariant violated: entries without buckets"

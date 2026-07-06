@@ -69,7 +69,7 @@ EndOfFile,
 							(ty-var (raw "a")))
 						(ty (name "Str")))
 					(where
-						(method (module-of "a") (name "frobnicate")
+						(method (module-of "a") (name "frobnicate") (effectful false)
 							(args
 								(ty-var (raw "a")))
 							(ty (name "Str")))))
@@ -88,7 +88,7 @@ EndOfFile,
 				(ty-var (raw "b"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "b") (name "unwrap")
+				(method (module-of "b") (name "unwrap") (effectful false)
 					(args
 						(ty-var (raw "b")))
 					(ty (name "Str")))))
@@ -144,7 +144,7 @@ main = run(Wrap.W(42.U8))
 					(ty-rigid-var (name "a")))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "frobnicate")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "frobnicate") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))
@@ -163,7 +163,7 @@ main = run(Wrap.W(42.U8))
 				(ty-rigid-var (name "b"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "unwrap")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "unwrap") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "b"))))
 					(ty-lookup (name "Str") (builtin))))))

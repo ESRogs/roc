@@ -992,7 +992,7 @@ pub fn publishProgramKeepingReportedComptimeProblems(
     source_kind: SourceKind,
     source: []const u8,
     imports: []const ModuleSource,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgramWithRootModeReporting(
         allocator,
         source_kind,

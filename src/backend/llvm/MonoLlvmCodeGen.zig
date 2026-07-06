@@ -560,6 +560,48 @@ pub const MonoLlvmCodeGen = struct {
         builder.finishModuleAsm(&aw) catch return error.OutOfMemory;
     }
 
+    fn emitDefaultBuildStartModuleAsm(self: *MonoLlvmCodeGen, builder: *LlvmBuilder, main_symbol: []const u8) Error!void {
+        if (self.target.os.tag != .linux) return error.CompilationFailed;
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+
+        switch (self.target.cpu.arch) {
+            .x86_64 => w.print(
+                \\.text
+                \\.globl _start
+                \\.type _start,@function
+                \\_start:
+                \\    and $-16, %rsp
+                \\    call roc_default_runtime_init
+                \\    call {s}
+                \\    mov %rax, %rdi
+                \\    mov $60, %rax
+                \\    syscall
+                \\    ud2
+                \\.size _start, .-_start
+                \\
+            , .{main_symbol}) catch return error.OutOfMemory,
+            .aarch64 => w.print(
+                \\.text
+                \\.globl _start
+                \\.type _start,%function
+                \\_start:
+                \\    bl roc_default_runtime_init
+                \\    bl {s}
+                \\    mov x8, #94
+                \\    svc #0
+                \\    brk #0
+                \\.size _start, .-_start
+                \\
+            , .{main_symbol}) catch return error.OutOfMemory,
+            else => return error.CompilationFailed,
+        }
+
+        builder.finishModuleAsm(&aw) catch return error.OutOfMemory;
+    }
+
     pub fn generateEntrypointModule(
         self: *MonoLlvmCodeGen,
         module_name: []const u8,
@@ -1653,6 +1695,8 @@ pub const MonoLlvmCodeGen = struct {
         arg_layouts: []const layout.Idx,
         ret_layout: layout.Idx,
     ) Error!void {
+        if (!std.mem.eql(u8, symbol_name, "_start")) return error.CompilationFailed;
+
         switch (self.target.cpu.arch) {
             .x86_64, .aarch64 => {},
             else => return error.CompilationFailed,
@@ -1661,8 +1705,9 @@ pub const MonoLlvmCodeGen = struct {
         const builder = self.builder orelse return error.CompilationFailed;
         const proc_fn = self.proc_registry.get(@intFromEnum(entry_proc)) orelse return error.CompilationFailed;
 
-        const wrapper_ty = builder.fnType(.void, &.{}, .normal) catch return error.OutOfMemory;
-        const wrapper_name = try self.exportedFunctionName(builder, symbol_name);
+        const main_symbol = "roc_default_start_main";
+        const wrapper_ty = builder.fnType(self.ptrSizedIntType(), &.{}, .normal) catch return error.OutOfMemory;
+        const wrapper_name = builder.strtabString(main_symbol) catch return error.OutOfMemory;
         const wrapper = builder.addFunction(wrapper_ty, wrapper_name, .default) catch return error.OutOfMemory;
         wrapper.setLinkage(.external, builder);
         var attrs_wip: LlvmBuilder.FunctionAttributes.Wip = .{};
@@ -1681,20 +1726,16 @@ pub const MonoLlvmCodeGen = struct {
         const entry = wip.block(0, "entry") catch return error.OutOfMemory;
         wip.cursor = .{ .block = entry };
 
-        if (self.enable_default_platform_runtime) {
-            const init_ty = builder.fnType(.void, &.{}, .normal) catch return error.OutOfMemory;
-            const init_fn = try self.declareExternSymbol("roc_default_runtime_init", init_ty);
-            _ = wip.call(.normal, .ccc, .none, init_ty, init_fn.toValue(builder), &.{}, "") catch return error.OutOfMemory;
-        }
-
         const ret_slot = try self.allocArgBuffer(&.{ret_layout}, false);
         const args_buf = try self.allocArgBuffer(arg_layouts, true);
         _ = try self.callFunctionIndex(proc_fn, &.{ ret_slot, args_buf }, false);
 
         const exit_code_raw = try self.loadScalar(ret_slot, ret_layout);
         const exit_code = try self.coerceScalar(exit_code_raw, self.ptrSizedIntType(), false);
-        try self.emitLinuxExitSyscall(exit_code);
+        _ = wip.ret(exit_code) catch return error.OutOfMemory;
         try self.finishCurrentWipFunction();
+
+        try self.emitDefaultBuildStartModuleAsm(builder, main_symbol);
     }
 
     fn createBuilder(self: *MonoLlvmCodeGen, name: []const u8) Error!LlvmBuilder {
@@ -8234,14 +8275,6 @@ pub const MonoLlvmCodeGen = struct {
         }
     }
 
-    fn emitLinuxExitSyscall(self: *MonoLlvmCodeGen, code: LlvmBuilder.Value) Error!void {
-        switch (self.target.cpu.arch) {
-            .x86_64 => try self.emitX86_64LinuxExitSyscall(code),
-            .aarch64 => try self.emitAarch64LinuxExitSyscall(code),
-            else => return error.CompilationFailed,
-        }
-    }
-
     fn emitX86_64LinuxWriteStdout(self: *MonoLlvmCodeGen, ptr: LlvmBuilder.Value, len: LlvmBuilder.Value) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const wip = self.wip orelse return error.CompilationFailed;
@@ -8284,48 +8317,6 @@ pub const MonoLlvmCodeGen = struct {
             },
             "",
         ) catch return error.OutOfMemory;
-    }
-
-    fn emitX86_64LinuxExitSyscall(self: *MonoLlvmCodeGen, code: LlvmBuilder.Value) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
-        const usize_ty = self.ptrSizedIntType();
-        const fn_ty = builder.fnType(.void, &.{ usize_ty, usize_ty }, .normal) catch return error.OutOfMemory;
-
-        _ = wip.callAsm(
-            .none,
-            fn_ty,
-            .{ .sideeffect = true },
-            builder.string("syscall") catch return error.OutOfMemory,
-            builder.string("{rax},{rdi},~{rcx},~{r11},~{memory}") catch return error.OutOfMemory,
-            &.{
-                builder.intValue(usize_ty, 60) catch return error.OutOfMemory,
-                code,
-            },
-            "",
-        ) catch return error.OutOfMemory;
-        _ = wip.@"unreachable"() catch return error.OutOfMemory;
-    }
-
-    fn emitAarch64LinuxExitSyscall(self: *MonoLlvmCodeGen, code: LlvmBuilder.Value) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
-        const usize_ty = self.ptrSizedIntType();
-        const fn_ty = builder.fnType(.void, &.{ usize_ty, usize_ty }, .normal) catch return error.OutOfMemory;
-
-        _ = wip.callAsm(
-            .none,
-            fn_ty,
-            .{ .sideeffect = true },
-            builder.string("svc #0") catch return error.OutOfMemory,
-            builder.string("{x8},{x0},~{memory}") catch return error.OutOfMemory,
-            &.{
-                builder.intValue(usize_ty, 94) catch return error.OutOfMemory,
-                code,
-            },
-            "",
-        ) catch return error.OutOfMemory;
-        _ = wip.@"unreachable"() catch return error.OutOfMemory;
     }
 
     /// Emit a hosted-function call using the platform C ABI: small arguments and the return

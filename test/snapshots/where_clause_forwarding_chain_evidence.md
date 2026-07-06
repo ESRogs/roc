@@ -52,7 +52,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "describe")
+				(method (module-of "a") (name "describe") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -70,7 +70,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "describe")
+				(method (module-of "a") (name "describe") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -87,7 +87,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "describe")
+				(method (module-of "a") (name "describe") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -167,7 +167,7 @@ main = f(Named.N("ok"))
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "describe")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "describe") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))
@@ -186,7 +186,7 @@ main = f(Named.N("ok"))
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "describe")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "describe") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))
@@ -205,7 +205,7 @@ main = f(Named.N("ok"))
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "describe")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "describe") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))

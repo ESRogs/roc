@@ -1,17 +1,5 @@
 //! Tests for compile-time diagnostics that are emitted while publishing checked modules.
 
-const std = @import("std");
-const check = @import("check");
-const eval = @import("eval");
-
-fn countProblemTag(problems: []const check.problem.Problem, tag: check.problem.Problem.Tag) usize {
-    var count: usize = 0;
-    for (problems) |problem| {
-        if (std.meta.activeTag(problem) == tag) count += 1;
-    }
-    return count;
-}
-
 // Ported pending iterator redesign: the comptime_dbg problem kind this test counts is not part of the current problem set.
 // test "imported eligible top-level diagnostics run during checking" {
 //     const allocator = std.testing.allocator;

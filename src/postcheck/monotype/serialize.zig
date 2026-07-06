@@ -24,7 +24,8 @@ pub const MAGIC: [8]u8 = .{ 'R', 'O', 'C', 'S', 'P', 'E', 'C', 0 };
 /// Serialization format version for specialization cache files.
 /// Version 3: `SpecRecord` carries an immutable requested-type identity plus
 /// separate request/solved type views.
-pub const FORMAT_VERSION: u32 = 3;
+/// Version 4: Type definitions carry generated iterator backing evidence.
+pub const FORMAT_VERSION: u32 = 4;
 
 const SECTION_COUNT = 39;
 /// Required byte alignment for every section payload. This covers all typed

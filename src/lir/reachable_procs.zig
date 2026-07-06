@@ -250,11 +250,9 @@ const Pass = struct {
         }
     }
 
-    fn markStaticData(self: *Pass, id: LIR.StaticDataId) Allocator.Error!void {
+    fn markStaticData(_: *Pass, _: LIR.StaticDataId) Allocator.Error!void {
         // No lowering stage emits static-data literals, so the LIR program
         // carries no static-data value table for this reference to index.
-        _ = self;
-        _ = id;
         reachableProcInvariant("static data literal reached reachable-proc marking without a static data table");
     }
 
@@ -552,11 +550,9 @@ const Pass = struct {
         if (@intFromEnum(proc) >= proc_count) reachableProcInvariant("stmt proc reference exceeds compact proc_specs len");
     }
 
-    fn verifyStaticDataRef(self: *Pass, id: LIR.StaticDataId) void {
+    fn verifyStaticDataRef(_: *Pass, _: LIR.StaticDataId) void {
         // No lowering stage emits static-data literals, so any reference here
         // has nothing to resolve against.
-        _ = self;
-        _ = id;
         reachableProcInvariant("stmt static data reference has no static data table to resolve against");
     }
 
