@@ -38,7 +38,8 @@ pub const Constants = struct {
     /// 13: ModuleEnv stores deep content identity hashes.
     /// 14: ModuleEnv also stores scheme instantiation evidence records.
     /// 15: Checked encoder_for runtime representation changed serialized compiler state.
-    pub const CACHE_VERSION = 15;
+    /// 16: Static dispatch constraints carry introducing-site provenance.
+    pub const CACHE_VERSION = 16;
 };
 
 /// Configuration for the Roc cache system.

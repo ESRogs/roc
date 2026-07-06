@@ -137,6 +137,10 @@ fn isVarIdent(self: *Parser, token: Token.Idx) bool {
     return false;
 }
 
+fn isLowerRecordFieldName(self: *Parser, token: Token.Idx) bool {
+    return self.tok_buf.tokens.items(.tag)[token] == .LowerIdent and !self.isVarIdent(token);
+}
+
 /// Check if the current position looks like a type declaration with a valid type following.
 /// This peeks ahead without consuming tokens to determine if we have:
 /// - `Name :` followed by a valid type start token
@@ -804,9 +808,10 @@ fn parseStringExprTokens(self: *Parser) std.mem.Allocator.Error!AST.Expr.Idx {
 
 fn parseRecordFieldTokens(self: *Parser) std.mem.Allocator.Error!AST.RecordField.Idx {
     const start = self.pos;
-    self.expect(.LowerIdent) catch {
+    if (!self.isLowerRecordFieldName(start)) {
         return try self.pushMalformed(AST.RecordField.Idx, .expected_expr_record_field_name, start);
-    };
+    }
+    self.advance();
     const name = start;
     var value: ?AST.Expr.Idx = null;
     if (self.peek() == .OpColon) {
@@ -1773,9 +1778,10 @@ fn parseSymbolMapCollectionTokens(
     open_tag: AST.Diagnostic.Tag,
     close_tag: AST.Diagnostic.Tag,
 ) std.mem.Allocator.Error!AST.SymbolMapEntry.Span {
+    const start = self.pos;
     self.expect(.OpenCurly) catch {
         _ = try self.pushMalformed(AST.SymbolMapEntry.Idx, open_tag, self.pos);
-        return .{ .span = .{ .start = 0, .len = 0 } };
+        return .{ .span = .{ .start = 0, .len = 0 }, .region = .{ .start = start, .end = self.pos } };
     };
     const top = self.store.scratchSymbolMapEntryTop();
     while (self.peek() != .CloseCurly and self.peek() != .EndOfFile) {
@@ -1787,9 +1793,9 @@ fn parseSymbolMapCollectionTokens(
     self.expect(.CloseCurly) catch {
         self.store.clearScratchSymbolMapEntriesFrom(top);
         _ = try self.pushMalformed(AST.SymbolMapEntry.Idx, close_tag, self.pos);
-        return .{ .span = .{ .start = 0, .len = 0 } };
+        return .{ .span = .{ .start = 0, .len = 0 }, .region = .{ .start = start, .end = self.pos } };
     };
-    return try self.store.symbolMapEntrySpanFrom(top);
+    return try self.store.symbolMapEntrySpanFrom(top, .{ .start = start, .end = self.pos });
 }
 
 fn parsePlatformHeaderTokens(self: *Parser) std.mem.Allocator.Error!AST.Header.Idx {
@@ -3216,10 +3222,10 @@ fn runExprStatementKernel(
                 }
                 if (tok == .TripleDot) {
                     const start = self.pos;
+                    self.advance();
                     const expr = try self.store.addExpr(.{ .ellipsis = .{
                         .region = .{ .start = start, .end = self.pos },
                     } });
-                    self.advance();
                     expr_finish_state = .{ .start = start, .min_bp = expr_state.min_bp, .expr = expr };
                     continue :expr_kernel .suffix;
                 }
@@ -4179,6 +4185,13 @@ fn runExprStatementKernel(
             .CloseCurly => continue :expr_kernel .record_finish,
             .LowerIdent => {
                 const field_start = self.pos;
+                if (!self.isLowerRecordFieldName(field_start)) {
+                    const malformed_field = try self.pushMalformed(AST.RecordField.Idx, .expected_expr_record_field_name, field_start);
+                    try self.store.addScratchRecordField(malformed_field);
+                    const expr = try self.pushMalformed(AST.Expr.Idx, .expected_expr_close_curly_or_comma, self.pos);
+                    expr_finish_state = .{ .start = expr_record_state.start, .min_bp = expr_record_state.min_bp, .expr = expr };
+                    continue :expr_kernel .suffix;
+                }
                 self.advance();
                 const name = field_start;
                 if (self.peek() == .OpColon) {
@@ -4825,6 +4838,16 @@ fn runExprStatementKernel(
             // record types. They parse like any other field name.
             .LowerIdent, .Underscore, .NamedUnderscore => {
                 const field_start = self.pos;
+                if (self.peek() == .LowerIdent and !self.isLowerRecordFieldName(field_start)) {
+                    while (self.peek() != .CloseCurly and self.peek() != .Comma and self.peek() != .EndOfFile) {
+                        self.advance();
+                    }
+                    const malformed_field = try self.pushMalformed(AST.AnnoRecordField.Idx, .expected_type_field_name, field_start);
+                    try self.store.addScratchAnnoRecordField(malformed_field);
+                    self.store.clearScratchAnnoRecordFieldsFrom(type_record_state.scratch_top);
+                    last_type_anno = try self.pushMalformed(AST.TypeAnno.Idx, .expected_ty_close_curly_or_comma, self.pos);
+                    continue :expr_kernel .type_complete;
+                }
                 const name = self.pos;
                 self.advance();
                 if (self.peek() != .OpColon) {
@@ -6102,6 +6125,13 @@ fn runExprStatementKernel(
             },
             .LowerIdent => {
                 const field_start = self.pos;
+                if (!self.isLowerRecordFieldName(field_start)) {
+                    while (self.peek() != .EndOfFile and self.peek() != .CloseCurly) {
+                        self.advance();
+                    }
+                    last_pattern = try self.pushMalformed(AST.Pattern.Idx, .expected_lower_ident_pat_field_name, field_start);
+                    continue :expr_kernel .pattern_complete;
+                }
                 const name = self.pos;
                 self.advance();
                 if (self.peek() == .Comma or self.peek() == .CloseCurly) {
