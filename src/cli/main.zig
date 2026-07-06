@@ -12886,7 +12886,7 @@ fn bumpExtractApi(ctx: *CliCtx, build_env: *compile.BuildEnv, side: []const u8) 
         } }),
     }
 
-    // Map every compiled module's name to the package that owns it, so type
+    // Map every compiled module's identity to the package that owns it, so type
     // origins in public signatures resolve to stable package identities.
     var origins = bump.extract.OriginMap{};
     defer origins.deinit(ctx.gpa);
@@ -12918,6 +12918,8 @@ fn bumpExtractApi(ctx: *CliCtx, build_env: *compile.BuildEnv, side: []const u8) 
                         .kind = origin_kind,
                         .module_name = mod_env.module_name,
                     };
+                    const identity_hash = mod_env.contentIdentityHash() orelse return error.Internal;
+                    try origins.putIdentity(ctx.gpa, identity_hash, origin);
                     try origins.put(ctx.gpa, mod_env.module_name, origin);
                     try origins.put(ctx.gpa, mod_env.getIdentText(mod_env.qualified_module_ident), origin);
                 }

@@ -34,12 +34,11 @@ pub const ModuleInput = struct {
     artifact: *const CheckedModuleArtifact,
 };
 
-/// Resolves an origin module name (as recorded in checked types, which may be
-/// package-qualified like "json.Decode") to the package that owns it. Built
-/// by the caller from resolver results; register each module under both its
-/// bare and qualified names.
+/// Resolves an origin module identity (as recorded in checked types) to the
+/// package that owns it. Built by the caller from resolver results.
 pub const OriginMap = struct {
     map: std.StringHashMapUnmanaged(Origin) = .empty,
+    identity_map: std.AutoHashMapUnmanaged([32]u8, Origin) = .empty,
 
     pub const Origin = struct {
         kind: Kind,
@@ -63,7 +62,12 @@ pub const OriginMap = struct {
         try self.map.put(gpa, key, origin);
     }
 
+    pub fn putIdentity(self: *OriginMap, gpa: Allocator, key: *const [32]u8, origin: Origin) Allocator.Error!void {
+        try self.identity_map.put(gpa, key.*, origin);
+    }
+
     pub fn deinit(self: *OriginMap, gpa: Allocator) void {
+        self.identity_map.deinit(gpa);
         self.map.deinit(gpa);
     }
 };
@@ -187,7 +191,7 @@ const Extractor = struct {
             const key = try canonical_type_keys.fromVar(
                 self.gpa,
                 &module_env.types,
-                module_env.getIdentStoreConst(),
+                module_env,
                 decl_var,
             );
             const root = view.rootForKey(key) orelse
@@ -220,7 +224,7 @@ const Extractor = struct {
             const scheme_key = try canonical_type_keys.schemeFromVar(
                 self.gpa,
                 &module_env.types,
-                module_env.getIdentStoreConst(),
+                module_env,
                 ModuleEnv.varFrom(def_idx),
             );
             const scheme = view.schemeForKey(scheme_key) orelse
@@ -304,7 +308,7 @@ const Extractor = struct {
                 const api_id = try self.addNamedRef(
                     view,
                     names,
-                    names.moduleNameText(alias.origin_module),
+                    alias.origin_module,
                     names.typeNameText(alias.name),
                     alias.builtin_origin,
                     alias.args,
@@ -317,7 +321,7 @@ const Extractor = struct {
                 const api_id = try self.addNamedRef(
                     view,
                     names,
-                    names.moduleNameText(nominal.origin_module),
+                    nominal.origin_module,
                     names.typeNameText(nominal.name),
                     nominal.builtin != null,
                     nominal.args,
@@ -411,7 +415,7 @@ const Extractor = struct {
         self: *Extractor,
         view: CheckedTypeStoreView,
         names: *const check.CanonicalNames.CanonicalNameStore,
-        origin_module: []const u8,
+        origin_module: check.CanonicalNames.ModuleIdentityId,
         type_name: []const u8,
         is_builtin: bool,
         args: []const CheckedTypeId,
@@ -419,10 +423,11 @@ const Extractor = struct {
     ) ExtractError!PackageApi.TypeId {
         const alloc = self.api.allocator();
 
-        var path_module = origin_module;
-        const origin: PackageApi.TypeOrigin = if (is_builtin or std.mem.eql(u8, origin_module, "Builtin"))
+        var path_module: []const u8 = "Builtin";
+        const origin_hash = names.moduleIdentityBytes(origin_module);
+        const origin: PackageApi.TypeOrigin = if (is_builtin)
             .builtin
-        else if (self.origins.map.get(origin_module)) |resolved| origin_blk: {
+        else if (self.origins.identity_map.get(origin_hash.*)) |resolved| origin_blk: {
             path_module = resolved.module_name;
             break :origin_blk switch (resolved.kind) {
                 .self => .self,
@@ -434,7 +439,10 @@ const Extractor = struct {
                 .unstable => |spec| return self.fail(.unstable_dependency_in_public_api, spec),
             };
         } else {
-            return self.fail(.unknown_origin_module, origin_module);
+            const origin_hex = std.fmt.bytesToHex(origin_hash.*, .lower);
+            const detail = try std.fmt.allocPrint(self.gpa, "0x{s}", .{origin_hex[0..]});
+            defer self.gpa.free(detail);
+            return self.fail(.unknown_origin_module, detail);
         };
 
         const path = try qualifiedPath(alloc, origin, path_module, type_name);
