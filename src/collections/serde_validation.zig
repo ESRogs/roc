@@ -1,7 +1,6 @@
 //! Shared compile-time and load-time checks for relocatable serialized data.
 
-const std = @import("std");
-
+/// Maps a field name in an owning type to its serialized field name.
 pub const FieldRename = struct {
     owner: []const u8,
     serialized: []const u8,
@@ -36,6 +35,8 @@ fn renamedSerializedField(comptime renames: []const FieldRename, comptime owner:
     return null;
 }
 
+/// Verifies that serialized fields and owner fields match, accounting for
+/// explicitly excluded fields and explicit renames.
 pub fn assertBidirectionalFieldSet(
     comptime Owner: type,
     comptime Serialized: type,
@@ -128,6 +129,7 @@ pub fn assertSerializedRelocatable(comptime T: type) void {
     }
 }
 
+/// Validates every relocatable marker reachable from a serialized value.
 pub fn validateSerializedRelocations(comptime T: type, self: *const T, backing_len: u64) error{CorruptArtifact}!void {
     switch (@typeInfo(T)) {
         .@"struct" => |s| {

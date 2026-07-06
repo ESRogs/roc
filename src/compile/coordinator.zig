@@ -93,6 +93,7 @@ const CheckedModuleCacheRunError = eval.BuiltinModules.InitError || Allocator.Er
     TestUnexpectedResult,
 };
 const OverwriteFilesUnderDirError = Allocator.Error || std.Io.Dir.OpenError || std.Io.Dir.SelectiveWalker.Error || std.Io.Dir.WriteFileError;
+const CorruptCheckedModuleCacheError = Allocator.Error || std.Io.Dir.OpenError || std.Io.Dir.SelectiveWalker.Error || std.Io.Dir.ReadFileAllocError || std.Io.Dir.WriteFileError || error{FileNotFound};
 const TypeCheckedResult = messages.TypeCheckedResult;
 const CompileFailure = messages.CompileFailure;
 const DiscoveredLocalImport = messages.DiscoveredLocalImport;
@@ -5527,7 +5528,7 @@ fn overwriteFilesUnderDir(allocator: Allocator, absolute_dir: []const u8, conten
     return overwritten;
 }
 
-fn corruptFirstCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_module_cache_dir: []const u8) !void {
+fn corruptFirstCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!void {
     const env_ident_bytes_len_offset =
         checked_module_cache_header_len +
         @offsetOf(ModuleEnv.Serialized, "common") +
