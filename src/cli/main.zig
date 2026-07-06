@@ -7193,6 +7193,29 @@ fn configuredWasmMinimumMemory(args: cli_args.BuildArgs, wasm: ?roc_target.WasmT
     return linker.DEFAULT_WASM_INITIAL_MEMORY;
 }
 
+/// Whether linked wasm output may assume linear memory starts zero-filled.
+/// Fresh (non-imported) wasm memory is always zeroed; imported memory is
+/// zeroed only when the platform's targets config declares
+/// `import_memory: Zeroed`. Mirrors the dev backend's
+/// `omit_zero_fill_data_segments` decision in `configuredWasmMemory`.
+fn configuredWasmZeroFilledMemory(wasm: ?roc_target.WasmTargetConfig) bool {
+    if (wasm) |config| {
+        return !config.import_memory.importsMemory() or config.import_memory.importedMemoryIsZeroed();
+    }
+    return true;
+}
+
+/// Binaryen post-link optimization mode for linked wasm output, derived from
+/// the build's opt level: LLVM opt levels get the matching Binaryen pass;
+/// dev/interpreter builds skip Binaryen entirely.
+fn wasmOptimizeMode(opt: cli_args.OptLevel) linker.WasmOptimizeMode {
+    return switch (opt) {
+        .size => .size,
+        .speed => .speed,
+        .dev, .interpreter => .none,
+    };
+}
+
 fn configuredWasmMemory(
     args: cli_args.BuildArgs,
     wasm: ?roc_target.WasmTargetConfig,
@@ -7513,6 +7536,9 @@ fn rocBuildWasmSurgical(
             .wasm_maximum_memory = if (link_inputs.wasm) |wasm| wasm.maximum_memory else null,
             .wasm_stack_size = configuredWasmStackBytes(args, link_inputs.wasm),
             .wasm_import_memory = if (link_inputs.wasm) |wasm| wasm.import_memory.importsMemory() else false,
+            .wasm_zero_filled_memory = configuredWasmZeroFilledMemory(link_inputs.wasm),
+            .wasm_debug_info = args.debug,
+            .wasm_optimize = wasmOptimizeMode(args.opt),
             .wasm_global_base = if (link_inputs.wasm) |wasm| wasm.global_base else null,
             .wasm_exports = wasm_exports,
             .platform_files_dir = link_inputs.platform_files_dir,
@@ -7997,6 +8023,9 @@ fn rocBuildWasmLlvm(
             .wasm_maximum_memory = if (link_inputs.wasm) |wasm| wasm.maximum_memory else null,
             .wasm_stack_size = configuredWasmStackBytes(args, link_inputs.wasm),
             .wasm_import_memory = if (link_inputs.wasm) |wasm| wasm.import_memory.importsMemory() else false,
+            .wasm_zero_filled_memory = configuredWasmZeroFilledMemory(link_inputs.wasm),
+            .wasm_debug_info = args.debug,
+            .wasm_optimize = wasmOptimizeMode(args.opt),
             .wasm_global_base = if (link_inputs.wasm) |wasm| wasm.global_base else null,
             .wasm_exports = wasm_exports,
             .platform_files_dir = link_inputs.platform_files_dir,
@@ -8993,6 +9022,9 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
             .wasm_maximum_memory = if (link_inputs.wasm) |wasm| wasm.maximum_memory else null,
             .wasm_stack_size = configuredWasmStackBytes(args, link_inputs.wasm),
             .wasm_import_memory = if (link_inputs.wasm) |wasm| wasm.import_memory.importsMemory() else false,
+            .wasm_zero_filled_memory = configuredWasmZeroFilledMemory(link_inputs.wasm),
+            .wasm_debug_info = args.debug,
+            .wasm_optimize = wasmOptimizeMode(args.opt),
             .wasm_global_base = if (link_inputs.wasm) |wasm| wasm.global_base else null,
             .platform_files_dir = link_inputs.platform_files_dir,
             .scratch_dir = build_cache_dir,
