@@ -279,7 +279,6 @@ pub fn parseDiagnosticToReport(self: *AST, env: *const CommonEnv, diagnostic: Di
         .nominal_associated_cannot_have_final_expression => "Expression In Associated Items",
         .deprecated_number_suffix => "Deprecated Number Suffix",
         .expr_double_dot_is_not_range => "Not A Range Operator",
-        else => "Parse Error",
     };
 
     // Lead sentence for the report's headline. Dynamic branches (whose lead
@@ -311,7 +310,6 @@ pub fn parseDiagnosticToReport(self: *AST, env: *const CommonEnv, diagnostic: Di
         .nominal_associated_cannot_have_final_expression => "Associated items (such as types or methods) can only have associated types and values, not plain expressions.",
         .deprecated_number_suffix => "This number literal uses a deprecated suffix syntax.",
         .expr_double_dot_is_not_range => ".. is not an operator. For an exclusive range use ..<; for an inclusive range use ..=.",
-        else => "",
     };
 
     var report = try reporting.Report.init(allocator, title, headline, .runtime_error);
@@ -585,14 +583,6 @@ pub fn parseDiagnosticToReport(self: *AST, env: *const CommonEnv, diagnostic: Di
             return report;
         },
         .expr_double_dot_is_not_range => {},
-        else => {
-            const tag_name = @tagName(diagnostic.tag);
-            const owned_tag = try report.addOwnedString(tag_name);
-            try report.document.addText("A parsing error occurred: ");
-            try report.document.addAnnotated(owned_tag, .dimmed);
-            try report.document.addLineBreak();
-            try report.document.addReflowingText("This is an unexpected parsing error. Please check your syntax.");
-        },
     }
 
     // Add source context if we have a valid region
