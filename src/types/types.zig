@@ -40,8 +40,9 @@ test {
     // Folding `binop_negated` and `num_literal` into the `origin` union is a
     // semantic regrouping (kind-specific payloads now live inside their variant),
     // not a size win: the literal-origin variant still embeds a full `NumeralInfo`,
-    // so the `Origin` union dominates the struct at 52 bytes total.
-    try std.testing.expectEqual(52, @sizeOf(StaticDispatchConstraint));
+    // so the `Origin` union dominates the struct. Provenance adds a raw expr index
+    // (4B) plus a where-clause expect region (8B), both `maxInt`-sentinel packed.
+    try std.testing.expectEqual(64, @sizeOf(StaticDispatchConstraint));
     try std.testing.expectEqual(16, @sizeOf(Func));
 }
 
@@ -933,6 +934,67 @@ pub const StaticDispatchConstraint = struct {
     /// literal). Kind-specific payloads (binop negation, literal info) live
     /// *inside* the variant, so they can't exist without or apart from it.
     origin: Origin,
+    /// Where this constraint was introduced, so ambiguity can be reported at the
+    /// user's own expression without reconstructing var->expr maps after the
+    /// fact. Copied verbatim by instantiation and cross-module import. This is
+    /// METADATA: it is deliberately excluded from type identity — canonical type
+    /// keys (`writeConstraints`) and unification content-equality never read it,
+    /// so two structurally identical constraints with different provenance stay
+    /// equal.
+    provenance: Provenance = .{},
+
+    /// The introducing site of a static dispatch constraint. `intro_expr` is the
+    /// raw `CIR.Expr.Idx` of the expression that created the constraint, stored
+    /// as a plain index because `types` sits below `canonicalize` in the layering
+    /// and cannot name `CIR.Expr.Idx`; the checker converts it back. It is
+    /// module-local — after cross-module import it refers to the ORIGINATING
+    /// module's CIR. `expect_region` is the where-clause "expect" region, set
+    /// only when the constraint was created inside a where-clause annotation
+    /// context (distinct from the intro expr's own region). Both use a `maxInt`
+    /// sentinel for "absent" so the record grows by only an index + a region.
+    pub const Provenance = struct {
+        intro_expr: OptExprIdx = .none,
+        expect_region: OptRegion = OptRegion.none,
+
+        /// An optional raw `CIR.Expr.Idx`. `none` marks a synthetic constraint
+        /// with no introducing expression.
+        pub const OptExprIdx = enum(u32) {
+            none = std.math.maxInt(u32),
+            _,
+
+            pub fn from(raw: u32) OptExprIdx {
+                std.debug.assert(raw != std.math.maxInt(u32));
+                return @enumFromInt(raw);
+            }
+
+            /// The raw index, or null when absent.
+            pub fn get(self: OptExprIdx) ?u32 {
+                return if (self == .none) null else @intFromEnum(self);
+            }
+        };
+
+        /// An optional region packed into a `Region` using a `maxInt` start
+        /// offset as the "absent" sentinel (a real region never starts at
+        /// `maxInt`), avoiding the extra tag byte a Zig optional would add.
+        pub const OptRegion = struct {
+            region: base.Region,
+
+            pub const none = OptRegion{ .region = .{
+                .start = .{ .offset = std.math.maxInt(u32) },
+                .end = .{ .offset = std.math.maxInt(u32) },
+            } };
+
+            pub fn some(region: base.Region) OptRegion {
+                std.debug.assert(region.start.offset != std.math.maxInt(u32));
+                return .{ .region = region };
+            }
+
+            /// The region, or null when absent.
+            pub fn get(self: OptRegion) ?base.Region {
+                return if (self.region.start.offset == std.math.maxInt(u32)) null else self.region;
+            }
+        };
+    };
 
     /// The kinds of literal that desugar to open literal-conversion constraints.
     /// Adding a variant makes every kind-keyed `switch` fail to compile until

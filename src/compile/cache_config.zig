@@ -39,7 +39,8 @@ pub const Constants = struct {
     /// 14: merged cache layout changes from static builtins and module identities.
     /// 15: ModuleEnv also stores scheme instantiation evidence records.
     /// 16: Checked encoder_for runtime representation changed serialized compiler state.
-    pub const CACHE_VERSION = 16;
+    /// 17: Static dispatch constraints carry introducing-site provenance.
+    pub const CACHE_VERSION = 17;
 };
 
 /// Configuration for the Roc cache system.
