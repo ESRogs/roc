@@ -74,7 +74,7 @@ pub const TestKind = enum {
     /// arm keys are the value zero-extended at layout width.
     int_switch,
     /// Sequential equality tests sharing one scrutinee local: wide integers,
-    /// Dec, floats (which must keep IEEE `==` semantics), and string literals
+    /// Dec, floats (which must keep IEEE `==` comparison behavior), and string literals
     /// when they cannot be string-set arms.
     eq_chain,
     /// `str_match_set` arms (string interpolation patterns, and string
@@ -274,7 +274,7 @@ pub fn Compiler(comptime Ctx: type) type {
             stats: Stats,
         };
 
-        const OccKey = struct {
+        const OccDigest = struct {
             parent: u32,
             tag: u8,
             a: u32,
@@ -303,12 +303,12 @@ pub fn Compiler(comptime Ctx: type) type {
             arena: std.mem.Allocator,
             ctx: Ctx,
             occ_entries: std.ArrayList(OccEntry),
-            occ_map: std.AutoHashMap(OccKey, u32),
+            occ_map: std.AutoHashMap(OccDigest, u32),
             exits: std.ArrayList(ExitState),
             stats: Stats,
 
             fn intern(self: *Builder, parent: OccId, step: Step, ty: TypeId) error{OutOfMemory}!OccId {
-                const key = occKey(parent, step);
+                const key = occDigest(parent, step);
                 const gop = try self.occ_map.getOrPut(key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = @intCast(self.occ_entries.items.len);
@@ -317,7 +317,7 @@ pub fn Compiler(comptime Ctx: type) type {
                 return @enumFromInt(gop.value_ptr.*);
             }
 
-            fn occKey(parent: OccId, step: Step) OccKey {
+            fn occDigest(parent: OccId, step: Step) OccDigest {
                 return switch (step) {
                     .root => .{ .parent = parent.idx(), .tag = 0, .a = 0, .b = 0 },
                     .field => |i| .{ .parent = parent.idx(), .tag = 1, .a = i, .b = 0 },
@@ -468,7 +468,13 @@ pub fn Compiler(comptime Ctx: type) type {
             /// Pick the occurrence to test next: the column of `rows[0]` with
             /// the longest same-kind run down the matrix (ties broken by
             /// first-column order). Longer runs mean more rows dispatched by
-            /// one multiway test.
+            /// one multiway test. Measured against plain first-column
+            /// selection on the generated corpus
+            /// (src/compile/test/match_corpus_test.zig) the two produced
+            /// identical statement totals — realistic matrices rarely give
+            /// row 0 multiple refutable columns with different run lengths —
+            /// so run length is kept because it dominates first-column by
+            /// construction whenever they do differ.
             fn selectColumn(self: *Builder, rows: []const Row) Col {
                 const row0 = rows[0];
                 var best = row0.cols[0];
@@ -1001,7 +1007,7 @@ pub fn Compiler(comptime Ctx: type) type {
 
         /// The scope that must be entered before an occurrence's value can be
         /// extracted: the last constructor-dependent step on its path.
-        const ScopeKey = union(enum) {
+        const Scope = union(enum) {
             /// Safe from the match entry (fields, nominal backings, and their
             /// derived reads).
             top,
@@ -1137,7 +1143,7 @@ pub fn Compiler(comptime Ctx: type) type {
             }
 
             /// The scope in which `occ`'s value becomes extractable.
-            fn establishingScope(self: *const Emitter, occ: OccId) ScopeKey {
+            fn establishingScope(self: *const Emitter, occ: OccId) Scope {
                 var walk = occ;
                 while (walk != .root) {
                     const entry = self.occEntry(walk);
@@ -1154,7 +1160,7 @@ pub fn Compiler(comptime Ctx: type) type {
                 return .top;
             }
 
-            fn scopeSatisfies(scope: ScopeKey, needed: ScopeKey) bool {
+            fn scopeSatisfies(scope: Scope, needed: Scope) bool {
                 return switch (needed) {
                     .top => scope == .top,
                     .tag_arm => |n| scope == .tag_arm and scope.tag_arm.occ == n.occ and scope.tag_arm.variant == n.variant,
@@ -1172,14 +1178,13 @@ pub fn Compiler(comptime Ctx: type) type {
             fn enterScope(
                 self: *Emitter,
                 env: *Env,
-                scope: ScopeKey,
+                scope: Scope,
                 extractions: *std.ArrayList(Extraction),
             ) Ctx.LowerError!void {
                 // Deterministic iteration: walk occs in interning order.
-                for (self.occs, 0..) |entry, i| {
+                for (0..self.occs.len) |i| {
                     const occ: OccId = @enumFromInt(i);
                     const use = self.uses.get(occ) orelse continue;
-                    _ = entry;
                     if (!scopeSatisfies(scope, self.establishingScope(occ))) continue;
                     try self.materialize(env, occ, use, extractions);
                 }
@@ -1263,18 +1268,15 @@ pub fn Compiler(comptime Ctx: type) type {
                 return current;
             }
 
-            fn valueLocal(self: *const Emitter, env: *Env, occ: OccId) CtxLocal {
-                _ = self;
+            fn valueLocal(_: *const Emitter, env: *Env, occ: OccId) CtxLocal {
                 return (env.locals.get(occ) orelse unreachable).value orelse unreachable;
             }
 
-            fn lenLocal(self: *const Emitter, env: *Env, occ: OccId) CtxLocal {
-                _ = self;
+            fn lenLocal(_: *const Emitter, env: *Env, occ: OccId) CtxLocal {
                 return (env.locals.get(occ) orelse unreachable).len orelse unreachable;
             }
 
-            fn discLocal(self: *const Emitter, env: *Env, occ: OccId) CtxLocal {
-                _ = self;
+            fn discLocal(_: *const Emitter, env: *Env, occ: OccId) CtxLocal {
                 return (env.locals.get(occ) orelse unreachable).disc orelse unreachable;
             }
 
@@ -1347,7 +1349,7 @@ pub fn Compiler(comptime Ctx: type) type {
             fn emitArm(self: *Emitter, t: TestNode, arm: Arm, env: *Env) Ctx.LowerError!CtxStmt {
                 var arm_env = try env.clone(self.arena);
                 var extractions: std.ArrayList(Extraction) = .empty;
-                const scope: ScopeKey = switch (t.kind) {
+                const scope: Scope = switch (t.kind) {
                     .tag => .{ .tag_arm = .{ .occ = t.occ, .variant = @intCast(arm.key) } },
                     .callable => .{ .callable_arm = .{ .occ = t.occ, .variant = @intCast(arm.key) } },
                     .list_len => .{ .list_len = .{ .occ = t.occ, .min_len = @truncate(arm.key) } },
@@ -1528,8 +1530,7 @@ const MockCtx = struct {
         return @intCast(self.get(pat).record.len);
     }
 
-    pub fn recordDestruct(self: MockCtx, pat: u32, ty: u32, i: u16) LowerError!MockSub {
-        _ = ty;
+    pub fn recordDestruct(self: MockCtx, pat: u32, _: u32, i: u16) LowerError!MockSub {
         return self.get(pat).record[i];
     }
 
@@ -1537,18 +1538,15 @@ const MockCtx = struct {
         return @intCast(self.get(pat).tuple.len);
     }
 
-    pub fn tupleItem(self: MockCtx, pat: u32, ty: u32, i: u16) LowerError!MockSub {
-        _ = ty;
+    pub fn tupleItem(self: MockCtx, pat: u32, _: u32, i: u16) LowerError!MockSub {
         return self.get(pat).tuple[i];
     }
 
-    pub fn nominalInner(self: MockCtx, pat: u32, ty: u32) LowerError!MockSub {
-        _ = ty;
+    pub fn nominalInner(self: MockCtx, pat: u32, _: u32) LowerError!MockSub {
         return self.get(pat).nominal;
     }
 
-    pub fn tagVariant(self: MockCtx, pat: u32, ty: u32) u16 {
-        _ = ty;
+    pub fn tagVariant(self: MockCtx, pat: u32, _: u32) u16 {
         return self.get(pat).tag.variant;
     }
 
@@ -1556,8 +1554,7 @@ const MockCtx = struct {
         return @intCast(self.get(pat).tag.payloads.len);
     }
 
-    pub fn tagPayload(self: MockCtx, pat: u32, ty: u32, i: u16) LowerError!MockSub {
-        _ = ty;
+    pub fn tagPayload(self: MockCtx, pat: u32, _: u32, i: u16) LowerError!MockSub {
         return self.get(pat).tag.payloads[i];
     }
 
@@ -1566,23 +1563,15 @@ const MockCtx = struct {
         return null;
     }
 
-    pub fn callableVariant(self: MockCtx, pat: u32, ty: u32) u16 {
-        _ = self;
-        _ = pat;
-        _ = ty;
+    pub fn callableVariant(_: MockCtx, _: u32, _: u32) u16 {
         unreachable;
     }
 
-    pub fn callablePayload(self: MockCtx, pat: u32, ty: u32) LowerError!?MockSub {
-        _ = self;
-        _ = pat;
-        _ = ty;
+    pub fn callablePayload(_: MockCtx, _: u32, _: u32) LowerError!?MockSub {
         unreachable;
     }
 
-    pub fn callableVariantCount(self: MockCtx, ty: u32) ?u32 {
-        _ = self;
-        _ = ty;
+    pub fn callableVariantCount(_: MockCtx, _: u32) ?u32 {
         return null;
     }
 
@@ -1600,13 +1589,11 @@ const MockCtx = struct {
         return self.get(pat).list.elems[i];
     }
 
-    pub fn listElemTy(self: MockCtx, ty: u32) u32 {
-        _ = self;
+    pub fn listElemTy(_: MockCtx, ty: u32) u32 {
         return ty + 100; // arbitrary distinct element type id
     }
 
-    pub fn ctorKey(self: MockCtx, pat: u32, ty: u32) LowerError!u128 {
-        _ = ty;
+    pub fn ctorKey(self: MockCtx, pat: u32, _: u32) LowerError!u128 {
         return switch (self.get(pat)) {
             .tag => |t| t.variant,
             .int_lit => |i| @bitCast(@as(i128, i.value)),
@@ -1618,15 +1605,13 @@ const MockCtx = struct {
         };
     }
 
-    pub fn intSwitchValue(self: MockCtx, pat: u32, ty: u32) ?u64 {
-        _ = ty;
+    pub fn intSwitchValue(self: MockCtx, pat: u32, _: u32) ?u64 {
         const lit = self.get(pat).int_lit;
         if (!lit.switchable) return null;
         return @bitCast(lit.value);
     }
 
-    pub fn strLitIsSetArm(self: MockCtx) bool {
-        _ = self;
+    pub fn strLitIsSetArm(_: MockCtx) bool {
         return true;
     }
 
@@ -1649,7 +1634,7 @@ fn buildMock(
     ctx: MockCtx,
     scrutinee_ty: u32,
     branches: []const TestCompiler.Branch,
-) !TestCompiler.BuildResult {
+) error{OutOfMemory}!TestCompiler.BuildResult {
     return try TestCompiler.build(arena, ctx, scrutinee_ty, branches);
 }
 

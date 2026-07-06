@@ -4366,23 +4366,15 @@ const Lowerer = struct {
             };
         }
 
-        pub fn callableVariant(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) u16 {
-            _ = self;
-            _ = pat_id;
-            _ = ty;
+        pub fn callableVariant(_: MatchTreeCtx, _: Lifted.PatId, _: Type.TypeId) u16 {
             Common.invariant("callable pattern reached solved match lowering");
         }
 
-        pub fn callablePayload(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) Common.LowerError!?SubPat {
-            _ = self;
-            _ = pat_id;
-            _ = ty;
+        pub fn callablePayload(_: MatchTreeCtx, _: Lifted.PatId, _: Type.TypeId) Common.LowerError!?SubPat {
             Common.invariant("callable pattern reached solved match lowering");
         }
 
-        pub fn callableVariantCount(self: MatchTreeCtx, ty: Type.TypeId) ?u32 {
-            _ = self;
-            _ = ty;
+        pub fn callableVariantCount(_: MatchTreeCtx, _: Type.TypeId) ?u32 {
             return null;
         }
 
@@ -4413,7 +4405,7 @@ const Lowerer = struct {
                 .tag => |tag| self.l.tagIndex(ty, tag.name),
                 .int_lit => |value| @bitCast(value.toI128()),
                 .dec_lit => |value| @bitCast(value.num),
-                // IEEE equality semantics: +0.0 and -0.0 are the same
+                // IEEE `==` behavior: +0.0 and -0.0 are the same
                 // constructor; NaN arms never match but stay distinct.
                 .frac_f32_lit => |value| @as(u32, @bitCast(if (value == 0.0) @as(f32, 0.0) else value)),
                 .frac_f64_lit => |value| @as(u64, @bitCast(if (value == 0.0) @as(f64, 0.0) else value)),
@@ -4492,8 +4484,7 @@ const Lowerer = struct {
             };
         }
 
-        pub fn strLitIsSetArm(self: MatchTreeCtx) bool {
-            _ = self;
+        pub fn strLitIsSetArm(_: MatchTreeCtx) bool {
             // A str_match arm with no steps and an exact end is byte equality,
             // which is exactly Str equality (see execStrMatchArm).
             return true;
@@ -4539,9 +4530,7 @@ const Lowerer = struct {
             return try self.l.result.store.addCFStmt(.{ .runtime_error = {} });
         }
 
-        pub fn lirLocalForOcc(self: MatchTreeCtx, step: match_tree.Step, ty: Type.TypeId, parent: ?LIR.LocalId) Common.LowerError!LIR.LocalId {
-            _ = step;
-            _ = parent;
+        pub fn lirLocalForOcc(self: MatchTreeCtx, _: match_tree.Step, ty: Type.TypeId, _: ?LIR.LocalId) Common.LowerError!LIR.LocalId {
             return try self.l.addTemp(ty);
         }
 
@@ -4606,13 +4595,7 @@ const Lowerer = struct {
             );
         }
 
-        pub fn readCallablePayload(self: MatchTreeCtx, dest: LIR.LocalId, ty: Type.TypeId, source: LIR.LocalId, variant: u16, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-            _ = self;
-            _ = dest;
-            _ = ty;
-            _ = source;
-            _ = variant;
-            _ = next;
+        pub fn readCallablePayload(_: MatchTreeCtx, _: LIR.LocalId, _: Type.TypeId, _: LIR.LocalId, _: u16, _: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
             Common.invariant("callable pattern reached solved match lowering");
         }
 

@@ -2200,8 +2200,7 @@ const Lowerer = struct {
             return @intCast(self.l.program.patSpan(self.l.pat(pat_id).data.tuple).len);
         }
 
-        pub fn tupleItem(self: MatchTreeCtx, pat_id: LambdaMono.PatId, ty: Type.TypeId, i: u16) Common.LowerError!SubPat {
-            _ = ty;
+        pub fn tupleItem(self: MatchTreeCtx, pat_id: LambdaMono.PatId, _: Type.TypeId, i: u16) Common.LowerError!SubPat {
             const items = self.l.program.patSpan(self.l.pat(pat_id).data.tuple);
             return .{ .index = i, .ty = self.l.pat(items[i]).ty, .pat = items[i] };
         }
@@ -2219,8 +2218,7 @@ const Lowerer = struct {
             return @intCast(self.l.program.patSpan(self.l.pat(pat_id).data.tag.payloads).len);
         }
 
-        pub fn tagPayload(self: MatchTreeCtx, pat_id: LambdaMono.PatId, ty: Type.TypeId, i: u16) Common.LowerError!SubPat {
-            _ = ty;
+        pub fn tagPayload(self: MatchTreeCtx, pat_id: LambdaMono.PatId, _: Type.TypeId, i: u16) Common.LowerError!SubPat {
             const payloads = self.l.program.patSpan(self.l.pat(pat_id).data.tag.payloads);
             return .{ .index = i, .ty = self.l.pat(payloads[i]).ty, .pat = payloads[i] };
         }
@@ -2237,19 +2235,16 @@ const Lowerer = struct {
             return self.l.callableVariantIndex(ty, self.l.pat(pat_id).data.callable.variant);
         }
 
-        pub fn callablePayload(self: MatchTreeCtx, pat_id: LambdaMono.PatId, ty: Type.TypeId) Common.LowerError!?SubPat {
-            _ = ty;
+        pub fn callablePayload(self: MatchTreeCtx, pat_id: LambdaMono.PatId, _: Type.TypeId) Common.LowerError!?SubPat {
             const payload = self.l.pat(pat_id).data.callable.payload orelse return null;
             return .{ .index = 0, .ty = self.l.pat(payload).ty, .pat = payload };
         }
 
-        pub fn callableVariantCount(self: MatchTreeCtx, ty: Type.TypeId) ?u32 {
+        pub fn callableVariantCount(_: MatchTreeCtx, _: Type.TypeId) ?u32 {
             // Callable dispatch is always over the full variant set the
             // Lambda Mono decisions committed, but the chain kept an explicit
             // miss default; matching that behavior keeps the two lowerers'
             // structural comparison exact and the terminal unreachable.
-            _ = self;
-            _ = ty;
             return null;
         }
 
@@ -2285,7 +2280,7 @@ const Lowerer = struct {
                 .callable => |callable| self.l.callableVariantIndex(ty, callable.variant),
                 .int_lit => |value| @bitCast(value.toI128()),
                 .dec_lit => |value| @bitCast(value.num),
-                // IEEE equality semantics: +0.0 and -0.0 are the same
+                // IEEE `==` behavior: +0.0 and -0.0 are the same
                 // constructor; NaN arms never match but stay distinct.
                 .frac_f32_lit => |value| @as(u32, @bitCast(if (value == 0.0) @as(f32, 0.0) else value)),
                 .frac_f64_lit => |value| @as(u64, @bitCast(if (value == 0.0) @as(f64, 0.0) else value)),
@@ -2355,8 +2350,7 @@ const Lowerer = struct {
             };
         }
 
-        pub fn strLitIsSetArm(self: MatchTreeCtx) bool {
-            _ = self;
+        pub fn strLitIsSetArm(_: MatchTreeCtx) bool {
             return true;
         }
 
@@ -2433,8 +2427,7 @@ const Lowerer = struct {
             } });
         }
 
-        pub fn readField(self: MatchTreeCtx, dest: LIR.LocalId, ty: Type.TypeId, source: LIR.LocalId, index: u16, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-            _ = ty;
+        pub fn readField(self: MatchTreeCtx, dest: LIR.LocalId, _: Type.TypeId, source: LIR.LocalId, index: u16, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
             return try self.l.assignRefRead(
                 dest,
                 self.l.localFieldLayout(source, index),
@@ -2443,8 +2436,7 @@ const Lowerer = struct {
             );
         }
 
-        pub fn readTagPayload(self: MatchTreeCtx, dest: LIR.LocalId, ty: Type.TypeId, source: LIR.LocalId, variant: u16, index: u16, single: bool, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-            _ = ty;
+        pub fn readTagPayload(self: MatchTreeCtx, dest: LIR.LocalId, _: Type.TypeId, source: LIR.LocalId, variant: u16, index: u16, single: bool, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
             if (single) {
                 return try self.l.assignRefRead(
                     dest,
@@ -2470,8 +2462,7 @@ const Lowerer = struct {
             );
         }
 
-        pub fn readCallablePayload(self: MatchTreeCtx, dest: LIR.LocalId, ty: Type.TypeId, source: LIR.LocalId, variant: u16, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-            _ = ty;
+        pub fn readCallablePayload(self: MatchTreeCtx, dest: LIR.LocalId, _: Type.TypeId, source: LIR.LocalId, variant: u16, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
             return try self.l.result.store.addCFStmt(.{ .assign_ref = .{
                 .target = dest,
                 .op = .{ .tag_payload_struct = .{
@@ -2509,9 +2500,7 @@ const Lowerer = struct {
             return try self.l.lenMinusConst(keep_after_front, len_local, @intCast(front), current);
         }
 
-        pub fn readNominalBacking(self: MatchTreeCtx, dest: LIR.LocalId, backing_ty: Type.TypeId, source: LIR.LocalId, nominal_ty: Type.TypeId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-            _ = backing_ty;
-            _ = nominal_ty;
+        pub fn readNominalBacking(self: MatchTreeCtx, dest: LIR.LocalId, _: Type.TypeId, source: LIR.LocalId, _: Type.TypeId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
             const source_layout = self.l.result.store.getLocal(source).layout_idx;
             return try self.l.assignNominalBoundary(dest, source, source_layout, next);
         }
@@ -2606,8 +2595,7 @@ const Lowerer = struct {
             } });
         }
 
-        pub fn bindPatternLocal(self: MatchTreeCtx, local: LambdaMono.LocalId, ty: Type.TypeId, source: LIR.LocalId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-            _ = ty;
+        pub fn bindPatternLocal(self: MatchTreeCtx, local: LambdaMono.LocalId, _: Type.TypeId, source: LIR.LocalId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
             return try self.l.assignLocal(try self.l.localFor(local), source, next);
         }
 
