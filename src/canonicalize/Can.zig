@@ -936,13 +936,8 @@ fn populateBuiltinAutoImportedTypes(
         });
     }
 
-    const encoding_ident = try calling_module_env.insertIdent(base.Ident.for_text("Encoding"));
-    const encoding_qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text("Builtin.Encoding"));
-    try self.builtin_auto_imported_types.put(gpa, encoding_ident, .{
-        .env = builtin_module_env,
-        .statement_idx = null,
-        .qualified_type_ident = encoding_qualified_ident,
-    });
+    try putBuiltinAutoImportedContainerUnmanaged(gpa, &self.builtin_auto_imported_types, calling_module_env, builtin_module_env, "Encoding", "Builtin.Encoding");
+    try putBuiltinAutoImportedContainerUnmanaged(gpa, &self.builtin_auto_imported_types, calling_module_env, builtin_module_env, "Json", "Builtin.Encoding.Json");
 }
 
 /// Legacy helper for caller-owned import maps.
@@ -970,12 +965,40 @@ pub fn populateModuleEnvs(
         });
     }
 
-    const encoding_ident = try calling_module_env.insertIdent(base.Ident.for_text("Encoding"));
-    const encoding_qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text("Builtin.Encoding"));
-    try module_envs_map.put(encoding_ident, .{
+    try putBuiltinAutoImportedContainerManaged(module_envs_map, calling_module_env, builtin_module_env, "Encoding", "Builtin.Encoding");
+    try putBuiltinAutoImportedContainerManaged(module_envs_map, calling_module_env, builtin_module_env, "Json", "Builtin.Encoding.Json");
+}
+
+fn putBuiltinAutoImportedContainerUnmanaged(
+    gpa: std.mem.Allocator,
+    map: *std.AutoHashMapUnmanaged(Ident.Idx, AutoImportedType),
+    calling_module_env: *ModuleEnv,
+    builtin_module_env: *const ModuleEnv,
+    display_name: []const u8,
+    qualified_name: []const u8,
+) Allocator.Error!void {
+    const display_ident = try calling_module_env.insertIdent(base.Ident.for_text(display_name));
+    const qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text(qualified_name));
+    try map.put(gpa, display_ident, .{
         .env = builtin_module_env,
         .statement_idx = null,
-        .qualified_type_ident = encoding_qualified_ident,
+        .qualified_type_ident = qualified_ident,
+    });
+}
+
+fn putBuiltinAutoImportedContainerManaged(
+    map: *std.AutoHashMap(Ident.Idx, AutoImportedType),
+    calling_module_env: *ModuleEnv,
+    builtin_module_env: *const ModuleEnv,
+    display_name: []const u8,
+    qualified_name: []const u8,
+) Allocator.Error!void {
+    const display_ident = try calling_module_env.insertIdent(base.Ident.for_text(display_name));
+    const qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text(qualified_name));
+    try map.put(display_ident, .{
+        .env = builtin_module_env,
+        .statement_idx = null,
+        .qualified_type_ident = qualified_ident,
     });
 }
 
@@ -1416,6 +1439,27 @@ fn parserTypePathForDependencySegments(
 fn typePathForBinding(self: *const Self, binding: Scope.TypeBinding) ?AST.DeclIndex.TypePathIdx {
     const stmt_idx = typeBindingStatement(binding) orelse return null;
     return self.type_decl_paths.get(stmt_idx);
+}
+
+/// The type name a top-level alias declaration refers to, when its annotation
+/// is a plain (possibly applied) type reference — `ThingAlias : Thing` or
+/// `Wrapped(a) : Wrapper(a)`. Null for every other binding or annotation
+/// shape.
+fn aliasBindingTargetName(self: *const Self, binding: Scope.TypeBinding) ?Ident.Idx {
+    const stmt_idx = switch (binding) {
+        .local_alias => |stmt_idx| stmt_idx,
+        .local_nominal, .associated_nominal, .external_nominal => return null,
+    };
+    const alias = switch (self.env.store.getStatement(stmt_idx)) {
+        .s_alias_decl => |alias| alias,
+        else => return null,
+    };
+    if (alias.anno == .placeholder) return null;
+    return switch (self.env.store.getTypeAnno(alias.anno)) {
+        .lookup => |lookup| lookup.name,
+        .apply => |apply| apply.name,
+        else => null,
+    };
 }
 
 fn qualifierTypePath(
@@ -3564,7 +3608,8 @@ fn canonicalizeAssociatedItems(
                             qualified_idx
                         else blk_tqd: {
                             const type_text = self.env.getIdent(type_name);
-                            break :blk_tqd try self.insertQualifiedIdent(type_text, decl_text);
+                            const fresh_decl_text = self.env.getIdent(decl_ident);
+                            break :blk_tqd try self.insertQualifiedIdent(type_text, fresh_decl_text);
                         };
                         const assoc_key: ?AST.DeclIndex.AssocValue = if (owner_type_path) |owner|
                             .{ .owner = owner, .item = decl_ident }
@@ -6943,10 +6988,23 @@ fn canonicalizeTypeDispatchFieldAccess(
 
 fn canonicalizeTypeAssociatedLookup(
     self: *Self,
-    module_alias: Ident.Idx,
+    unresolved_module_alias: Ident.Idx,
     ident: Ident.Idx,
     region: Region,
 ) std.mem.Allocator.Error!?CanonicalizedExpr {
+    // Type aliases are transparent for associated-item lookup: given
+    // `ThingAlias : Thing`, `ThingAlias.from_u64` resolves against `Thing`'s
+    // associated items (#9875). Follow the (finite, cycle-guarded) alias
+    // chain to the terminal type name before looking anything up.
+    var module_alias = unresolved_module_alias;
+    var alias_hops: u32 = 32;
+    while (alias_hops > 0) : (alias_hops -= 1) {
+        const binding_location = (try self.scopeLookupOrPrepareTypeBinding(module_alias)) orelse break;
+        const target = self.aliasBindingTargetName(binding_location.binding.*) orelse break;
+        if (target.eql(module_alias)) break;
+        module_alias = target;
+    }
+
     const local_type_binding = try self.scopeLookupOrPrepareTypeBinding(module_alias);
     const is_type_in_scope = local_type_binding != null;
     const is_auto_imported_type = self.hasAvailableModuleEnv(module_alias);
@@ -7080,7 +7138,7 @@ fn canonicalizeModuleQualifiedIdent(
             const fully_qualified_idx = try self.insertQualifiedIdent(qualified_text, nested_path);
             break :name_blk self.env.getIdent(fully_qualified_idx);
         } else name_blk: {
-            if (qualifier_tokens.len == 1) {
+            if (qualifier_tokens.len == 1 and !compiler_builtin_auto_import) {
                 break :name_blk field_text;
             }
             const qualified_text = if (compiler_builtin_auto_import)
