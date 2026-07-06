@@ -296,10 +296,6 @@ pub const tests = [_]TestCase{
         ,
         .expected = .{ .inspect_str = "(\"lit\", \"pre:fix\", \"txt\", \"miss\")" },
     },
-    // Documented pre-existing hazard (see the skipped tests at the bottom of
-    // this file): a guard failure inside a grouped string arm skips later
-    // branches with the same string pattern, so this expected-correct case is
-    // skipped until the decision-tree compiler lands.
     .{
         .name = "match-dt: string capture binding visible in guard",
         .source_kind = .module,
@@ -314,7 +310,6 @@ pub const tests = [_]TestCase{
         \\main = (route("v1"), route("v2"), route("x"))
         ,
         .expected = .{ .inspect_str = "(\"one\", \"v:2\", \"miss\")" },
-        .skip = .{ .interpreter = true, .dev = true, .wasm = true, .llvm = true },
     },
 
     // --- Records and tuples ---
@@ -546,13 +541,10 @@ pub const tests = [_]TestCase{
         .expected = .{ .problem = {} },
     },
 
-    // --- Documented pre-existing hazard: duplicate string-pattern guard fallthrough ---
-    // The chain's string-group special case sends a guard failure to the GROUP
-    // miss join, skipping later branches with the same string pattern. Source
-    // order demands the second branch ("n:hi"). This is expected to be wrong on
-    // the chain (returns "miss"); the decision-tree compiler must fix it. Skips
-    // are removed when the tree lands (see
-    // docs/superpowers/plans/2026-07-06-decision-tree-match-compiler.md Task 6).
+    // Regression coverage for the chain's string-group hazard: a guard failure
+    // inside a string arm must retry later branches with the same string
+    // pattern in source order (the deleted group special case jumped past the
+    // whole group instead).
     .{
         .name = "match-dt: guard failure retries later branch with same string pattern",
         .source_kind = .module,
@@ -567,6 +559,5 @@ pub const tests = [_]TestCase{
         \\main = (route("hi!", True), route("hi!", False), route("hi", True))
         ,
         .expected = .{ .inspect_str = "(\"g:hi\", \"n:hi\", \"miss\")" },
-        .skip = .{ .interpreter = true, .dev = true, .wasm = true, .llvm = true },
     },
 };
