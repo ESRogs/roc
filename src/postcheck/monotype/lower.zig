@@ -7837,14 +7837,25 @@ const BodyContext = struct {
         source: NominalInstantiationSource,
         args: []NodeId,
     ) Allocator.Error!NodeId {
-        if (moduleBytesEqual(source.view.key.bytes, self.view.key.bytes)) {
-            return try self.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+        const declaration_id: u32 = @intFromEnum(source.declaration.id);
+        if (self.graph.nominalBackingNode(source.view.key.bytes, declaration_id, args)) |cached| {
+            return cached;
         }
-        var source_ctx = try BodyContext.init(self.allocator, self.builder, source.view, self.owner_template, self.graph, self.draft);
-        defer source_ctx.deinit();
-        source_ctx.owner_context_fn_key = self.owner_context_fn_key;
-        source_ctx.current_fn_key = self.current_fn_key;
-        return try source_ctx.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+
+        const placeholder = try self.graph.newNode(.{ .unresolved = InstVariable.placeholder() });
+        try self.graph.putNominalBackingNode(source.view.key.bytes, declaration_id, args, placeholder);
+
+        const backing = if (moduleBytesEqual(source.view.key.bytes, self.view.key.bytes)) backing: {
+            break :backing try self.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+        } else backing: {
+            var source_ctx = try BodyContext.init(self.allocator, self.builder, source.view, self.owner_template, self.graph, self.draft);
+            defer source_ctx.deinit();
+            source_ctx.owner_context_fn_key = self.owner_context_fn_key;
+            source_ctx.current_fn_key = self.current_fn_key;
+            break :backing try source_ctx.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+        };
+        try self.graph.unify(placeholder, backing);
+        return placeholder;
     }
 
     fn instNominalDeclarationBackingNodeInCurrentView(
@@ -7880,37 +7891,12 @@ const BodyContext = struct {
                 .view = self.view,
                 .declaration = self.view.types.nominalDeclarationById(id),
             },
-            .local_box_payload_capability => blk: {
-                const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse
-                    Common.invariant("local box-payload nominal had no declaration source");
-                break :blk .{
-                    .view = lookup.view,
-                    .declaration = lookup.declaration,
-                };
-            },
-            .imported_declaration => |imported| blk: {
-                const source_view = self.builder.moduleForId(checked.importedNominalDeclarationModuleId(imported));
-                break :blk .{
-                    .view = source_view,
-                    .declaration = source_view.types.nominalDeclarationById(imported.declaration),
-                };
-            },
-            .imported_box_payload_capability => blk: {
-                const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse
-                    Common.invariant("imported box-payload nominal had no declaration source");
-                break :blk .{
-                    .view = lookup.view,
-                    .declaration = lookup.declaration,
-                };
-            },
-            .builtin => blk: {
-                const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse break :blk null;
-                break :blk .{
-                    .view = lookup.view,
-                    .declaration = lookup.declaration,
-                };
-            },
-            .opaque_without_backing => null,
+            .local_box_payload_capability,
+            .imported_declaration,
+            .imported_box_payload_capability,
+            .builtin,
+            .opaque_without_backing,
+            => null,
         };
     }
 
