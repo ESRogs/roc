@@ -20,19 +20,38 @@
 # musl realpath conditionally inspects internal path-buffer bytes while
 # canonicalizing a path. Valgrind 3.26 reports this inside libc before control
 # returns to Zig's std.fs realpath wrapper; this does not indicate that Roc
-# read uninitialized program memory.
+# read uninitialized program memory. Match any internal realpath helper frames
+# because Zig's optimized libc memcpy path varies by source/destination length.
 {
    musl-realpath-dir-realpath
    Memcheck:Cond
+   ...
    fun:realpath
    fun:Io.Threaded.dirRealPathFilePosix
 }
 
 {
-   musl-realpath-small-copy-dir-realpath
-   Memcheck:Cond
-   fun:copySmallLength
-   fun:memcpy
+   musl-realpath-value-dir-realpath
+   Memcheck:Value8
+   ...
+   fun:realpath
+   fun:Io.Threaded.dirRealPathFilePosix
+}
+
+{
+   musl-realpath-readlink-dir-realpath
+   Memcheck:Param
+   readlink(buf)
+   fun:readlink
+   fun:realpath
+   fun:Io.Threaded.dirRealPathFilePosix
+}
+
+{
+   musl-realpath-readlink-bufsiz-dir-realpath
+   Memcheck:Param
+   readlink(bufsiz)
+   fun:readlink
    fun:realpath
    fun:Io.Threaded.dirRealPathFilePosix
 }
