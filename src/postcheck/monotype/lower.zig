@@ -17522,7 +17522,7 @@ const BodyContext = struct {
                     .func => |func| {
                         const args = self.builder.program.types.span(func.args);
                         if (path_step.data >= args.len) return null;
-                        ty = args[path_step.data];
+                        ty = GuardedList.at(args, path_step.data);
                     },
                     else => return null,
                 },
@@ -17534,7 +17534,7 @@ const BodyContext = struct {
                     .named => |named| {
                         const args = self.builder.program.types.span(named.args);
                         if (path_step.data >= args.len) return null;
-                        ty = args[path_step.data];
+                        ty = GuardedList.at(args, path_step.data);
                     },
                     // Builtin containers erase to dedicated nodes: their
                     // single type argument is the payload.
@@ -17555,7 +17555,7 @@ const BodyContext = struct {
                     .tuple => |span| {
                         const elems = self.builder.program.types.span(span);
                         if (path_step.data >= elems.len) return null;
-                        ty = elems[path_step.data];
+                        ty = GuardedList.at(elems, path_step.data);
                     },
                     else => return null,
                 },
@@ -17563,8 +17563,13 @@ const BodyContext = struct {
                     .record => |span| {
                         const label = try self.builder.recordFieldName(view, @enumFromInt(path_step.data));
                         const fields = self.builder.program.types.fieldSpan(span);
-                        ty = for (fields) |field| {
-                            if (field.name == label) break field.ty;
+                        var field_index: usize = 0;
+                        while (field_index < fields.len) : (field_index += 1) {
+                            const field = GuardedList.at(fields, field_index);
+                            if (field.name == label) {
+                                ty = field.ty;
+                                break;
+                            }
                         } else return null;
                     },
                     else => return null,
@@ -17573,9 +17578,14 @@ const BodyContext = struct {
                     .tag_union => |span| {
                         const label = try self.builder.tagName(view, @enumFromInt(path_step.data));
                         const tags = self.builder.program.types.tagSpan(span);
-                        const tag = for (tags) |tag| {
-                            if (tag.name == label) break tag;
-                        } else return null;
+                        const tag = blk: {
+                            var tag_index: usize = 0;
+                            while (tag_index < tags.len) : (tag_index += 1) {
+                                const tag = GuardedList.at(tags, tag_index);
+                                if (tag.name == label) break :blk tag;
+                            }
+                            return null;
+                        };
                         // The next step must be the payload index.
                         return try self.walkTagPayloadPath(view, tag, path[1..]);
                     },
@@ -17598,7 +17608,7 @@ const BodyContext = struct {
         if (rest[0].stepKind() != .tag_payload_index) return null;
         const payloads = self.builder.program.types.span(tag.payloads);
         if (rest[0].data >= payloads.len) return null;
-        return try self.walkEvidencePath(view, payloads[rest[0].data], rest[1..]);
+        return try self.walkEvidencePath(view, GuardedList.at(payloads, rest[0].data), rest[1..]);
     }
 
     fn methodTargetCalleeWithMono(
