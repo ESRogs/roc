@@ -173,7 +173,7 @@ invalid_empty_record_score : Try({}, Json.ParseErr) -> U64
 invalid_empty_record_score = |invalid_empty_result|
 	match invalid_empty_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 37
+		Err(InvalidJson(_)) => 37
 		Err(_) => 999999
 	}
 
@@ -181,7 +181,7 @@ trailing_empty_record_score : Try({}, Json.ParseErr) -> U64
 trailing_empty_record_score = |trailing_empty_result|
 	match trailing_empty_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 41
+		Err(InvalidJson(_)) => 41
 		Err(_) => 999999
 	}
 
@@ -196,7 +196,7 @@ invalid_string_score : Try(Str, Json.ParseErr) -> U64
 invalid_string_score = |string_result|
 	match string_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 43
+		Err(InvalidJson(_)) => 43
 		Err(_) => 999999
 	}
 
@@ -204,7 +204,7 @@ null_string_score : Try(Str, Json.ParseErr) -> U64
 null_string_score = |string_result|
 	match string_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 47
+		Err(InvalidJson(_)) => 47
 		Err(_) => 999999
 	}
 
@@ -212,7 +212,7 @@ strict_trailing_comma_score : Try({ foo : Str }, Json.ParseErr) -> U64
 strict_trailing_comma_score = |record_result|
 	match record_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 53
+		Err(InvalidJson(_)) => 53
 		Err(_) => 999999
 	}
 
@@ -232,7 +232,7 @@ strict_tag_trailing_comma_score : Try([Active, Paused], Json.ParseErr) -> U64
 strict_tag_trailing_comma_score = |tag_result|
 	match tag_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 67
+		Err(InvalidJson(_)) => 67
 		Err(_) => 999999
 	}
 
@@ -260,7 +260,7 @@ strict_unknown_array_trailing_comma_score : Try({ foo : Str }, Json.ParseErr) ->
 strict_unknown_array_trailing_comma_score = |record_result|
 	match record_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 73
+		Err(InvalidJson(_)) => 73
 		Err(_) => 999999
 	}
 
@@ -280,7 +280,7 @@ invalid_unknown_scalar_score : Try({ foo : Str }, Json.ParseErr) -> U64
 invalid_unknown_scalar_score = |record_result|
 	match record_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 83
+		Err(InvalidJson(_)) => 83
 		Err(_) => 999999
 	}
 
@@ -288,7 +288,7 @@ invalid_unknown_array_scalar_score : Try({ foo : Str }, Json.ParseErr) -> U64
 invalid_unknown_array_scalar_score = |record_result|
 	match record_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 89
+		Err(InvalidJson(_)) => 89
 		Err(_) => 999999
 	}
 
@@ -296,7 +296,7 @@ invalid_u64_plus_score : Try({ n : U64 }, Json.ParseErr) -> U64
 invalid_u64_plus_score = |record_result|
 	match record_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 97
+		Err(InvalidJson(_)) => 97
 		Err(_) => 999999
 	}
 
@@ -304,7 +304,7 @@ invalid_u64_leading_zero_score : Try({ n : U64 }, Json.ParseErr) -> U64
 invalid_u64_leading_zero_score = |record_result|
 	match record_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 101
+		Err(InvalidJson(_)) => 101
 		Err(_) => 999999
 	}
 
@@ -312,6 +312,6 @@ invalid_missing_tag_payload_score : Try([Active, Paused], Json.ParseErr) -> U64
 invalid_missing_tag_payload_score = |tag_result|
 	match tag_result {
 		Ok(_) => 999999
-		Err(InvalidJson) => 103
+		Err(InvalidJson(_)) => 103
 		Err(_) => 999999
 	}

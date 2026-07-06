@@ -1732,7 +1732,7 @@ JsonEncoding :: [Default, CamelCase, TrailingCommas].{
 }
 
 Json :: {}.{
-	ParseErr : [MissingRequired, InvalidJson]
+	ParseErr : [MissingRequiredField(Str), InvalidJson(Str)]
 
 	parse : Str -> Try(a, Json.ParseErr)
 		where [
@@ -1748,7 +1748,7 @@ Json :: {}.{
 				if Str.is_empty(Str.trim_start(rest)) {
 					Ok(parsed.value)
 				} else {
-					Err(InvalidJson)
+					Err(InvalidJson("Invalid JSON"))
 				}
 		}
 	}
@@ -1767,7 +1767,7 @@ Json :: {}.{
 				if Str.is_empty(Str.trim_start(rest)) {
 					Ok(parsed.value)
 				} else {
-					Err(InvalidJson)
+					Err(InvalidJson("Invalid JSON"))
 				}
 		}
 	}
@@ -1788,7 +1788,7 @@ Json :: {}.{
 					if Str.is_empty(Str.trim_start(rest)) {
 						Ok(parsed.value)
 					} else {
-						Err(InvalidJson)
+						Err(InvalidJson("Invalid JSON"))
 					}
 			}
 		}
