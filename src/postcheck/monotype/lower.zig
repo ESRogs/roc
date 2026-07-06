@@ -564,6 +564,8 @@ const Builder = struct {
     /// requests made anywhere inside that specialization defer to its end,
     /// when its types are final and specialization keys are stable.
     active_graph: ?*InstGraph = null,
+    batched_requester_drain_graph: ?*InstGraph = null,
+    batched_requester_drain_needed: bool = false,
     final_body_output_allowance: FinalBodyOutputCounts = .{},
 
     fn init(allocator: Allocator, modules: Common.CheckedModules, program: *Ast.Program, options: Options) Builder {
@@ -592,6 +594,8 @@ const Builder = struct {
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
+            .batched_requester_drain_graph = null,
+            .batched_requester_drain_needed = false,
         };
     }
 
@@ -665,8 +669,15 @@ const Builder = struct {
             self.countBy("specialization_type_digest_nodes_visited", @intCast(stats.nodes_visited));
             return digest;
         }
-
         return self.program.types.specializationDigestCached(&self.program.names, ty, null);
+    }
+
+    fn drainRequesterGraph(self: *Builder, graph: *InstGraph) Allocator.Error!void {
+        if (self.batched_requester_drain_graph == graph) {
+            self.batched_requester_drain_needed = true;
+            return;
+        }
+        try graph.drainDirty();
     }
 
     fn initHostedCatalog(self: *Builder) Allocator.Error!void {
@@ -1287,7 +1298,7 @@ const Builder = struct {
                     if (existing.status == .ready and existing.solved_fn_ty != fn_ty) {
                         try graph.unify(try graph.importMono(fn_ty), try graph.importMono(existing.solved_fn_ty));
                     }
-                    try graph.drainDirty();
+                    try self.drainRequesterGraph(graph);
                 }
                 switch (existing.status) {
                     .ready,
@@ -1433,7 +1444,7 @@ const Builder = struct {
                 try requester_graph.importMono(fn_ty),
                 try requester_graph.importMono(solved_requester_fn_ty),
             );
-            try requester_graph.drainDirty();
+            try self.drainRequesterGraph(requester_graph);
         }
         const sealed = try self.sealActiveBodyDraft(
             graph,
@@ -1491,7 +1502,7 @@ const Builder = struct {
             if (existing.status == .ready and existing.solved_fn_ty != fn_ty) {
                 try requester.unify(try requester.importMono(fn_ty), try requester.importMono(existing.solved_fn_ty));
             }
-            try requester.drainDirty();
+            try self.drainRequesterGraph(requester);
             const def = self.program.defs.items[@intFromEnum(existing.def)];
             return .{
                 .target = .{ .local = def.fn_id orelse
@@ -2797,7 +2808,7 @@ const Builder = struct {
                 );
                 unified = true;
             }
-            if (unified) try request.ctx.graph.drainDirty();
+            if (unified) try self.drainRequesterGraph(request.ctx.graph);
             switch (existing.status) {
                 .ready,
                 .lowering,
@@ -3003,6 +3014,14 @@ const Builder = struct {
     /// every remaining request before lowering it.
     fn drainSpecRequestsFrom(self: *Builder, graph: *InstGraph, start_len: usize) Allocator.Error!void {
         if (start_len == 0) try self.sealDeferredSpecRequestsFrom(graph, start_len);
+        const saved_batched_graph = self.batched_requester_drain_graph;
+        const saved_batched_needed = self.batched_requester_drain_needed;
+        self.batched_requester_drain_graph = graph;
+        self.batched_requester_drain_needed = false;
+        errdefer {
+            self.batched_requester_drain_graph = saved_batched_graph;
+            self.batched_requester_drain_needed = saved_batched_needed;
+        }
         while (graph.deferred_templates.items.len > start_len) {
             const request = graph.deferred_templates.pop() orelse
                 Common.invariant("deferred template queue length changed while draining");
@@ -3017,6 +3036,12 @@ const Builder = struct {
                 request.source_region_override,
                 request.current_entry_root,
             );
+        }
+        const drain_needed = self.batched_requester_drain_needed;
+        self.batched_requester_drain_graph = saved_batched_graph;
+        self.batched_requester_drain_needed = saved_batched_needed or (drain_needed and saved_batched_graph == graph);
+        if (drain_needed and saved_batched_graph != graph) {
+            try graph.drainDirty();
         }
     }
 
@@ -15662,8 +15687,8 @@ const BodyContext = struct {
         if (monoAliasBacking(&self.builder.program.types, actual)) |backing| {
             if (self.sameTypeInner(expected, backing, visiting)) return true;
         }
-        const expected_digest = self.builder.program.types.typeDigest(&self.builder.program.names, expected);
-        const actual_digest = self.builder.program.types.typeDigest(&self.builder.program.names, actual);
+        const expected_digest = self.builder.program.types.typeDigestCached(&self.builder.program.names, expected, null);
+        const actual_digest = self.builder.program.types.typeDigestCached(&self.builder.program.names, actual, null);
         if (std.mem.eql(u8, expected_digest.bytes[0..], actual_digest.bytes[0..])) return true;
 
         const pair = TypePair{ .expected = expected, .actual = actual };
