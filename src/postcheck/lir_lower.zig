@@ -1601,10 +1601,7 @@ const Lowerer = struct {
         const branches = try GuardedList.dupe(self.allocator, LambdaMono.Branch, self.program.branchSpan(branches_span));
         defer self.allocator.free(branches);
         const done = self.freshJoinPointId();
-        const branch_chain = if (match_tree.lowering_mode == .tree)
-            try self.lowerBranchTree(scrutinee_local, self.expr(scrutinee).ty, branches, target, done, comptime_site)
-        else
-            try self.lowerBranchChain(scrutinee_local, branches, target, done, comptime_site);
+        const branch_chain = try self.lowerBranchTree(scrutinee_local, self.expr(scrutinee).ty, branches, target, done, comptime_site);
         const remainder = try self.lowerExprInto(scrutinee_local, scrutinee, branch_chain);
         return try self.result.store.addCFStmt(.{ .join = .{
             .id = done,
@@ -2630,110 +2627,6 @@ const Lowerer = struct {
             return try self.l.boolSwitchNoContinuation(cond, then, els);
         }
     };
-
-    fn lowerBranchChain(
-        self: *Lowerer,
-        scrutinee: LIR.LocalId,
-        branches: []const LambdaMono.Branch,
-        target: LIR.LocalId,
-        done: LIR.JoinPointId,
-        comptime_site: ?LambdaMono.ComptimeSiteId,
-    ) Common.LowerError!LIR.CFStmtId {
-        var current = if (comptime_site) |site|
-            try self.result.store.addCFStmt(.{ .comptime_exhaustiveness_failed = .{ .site = try self.lowerComptimeSite(site) } })
-        else
-            try self.result.store.addCFStmt(.{ .runtime_error = {} });
-        var i = branches.len;
-        while (i > 0) {
-            const group_end = i;
-            const group_start = self.strPatternBranchGroupStart(branches, group_end);
-            if (group_end - group_start >= 2) {
-                const next_branch = current;
-                const miss = PatternMiss{ .join_id = self.freshJoinPointId() };
-                const branch_start = try self.lowerStrPatternBranchGroup(branches[group_start..group_end], scrutinee, target, done, miss);
-                current = try self.result.store.addCFStmt(.{ .join = .{
-                    .id = miss.join_id,
-                    .params = LIR.LocalSpan.empty(),
-                    .body = next_branch,
-                    .remainder = branch_start,
-                } });
-                i = group_start;
-                continue;
-            }
-
-            i -= 1;
-            const next_branch = current;
-            const needs_miss_join = branches[i].guard != null or self.patternCanMiss(branches[i].pat);
-            const miss = if (needs_miss_join)
-                PatternMiss{ .join_id = self.freshJoinPointId() }
-            else
-                null;
-            const branch_done = try self.joinJump(done);
-            const branch_body = try self.lowerExprInto(target, branches[i].body, branch_done);
-            const guarded = if (branches[i].guard) |guard| blk: {
-                const guard_local = try self.addTemp(self.expr(guard).ty);
-                const guard_switch = try self.boolSwitchNoContinuation(guard_local, branch_body, try self.patternMissJump(miss));
-                break :blk try self.lowerExprInto(guard_local, guard, guard_switch);
-            } else branch_body;
-            const branch_start = try self.lowerPatternThen(branches[i].pat, scrutinee, guarded, miss, branch_done);
-            current = if (miss) |miss_info|
-                try self.result.store.addCFStmt(.{ .join = .{
-                    .id = miss_info.join_id,
-                    .params = LIR.LocalSpan.empty(),
-                    .body = next_branch,
-                    .remainder = branch_start,
-                } })
-            else
-                branch_start;
-        }
-        return current;
-    }
-
-    fn strPatternBranchGroupStart(self: *Lowerer, branches: []const LambdaMono.Branch, end: usize) usize {
-        var start = end;
-        while (start > 0 and self.directStrPattern(branches[start - 1].pat) != null) {
-            start -= 1;
-        }
-        return start;
-    }
-
-    fn directStrPattern(self: *Lowerer, pat_id: LambdaMono.PatId) ?LambdaMono.StrPattern {
-        const pat_data = self.pat(pat_id);
-        return switch (pat_data.data) {
-            .str_pattern => |str| str,
-            else => null,
-        };
-    }
-
-    fn lowerStrPatternBranchGroup(
-        self: *Lowerer,
-        branches: []const LambdaMono.Branch,
-        source: LIR.LocalId,
-        target: LIR.LocalId,
-        done: LIR.JoinPointId,
-        miss: PatternMiss,
-    ) Common.LowerError!LIR.CFStmtId {
-        const arms = try self.allocator.alloc(LIR.StrMatchArm, branches.len);
-        defer self.allocator.free(arms);
-
-        for (branches, arms) |branch, *arm| {
-            const str = self.directStrPattern(branch.pat) orelse Common.invariant("string-pattern branch group contained a non-string-pattern branch");
-            const branch_done = try self.joinJump(done);
-            const branch_body = try self.lowerExprInto(target, branch.body, branch_done);
-            const guarded = if (branch.guard) |guard| blk: {
-                const guard_local = try self.addTemp(self.expr(guard).ty);
-                const guard_switch = try self.boolSwitchNoContinuation(guard_local, branch_body, try self.patternMissJump(miss));
-                break :blk try self.lowerExprInto(guard_local, guard, guard_switch);
-            } else branch_body;
-            arm.* = try self.lowerStrPatternArm(str, guarded);
-        }
-
-        return try self.result.store.addCFStmt(.{ .str_match_set = .{
-            .source = source,
-            .arms = try self.result.store.addStrMatchArms(arms),
-            .on_miss = try self.patternMissJump(miss),
-        } });
-    }
 
     fn joinJump(self: *Lowerer, join_id: LIR.JoinPointId) Common.LowerError!LIR.CFStmtId {
         return try self.result.store.addCFStmt(.{ .jump = .{ .target = join_id } });

@@ -2,32 +2,21 @@
 //! (src/postcheck/match_tree.zig), per
 //! projects/big/decision-tree-match-compiler.md:
 //!
-//! - An N-branch tag match lowers to exactly ONE multiway `switch_stmt` with
-//!   one discriminant read (the chain emitted N one-armed switches with N
-//!   reads).
+//! - An N-branch tag match on one scrutinee lowers to exactly ONE multiway
+//!   `switch_stmt` with ONE discriminant read (the deleted chain emitted N
+//!   one-armed switches with N reads).
 //! - The PR 9707 list-match family grows linearly in statement count.
-//! - Guard, string, list, and nominal matches pass ARC certification under
-//!   the tree (the harness runs the certifier).
+//! - Guard, string, list, and nominal matches pass ARC certification (the
+//!   harness runs the certifier).
 
 const std = @import("std");
 const layout = @import("layout");
 const lir = @import("lir");
-const postcheck = @import("postcheck");
 
 const harness = @import("lower_to_lir_harness.zig");
 const expectLowersToLir = harness.expectLowersToLir;
 const expectDeterministicLir = harness.expectDeterministicLir;
 const expectLirInspection = harness.expectLirInspection;
-
-const match_tree = postcheck.MatchTree;
-
-fn withTreeLowering() void {
-    match_tree.lowering_mode = .tree;
-}
-
-fn restoreChainLowering() void {
-    match_tree.lowering_mode = .chain;
-}
 
 const six_tag_match_app =
     \\Color := [Red, Green, Blue, Yellow, Purple, Orange]
@@ -54,48 +43,50 @@ const six_tag_match_app =
 ;
 
 var counted_multiway_switches: usize = 0;
-var counted_discriminant_reads: usize = 0;
 var counted_total_stmts: usize = 0;
 
 fn countShapes(store: *const lir.LirStore, layouts: *const layout.Store) harness.LowerToLirHarnessError!void {
     _ = layouts;
     counted_multiway_switches = 0;
-    counted_discriminant_reads = 0;
     counted_total_stmts = store.cf_stmts.items.len;
     for (store.cf_stmts.items) |stmt| {
         switch (stmt) {
             .switch_stmt => |sw| {
                 if (sw.branches.len >= 5) counted_multiway_switches += 1;
             },
-            .assign_ref => |ref| {
-                if (ref.op == .discriminant) counted_discriminant_reads += 1;
-            },
             else => {},
         }
     }
 }
 
-test "tree lowers an N-branch tag match to one multiway switch with one discriminant read" {
-    withTreeLowering();
-    defer restoreChainLowering();
-    try expectLirInspection(six_tag_match_app, countShapes);
-    const tree_switches = counted_multiway_switches;
-    const tree_disc_reads = counted_discriminant_reads;
+/// For every proc containing a >= 5-case switch (the `rank` specializations),
+/// assert the proc reads exactly one discriminant: one multiway dispatch per
+/// match, one read per tested position.
+fn checkRankProcShape(store: *const lir.LirStore, layouts: *const layout.Store) harness.LowerToLirHarnessError!void {
+    const gpa = std.testing.allocator;
+    const buf = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(buf);
+    var found_multiway_proc = false;
+    for (0..store.proc_specs.items.len) |index| {
+        var writer = std.Io.Writer.fixed(buf);
+        try lir.DebugPrint.writeProc(gpa, store, layouts, @enumFromInt(@as(u32, @intCast(index))), &writer);
+        const text = writer.buffered();
+        if (std.mem.count(u8, text, "case ") >= 5) {
+            found_multiway_proc = true;
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "ref.discriminant"));
+        }
+    }
+    try std.testing.expect(found_multiway_proc);
+}
 
-    restoreChainLowering();
+test "an N-branch tag match lowers to one multiway switch with one discriminant read" {
     try expectLirInspection(six_tag_match_app, countShapes);
-    const chain_switches = counted_multiway_switches;
-    const chain_disc_reads = counted_discriminant_reads;
-
     // The only match with >= 6 same-scrutinee tag branches in the whole
     // program (app, echo platform wrapper, and reachable builtins) is `rank`:
     // the closed 6-variant union lowers to one 5-branch switch whose default
-    // is the last arm (checker-verdict exhaustiveness), per `rank`
-    // specialization. The chain never produces a multiway switch, and needs
-    // one discriminant re-read per branch where the tree reads once.
-    try std.testing.expect(tree_switches >= 1);
-    try std.testing.expectEqual(@as(usize, 0), chain_switches);
-    try std.testing.expect(tree_disc_reads < chain_disc_reads);
+    // is the last arm (checker-verdict exhaustiveness).
+    try std.testing.expect(counted_multiway_switches >= 1);
+    try expectLirInspection(six_tag_match_app, checkRankProcShape);
 }
 
 fn listMatchApp(comptime branch_count: usize) []const u8 {
@@ -133,10 +124,7 @@ fn listMatchApp(comptime branch_count: usize) []const u8 {
     return built;
 }
 
-test "tree keeps the PR 9707 list-match family linear in statement count" {
-    withTreeLowering();
-    defer restoreChainLowering();
-
+test "the PR 9707 list-match family stays linear in statement count" {
     try expectLirInspection(listMatchApp(3), countShapes);
     const count3 = counted_total_stmts;
     try expectLirInspection(listMatchApp(4), countShapes);
@@ -155,9 +143,7 @@ test "tree keeps the PR 9707 list-match family linear in statement count" {
     try std.testing.expect(delta_b < 200);
 }
 
-test "guard, string, list, and as-pattern matches pass ARC certification under the tree" {
-    withTreeLowering();
-    defer restoreChainLowering();
+test "guard, string, list, and as-pattern matches pass ARC certification" {
     try expectLowersToLir(
         \\describe : Try(I64, Str), Bool -> Str
         \\describe = |v, flag| match v {
@@ -197,9 +183,7 @@ test "guard, string, list, and as-pattern matches pass ARC certification under t
     );
 }
 
-test "nominal record match with declared order differing from backing order lowers under the tree" {
-    withTreeLowering();
-    defer restoreChainLowering();
+test "nominal record match with declared order differing from backing order lowers" {
     try expectLowersToLir(
         \\P := { y : U8, x : U64 }
         \\
@@ -220,9 +204,7 @@ test "nominal record match with declared order differing from backing order lowe
     );
 }
 
-test "tree lowering is deterministic" {
-    withTreeLowering();
-    defer restoreChainLowering();
+test "match lowering is deterministic" {
     try expectDeterministicLir(
         \\f : Try(I64, Str) -> I64
         \\f = |v| match v {
