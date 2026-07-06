@@ -31,6 +31,9 @@ const child_command_timeout_reserve_ms: u64 = 1_000;
 const timeout_result_grace_ms: u64 = 5_000;
 const default_timeout_ms: u64 = 120_000;
 const glue_timeout_ms: u64 = 240_000;
+const json_round_trip_timeout_ms: u64 = 300_000;
+
+var explicit_timeout_requested: bool = false;
 
 const CliRunnerError = util.RocRunError ||
     util.ChildTimeoutError ||
@@ -414,6 +417,9 @@ const CliCase = struct {
     name: []const u8,
     /// Execution mode when the case has one.
     backend: ?OptMode = null,
+    /// Custom default timeout for known-large cases. An explicit CLI
+    /// --timeout still overrides this value.
+    timeout_ms: ?u64 = null,
     skip: Skip = .never,
     body: Body,
 
@@ -918,7 +924,7 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc test supports structural encode_to on records", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/EncodeToStructuralRecord.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test supports structural encode_to on empty records without field methods", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/EncodeToEmptyRecordNoFieldMethods.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test supports stored top-level encode_to value", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/EncodeToTopLevelStored.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
-    .{ .id = 0, .suite = .subcommands, .name = "roc test round-trips JSON parse and encode", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/JsonEncodeRoundTrip.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test round-trips JSON parse and encode", .timeout_ms = json_round_trip_timeout_ms, .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/JsonEncodeRoundTrip.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test covers JSON integer edge cases", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/JsonEncodeEdgeCases.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test covers JSON numeric edge cases", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/JsonEncodeNumberEdgeCases.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test covers JSON null container edge cases", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/JsonEncodeNullContainerEdgeCases.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
@@ -1280,16 +1286,18 @@ fn skipReason(skip: Skip) ?[]const u8 {
 }
 
 fn runSingleTest(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: u64) TestResult {
+    const case_timeout_ms = getCliCaseTimeoutMs(spec, timeout_ms);
+
     if (skipReason(spec.skip)) |reason| {
         var timer = harness.Timer.start() catch return .{ .status = .skip, .phase = .setup, .message = reason };
         return .{ .status = .skip, .phase = .setup, .duration_ns = timer.read(), .message = reason };
     }
 
     return switch (spec.body) {
-        .platform => runPlatformCase(io, allocator, spec, timeout_ms),
-        .command => |command| runCommandCase(io, allocator, command, timeout_ms),
-        .custom => |custom| runCustomCase(io, allocator, spec, custom, timeout_ms),
-        .glue_matrix => |matrix| runGlueMatrixCase(io, allocator, matrix, timeout_ms),
+        .platform => runPlatformCase(io, allocator, spec, case_timeout_ms),
+        .command => |command| runCommandCase(io, allocator, command, case_timeout_ms),
+        .custom => |custom| runCustomCase(io, allocator, spec, custom, case_timeout_ms),
+        .glue_matrix => |matrix| runGlueMatrixCase(io, allocator, matrix, case_timeout_ms),
     };
 }
 
@@ -5984,6 +5992,11 @@ fn getTestName(spec: CliCase) []const u8 {
     return spec.name;
 }
 
+fn getCliCaseTimeoutMs(spec: CliCase, default_case_timeout_ms: u64) u64 {
+    if (explicit_timeout_requested) return default_case_timeout_ms;
+    return spec.timeout_ms orelse default_case_timeout_ms;
+}
+
 fn dupeOptional(gpa: Allocator, value: ?[]const u8) ?[]const u8 {
     return if (value) |slice| gpa.dupe(u8, slice) catch null else null;
 }
@@ -6012,6 +6025,7 @@ const Pool = harness.ProcessPool(CliCase, TestResult, .{
     .timeout_result = .{ .status = .timeout },
     .stabilizeResult = &stabilizeResult,
     .getName = &getTestName,
+    .getTimeoutMs = &getCliCaseTimeoutMs,
     .use_process_groups = true,
     .timeout_report_grace_ms = timeout_result_grace_ms,
     .windows_persistent_workers = false,
@@ -6512,6 +6526,7 @@ pub fn main(init: std.process.Init) CliRunnerError!void {
     }
 
     project_root_path = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", spec_arena.allocator());
+    explicit_timeout_requested = args.timeout_provided;
     roc_binary_path = if (std.fs.path.isAbsolute(args.positional[0]))
         args.positional[0]
     else
@@ -6578,7 +6593,8 @@ pub fn main(init: std.process.Init) CliRunnerError!void {
     const max_children = args.max_threads orelse @min(cpu_count, tests.len);
 
     std.debug.print("=== CLI Test Runner ===\n", .{});
-    std.debug.print("{d} tests, {d} workers, {d}s timeout", .{ tests.len, max_children, timeout_ms / 1000 });
+    const timeout_label = if (args.timeout_provided) "timeout" else "default timeout";
+    std.debug.print("{d} tests, {d} workers, {d}s {s}", .{ tests.len, max_children, timeout_ms / 1000, timeout_label });
     if (args.include_llvm) {
         std.debug.print(", backends: interpreter, dev, size, speed\n\n", .{});
     } else {

@@ -1036,6 +1036,10 @@ const Constraint = union(enum) {
         /// pattern var) is not yet unified with the annotation. Null for non-
         /// recursive edges.
         recursive_annotated_fn_var: ?Var = null,
+        /// The lambda that owns this deferred return edge. Set only for
+        /// `.early_return` and `.try_operator` contexts so lambda exit can
+        /// process the edges that belong to the lambda whose body just finished.
+        return_lambda: ?CIR.Expr.Idx = null,
     },
 
     pub const SafeList = MkSafeList(@This());
@@ -11257,77 +11261,16 @@ fn checkExprIter(self: *Self, root_idx: CIR.Expr.Idx, root_env: *Env, root_expec
                         // POST-CHILD body. The child's does_fx was already OR'd
                         // into f.does_fx when the child frame popped.
                         const tuple_var = ModuleEnv.varFrom(ta.tuple);
-                        const resolved = self.types.resolveVar(tuple_var);
-
-                        switch (resolved.desc.content) {
-                            .structure => |s| switch (s) {
-                                .tuple => |t| {
-                                    // Access the element at the given index
-                                    const elem_index = ta.elem_index;
-                                    const elems = self.types.sliceVars(t.elems);
-                                    if (elem_index < elems.len) {
-                                        const elem_var = elems[elem_index];
-                                        _ = try self.unify(f.prologue.expr_var, elem_var, f.env);
-                                    } else {
-                                        const min_elems = elem_index + 1;
-                                        const scratch_vars_top = self.scratch_vars.top();
-                                        defer self.scratch_vars.clearFrom(scratch_vars_top);
-
-                                        for (0..min_elems) |_| {
-                                            const fresh_var = try self.fresh(f.env, f.prologue.expr_region);
-                                            try self.scratch_vars.append(fresh_var);
-                                        }
-                                        const expected_elems = try self.types.appendVars(self.scratch_vars.sliceFromStart(scratch_vars_top));
-                                        const expected_tuple_var = try self.freshFromContent(.{ .structure = .{
-                                            .tuple = .{ .elems = expected_elems },
-                                        } }, f.env, f.prologue.expr_region);
-
-                                        _ = try self.unify(expected_tuple_var, tuple_var, f.env);
-                                        try self.unifyWith(f.prologue.expr_var, .err, f.env);
-                                    }
-                                },
-                                else => {
-                                    // Not a tuple - create a flex var with expected tuple constraint
-                                    // The elem_index + 1 gives us the minimum tuple size needed
-                                    const min_elems = ta.elem_index + 1;
-                                    const scratch_vars_top = self.scratch_vars.top();
-                                    defer self.scratch_vars.clearFrom(scratch_vars_top);
-
-                                    for (0..min_elems) |_| {
-                                        const fresh_var = try self.fresh(f.env, f.prologue.expr_region);
-                                        try self.scratch_vars.append(fresh_var);
-                                    }
-                                    const elem_vars = try self.types.appendVars(self.scratch_vars.sliceFromStart(scratch_vars_top));
-
-                                    const expected_tuple_var = try self.freshFromContent(.{ .structure = .{
-                                        .tuple = .{ .elems = elem_vars },
-                                    } }, f.env, f.prologue.expr_region);
-
-                                    // A non-tuple structure can never satisfy a tuple access,
-                                    // so this unify reports the mismatch. Poison the result to
-                                    // `.err` (like the out-of-bounds branch above) rather than
-                                    // leaving it a fresh flex var, so conflicting downstream
-                                    // uses of the result don't produce cascading errors.
-                                    _ = try self.unify(tuple_var, expected_tuple_var, f.env);
-                                    try self.unifyWith(f.prologue.expr_var, .err, f.env);
-                                },
-                            },
-                            .flex => {
-                                try self.pending_tuple_accesses.append(self.gpa, .{
-                                    .tuple_var = resolved.var_,
-                                    .result_var = f.prologue.expr_var,
-                                    .elem_index = ta.elem_index,
-                                    .region = f.prologue.expr_region,
-                                });
-                            },
-                            .err => {
-                                // Propagate error
-                                try self.unifyWith(f.prologue.expr_var, .err, f.env);
-                            },
-                            else => {
-                                // Not a tuple
-                                try self.unifyWith(f.prologue.expr_var, .err, f.env);
-                            },
+                        const pending = PendingTupleAccess{
+                            .tuple_var = self.types.resolveVar(tuple_var).var_,
+                            .result_var = f.prologue.expr_var,
+                            .elem_index = ta.elem_index,
+                            .region = f.prologue.expr_region,
+                        };
+                        // Share alias unwrapping and unresolved-flex handling with
+                        // the final pending-access sweep.
+                        if (!try self.resolvePendingTupleAccess(pending, f.env, false)) {
+                            try self.pending_tuple_accesses.append(self.gpa, pending);
                         }
                     },
                     .e_block => |block| {
@@ -11868,6 +11811,7 @@ fn checkExprIter(self: *Self, root_idx: CIR.Expr.Idx, root_env: *Env, root_expec
                                 .expected = ModuleEnv.varFrom(lambda_expr.e_lambda.body),
                                 .actual = ret_var,
                                 .ctx = return_ctx,
+                                .return_lambda = ret.lambda,
                             } });
                         }
                         // Note: we DO NOT unify the return type with the expr here,
@@ -13352,6 +13296,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                         .expected = ModuleEnv.varFrom(lambda_expr.e_lambda.body),
                         .actual = ret_var,
                         .ctx = .early_return,
+                        .return_lambda = ret.lambda,
                     } });
                 }
 
@@ -15972,7 +15917,8 @@ fn enterLambdaExpr(self: *Self, top: usize) Allocator.Error!void {
 /// to both `hoist_frame.finish` (in the epilogue) and its parent. No `checkExpr`
 /// re-entry / no `check_frame_stack` append below, so `items[top]` stays valid.
 fn exitLambdaExpr(self: *Self, top: usize) Allocator.Error!void {
-    const lambda = self.cir.store.getExpr(self.check_frame_stack.items[top].expr_idx).e_lambda;
+    const lambda_idx = self.check_frame_stack.items[top].expr_idx;
+    const lambda = self.cir.store.getExpr(lambda_idx).e_lambda;
     const env = self.check_frame_stack.items[top].env;
     const expr_var = self.check_frame_stack.items[top].prologue.expr_var;
     const st = self.check_frame_stack.items[top].kind_state.lambda;
@@ -15994,7 +15940,7 @@ fn exitLambdaExpr(self: *Self, top: usize) Allocator.Error!void {
 
     // Process pending return constraints (early returns / `?`) before generalizing
     // the function type, then check for infinite types.
-    try self.processReturnConstraints(env);
+    try self.processReturnConstraints(env, lambda_idx);
     try self.checkForInfiniteType(CIR.Expr.Idx, lambda.body);
 
     // Create the function type. Re-derive `arg_vars` from the param span.
@@ -18210,28 +18156,46 @@ fn isDecNominal(self: *Self, var_: Var) bool {
     return nominal.ident.ident_idx.eql(self.cir.idents.dec_type);
 }
 
-/// Process only early_return and try_operator constraints, keeping other
-/// constraints for later processing. Called at the end of e_lambda to ensure return type
-/// information is unified with the body type before the function type is generalized,
-/// without prematurely processing other constraints from recursive lookups.
-fn processReturnConstraints(self: *Self, env: *Env) std.mem.Allocator.Error!void {
+/// Process early_return and try_operator constraints owned by one lambda,
+/// keeping other constraints for later processing. Called at the end of
+/// e_lambda to ensure return type information is unified with the body type
+/// before the function type is generalized, without prematurely processing
+/// return constraints owned by nested lambdas or constraints from recursive
+/// lookups.
+fn processReturnConstraints(self: *Self, env: *Env, lambda_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
     const original_len = self.constraints.items.items.len;
     var write_idx: usize = 0;
     for (0..original_len) |read_idx| {
         const constraint = self.constraints.items.items[read_idx];
+        var keep = true;
         switch (constraint) {
             .eql => |eql| switch (eql.ctx) {
                 .early_return => {
-                    _ = try self.unifyInContext(eql.expected, eql.actual, env, .early_return);
+                    if (eql.return_lambda) |owner| {
+                        if (owner == lambda_idx) {
+                            _ = try self.unifyInContext(eql.expected, eql.actual, env, .early_return);
+                            keep = false;
+                        }
+                    } else {
+                        std.debug.assert(false);
+                    }
                 },
                 .try_operator => {
-                    _ = try self.unifyInContext(eql.expected, eql.actual, env, .try_operator);
+                    if (eql.return_lambda) |owner| {
+                        if (owner == lambda_idx) {
+                            _ = try self.unifyInContext(eql.expected, eql.actual, env, .try_operator);
+                            keep = false;
+                        }
+                    } else {
+                        std.debug.assert(false);
+                    }
                 },
-                else => {
-                    self.constraints.items.items[write_idx] = constraint;
-                    write_idx += 1;
-                },
+                else => {},
             },
+        }
+        if (keep) {
+            self.constraints.items.items[write_idx] = constraint;
+            write_idx += 1;
         }
     }
     std.debug.assert(self.constraints.items.items.len == original_len);

@@ -370,6 +370,49 @@ test "check - repro - issue 8848" {
     // regression we're guarding against
 }
 
+test "check - repro - issue 9827 - nested effectful decoder lambda with try" {
+    // Repro for https://github.com/roc-lang/roc/issues/9827. Return constraints
+    // created inside the returned decoder lambda belong to that lambda.
+    const src =
+        \\main! = |_args| {}
+        \\
+        \\Stmt : {}
+        \\MaybeI64 : [Null, NotNull(I64)]
+        \\
+        \\str_decoder : Str -> (List(Str) -> (Stmt => Try(Str, [DbErr, ..])))
+        \\str_decoder = |_name| |_cols| |_stmt| Ok("todo")
+        \\
+        \\nullable_i64_decoder : Str -> (List(Str) -> (Stmt => Try(MaybeI64, [DbErr, ..])))
+        \\nullable_i64_decoder = |_name| |_cols| |_stmt| Ok(Null)
+        \\
+        \\decode = |cols|
+        \\    |stmt| {
+        \\        status_str = str_decoder("status")(cols)(stmt)?
+        \\        status = decode_status(status_str)?
+        \\        edited_raw = nullable_i64_decoder("edited")(cols)(stmt)?
+        \\        edited = decode_edited(edited_raw)
+        \\        Ok({ status, edited })
+        \\    }
+        \\
+        \\decode_status = |s|
+        \\    match s {
+        \\        "todo" => Ok(Todo)
+        \\        _ => Err(ParseError("x"))
+        \\    }
+        \\
+        \\decode_edited = |e|
+        \\    match e {
+        \\        NotNull(1) => Edited
+        \\        _ => Unknown
+        \\    }
+    ;
+
+    var test_env = try TestEnv.init("Test", src);
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+}
+
 test "check - repro - bad return branch mismatch after utf8 empty guard" {
     const src =
         \\main! = |_| {}
