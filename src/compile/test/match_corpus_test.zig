@@ -1,11 +1,10 @@
-//! Differential tests for the decision-tree match compiler: every generated
-//! program is compiled and interpreted twice — once with the per-branch chain
-//! lowering and once with the decision tree — and the observed outputs
-//! (including compile problems and crashes) must be identical.
-//!
-//! Compile-time finalization itself lowers and runs LIR through the dev
-//! backend, so each compilation also differential-tests the native codegen of
-//! the tree's multiway switches, not just the interpreter.
+//! Generated-corpus tests for the decision-tree match compiler. During the
+//! migration these compared the deleted per-branch chain against the tree;
+//! they now run each generated program through compilation (compile-time
+//! finalization executes tree-lowered LIR on the dev backend) and the LIR
+//! interpreter, catching lowering panics, statement-count lint violations,
+//! ARC issues, and evaluation crashes. Cross-executor agreement is covered by
+//! `zig build run-test-eval`.
 //!
 //! Programs are generated from fixed seeds (never wall-clock), covering
 //! random nesting of tags, records, tuples, lists (with rests), strings
@@ -15,10 +14,8 @@
 
 const std = @import("std");
 const eval = @import("eval");
-const postcheck = @import("postcheck");
 
 const helpers = eval.test_helpers;
-const match_tree = postcheck.MatchTree;
 
 const Buf = std.ArrayList(u8);
 
@@ -28,13 +25,12 @@ fn appendf(buf: *Buf, alloc: std.mem.Allocator, comptime fmt: []const u8, args: 
     try buf.appendSlice(alloc, piece);
 }
 
-/// Run `source` (a module whose `main` is inspect-wrapped) through the LIR
-/// interpreter under the given lowering mode, capturing compile problems and
-/// crashes as comparable strings.
-fn runUnderMode(alloc: std.mem.Allocator, mode: match_tree.Mode, source: []const u8) ![]u8 {
-    match_tree.lowering_mode = mode;
-    defer match_tree.lowering_mode = .tree;
-
+/// Compile `source` (a module whose `main` is inspect-wrapped) and run it
+/// through the LIR interpreter, capturing compile problems and crashes as
+/// strings. A rare COMPILE_ERROR (e.g. a generated redundant branch the
+/// checker rejects) is an acceptable outcome; a RUN_ERROR is not — every
+/// generated match ends in a wildcard branch and its bodies cannot crash.
+fn runProgram(alloc: std.mem.Allocator, source: []const u8) ![]u8 {
     var compiled = helpers.compileInspectedProgram(alloc, std.testing.io, .module, source, &.{}) catch |err| {
         return try std.fmt.allocPrint(alloc, "COMPILE_ERROR:{s}", .{@errorName(err)});
     };
@@ -44,13 +40,11 @@ fn runUnderMode(alloc: std.mem.Allocator, mode: match_tree.Mode, source: []const
     };
 }
 
-fn expectSameUnderBothModes(alloc: std.mem.Allocator, source: []const u8) !void {
-    const chain_out = try runUnderMode(alloc, .chain, source);
-    defer alloc.free(chain_out);
-    const tree_out = try runUnderMode(alloc, .tree, source);
-    defer alloc.free(tree_out);
-    std.testing.expectEqualStrings(chain_out, tree_out) catch |err| {
-        std.debug.print("\n=== chain/tree divergence for program ===\n{s}\n=== chain: {s}\n=== tree:  {s}\n", .{ source, chain_out, tree_out });
+fn expectRunsCleanly(alloc: std.mem.Allocator, source: []const u8) !void {
+    const out = try runProgram(alloc, source);
+    defer alloc.free(out);
+    std.testing.expect(!std.mem.startsWith(u8, out, "RUN_ERROR")) catch |err| {
+        std.debug.print("\n=== generated match program failed ===\n{s}\n=== result: {s}\n", .{ source, out });
         return err;
     };
 }
@@ -339,31 +333,31 @@ fn runFamily(family: Family, program_count: usize, seed_base: u64) !void {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const source = try genProgram(arena, family, seed_base + i);
-        try expectSameUnderBothModes(alloc, source);
+        try expectRunsCleanly(alloc, source);
     }
 }
 
-test "differential: random tag matches agree between chain and tree" {
+test "corpus: random tag matches compile and run" {
     try runFamily(.tags, 10, 0x7a95_0001);
 }
 
-test "differential: random list matches agree between chain and tree" {
+test "corpus: random list matches compile and run" {
     try runFamily(.lists, 10, 0x7a95_0002);
 }
 
-test "differential: random string matches agree between chain and tree" {
+test "corpus: random string matches compile and run" {
     try runFamily(.strings, 10, 0x7a95_0003);
 }
 
-test "differential: random record matches agree between chain and tree" {
+test "corpus: random record matches compile and run" {
     try runFamily(.record_nested, 8, 0x7a95_0004);
 }
 
-test "differential: random tuple matches agree between chain and tree" {
+test "corpus: random tuple matches compile and run" {
     try runFamily(.tuple_nested, 8, 0x7a95_0005);
 }
 
-test "differential: small-universe enumeration agrees between chain and tree" {
+test "corpus: small-universe enumeration compiles and runs" {
     // Every value of E := [A, B(Bool)] against random pattern lists; all
     // three values are enumerated in every program.
     const alloc = std.testing.allocator;
@@ -406,6 +400,6 @@ test "differential: small-universe enumeration agrees between chain and tree" {
             \\main = (f(A, 1), f(B(True), 2), f(B(False), 3))
             \\
         );
-        try expectSameUnderBothModes(alloc, buf.items);
+        try expectRunsCleanly(alloc, buf.items);
     }
 }

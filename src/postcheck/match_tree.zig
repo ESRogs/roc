@@ -43,14 +43,6 @@
 
 const std = @import("std");
 
-/// Which match lowering the LIR lowerers use. Tests override this to exercise
-/// and differential-test the tree path; the toggle (and the chain) is deleted
-/// at the end of the migration (see
-/// docs/superpowers/plans/2026-07-06-decision-tree-match-compiler.md).
-pub const Mode = enum { chain, tree };
-/// Temporary migration toggle; see `Mode`.
-pub var lowering_mode: Mode = .tree;
-
 /// Pattern kinds the accessor context reports. This is the module's neutral
 /// view of `PatData` across Monotype Lifted and Lambda Mono inputs; `callable`
 /// only occurs for Lambda Mono.
