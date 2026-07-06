@@ -28450,6 +28450,7 @@ fn expectProvidedExportKind(
         builtin_module,
         &builtin_names,
         &builtin_template_lookup,
+        &.{},
         &builtin_checked_type_publication,
         builtin_bodies,
     );
