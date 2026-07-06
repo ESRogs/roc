@@ -3679,9 +3679,13 @@ pub const CheckedTypeStore = struct {
 
         var node_idx: u32 = 0;
         while (node_idx < module.nodeCount()) : (node_idx += 1) {
-            const node: CIR.Node.Idx = @enumFromInt(node_idx);
-            const tag = module.nodeTag(node);
-            if (isExprNodeTag(tag) and source_nodes.hasExpr(@enumFromInt(node_idx))) {
+            // Every source-marked expr/pattern node gets a published type
+            // root, matching exactly what `CheckedBodyStore.fromModule`
+            // demands. That includes nodes checking rewrote to runtime
+            // errors (tag `.malformed`, e.g. via ambiguity poisoning): their
+            // type vars are real, and the body store still publishes the
+            // node so the user-facing diagnostics survive to reporting.
+            if (source_nodes.hasExpr(@enumFromInt(node_idx))) {
                 const expr_idx: CIR.Expr.Idx = @enumFromInt(node_idx);
                 _ = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, module.exprType(expr_idx));
                 switch (module.expr(expr_idx).data) {
@@ -3690,7 +3694,7 @@ pub const CheckedTypeStore = struct {
                     },
                     else => {},
                 }
-            } else if (isPatternNodeTag(tag) and source_nodes.hasPattern(@enumFromInt(node_idx))) {
+            } else if (source_nodes.hasPattern(@enumFromInt(node_idx))) {
                 const pattern_source_var = checkedPatternSourceTypeVar(module, &top_level_defs, @enumFromInt(node_idx));
                 _ = try appendCheckedTypeRoot(
                     allocator,
