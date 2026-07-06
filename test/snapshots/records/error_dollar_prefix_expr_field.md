@@ -1,23 +1,23 @@
 # META
 ~~~ini
-description=minimal reproduction of record parsing index out of bounds crash
+description=Dollar-prefixed expression record field names are rejected
 type=expr
 ~~~
 # SOURCE
 ~~~roc
-{ i, Complete]
+{ $name: "Ada" }
 ~~~
 # EXPECTED
-EXPECTED RECORD FIELD - fuzz_crash_033.md:1:6:1:14
+EXPECTED RECORD FIELD - error_dollar_prefix_expr_field.md:1:3:1:8
 # PROBLEMS
 
 ┌───────────────────────┐
 │ EXPECTED RECORD FIELD ├─ I was parsing a record expression, and I ──────────┐
 └┬──────────────────────┘  expected a lowercase field name.                   │
  │                                                                            │
- │  { i, Complete]                                                            │
- │       ‾‾‾‾‾‾‾‾                                                             │
- └───────────────────────────────────────────────────── fuzz_crash_033.md:1:6 ┘
+ │  { $name: "Ada" }                                                          │
+ │    ‾‾‾‾‾                                                                   │
+ └───────────────────────────────────── error_dollar_prefix_expr_field.md:1:3 ┘
 
     Record fields start with lowercase names. After the name, either write `:
     value` or omit the value to use field punning.
@@ -25,13 +25,13 @@ EXPECTED RECORD FIELD - fuzz_crash_033.md:1:6:1:14
     For example:
         { name: "Ada", age }
 
-    I found `Complete` here.
-    Names that start with uppercase letters are used for tags, type names, and
-    module names in Roc.
+    I found `$name` here.
+    Dollar-prefixed names are mutable variables in Roc. Record fields are
+    labels, so they cannot start with `$`.
 
 # TOKENS
 ~~~zig
-OpenCurly,LowerIdent,Comma,UpperIdent,CloseSquare,
+OpenCurly,LowerIdent,OpColon,StringStart,StringPart,StringEnd,CloseCurly,
 EndOfFile,
 ~~~
 # PARSE
