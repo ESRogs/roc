@@ -15,8 +15,12 @@ pub const UrlId = struct {
 
 /// A package version parsed from a package URL path segment.
 ///
-/// Versions with major 0 (including the 0.0.0 "no version" sentinel) are
-/// rejected by URL parsing; the lowest publishable version is 1.0.0.
+/// 0.0.0 is reserved as the "no version" sentinel and is rejected by URL
+/// parsing; the lowest publishable version is 0.0.1.
+///
+/// For versions with major 0, the minor number is the compatibility boundary:
+/// in 0.X.Y, bumping X signals a breaking change and bumping Y signals a
+/// compatible one. From 1.0.0 onwards, normal SemVer semantics apply.
 pub const Version = struct {
     major: u32,
     minor: u32,
@@ -32,11 +36,13 @@ pub const Version = struct {
         return self.major != 0 or self.minor != 0 or self.patch != 0;
     }
 
-    /// Order two versions within the same major version: by minor, then patch.
-    /// Asserts that the major versions match, since different major versions
-    /// are different packages for solving purposes and must never be compared.
+    /// Order two versions within the same compatibility group: by minor, then
+    /// patch. Asserts that the major versions match — and for major 0, that
+    /// the minors match too — since different compatibility groups are
+    /// different packages for solving purposes and must never be compared.
     pub fn orderWithinMajor(self: Version, other: Version) std.math.Order {
         std.debug.assert(self.major == other.major);
+        std.debug.assert(self.major != 0 or self.minor == other.minor);
         const minor_order = std.math.order(self.minor, other.minor);
         if (minor_order != .eq) return minor_order;
         return std.math.order(self.patch, other.patch);
@@ -146,9 +152,9 @@ pub fn parseUrlPath(url: []const u8) error{ InvalidUrl, InvalidVersion, NoHashIn
     else
         null;
     if (version_parse) |parsed_version| {
-        // Package versions start at 1.0.0; major 0 is rejected (0.0.0 doubles
-        // as the no-version sentinel).
-        if (parsed_version.major == 0) return error.InvalidVersion;
+        // 0.0.0 is reserved as the no-version sentinel; the lowest publishable
+        // version is 0.0.1.
+        if (!parsed_version.isPresent()) return error.InvalidVersion;
     }
     const version = version_parse orelse Version.none;
     const url_id_end = if (version_parse != null)
@@ -253,7 +259,7 @@ test "parseUrlPath extracts url id" {
     }
 }
 
-test "parseUrlPath rejects versions below 1.0.0" {
+test "parseUrlPath rejects the reserved 0.0.0 version" {
     try std.testing.expectError(
         error.InvalidVersion,
         parseUrlPath("https://example.com/0.0.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
@@ -262,18 +268,28 @@ test "parseUrlPath rejects versions below 1.0.0" {
         error.InvalidVersion,
         parseUrlPath("https://example.com/foo/bar/0.0.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
     );
-    try std.testing.expectError(
-        error.InvalidVersion,
-        parseUrlPath("https://example.com/foo/0.0.1/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
-    );
-    try std.testing.expectError(
-        error.InvalidVersion,
-        parseUrlPath("https://example.com/foo/0.9.9/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
-    );
-    try std.testing.expectError(
-        error.InvalidVersion,
-        parseUrlPath("https://example.com/foo/0.20.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
-    );
+}
+
+test "parseUrlPath accepts 0.x versions" {
+    const cases = [_]struct { url: []const u8, version: Version }{
+        .{
+            .url = "https://example.com/foo/0.0.1/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .version = .{ .major = 0, .minor = 0, .patch = 1 },
+        },
+        .{
+            .url = "https://example.com/foo/0.9.9/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .version = .{ .major = 0, .minor = 9, .patch = 9 },
+        },
+        .{
+            .url = "https://example.com/foo/0.20.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .version = .{ .major = 0, .minor = 20, .patch = 0 },
+        },
+    };
+    for (cases) |case| {
+        const parsed = try parseUrlPath(case.url);
+        try std.testing.expectEqualStrings("example.com/foo", parsed.urlId(case.url));
+        try std.testing.expectEqual(case.version, parsed.version);
+    }
 }
 
 test "parseUrlPath rejects URLs without a hash path segment" {
@@ -311,4 +327,9 @@ test "Version.orderWithinMajor orders by minor then patch" {
     try std.testing.expectEqual(std.math.Order.lt, v1_2_3.orderWithinMajor(v1_2_4));
     try std.testing.expectEqual(std.math.Order.gt, v1_3_1.orderWithinMajor(v1_2_4));
     try std.testing.expectEqual(std.math.Order.eq, v1_2_3.orderWithinMajor(v1_2_3));
+
+    // For major 0, ordering happens within a 0.X compatibility group.
+    const v0_5_2 = Version{ .major = 0, .minor = 5, .patch = 2 };
+    const v0_5_3 = Version{ .major = 0, .minor = 5, .patch = 3 };
+    try std.testing.expectEqual(std.math.Order.lt, v0_5_2.orderWithinMajor(v0_5_3));
 }

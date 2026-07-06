@@ -406,16 +406,33 @@ test "download URL validation only recognizes strict version components" {
     }
 }
 
-test "download URL validation rejects versions below 1.0.0" {
-    const urls = [_][]const u8{
-        "https://example.com/packages/0.0.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
-        "https://example.com/packages/0.0.1/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
-        "https://example.com/packages/0.9.9/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
-        "https://example.com/packages/0.20.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+test "download URL validation rejects the reserved 0.0.0 version" {
+    try testing.expectError(
+        download.DownloadError.InvalidVersion,
+        download.validateUrl("https://example.com/packages/0.0.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
+    );
+}
+
+test "download URL validation accepts 0.x versions" {
+    const cases = [_]struct { url: []const u8, version: download.Version }{
+        .{
+            .url = "https://example.com/packages/0.0.1/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .version = .{ .major = 0, .minor = 0, .patch = 1 },
+        },
+        .{
+            .url = "https://example.com/packages/0.9.9/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .version = .{ .major = 0, .minor = 9, .patch = 9 },
+        },
+        .{
+            .url = "https://example.com/packages/0.20.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .version = .{ .major = 0, .minor = 20, .patch = 0 },
+        },
     };
 
-    for (urls) |url| {
-        try testing.expectError(download.DownloadError.InvalidVersion, download.validateUrl(url));
+    for (cases) |case| {
+        const parsed = try download.validateUrl(case.url);
+        try testing.expectEqual(case.version, parsed.version);
+        try testing.expectEqualStrings("example.com/packages", parsed.urlId(case.url));
     }
 }
 

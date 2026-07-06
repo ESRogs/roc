@@ -286,7 +286,7 @@ const Edge = struct {
     const InvalidSpec = enum {
         unparsable_url,
         insecure_url,
-        below_minimum_version,
+        reserved_version,
     };
 };
 
@@ -512,17 +512,14 @@ pub const Resolver = struct {
                             .spec = dep.spec,
                             .is_platform = dep.is_platform,
                             .target = .{ .invalid = switch (err) {
-                                error.InvalidVersion => .below_minimum_version,
+                                error.InvalidVersion => .reserved_version,
                                 else => .unparsable_url,
                             } },
                         });
                         continue;
                     };
 
-                    const group = if (parsed.version.isPresent())
-                        try std.fmt.allocPrint(self.arena(), "v{d}@{s}", .{ parsed.version.major, parsed.urlId(dep.spec) })
-                    else
-                        try std.fmt.allocPrint(self.arena(), "u@{s}", .{dep.spec});
+                    const group = try self.urlGroupKey(parsed, dep.spec);
 
                     const target = UrlTarget{
                         .group = group,
@@ -817,14 +814,26 @@ pub const Resolver = struct {
         }
     }
 
+    /// Build the sharing-group key for a parsed package URL. Versions in the
+    /// same group may be swapped for one another during solving: 1.0.0+
+    /// versions group by major, 0.X.Y versions group by 0.X (a 0.minor bump
+    /// signals a breaking change), and versionless URLs only ever match
+    /// themselves exactly.
+    fn urlGroupKey(self: *Resolver, parsed: base.url.ParsedUrl, spec: []const u8) Allocator.Error![]const u8 {
+        if (!parsed.version.isPresent()) {
+            return try std.fmt.allocPrint(self.arena(), "u@{s}", .{spec});
+        }
+        if (parsed.version.major == 0) {
+            return try std.fmt.allocPrint(self.arena(), "v0.{d}@{s}", .{ parsed.version.minor, parsed.urlId(spec) });
+        }
+        return try std.fmt.allocPrint(self.arena(), "v{d}@{s}", .{ parsed.version.major, parsed.urlId(spec) });
+    }
+
     fn groupKeyForSpec(self: *Resolver, parent_dir: []const u8, spec: []const u8) Allocator.Error!?[]const u8 {
         if (specIsUrlLike(spec)) {
             if (!base.url.isSafeUrl(spec)) return null;
             const parsed = base.url.parseUrlPath(spec) catch return null;
-            if (parsed.version.isPresent()) {
-                return try std.fmt.allocPrint(self.arena(), "v{d}@{s}", .{ parsed.version.major, parsed.urlId(spec) });
-            }
-            return try std.fmt.allocPrint(self.arena(), "u@{s}", .{spec});
+            return try self.urlGroupKey(parsed, spec);
         }
         const abs = try self.resolveLocalPath(parent_dir, spec);
         return try std.fmt.allocPrint(self.arena(), "l@{s}", .{abs});
@@ -849,10 +858,10 @@ pub const Resolver = struct {
                                 "Package URLs must use https (or http to localhost, for testing).",
                             .{ owner, edge.spec },
                         ),
-                        .below_minimum_version => try self.addDiagnostic(
+                        .reserved_version => try self.addDiagnostic(
                             "Invalid Package Version",
-                            "{s} depends on this URL, whose version is below 1.0.0:\n\n    {s}\n\n" ++
-                                "Roc package versions start at 1.0.0. (The version 0.0.0 is reserved to mean \"no version.\")",
+                            "{s} depends on this URL, which uses the reserved version 0.0.0:\n\n    {s}\n\n" ++
+                                "The lowest publishable package version is 0.0.1.",
                             .{ owner, edge.spec },
                         ),
                         .unparsable_url => try self.addDiagnostic(
@@ -2602,21 +2611,99 @@ test "insecure URLs are rejected" {
     try std.testing.expectEqualStrings("Insecure Package URL", resolver.diagnostics.items[0].title);
 }
 
-test "URL versions below 1.0.0 are rejected" {
+test "0.x versions within the same 0.minor share one package" {
     const gpa = std.testing.allocator;
     var registry = TestRegistry.init(gpa);
     defer registry.deinit();
 
+    const a_url = "https://example.com/a/1.0.0/hashA.tar.zst";
+    const b_url = "https://example.com/b/1.0.0/hashB.tar.zst";
+    const c_050 = "https://example.com/c/0.5.0/hashC050.tar.zst";
+    const c_052 = "https://example.com/c/0.5.2/hashC052.tar.zst";
+
     try registry.locals.put("/app/main.roc", .{
         .kind = .package,
-        .deps = &.{.{ .alias = "a", .spec = "https://example.com/a/0.5.0/hashA.tar.zst", .is_platform = false }},
+        .deps = &.{
+            .{ .alias = "a", .spec = a_url, .is_platform = false },
+            .{ .alias = "b", .spec = b_url, .is_platform = false },
+        },
     });
+    try registry.urls.put(a_url, .{ .deps = &.{.{ .alias = "c", .spec = c_050, .is_platform = false }} });
+    try registry.urls.put(b_url, .{ .deps = &.{.{ .alias = "c", .spec = c_052, .is_platform = false }} });
+    try registry.urls.put(c_050, .{});
+    try registry.urls.put(c_052, .{});
+
+    var resolver = Resolver.init(gpa, registry.fetcher(), .{});
+    defer resolver.deinit();
+
+    var resolved = try resolver.resolve("/app/main.roc");
+    defer resolved.deinit();
+
+    // 0.5.0 and 0.5.2 are the same compatibility group; the max wins.
+    try std.testing.expectEqual(@as(usize, 4), resolved.packages.len);
+    const a = testFindPackage(&resolved, a_url).?;
+    const b = testFindPackage(&resolved, b_url).?;
+    try std.testing.expectEqual(a.deps[0].target, b.deps[0].target);
+    try std.testing.expectEqualStrings(c_052, resolved.packages[a.deps[0].target].identity);
+}
+
+test "different 0.minor versions are different packages" {
+    const gpa = std.testing.allocator;
+    var registry = TestRegistry.init(gpa);
+    defer registry.deinit();
+
+    const a_05 = "https://example.com/a/0.5.0/hashA05.tar.zst";
+    const a_06 = "https://example.com/a/0.6.1/hashA06.tar.zst";
+    const b_url = "https://example.com/b/1.0.0/hashB.tar.zst";
+
+    try registry.locals.put("/app/main.roc", .{
+        .kind = .app,
+        .deps = &.{
+            .{ .alias = "a", .spec = a_05, .is_platform = false },
+            .{ .alias = "b", .spec = b_url, .is_platform = false },
+        },
+    });
+    try registry.urls.put(a_05, .{});
+    try registry.urls.put(a_06, .{});
+    try registry.urls.put(b_url, .{ .deps = &.{.{ .alias = "a", .spec = a_06, .is_platform = false }} });
+
+    var resolver = Resolver.init(gpa, registry.fetcher(), .{});
+    defer resolver.deinit();
+
+    var resolved = try resolver.resolve("/app/main.roc");
+    defer resolved.deinit();
+
+    // A 0.minor bump is a breaking change, so 0.5.x and 0.6.x are different
+    // packages: no conflict, both present.
+    try std.testing.expect(testFindPackage(&resolved, a_05) != null);
+    try std.testing.expect(testFindPackage(&resolved, a_06) != null);
+}
+
+test "app pins constrain their own 0.minor group" {
+    const gpa = std.testing.allocator;
+    var registry = TestRegistry.init(gpa);
+    defer registry.deinit();
+
+    const a_050 = "https://example.com/a/0.5.0/hashA050.tar.zst";
+    const a_052 = "https://example.com/a/0.5.2/hashA052.tar.zst";
+    const b_url = "https://example.com/b/1.0.0/hashB.tar.zst";
+
+    try registry.locals.put("/app/main.roc", .{
+        .kind = .app,
+        .deps = &.{
+            .{ .alias = "a", .spec = a_050, .is_platform = false },
+            .{ .alias = "b", .spec = b_url, .is_platform = false },
+        },
+    });
+    try registry.urls.put(a_050, .{});
+    try registry.urls.put(a_052, .{});
+    try registry.urls.put(b_url, .{ .deps = &.{.{ .alias = "a", .spec = a_052, .is_platform = false }} });
 
     var resolver = Resolver.init(gpa, registry.fetcher(), .{});
     defer resolver.deinit();
 
     try std.testing.expectError(error.ResolutionFailed, resolver.resolve("/app/main.roc"));
-    try std.testing.expectEqualStrings("Invalid Package Version", resolver.diagnostics.items[0].title);
+    try std.testing.expectEqualStrings("Package Version Conflict", resolver.diagnostics.items[0].title);
 }
 
 test "the reserved 0.0.0 version is rejected" {

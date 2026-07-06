@@ -6050,7 +6050,7 @@ fn resolveUrlBundle(ctx: *CliCtx, url: []const u8) (CliError || error{OutOfMemor
     const parsed_url = download.validateUrl(url) catch |err| switch (err) {
         error.InvalidVersion => return ctx.fail(.{ .invalid_url = .{
             .url = url,
-            .reason = "This URL uses a version below 1.0.0. Roc package versions start at 1.0.0.",
+            .reason = "This URL uses the reserved version 0.0.0, which means \"no version\". The lowest publishable version is 0.0.1.",
         } }),
         else => return ctx.fail(.{ .invalid_url = .{
             .url = url,

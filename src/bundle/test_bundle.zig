@@ -1372,9 +1372,18 @@ test "download URL validation" {
         try testing.expectEqualStrings("example.com/packages", parsed.urlId(url));
     }
 
-    // Invalid: version below 1.0.0
+    // Valid: 0.x version
     {
         const url = "https://example.com/packages/0.1.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
+        const parsed = try download.validateUrl(url);
+        try testing.expectEqualStrings(expected_hash, parsed.hash);
+        try testing.expectEqual(download.Version{ .major = 0, .minor = 1, .patch = 0 }, parsed.version);
+        try testing.expectEqualStrings("example.com/packages", parsed.urlId(url));
+    }
+
+    // Invalid: the reserved 0.0.0 version
+    {
+        const url = "https://example.com/packages/0.0.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
         const result = download.validateUrl(url);
         try testing.expectError(download.DownloadError.InvalidVersion, result);
     }
