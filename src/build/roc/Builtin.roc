@@ -666,16 +666,16 @@ Builtin :: [].{
 			end_array : JsonEncoding, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
 			end_array = |_, state| JsonEncoding.end_array(state)
 
-			encode : a -> Try(Str, err)
+			to_str : a -> Str
 				where [
-					a.encoder_for : JsonEncoding -> (a, JsonEncodeState -> Try(JsonEncodeState, err)),
+					a.encoder_for : JsonEncoding -> (a, JsonEncodeState -> Try(JsonEncodeState, [])),
 				]
-			encode = |value| {
+			to_str = |value| {
 				Shape : a
 				encode_shape = Shape.encoder_for(JsonEncoding.Default)
-				encoded = encode_shape(value, JsonEncodeState.{ output: u8_list_with_capacity(64), container_commas: [] })?
+				Ok(encoded) = encode_shape(value, JsonEncodeState.{ output: u8_list_with_capacity(64), container_commas: [] })
 
-				Ok(Str.from_utf8_lossy(encoded.output))
+				Str.from_utf8_lossy(encoded.output)
 			}
 
 			parse : Str -> Try(a, Json)
@@ -4152,7 +4152,7 @@ Builtin :: [].{
 
 			|self, state| {
 				started = Encoding.begin_array(state)?
-				encoded_items =
+				encoded_items = 
 					List.fold(
 						self,
 						Ok(started),

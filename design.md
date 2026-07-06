@@ -1200,7 +1200,7 @@ thing = Json.parse(json_str)?
 thing = Json.parse_trailing_commas(json_str)?
 thing = Json.Utf8.parse(json_bytes)?
 
-json_str = Json.encode(thing)?
+json_str = Json.to_str(thing)
 json_bytes = Json.Utf8.encode(thing)?
 
 headers = Encoding.HttpHeader.parse(raw_headers)?
@@ -1208,23 +1208,25 @@ headers = Encoding.HttpHeader.parse(raw_headers)?
 
 The convenience functions construct the internal format state directly, call the
 value or type's ordinary method, validate the remaining state if the format
-requires it, and return the final `Try`. They do not need a required `init`,
-`finish`, or `default` hook. The runtime cursor types are implementation
-details of the builtin format module, not public `Json.State` or
+requires it, and return the final public value. A fallible helper returns a
+`Try`; an infallible helper such as `Json.to_str` requires an empty encoder
+error type and returns the string directly. They do not need a required `init`,
+`finish`, or `default` hook. The runtime cursor types are implementation details
+of the builtin format module, not public `Json.State` or
 `Encoding.HttpHeader.State` APIs.
 
 The underlying parse method is public and callable. It is deliberately curried:
 
 ```roc
 a.parser_for : encoding -> (state -> Try({ value : a, rest : state }, err))
-a.encoder_for : a, encoding -> (state -> Try(state, err))
+a.encoder_for : encoding -> (a, state -> Try(state, err))
 ```
 
-`parser_for` is a method on the value type being produced. `encoder_for` is a method
-on the value being serialized. Structural types get these methods from the
-compiler. Nominal types may define them explicitly, and structural derivation
-uses those explicit nominal methods when a field, payload, list element, nested
-value, or other sub-shape has that nominal type.
+`parser_for` is a method on the value type being produced. `encoder_for` is a
+method on the value type being serialized. Structural types get these methods
+from the compiler. Nominal types may define them explicitly, and structural
+derivation uses those explicit nominal methods when a field, payload, list
+element, nested value, or other sub-shape has that nominal type.
 
 The `encoding` argument is the pure format/configuration value used to construct
 the specialized parser. It may represent choices such as JSON object field
@@ -1233,7 +1235,9 @@ header matching mode. The `state`
 argument is the runtime cursor or output state. Keeping these separate matters:
 parser construction can transform the requested structural shape before the
 runtime scan starts, while the returned runtime function threads only the cursor
-state and parsed values.
+state and parsed values. Encoder construction can similarly precompute
+shape-specific metadata before the returned runtime function receives the value
+and output state.
 
 For example, the builtin HTTP header helper inside `Builtin.Encoding` has this
 shape:
@@ -1262,8 +1266,9 @@ zero-sized internal encoding value.
 
 The error type is inferred from the format methods. All `Try` errors in one
 parse or encode operation unify with the public function's returned error type.
-When a concrete operation cannot fail, its error type is empty, so an exhaustive
-`Ok(value) = Json.encode(thing)` binding is accepted.
+When a concrete encode operation cannot fail, its error type is empty, so
+`Json.to_str` can bind the underlying encoder result with an exhaustive
+`Ok(encoded_state) = ...` pattern and return `Str` directly.
 
 Checking derives structural methods by emitting ordinary static-dispatch
 constraints. For example, deriving `a.parser_for` for a concrete shape asks the
@@ -1879,15 +1884,17 @@ inferred `Try` error type as parsing.
 The public structural encode method has this exact shape:
 
 ```roc
-value.encoder_for : value, encoding -> (state -> Try(state, err))
+value.encoder_for : encoding -> (value, state -> Try(state, err))
 ```
 
 Generated encoders compose child error rows. JSON helpers that cannot fail use a
 named `_never_fails` row variable so they can sequence with encoders that can
-fail. JSON `F32` and `F64` encoders are the deliberate failing scalar case:
-finite values encode as JSON numbers, while `NaN`, positive infinity, and
+fail. `Json.to_str` requires the final structural encoder's error type to be the
+empty row `[]`. JSON `F32` and `F64` encoders are the deliberate failing scalar
+case: finite values encode as JSON numbers, while `NaN`, positive infinity, and
 negative infinity return `Err(NaN)`, `Err(Infinity)`, or
-`Err(NegativeInfinity)`. They must not encode non-finite values as JSON `null`.
+`Err(NegativeInfinity)`. They must not encode non-finite values as JSON `null`,
+and they do not satisfy `Json.to_str`'s infallible encoder requirement.
 
 For a concrete record, the compiler can derive:
 
@@ -1895,7 +1902,7 @@ For a concrete record, the compiler can derive:
 {
 	count : U64,
 	foo_bar : Str,
-}.encoder_for : { count : U64, foo_bar : Str }, MyEncoding -> (MyEncoding -> Try(MyEncoding, MyErr))
+}.encoder_for : MyEncoding -> ({ count : U64, foo_bar : Str }, MyState -> Try(MyState, MyErr))
 ```
 
 The encoding type owns the output methods required by that shape:

@@ -34,9 +34,7 @@ expect {
 	value : { optional : Try(Str, [Missing]) }
 	value = { optional: Err(Missing) }
 
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	encoded_result == Ok("{}")
+	Json.to_str(value) == "{}"
 }
 
 expect {
@@ -58,9 +56,7 @@ expect {
 	value : { field : Try(Str, [Null]) }
 	value = { field: Err(Null) }
 
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	encoded_result == Ok("{\"field\":null}")
+	Json.to_str(value) == "{\"field\":null}"
 }
 
 expect {
@@ -78,7 +74,5 @@ expect {
 expect {
 	value = {}
 
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	encoded_result == Ok("{}")
+	Json.to_str(value) == "{}"
 }

@@ -7,9 +7,7 @@ list_record_parses_and_encodes = |json| {
 
 	match result {
 		Ok(parsed) => {
-			encoded_result : Try(Str, [])
-			encoded_result = Json.encode(parsed)
-			encoded_result == Ok("[{\"foo\":\"a\"},{\"foo\":\"b\"}]")
+			Json.to_str(parsed) == "[{\"foo\":\"a\"},{\"foo\":\"b\"}]"
 		}
 		Err(_) => False
 	}
@@ -24,9 +22,7 @@ list_tuple_record_parses_and_encodes = |json| {
 
 	match result {
 		Ok(parsed) => {
-			encoded_result : Try(Str, [])
-			encoded_result = Json.encode(parsed)
-			encoded_result == Ok("[{\"points\":[\"left\",1]},{\"points\":[\"right\",2]}]")
+			Json.to_str(parsed) == "[{\"points\":[\"left\",1]},{\"points\":[\"right\",2]}]"
 		}
 		Err(_) => False
 	}
@@ -41,9 +37,7 @@ list_tag_record_parses_and_encodes = |json| {
 
 	match result {
 		Ok(parsed) => {
-			encoded_result : Try(Str, [])
-			encoded_result = Json.encode(parsed)
-			encoded_result == Ok("[{\"status\":\"Active\"},{\"status\":\"Paused\"}]")
+			Json.to_str(parsed) == "[{\"status\":\"Active\"},{\"status\":\"Paused\"}]"
 		}
 		Err(_) => False
 	}
@@ -75,9 +69,7 @@ list_two_field_record_parses_and_encodes = |json| {
 
 	match result {
 		Ok(parsed) => {
-			encoded_result : Try(Str, [])
-			encoded_result = Json.encode(parsed)
-			encoded_result == Ok("[{\"bar\":1,\"foo\":\"a\"},{\"bar\":2,\"foo\":\"b\"}]")
+			Json.to_str(parsed) == "[{\"bar\":1,\"foo\":\"a\"},{\"bar\":2,\"foo\":\"b\"}]"
 		}
 		Err(_) => False
 	}
@@ -92,9 +84,7 @@ list_tag_tuple_record_parses_and_encodes = |json| {
 
 	match result {
 		Ok(parsed) => {
-			encoded_result : Try(Str, [])
-			encoded_result = Json.encode(parsed)
-			encoded_result == Ok("[{\"points\":[\"left\",1],\"status\":\"Active\"},{\"points\":[\"right\",2],\"status\":\"Paused\"}]")
+			Json.to_str(parsed) == "[{\"points\":[\"left\",1],\"status\":\"Active\"},{\"points\":[\"right\",2],\"status\":\"Paused\"}]"
 		}
 		Err(_) => False
 	}

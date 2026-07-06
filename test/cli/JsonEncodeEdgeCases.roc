@@ -2,9 +2,7 @@ JsonEncodeEdgeCases :: [].{}
 
 round_trip_u8 : U8 -> Bool
 round_trip_u8 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(U8, Json)
 	parsed = Json.parse(encoded)
@@ -13,9 +11,7 @@ round_trip_u8 = |value| {
 
 round_trip_i8 : I8 -> Bool
 round_trip_i8 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(I8, Json)
 	parsed = Json.parse(encoded)
@@ -24,9 +20,7 @@ round_trip_i8 = |value| {
 
 round_trip_u16 : U16 -> Bool
 round_trip_u16 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(U16, Json)
 	parsed = Json.parse(encoded)
@@ -35,9 +29,7 @@ round_trip_u16 = |value| {
 
 round_trip_i16 : I16 -> Bool
 round_trip_i16 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(I16, Json)
 	parsed = Json.parse(encoded)
@@ -46,9 +38,7 @@ round_trip_i16 = |value| {
 
 round_trip_u32 : U32 -> Bool
 round_trip_u32 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(U32, Json)
 	parsed = Json.parse(encoded)
@@ -57,9 +47,7 @@ round_trip_u32 = |value| {
 
 round_trip_i32 : I32 -> Bool
 round_trip_i32 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(I32, Json)
 	parsed = Json.parse(encoded)
@@ -68,9 +56,7 @@ round_trip_i32 = |value| {
 
 round_trip_u64 : U64 -> Bool
 round_trip_u64 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(U64, Json)
 	parsed = Json.parse(encoded)
@@ -79,9 +65,7 @@ round_trip_u64 = |value| {
 
 round_trip_i64 : I64 -> Bool
 round_trip_i64 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(I64, Json)
 	parsed = Json.parse(encoded)
@@ -90,9 +74,7 @@ round_trip_i64 = |value| {
 
 round_trip_u128 : U128 -> Bool
 round_trip_u128 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(U128, Json)
 	parsed = Json.parse(encoded)
@@ -101,9 +83,7 @@ round_trip_u128 = |value| {
 
 round_trip_i128 : I128 -> Bool
 round_trip_i128 = |value| {
-	encoded_result : Try(Str, [])
-	encoded_result = Json.encode(value)
-	Ok(encoded) = encoded_result
+	encoded = Json.to_str(value)
 
 	parsed : Try(I128, Json)
 	parsed = Json.parse(encoded)

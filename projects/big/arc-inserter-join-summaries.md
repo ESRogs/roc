@@ -9,13 +9,13 @@ number of local questions, but it is now a compile-time bottleneck on
 generated, join-heavy code.
 
 The concrete stress case is structural JSON encoding. `JsonEncodeRoundTrip.roc`
-contains a 27-field `Shape` with lists, sets, dicts, nested records, tag
-unions, nullable/missing fields, and 34 `Json.encode` sites. Structural
+contains a 25-field `Shape` with lists, sets, dicts, nested records, tag
+unions, nullable/missing fields, and 29 `Json.to_str` sites. Structural
 `encoder_for` lowering expands every field and payload into `Try`-sequenced
 state-passing code; every `Try` sequence introduces control flow. The LIR is
 valid, but ARC insertion then repeatedly analyzes the same generated regions
-with slightly different ownership sets. On a clean baseline, this single CLI
-test took 168 seconds with `roc test --no-cache`, and a sample of the running
+with slightly different ownership sets. This single CLI test took 212 seconds
+with `roc test --no-cache`, and a sample of the running
 compiler showed the main thread almost entirely in:
 
 ```text
@@ -136,12 +136,11 @@ tree.
     encoders. Every field/payload is sequenced through a `Try` state, so
     records and tag unions produce dense join-heavy LIR before ARC ever runs.
 - `test/cli/JsonEncodeRoundTrip.roc`
-  - 675 lines, 31 expects, 34 `Json.encode` sites.
-  - The main `Shape` record has 27 fields, including nested structural
+  - 575 lines, 27 expects, 29 `Json.to_str` sites.
+  - The main `Shape` record has 25 fields, including nested structural
     containers and custom/derived encode paths.
-  - Baseline `zig-out/bin/roc test --no-cache
-    test/cli/JsonEncodeRoundTrip.roc` measured `All (31) tests passed in
-    167940.4 ms` on a clean worktree.
+  - `zig-out/bin/roc test --no-cache test/cli/JsonEncodeRoundTrip.roc`
+    measured `All (27) tests passed in 212494.0 ms`.
 - `src/lir/tag_reachability.zig`
   - `Pass.analyze` loops while any `ValueInfo` changes.
   - `TagSet.mergeFrom` and `ValueInfo.mergeFrom` are monotone joins.

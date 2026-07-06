@@ -12,9 +12,7 @@ opaque_auto_token_encodes = |json| {
 
 	match parsed {
 		Ok(value) => {
-			encoded_result : Try(Str, [])
-			encoded_result = Json.encode(value)
-			encoded_result == Ok("{\"count\":7,\"raw\":\"opaque\"}")
+			Json.to_str(value) == "{\"count\":7,\"raw\":\"opaque\"}"
 		}
 		Err(_) => False
 	}
