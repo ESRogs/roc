@@ -227,7 +227,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         \\main! = |_| {
         \\    todos = [
         \\        { name: "Learn Roc", done: True },
-        \\        { nam: "Call mom", done: False },
+        \\        { label: "Call mom", done: False },
         \\    ]
         \\    Ok({})
         \\}
