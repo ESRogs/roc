@@ -2398,7 +2398,18 @@ test "randomized refcounted list slice operations match reference model" {
         }
 
         fn bytesForId(id: u8, buf: []u8) []const u8 {
-            return std.fmt.bufPrint(buf, "item-{d:0>3}-abcdefghijklmnopqrstuvwxyz", .{id}) catch unreachable;
+            const prefix = "item-";
+            const suffix = "-abcdefghijklmnopqrstuvwxyz";
+            const len = prefix.len + 3 + suffix.len;
+            std.debug.assert(buf.len >= len);
+
+            @memcpy(buf[0..prefix.len], prefix);
+            buf[prefix.len] = '0' + (id / 100);
+            buf[prefix.len + 1] = '0' + ((id / 10) % 10);
+            buf[prefix.len + 2] = '0' + (id % 10);
+            @memcpy(buf[prefix.len + 3 .. len], suffix);
+
+            return buf[0..len];
         }
 
         fn strForId(id: u8, roc_ops: *RocOps) RocStr {
@@ -2416,7 +2427,7 @@ test "randomized refcounted list slice operations match reference model" {
             return RocList.fromSlice(RocStr, strs[0..ids.len], true, roc_ops);
         }
 
-        fn expectList(list: RocList, expected: []const u8) !void {
+        fn expectList(list: RocList, expected: []const u8) error{ TestExpectedEqual, TestUnexpectedResult }!void {
             try std.testing.expectEqual(expected.len, list.len());
             if (expected.len == 0) {
                 return;
