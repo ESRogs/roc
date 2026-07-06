@@ -22,7 +22,9 @@ const TestCompareError = error{
 /// Magic bytes at the start of a specialization cache file.
 pub const MAGIC: [8]u8 = .{ 'R', 'O', 'C', 'S', 'P', 'E', 'C', 0 };
 /// Serialization format version for specialization cache files.
-pub const FORMAT_VERSION: u32 = 2;
+/// Version 3: `SpecRecord` carries an immutable requested-type identity plus
+/// separate request/solved type views.
+pub const FORMAT_VERSION: u32 = 3;
 
 const SECTION_COUNT = 39;
 /// Required byte alignment for every section payload. This covers all typed
@@ -453,6 +455,12 @@ pub const MappedProgramView = struct {
             if (!self.exprRefInBounds(branch.body)) return false;
         }
 
+        for (self.specs) |spec| {
+            if (!self.typeRefInBounds(spec.identity.request_fn_ty)) return false;
+            if (!self.typeRefInBounds(spec.request_fn_ty)) return false;
+            if (!self.typeRefInBounds(spec.solved_fn_ty)) return false;
+            if (!self.fnRefInBounds(spec.fn_id)) return false;
+        }
         for (self.defs) |def| {
             if (def.fn_id) |fn_id| {
                 if (!self.fnRefInBounds(fn_id)) return false;
@@ -1374,7 +1382,9 @@ fn writeProcedureUseTemplate(hasher: *std.crypto.hash.sha2.Sha256, use: checked.
 fn writeSpecRecord(hasher: *std.crypto.hash.sha2.Sha256, spec: Ast.SpecRecord) void {
     writeCallableIdentity(hasher, spec.identity.callable);
     writeHashBytes32(hasher, spec.identity.source_fn_ty_digest.bytes);
-    writeHashBytes32(hasher, spec.identity.mono_fn_ty_digest.bytes);
+    writeHashBytes32(hasher, spec.identity.request_fn_ty_digest.bytes);
+    writeHashBytes32(hasher, spec.request_fn_ty_digest.bytes);
+    writeHashBytes32(hasher, spec.solved_fn_ty_digest.bytes);
 }
 
 fn writeCallableIdentity(hasher: *std.crypto.hash.sha2.Sha256, callable: Ast.CallableIdentity) void {
@@ -2047,8 +2057,7 @@ test "monotype specialization cache maps fresh single-shard program view equival
     const pat = try program.addPat(.{ .ty = unit_ty, .data = .{ .bind = local } });
     const stmt = try program.addStmt(.{ .expr = call_expr });
 
-    const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(program.defs.items.len)));
-    try program.defs.append(allocator, .{
+    const def_id = try program.addDef(.{
         .symbol = @enumFromInt(2),
         .fn_def = fn_template,
         .fn_id = fn_id,
@@ -2056,7 +2065,7 @@ test "monotype specialization cache maps fresh single-shard program view equival
         .body = .{ .roc = call_expr },
         .ret = unit_ty,
     });
-    try program.nested_defs.append(allocator, .{
+    _ = try program.addNestedDef(.{
         .symbol = @enumFromInt(3),
         .fn_def = fn_template,
         .fn_id = fn_id,
@@ -2072,9 +2081,13 @@ test "monotype specialization cache maps fresh single-shard program view equival
                 .template = 1,
             } },
             .source_fn_ty_digest = .{},
-            .mono_fn_ty_digest = .{},
-            .mono_fn_ty = fn_ty,
+            .request_fn_ty_digest = .{},
+            .request_fn_ty = fn_ty,
         },
+        .request_fn_ty = fn_ty,
+        .request_fn_ty_digest = .{},
+        .solved_fn_ty = fn_ty,
+        .solved_fn_ty_digest = .{},
         .fn_id = fn_id,
         .status = .ready,
     });
@@ -2424,9 +2437,13 @@ test "monotype specialization cache validity includes stored specialization iden
                 .template = 2,
             } },
             .source_fn_ty_digest = first_source_digest,
-            .mono_fn_ty_digest = mono_digest,
-            .mono_fn_ty = spec_ty,
+            .request_fn_ty_digest = mono_digest,
+            .request_fn_ty = spec_ty,
         },
+        .request_fn_ty = spec_ty,
+        .request_fn_ty_digest = mono_digest,
+        .solved_fn_ty = spec_ty,
+        .solved_fn_ty_digest = mono_digest,
         .fn_id = spec_fn,
         .status = .ready,
     };

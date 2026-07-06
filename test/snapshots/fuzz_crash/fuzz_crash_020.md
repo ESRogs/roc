@@ -1621,17 +1621,21 @@ Map(a, b) : Lis, (ab) -> List(b)
 
 MapML # Ag
 	: # Aon
-		List(),
+		List( # rg
+		),
 		(ab) -> # row
 			List(b) # z)
 
-line : () # Co
+line : ( # Cm
+) # Co
 
 Som : { foo : O, bar : g }
 
-Ml(a) : {}
+Ml(a) : { # ld
+}
 
-Soine(a) : {} #
+Soine(a) : { #
+} #
 
 Maybe(a) : [Somne]
 
@@ -1930,7 +1934,7 @@ expect {
 				(s-expr
 					(e-not-implemented))
 				(s-expr
-					(e-call (constraint-fn-var 2309)
+					(e-call (constraint-fn-var 2312)
 						(e-lookup-local
 							(p-assign (ident "me")))
 						(e-not-implemented)))
@@ -1978,7 +1982,7 @@ expect {
 										(p-assign (ident "#interp_2"))
 										(e-lookup-local
 											(p-assign (ident "er"))))
-									(e-interpolation (constraint-fn-var 2593)
+									(e-interpolation (constraint-fn-var 2596)
 										(first
 											(e-literal (string "Ag ")))
 										(parts
@@ -1988,7 +1992,7 @@ expect {
 											(e-lookup-local
 												(p-assign (ident "#interp_2")))
 											(e-literal (string "")))))))
-						(e-dispatch-call (method "plus") (constraint-fn-var 2596)
+						(e-dispatch-call (method "plus") (constraint-fn-var 2599)
 							(receiver
 								(e-runtime-error (tag "ident_not_in_scope")))
 							(args
@@ -2052,7 +2056,7 @@ expect {
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 3042)
+								(e-dispatch-call (method "is_gt") (constraint-fn-var 3045)
 									(receiver
 										(e-match
 											(match
@@ -2086,18 +2090,18 @@ expect {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_lt") (constraint-fn-var 3159)
+													(e-dispatch-call (method "is_lt") (constraint-fn-var 3162)
 														(receiver
-															(e-dispatch-call (method "plus") (constraint-fn-var 3121)
+															(e-dispatch-call (method "plus") (constraint-fn-var 3124)
 																(receiver
 																	(e-num (value "13")))
 																(args
 																	(e-num (value "2")))))
 														(args
 															(e-num (value "5"))))
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 3268)
+													(e-dispatch-call (method "is_gte") (constraint-fn-var 3271)
 														(receiver
-															(e-dispatch-call (method "minus") (constraint-fn-var 3230)
+															(e-dispatch-call (method "minus") (constraint-fn-var 3233)
 																(receiver
 																	(e-num (value "10")))
 																(args
@@ -2112,7 +2116,7 @@ expect {
 											(builtin)
 											(e-tag (name "True")))))
 								(if-else
-									(e-dispatch-call (method "is_lte") (constraint-fn-var 3352)
+									(e-dispatch-call (method "is_lte") (constraint-fn-var 3355)
 										(receiver
 											(e-num (value "12")))
 										(args
@@ -2126,12 +2130,12 @@ expect {
 										(e-match
 											(match
 												(cond
-													(e-dispatch-call (method "ned") (constraint-fn-var 3419)
+													(e-dispatch-call (method "ned") (constraint-fn-var 3422)
 														(receiver
 															(e-match
 																(match
 																	(cond
-																		(e-dispatch-call (method "od") (constraint-fn-var 3386)
+																		(e-dispatch-call (method "od") (constraint-fn-var 3389)
 																			(receiver
 																				(e-match
 																					(match
