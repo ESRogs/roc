@@ -1714,7 +1714,7 @@ JsonEncoding :: [Default, CamelCase, TrailingCommas].{
 			TrailingCommas => True
 		}
 
-	parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json)
+	parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json.ParseErr)
 	parse_record_field : JsonEncoding, Encoding.FieldName.FieldNames(_shape), JsonState -> Try(
 		[
 			Field({ field : Encoding.FieldName(_shape), rest : JsonState }),
@@ -1723,18 +1723,20 @@ JsonEncoding :: [Default, CamelCase, TrailingCommas].{
 			Continue({ rest : JsonState }),
 			Done({ rest : JsonState }),
 		],
-		Json,
+		Json.ParseErr,
 	)
-	skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json)
-	missing_record_field : JsonEncoding, Str, JsonState -> Json
+	skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+	missing_record_field : JsonEncoding, Str, JsonState -> Json.ParseErr
 	missing_optional_field : JsonEncoding, Str, JsonState -> [Missing]
-	parse_tag_union : JsonEncoding, Encoding.ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json)
+	parse_tag_union : JsonEncoding, Encoding.ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 }
 
-Json := [MissingRequired, InvalidJson].{
-	parse : Str -> Try(a, Json)
+Json :: {}.{
+	ParseErr : [MissingRequired, InvalidJson]
+
+	parse : Str -> Try(a, Json.ParseErr)
 		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 		]
 	parse = |json| {
 		Shape : a
@@ -1746,14 +1748,14 @@ Json := [MissingRequired, InvalidJson].{
 				if Str.is_empty(Str.trim_start(rest)) {
 					Ok(parsed.value)
 				} else {
-					Err(Json.InvalidJson)
+					Err(InvalidJson)
 				}
 		}
 	}
 
-	parse_trailing_commas : Str -> Try(a, Json)
+	parse_trailing_commas : Str -> Try(a, Json.ParseErr)
 		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 		]
 	parse_trailing_commas = |json| {
 		Shape : a
@@ -1765,14 +1767,14 @@ Json := [MissingRequired, InvalidJson].{
 				if Str.is_empty(Str.trim_start(rest)) {
 					Ok(parsed.value)
 				} else {
-					Err(Json.InvalidJson)
+					Err(InvalidJson)
 				}
 		}
 	}
 
-	parser_camel : () -> (Str -> Try(a, Json))
+	parser_camel : () -> (Str -> Try(a, Json.ParseErr))
 		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 		]
 	parser_camel = || {
 		Shape : a
@@ -1786,7 +1788,7 @@ Json := [MissingRequired, InvalidJson].{
 					if Str.is_empty(Str.trim_start(rest)) {
 						Ok(parsed.value)
 					} else {
-						Err(Json.InvalidJson)
+						Err(InvalidJson)
 					}
 			}
 		}
@@ -1810,7 +1812,7 @@ The exact derived parser type for a JSON record is:
 		},
 		rest : JsonState,
 	},
-	Json,
+	Json.ParseErr,
 ))
 ```
 
@@ -1822,7 +1824,7 @@ The exact derived parser type for an externally tagged JSON union is:
 		value : [Admin({ name : Str }), Guest],
 		rest : JsonState,
 	},
-	Json,
+	Json.ParseErr,
 ))
 ```
 

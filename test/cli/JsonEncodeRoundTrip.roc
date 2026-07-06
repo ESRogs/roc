@@ -55,14 +55,14 @@ nullable_source = "{\"required_nullable\":null,\"optional_nullable\":null}"
 
 auto_nominal_round_trips : Str -> Bool
 auto_nominal_round_trips = |json| {
-	first_result : Try(AutoToken, Json)
+	first_result : Try(AutoToken, Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(AutoToken, Json)
+			second_result : Try(AutoToken, Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -94,14 +94,14 @@ expect {
 
 round_trips : Str -> Bool
 round_trips = |json| {
-	first_result : Try(Shape, Json)
+	first_result : Try(Shape, Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(Shape, Json)
+			second_result : Try(Shape, Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -118,14 +118,14 @@ round_trips = |json| {
 
 nullable_round_trips : Str -> Bool
 nullable_round_trips = |json| {
-	first_result : Try(NullableShape, Json)
+	first_result : Try(NullableShape, Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(NullableShape, Json)
+			second_result : Try(NullableShape, Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -156,18 +156,18 @@ shape_eq = |left, right|
 											and left.nested.count == right.nested.count
 												and left.i64 == right.i64
 													and left.u128 == right.u128
-											and left.i128 == right.i128
-												and left.dec == right.dec
-													and optional_str_eq(left.explicit_optional, right.explicit_optional)
-														and optional_str_eq(left.missing_optional, right.missing_optional)
-															and left.items == right.items
-																and Str.is_eq(left.nested.bar, right.nested.bar)
-																	and multi_eq(left.multi, right.multi)
-																		and pair_eq(left.pair, right.pair)
-																			and left.labels == right.labels
-																				and left.scores == right.scores
-																					and status_eq(left.status, right.status)
-																						and Str.is_eq(left.token.raw, right.token.raw)
+														and left.i128 == right.i128
+															and left.dec == right.dec
+																and optional_str_eq(left.explicit_optional, right.explicit_optional)
+																	and optional_str_eq(left.missing_optional, right.missing_optional)
+																		and left.items == right.items
+																			and Str.is_eq(left.nested.bar, right.nested.bar)
+																				and multi_eq(left.multi, right.multi)
+																					and pair_eq(left.pair, right.pair)
+																						and left.labels == right.labels
+																							and left.scores == right.scores
+																								and status_eq(left.status, right.status)
+																									and Str.is_eq(left.token.raw, right.token.raw)
 
 nullable_shape_eq : NullableShape, NullableShape -> Bool
 nullable_shape_eq = |left, right|
@@ -269,14 +269,14 @@ expect nullable_round_trips(nullable_source)
 
 list_round_trips : Str -> Bool
 list_round_trips = |json| {
-	first_result : Try(List(Try(Str, [Null])), Json)
+	first_result : Try(List(Try(Str, [Null])), Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(List(Try(Str, [Null])), Json)
+			second_result : Try(List(Try(Str, [Null])), Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -296,14 +296,14 @@ expect list_round_trips("[\"one\",null,\"two\"]")
 
 set_round_trips : Str -> Bool
 set_round_trips = |json| {
-	first_result : Try(Set(Str), Json)
+	first_result : Try(Set(Str), Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(Set(Str), Json)
+			second_result : Try(Set(Str), Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -332,14 +332,14 @@ expect {
 
 dict_round_trips : Str -> Bool
 dict_round_trips = |json| {
-	first_result : Try(Dict(Str, U64), Json)
+	first_result : Try(Dict(Str, U64), Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(Dict(Str, U64), Json)
+			second_result : Try(Dict(Str, U64), Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -368,14 +368,14 @@ expect {
 
 numeric_key_dict_round_trips : Str -> Bool
 numeric_key_dict_round_trips = |json| {
-	first_result : Try(Dict(U64, Bool), Json)
+	first_result : Try(Dict(U64, Bool), Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(Dict(U64, Bool), Json)
+			second_result : Try(Dict(U64, Bool), Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -395,14 +395,14 @@ expect numeric_key_dict_round_trips("{\"7\":true,\"8\":false}")
 
 unit_tag_key_dict_round_trips : Str -> Bool
 unit_tag_key_dict_round_trips = |json| {
-	first_result : Try(Dict([Active, Paused], U64), Json)
+	first_result : Try(Dict([Active, Paused], U64), Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try(Dict([Active, Paused], U64), Json)
+			second_result : Try(Dict([Active, Paused], U64), Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -430,7 +430,7 @@ expect {
 }
 
 expect {
-	result : Try(Dict(U8, Str), Json)
+	result : Try(Dict(U8, Str), Json.ParseErr)
 	result = Json.parse("{\"999\":\"too big\"}")
 
 	result == Err(Json.invalid_json)
@@ -446,7 +446,7 @@ expect {
 }
 
 expect {
-	result : Try(List(Str), Json)
+	result : Try(List(Str), Json.ParseErr)
 	result = Json.parse_trailing_commas("[\"alpha\",]")
 
 	result == Ok(["alpha"])
@@ -454,14 +454,14 @@ expect {
 
 tuple_round_trips : Str -> Bool
 tuple_round_trips = |json| {
-	first_result : Try((Str, U64, Bool), Json)
+	first_result : Try((Str, U64, Bool), Json.ParseErr)
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
 
-			second_result : Try((Str, U64, Bool), Json)
+			second_result : Try((Str, U64, Bool), Json.ParseErr)
 			second_result = Json.parse(encoded1)
 
 			match second_result {
@@ -489,21 +489,21 @@ expect {
 }
 
 expect {
-	result : Try((Str, U64), Json)
+	result : Try((Str, U64), Json.ParseErr)
 	result = Json.parse("[\"only\"]")
 
 	result == Err(Json.invalid_json)
 }
 
 expect {
-	result : Try((Str, U64), Json)
+	result : Try((Str, U64), Json.ParseErr)
 	result = Json.parse("[\"too\",2,true]")
 
 	result == Err(Json.invalid_json)
 }
 
 expect {
-	result : Try(Try(Str, [Null]), Json)
+	result : Try(Try(Str, [Null]), Json.ParseErr)
 	result = Json.parse("null")
 
 	result == Ok(Err(Null))
@@ -529,7 +529,7 @@ expect {
 
 box_parses : Str -> Bool
 box_parses = |json| {
-	result : Try(Box(Str), Json)
+	result : Try(Box(Str), Json.ParseErr)
 	result = Json.parse(json)
 
 	match result {
@@ -568,7 +568,7 @@ expect {
 }
 
 expect {
-	result : Try([Multi(Str, U64, Bool)], Json)
+	result : Try([Multi(Str, U64, Bool)], Json.ParseErr)
 	result = Json.parse("{\"Multi\":[\"tag\",9,true]}")
 
 	result == Ok(Multi("tag", 9, True))

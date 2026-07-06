@@ -25,536 +25,63 @@ Builtin :: [].{
 		JsonState :: [Input(Str)]
 		JsonEncodeState :: { output : List(U8), container_commas : List(Bool) }
 
-		JsonEncoding :: [Default, CamelCase, TrailingCommas].{
-			rename_field : JsonEncoding, Str -> Str
-			rename_field = |encoding, name|
-				match encoding {
-					Default => name
-					TrailingCommas => name
-					CamelCase => Json.snake_to_camel(name)
-				}
-
-			allows_trailing_commas : JsonEncoding -> Bool
-			allows_trailing_commas = |encoding|
-				match encoding {
-					Default => False
-					CamelCase => False
-					TrailingCommas => True
-				}
-
-			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json)
-			parse_str = |_, state|
-				match state {
-					Input(raw) => {
-						trimmed = Str.trim_start(raw)
-						if Str.starts_with(trimmed, "\"") {
-							string_parts = Json.split_json_string_tail(Str.drop_prefix(trimmed, "\""))?
-							rest = Str.trim_start(string_parts.after)
-							Ok({ value: string_parts.value, rest: JsonState.Input(rest) })
-						} else {
-							Err(Json.invalid_json)
-						}
-					}
-				}
-
-			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, Json)
-			parse_bool = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_bool(raw)
-				}
-
-			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, Json)
-			parse_u8 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_unsigned_int(raw, u8_from_str)
-				}
-
-			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, Json)
-			parse_i8 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_signed_int(raw, i8_from_str)
-				}
-
-			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, Json)
-			parse_u16 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_unsigned_int(raw, u16_from_str)
-				}
-
-			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, Json)
-			parse_i16 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_signed_int(raw, i16_from_str)
-				}
-
-			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, Json)
-			parse_u32 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_unsigned_int(raw, u32_from_str)
-				}
-
-			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, Json)
-			parse_i32 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_signed_int(raw, i32_from_str)
-				}
-
-			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, Json)
-			parse_u64 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_unsigned_int(raw, u64_from_str)
-				}
-
-			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, Json)
-			parse_i64 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_signed_int(raw, i64_from_str)
-				}
-
-			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, Json)
-			parse_u128 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_unsigned_int(raw, u128_from_str)
-				}
-
-			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, Json)
-			parse_i128 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_signed_int(raw, i128_from_str)
-				}
-
-			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, Json)
-			parse_dec = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_number(raw, Json.dec_from_json_number)
-				}
-
-			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, Json)
-			parse_f32 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_number(raw, f32_from_str)
-				}
-
-			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, Json)
-			parse_f64 = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_number(raw, f64_from_str)
-				}
-
-			parse_null : JsonEncoding, JsonState -> Try(JsonState, Json)
-			parse_null = |_, state|
-				match state {
-					Input(raw) => Json.parse_json_null(raw)
-				}
-
-			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, Json)
-			parse_array_start = |_, state|
-				match state {
-					Input(raw) => Json.parse_array_start_from_json(raw)
-				}
-
-			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], Json)
-			parse_array_next = |_, state|
-				match state {
-					Input(raw) => Json.parse_array_next_from_json(raw)
-				}
-
-			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], Json)
-			parse_array_after_element = |encoding, state|
-				match state {
-					Input(raw) => Json.parse_array_after_element_from_json(encoding, raw)
-				}
-
-			parse_record_field : JsonEncoding,
-			FieldName.FieldNames(_shape),
-			JsonState -> Try(
-				[
-					Field({ field : FieldName(_shape), rest : JsonState }),
-					TryField({ name : Str, rest : JsonState }),
-					TryFieldCaseless({ name : Str, rest : JsonState }),
-					Continue({ rest : JsonState }),
-					Done({ rest : JsonState }),
-				],
-				Json,
-			)
-			parse_record_field = |encoding, _, state|
-				match state {
-					Input(raw) => Json.parse_record_field_from_object(encoding, raw)
-				}
-
-			parse_object_next : JsonEncoding, JsonState -> Try([Entry({ key : Str, rest : JsonState }), Done({ rest : JsonState })], Json)
-			parse_object_next = |encoding, state|
-				match state {
-					Input(raw) =>
-						match Json.parse_record_field_from_object(encoding, raw) {
-							Ok(Field({ field, rest })) => Ok(Entry({ key: FieldName.name(field), rest }))
-							Ok(TryField({ name, rest })) => Ok(Entry({ key: name, rest }))
-							Ok(TryFieldCaseless({ name, rest })) => Ok(Entry({ key: name, rest }))
-							Ok(Continue(_)) => Err(Json.invalid_json)
-							Ok(Done({ rest })) => Ok(Done({ rest: rest }))
-							Err(err) => Err(err)
-						}
-					}
-
-			skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json)
-			skip_record_field = |encoding, state| Json.skip_json_value(encoding, state)
-
-			missing_record_field : JsonEncoding, Str, JsonState -> Json
-			missing_record_field = |_, _, _| Json.MissingRequired
-
-			missing_optional_field : JsonEncoding, Str, JsonState -> [Missing, ..]
-			missing_optional_field = |_, _, _| Missing
-
-			invalid_value : JsonEncoding, JsonState -> Json
-			invalid_value = |_, _| Json.invalid_json
-
-			parse_tag_union : JsonEncoding, ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json)
-			parse_tag_union = |encoding, spec, state|
-				match state {
-					Input(value) => Json.parse_tag_union_from_json(value, encoding, spec)
-				}
-
-			encode_record : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
-			encode_record = |state, _, write_fields| {
-				started = Json.write_record_start(state)?
-				finished = write_fields(started, Json.write_record_field)?
-				Json.write_record_end(finished)
-			}
-
-			encode_tuple : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
-			encode_tuple = |state, _, write_elements| {
-				started = Json.write_sequence_start(state)?
-				finished = write_elements(started, Json.write_sequence_element)?
-				Json.write_sequence_end(finished)
-			}
-
-			encode_list : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
-			encode_list = |state, count, write_elements| JsonEncoding.encode_tuple(state, count, write_elements)
-
-			encode_str : Str, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_str = |value, state|
-				Ok(
-					JsonEncodeState.{
-						output: Json.append_json_quoted_string(state.output, value),
-						container_commas: state.container_commas,
-					},
-				)
-
-			encode_bool : Bool, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_bool = |value, state|
-				Ok(
-					JsonEncodeState.{
-						output: Json.append_json_string_bytes(state.output, if value "true" else "false"),
-						container_commas: state.container_commas,
-					},
-				)
-
-			encode_u8 : U8, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_u8 = |value, state| Json.encode_json_number(json_u8_to_str(value), state)
-
-			encode_i8 : I8, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_i8 = |value, state| Json.encode_json_number(json_i8_to_str(value), state)
-
-			encode_u16 : U16, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_u16 = |value, state| Json.encode_json_number(json_u16_to_str(value), state)
-
-			encode_i16 : I16, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_i16 = |value, state| Json.encode_json_number(json_i16_to_str(value), state)
-
-			encode_u32 : U32, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_u32 = |value, state| Json.encode_json_number(json_u32_to_str(value), state)
-
-			encode_i32 : I32, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_i32 = |value, state| Json.encode_json_number(json_i32_to_str(value), state)
-
-			encode_u64 : U64, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_u64 = |value, state|
-				Ok(
-					JsonEncodeState.{
-						output: Json.append_json_string_bytes(state.output, json_u64_to_str(value)),
-						container_commas: state.container_commas,
-					},
-				)
-
-			encode_i64 : I64, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_i64 = |value, state| Json.encode_json_number(json_i64_to_str(value), state)
-
-			encode_u128 : U128, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_u128 = |value, state| Json.encode_json_number(json_u128_to_str(value), state)
-
-			encode_i128 : I128, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_i128 = |value, state| Json.encode_json_number(json_i128_to_str(value), state)
-
-			encode_dec : Dec, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_dec = |value, state| Json.encode_json_number(json_dec_to_str(value), state)
-
-			encode_f32 : F32, JsonEncodeState -> Try(JsonEncodeState, [Infinity, NaN, NegativeInfinity])
-			encode_f32 = |value, state| {
-				if json_f32_is_nan(value) {
-					Err(NaN)
-				} else if json_f32_is_infinite(value) {
-					if json_f32_is_negative(value) {
-						Err(NegativeInfinity)
-					} else {
-						Err(Infinity)
-					}
-				} else {
-					Json.encode_json_number(json_f32_to_str(value), state)
-				}
-			}
-
-			encode_f64 : F64, JsonEncodeState -> Try(JsonEncodeState, [Infinity, NaN, NegativeInfinity])
-			encode_f64 = |value, state| {
-				if json_f64_is_nan(value) {
-					Err(NaN)
-				} else if json_f64_is_infinite(value) {
-					if json_f64_is_negative(value) {
-						Err(NegativeInfinity)
-					} else {
-						Err(Infinity)
-					}
-				} else {
-					Json.encode_json_number(json_f64_to_str(value), state)
-				}
-			}
-
-			encode_null : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_null = |state|
-				Ok(
-					JsonEncodeState.{
-						output: Json.append_json_string_bytes(state.output, "null"),
-						container_commas: state.container_commas,
-					},
-				)
-
-			parse_key_str : JsonEncoding, Str -> Try(Str, Json)
-			parse_key_str = |_, key| Ok(key)
-
-			parse_key_bool : JsonEncoding, Str -> Try(Bool, Json)
-			parse_key_bool = |_, key|
-				if Str.is_eq(key, "true") {
-					Ok(True)
-				} else if Str.is_eq(key, "false") {
-					Ok(False)
-				} else {
-					Err(Json.invalid_json)
-				}
-
-			parse_key_u8 : JsonEncoding, Str -> Try(U8, Json)
-			parse_key_u8 = |_, key| Json.parse_json_key_unsigned_int(key, u8_from_str)
-
-			parse_key_i8 : JsonEncoding, Str -> Try(I8, Json)
-			parse_key_i8 = |_, key| Json.parse_json_key_signed_int(key, i8_from_str)
-
-			parse_key_u16 : JsonEncoding, Str -> Try(U16, Json)
-			parse_key_u16 = |_, key| Json.parse_json_key_unsigned_int(key, u16_from_str)
-
-			parse_key_i16 : JsonEncoding, Str -> Try(I16, Json)
-			parse_key_i16 = |_, key| Json.parse_json_key_signed_int(key, i16_from_str)
-
-			parse_key_u32 : JsonEncoding, Str -> Try(U32, Json)
-			parse_key_u32 = |_, key| Json.parse_json_key_unsigned_int(key, u32_from_str)
-
-			parse_key_i32 : JsonEncoding, Str -> Try(I32, Json)
-			parse_key_i32 = |_, key| Json.parse_json_key_signed_int(key, i32_from_str)
-
-			parse_key_u64 : JsonEncoding, Str -> Try(U64, Json)
-			parse_key_u64 = |_, key| Json.parse_json_key_unsigned_int(key, u64_from_str)
-
-			parse_key_i64 : JsonEncoding, Str -> Try(I64, Json)
-			parse_key_i64 = |_, key| Json.parse_json_key_signed_int(key, i64_from_str)
-
-			parse_key_u128 : JsonEncoding, Str -> Try(U128, Json)
-			parse_key_u128 = |_, key| Json.parse_json_key_unsigned_int(key, u128_from_str)
-
-			parse_key_i128 : JsonEncoding, Str -> Try(I128, Json)
-			parse_key_i128 = |_, key| Json.parse_json_key_signed_int(key, i128_from_str)
-
-			parse_key_dec : JsonEncoding, Str -> Try(Dec, Json)
-			parse_key_dec = |_, key| Json.parse_json_key_number(key, Json.dec_from_json_number)
-
-			parse_key_f32 : JsonEncoding, Str -> Try(F32, Json)
-			parse_key_f32 = |_, key| Json.parse_json_key_number(key, f32_from_str)
-
-			parse_key_f64 : JsonEncoding, Str -> Try(F64, Json)
-			parse_key_f64 = |_, key| Json.parse_json_key_number(key, f64_from_str)
-
-			encode_key_str : JsonEncoding, Str -> Try(Str, _never_fails)
-			encode_key_str = |_, key| Ok(key)
-
-			encode_key_bool : JsonEncoding, Bool -> Try(Str, _never_fails)
-			encode_key_bool = |_, key| Ok(if key "true" else "false")
-
-			encode_key_u8 : JsonEncoding, U8 -> Try(Str, _never_fails)
-			encode_key_u8 = |_, key| Ok(json_u8_to_str(key))
-
-			encode_key_i8 : JsonEncoding, I8 -> Try(Str, _never_fails)
-			encode_key_i8 = |_, key| Ok(json_i8_to_str(key))
-
-			encode_key_u16 : JsonEncoding, U16 -> Try(Str, _never_fails)
-			encode_key_u16 = |_, key| Ok(json_u16_to_str(key))
-
-			encode_key_i16 : JsonEncoding, I16 -> Try(Str, _never_fails)
-			encode_key_i16 = |_, key| Ok(json_i16_to_str(key))
-
-			encode_key_u32 : JsonEncoding, U32 -> Try(Str, _never_fails)
-			encode_key_u32 = |_, key| Ok(json_u32_to_str(key))
-
-			encode_key_i32 : JsonEncoding, I32 -> Try(Str, _never_fails)
-			encode_key_i32 = |_, key| Ok(json_i32_to_str(key))
-
-			encode_key_u64 : JsonEncoding, U64 -> Try(Str, _never_fails)
-			encode_key_u64 = |_, key| Ok(json_u64_to_str(key))
-
-			encode_key_i64 : JsonEncoding, I64 -> Try(Str, _never_fails)
-			encode_key_i64 = |_, key| Ok(json_i64_to_str(key))
-
-			encode_key_u128 : JsonEncoding, U128 -> Try(Str, _never_fails)
-			encode_key_u128 = |_, key| Ok(json_u128_to_str(key))
-
-			encode_key_i128 : JsonEncoding, I128 -> Try(Str, _never_fails)
-			encode_key_i128 = |_, key| Ok(json_i128_to_str(key))
-
-			encode_key_dec : JsonEncoding, Dec -> Try(Str, _never_fails)
-			encode_key_dec = |_, key| Ok(json_dec_to_str(key))
-
-			encode_key_f32 : JsonEncoding, F32 -> Try(Str, [Infinity, NaN, NegativeInfinity])
-			encode_key_f32 = |_, key| {
-				if json_f32_is_nan(key) {
-					Err(NaN)
-				} else if json_f32_is_infinite(key) {
-					if json_f32_is_negative(key) {
-						Err(NegativeInfinity)
-					} else {
-						Err(Infinity)
-					}
-				} else {
-					Ok(json_f32_to_str(key))
-				}
-			}
-
-			encode_key_f64 : JsonEncoding, F64 -> Try(Str, [Infinity, NaN, NegativeInfinity])
-			encode_key_f64 = |_, key| {
-				if json_f64_is_nan(key) {
-					Err(NaN)
-				} else if json_f64_is_infinite(key) {
-					if json_f64_is_negative(key) {
-						Err(NegativeInfinity)
-					} else {
-						Err(Infinity)
-					}
-				} else {
-					Ok(json_f64_to_str(key))
-				}
-			}
-		}
-
-		HttpHeaderState :: { raw : Str }
-
-		HttpHeaderEncoding :: [Caseless].{
-			rename_field : HttpHeaderEncoding, Str -> Str
-			rename_field = |_, name| HttpHeader.underscores_to_dashes(name)
-
-			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, HttpHeader)
-			parse_str = |_, state| {
-				value_parts = HttpHeader.take_header_value(state.raw)?
-				Ok({ value: value_parts.value, rest: HttpHeaderState.{ raw: value_parts.after } })
-			}
-
-			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, HttpHeader)
-			parse_u64 = |_, state| {
-				value_parts = HttpHeader.take_header_value(state.raw)?
-
-				match u64_from_str(value_parts.value) {
-					Ok(value) => Ok({ value, rest: HttpHeaderState.{ raw: value_parts.after } })
-					Err(_) => Err(HttpHeader.BadHeader)
-				}
-			}
-
-			parse_record_field : HttpHeaderEncoding,
-			FieldName.FieldNames(_shape),
-			HttpHeaderState -> Try(
-				[
-					Field({ field : FieldName(_shape), rest : HttpHeaderState }),
-					TryField({ name : Str, rest : HttpHeaderState }),
-					TryFieldCaseless({ name : Str, rest : HttpHeaderState }),
-					Continue({ rest : HttpHeaderState }),
-					Done({ rest : HttpHeaderState }),
-				],
-				HttpHeader,
-			)
-			parse_record_field = |_, fields, state|
-				HttpHeader.parse_record_field_from_headers(fields, state.raw)
-
-			skip_record_field : HttpHeaderEncoding, HttpHeaderState -> Try(HttpHeaderState, HttpHeader)
-			skip_record_field = |_, state| {
-				parts = HttpHeader.take_header_value(state.raw)?
-				Ok(HttpHeaderState.{ raw: parts.after })
-			}
-
-			missing_record_field : HttpHeaderEncoding, Str, HttpHeaderState -> HttpHeader
-			missing_record_field = |_, _, _| HttpHeader.MissingRequired
-
-			missing_optional_field : HttpHeaderEncoding, Str, HttpHeaderState -> [Missing]
-			missing_optional_field = |_, _, _| Missing
-		}
-
-		Json := [MissingRequired, InvalidJson].{
-			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json)
+		Json :: {}.{
+			ParseErr : [MissingRequired, InvalidJson]
+			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json.ParseErr)
 			parse_str = |encoding, state| JsonEncoding.parse_str(encoding, state)
 
-			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, Json)
+			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, Json.ParseErr)
 			parse_bool = |encoding, state| JsonEncoding.parse_bool(encoding, state)
 
-			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, Json)
+			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, Json.ParseErr)
 			parse_u8 = |encoding, state| JsonEncoding.parse_u8(encoding, state)
 
-			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, Json)
+			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, Json.ParseErr)
 			parse_i8 = |encoding, state| JsonEncoding.parse_i8(encoding, state)
 
-			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, Json)
+			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, Json.ParseErr)
 			parse_u16 = |encoding, state| JsonEncoding.parse_u16(encoding, state)
 
-			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, Json)
+			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, Json.ParseErr)
 			parse_i16 = |encoding, state| JsonEncoding.parse_i16(encoding, state)
 
-			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, Json)
+			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, Json.ParseErr)
 			parse_u32 = |encoding, state| JsonEncoding.parse_u32(encoding, state)
 
-			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, Json)
+			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, Json.ParseErr)
 			parse_i32 = |encoding, state| JsonEncoding.parse_i32(encoding, state)
 
-			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, Json)
+			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, Json.ParseErr)
 			parse_u64 = |encoding, state| JsonEncoding.parse_u64(encoding, state)
 
-			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, Json)
+			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, Json.ParseErr)
 			parse_i64 = |encoding, state| JsonEncoding.parse_i64(encoding, state)
 
-			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, Json)
+			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, Json.ParseErr)
 			parse_u128 = |encoding, state| JsonEncoding.parse_u128(encoding, state)
 
-			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, Json)
+			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, Json.ParseErr)
 			parse_i128 = |encoding, state| JsonEncoding.parse_i128(encoding, state)
 
-			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, Json)
+			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, Json.ParseErr)
 			parse_dec = |encoding, state| JsonEncoding.parse_dec(encoding, state)
 
-			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, Json)
+			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, Json.ParseErr)
 			parse_f32 = |encoding, state| JsonEncoding.parse_f32(encoding, state)
 
-			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, Json)
+			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, Json.ParseErr)
 			parse_f64 = |encoding, state| JsonEncoding.parse_f64(encoding, state)
 
-			parse_null : JsonEncoding, JsonState -> Try(JsonState, Json)
+			parse_null : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
 			parse_null = |encoding, state| JsonEncoding.parse_null(encoding, state)
 
-			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, Json)
+			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
 			parse_array_start = |encoding, state| JsonEncoding.parse_array_start(encoding, state)
 
-			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], Json)
+			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], Json.ParseErr)
 			parse_array_next = |encoding, state| JsonEncoding.parse_array_next(encoding, state)
 
-			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], Json)
+			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], Json.ParseErr)
 			parse_array_after_element = |encoding, state| JsonEncoding.parse_array_after_element(encoding, state)
 
 			encode_str : JsonEncoding, Str, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
@@ -642,9 +169,9 @@ Builtin :: [].{
 				Ok(Str.from_utf8_lossy(encoded.output))
 			}
 
-			parse : Str -> Try(a, Json)
+			parse : Str -> Try(a, Json.ParseErr)
 				where [
-					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 				]
 			parse = |json| {
 				Shape : a
@@ -661,9 +188,9 @@ Builtin :: [].{
 					}
 			}
 
-			parse_trailing_commas : Str -> Try(a, Json)
+			parse_trailing_commas : Str -> Try(a, Json.ParseErr)
 				where [
-					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 				]
 			parse_trailing_commas = |json| {
 				Shape : a
@@ -680,9 +207,9 @@ Builtin :: [].{
 					}
 			}
 
-			parser_camel : () -> (Str -> Try(a, Json))
+			parser_camel : () -> (Str -> Try(a, Json.ParseErr))
 				where [
-					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 				]
 			parser_camel = || {
 				Shape : a
@@ -702,10 +229,10 @@ Builtin :: [].{
 				}
 			}
 
-			invalid_json : Json
-			invalid_json = Json.InvalidJson
+			invalid_json : Json.ParseErr
+			invalid_json = InvalidJson
 
-			parse_json_bool : Str -> Try({ value : Bool, rest : JsonState }, Json)
+			parse_json_bool : Str -> Try({ value : Bool, rest : JsonState }, Json.ParseErr)
 			parse_json_bool = |raw| {
 				trimmed = Str.trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -719,7 +246,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_null : Str -> Try(JsonState, Json)
+			parse_json_null : Str -> Try(JsonState, Json.ParseErr)
 			parse_json_null = |raw| {
 				trimmed = Str.trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -731,7 +258,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_array_start_from_json : Str -> Try(JsonState, Json)
+			parse_array_start_from_json : Str -> Try(JsonState, Json.ParseErr)
 			parse_array_start_from_json = |raw| {
 				trimmed = Str.trim_start(raw)
 
@@ -742,7 +269,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_array_next_from_json : Str -> Try([Element(JsonState), Done(JsonState)], Json)
+			parse_array_next_from_json : Str -> Try([Element(JsonState), Done(JsonState)], Json.ParseErr)
 			parse_array_next_from_json = |raw| {
 				trimmed = Str.trim_start(raw)
 
@@ -753,7 +280,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_array_after_element_from_json : JsonEncoding, Str -> Try([Continue(JsonState), Done(JsonState)], Json)
+			parse_array_after_element_from_json : JsonEncoding, Str -> Try([Continue(JsonState), Done(JsonState)], Json.ParseErr)
 			parse_array_after_element_from_json = |encoding, raw| {
 				trimmed = Str.trim_start(raw)
 
@@ -776,7 +303,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json)
+			parse_json_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 			parse_json_unsigned_int = |raw, parse_num| {
 				trimmed = Str.trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -791,7 +318,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json)
+			parse_json_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 			parse_json_signed_int = |raw, parse_num| {
 				trimmed = Str.trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -806,7 +333,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_number : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json)
+			parse_json_number : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 			parse_json_number = |raw, parse_num| {
 				trimmed = Str.trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -941,7 +468,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_key_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json)
+			parse_json_key_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json.ParseErr)
 			parse_json_key_unsigned_int = |key, parse_num|
 				if Json.is_json_unsigned_int_literal(key) {
 					match parse_num(key) {
@@ -952,7 +479,7 @@ Builtin :: [].{
 					Err(Json.invalid_json)
 				}
 
-			parse_json_key_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json)
+			parse_json_key_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json.ParseErr)
 			parse_json_key_signed_int = |key, parse_num|
 				if Json.is_json_signed_int_literal(key) {
 					match parse_num(key) {
@@ -963,7 +490,7 @@ Builtin :: [].{
 					Err(Json.invalid_json)
 				}
 
-			parse_json_key_number : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json)
+			parse_json_key_number : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json.ParseErr)
 			parse_json_key_number = |key, parse_num|
 				if Json.is_json_number(key) {
 					match parse_num(key) {
@@ -1161,7 +688,7 @@ Builtin :: [].{
 					Continue({ rest : JsonState }),
 					Done({ rest : JsonState }),
 				],
-				Json,
+				Json.ParseErr,
 			)
 			parse_record_field_from_object = |encoding, raw| {
 				remaining = Str.trim_start(raw)
@@ -1264,7 +791,7 @@ Builtin :: [].{
 				}
 			}
 
-			skip_json_value : JsonEncoding, JsonState -> Try(JsonState, Json)
+			skip_json_value : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
 			skip_json_value = |encoding, state|
 				match state {
 					Input(raw) => {
@@ -1288,7 +815,7 @@ Builtin :: [].{
 					}
 				}
 
-			skip_json_object : JsonEncoding, Str -> Try(JsonState, Json)
+			skip_json_object : JsonEncoding, Str -> Try(JsonState, Json.ParseErr)
 			skip_json_object = |encoding, raw| {
 				remaining = Str.trim_start(raw)
 
@@ -1345,7 +872,7 @@ Builtin :: [].{
 				}
 			}
 
-			skip_json_array : JsonEncoding, Str -> Try(JsonState, Json)
+			skip_json_array : JsonEncoding, Str -> Try(JsonState, Json.ParseErr)
 			skip_json_array = |encoding, raw| {
 				remaining = Str.trim_start(raw)
 
@@ -1390,7 +917,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_tag_union_from_json : Str, JsonEncoding, ParseTagUnionSpec(a) -> Try({ value : a, rest : JsonState }, Json)
+			parse_tag_union_from_json : Str, JsonEncoding, ParseTagUnionSpec(a) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 			parse_tag_union_from_json = |raw, encoding, spec| {
 				remaining = Str.trim_start(raw)
 
@@ -1457,7 +984,7 @@ Builtin :: [].{
 				}
 			}
 
-			finish_tag_payload : JsonEncoding, a, Str -> Try({ value : a, rest : JsonState }, Json)
+			finish_tag_payload : JsonEncoding, a, Str -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 			finish_tag_payload = |encoding, value, raw| {
 				remaining = Str.trim_start(raw)
 
@@ -1501,7 +1028,7 @@ Builtin :: [].{
 				}
 			}
 
-			consume_empty_json_object : Str -> Try({ after : Str }, Json)
+			consume_empty_json_object : Str -> Try({ after : Str }, Json.ParseErr)
 			consume_empty_json_object = |raw| {
 				remaining = Str.trim_start(raw)
 
@@ -1718,7 +1245,7 @@ Builtin :: [].{
 					byte == 45
 				}
 
-			split_json_string_tail : Str -> Try({ value : Str, after : Str }, Json)
+			split_json_string_tail : Str -> Try({ value : Str, after : Str }, Json.ParseErr)
 			split_json_string_tail = |tail| {
 				quote_split = Str.find_first(tail, "\"")
 
@@ -1740,7 +1267,7 @@ Builtin :: [].{
 				}
 			}
 
-			split_json_scalar_tail : Str -> Try({ value : Str, after : Str }, Json)
+			split_json_scalar_tail : Str -> Try({ value : Str, after : Str }, Json.ParseErr)
 			split_json_scalar_tail = |raw| {
 				var $value = raw
 				var $after = ""
@@ -1837,6 +1364,480 @@ Builtin :: [].{
 				}
 			}
 
+		}
+
+		JsonEncoding :: [Default, CamelCase, TrailingCommas].{
+			rename_field : JsonEncoding, Str -> Str
+			rename_field = |encoding, name|
+				match encoding {
+					Default => name
+					TrailingCommas => name
+					CamelCase => Json.snake_to_camel(name)
+				}
+
+			allows_trailing_commas : JsonEncoding -> Bool
+			allows_trailing_commas = |encoding|
+				match encoding {
+					Default => False
+					CamelCase => False
+					TrailingCommas => True
+				}
+
+			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json.ParseErr)
+			parse_str = |_, state|
+				match state {
+					Input(raw) => {
+						trimmed = Str.trim_start(raw)
+						if Str.starts_with(trimmed, "\"") {
+							string_parts = Json.split_json_string_tail(Str.drop_prefix(trimmed, "\""))?
+							rest = Str.trim_start(string_parts.after)
+							Ok({ value: string_parts.value, rest: JsonState.Input(rest) })
+						} else {
+							Err(Json.invalid_json)
+						}
+					}
+				}
+
+			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, Json.ParseErr)
+			parse_bool = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_bool(raw)
+				}
+
+			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, Json.ParseErr)
+			parse_u8 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_unsigned_int(raw, u8_from_str)
+				}
+
+			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, Json.ParseErr)
+			parse_i8 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_signed_int(raw, i8_from_str)
+				}
+
+			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, Json.ParseErr)
+			parse_u16 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_unsigned_int(raw, u16_from_str)
+				}
+
+			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, Json.ParseErr)
+			parse_i16 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_signed_int(raw, i16_from_str)
+				}
+
+			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, Json.ParseErr)
+			parse_u32 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_unsigned_int(raw, u32_from_str)
+				}
+
+			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, Json.ParseErr)
+			parse_i32 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_signed_int(raw, i32_from_str)
+				}
+
+			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, Json.ParseErr)
+			parse_u64 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_unsigned_int(raw, u64_from_str)
+				}
+
+			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, Json.ParseErr)
+			parse_i64 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_signed_int(raw, i64_from_str)
+				}
+
+			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, Json.ParseErr)
+			parse_u128 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_unsigned_int(raw, u128_from_str)
+				}
+
+			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, Json.ParseErr)
+			parse_i128 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_signed_int(raw, i128_from_str)
+				}
+
+			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, Json.ParseErr)
+			parse_dec = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_number(raw, Json.dec_from_json_number)
+				}
+
+			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, Json.ParseErr)
+			parse_f32 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_number(raw, f32_from_str)
+				}
+
+			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, Json.ParseErr)
+			parse_f64 = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_number(raw, f64_from_str)
+				}
+
+			parse_null : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			parse_null = |_, state|
+				match state {
+					Input(raw) => Json.parse_json_null(raw)
+				}
+
+			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			parse_array_start = |_, state|
+				match state {
+					Input(raw) => Json.parse_array_start_from_json(raw)
+				}
+
+			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_next = |_, state|
+				match state {
+					Input(raw) => Json.parse_array_next_from_json(raw)
+				}
+
+			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_after_element = |encoding, state|
+				match state {
+					Input(raw) => Json.parse_array_after_element_from_json(encoding, raw)
+				}
+
+			parse_record_field : JsonEncoding,
+			FieldName.FieldNames(_shape),
+			JsonState -> Try(
+				[
+					Field({ field : FieldName(_shape), rest : JsonState }),
+					TryField({ name : Str, rest : JsonState }),
+					TryFieldCaseless({ name : Str, rest : JsonState }),
+					Continue({ rest : JsonState }),
+					Done({ rest : JsonState }),
+				],
+				Json.ParseErr,
+			)
+			parse_record_field = |encoding, _, state|
+				match state {
+					Input(raw) => Json.parse_record_field_from_object(encoding, raw)
+				}
+
+			parse_object_next : JsonEncoding, JsonState -> Try([Entry({ key : Str, rest : JsonState }), Done({ rest : JsonState })], Json.ParseErr)
+			parse_object_next = |encoding, state|
+				match state {
+					Input(raw) =>
+						match Json.parse_record_field_from_object(encoding, raw) {
+							Ok(Field({ field, rest })) => Ok(Entry({ key: FieldName.name(field), rest }))
+							Ok(TryField({ name, rest })) => Ok(Entry({ key: name, rest }))
+							Ok(TryFieldCaseless({ name, rest })) => Ok(Entry({ key: name, rest }))
+							Ok(Continue(_)) => Err(Json.invalid_json)
+							Ok(Done({ rest })) => Ok(Done({ rest: rest }))
+							Err(err) => Err(err)
+						}
+					}
+
+			skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			skip_record_field = |encoding, state| Json.skip_json_value(encoding, state)
+
+			missing_record_field : JsonEncoding, Str, JsonState -> Json.ParseErr
+			missing_record_field = |_, _, _| MissingRequired
+
+			missing_optional_field : JsonEncoding, Str, JsonState -> [Missing, ..]
+			missing_optional_field = |_, _, _| Missing
+
+			invalid_value : JsonEncoding, JsonState -> Json.ParseErr
+			invalid_value = |_, _| Json.invalid_json
+
+			parse_tag_union : JsonEncoding, ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)
+			parse_tag_union = |encoding, spec, state|
+				match state {
+					Input(value) => Json.parse_tag_union_from_json(value, encoding, spec)
+				}
+
+			encode_record : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_record = |state, _, write_fields| {
+				started = Json.write_record_start(state)?
+				finished = write_fields(started, Json.write_record_field)?
+				Json.write_record_end(finished)
+			}
+
+			encode_tuple : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_tuple = |state, _, write_elements| {
+				started = Json.write_sequence_start(state)?
+				finished = write_elements(started, Json.write_sequence_element)?
+				Json.write_sequence_end(finished)
+			}
+
+			encode_list : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_list = |state, count, write_elements| JsonEncoding.encode_tuple(state, count, write_elements)
+
+			encode_str : Str, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_str = |value, state|
+				Ok(
+					JsonEncodeState.{
+						output: Json.append_json_quoted_string(state.output, value),
+						container_commas: state.container_commas,
+					},
+				)
+
+			encode_bool : Bool, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_bool = |value, state|
+				Ok(
+					JsonEncodeState.{
+						output: Json.append_json_string_bytes(state.output, if value "true" else "false"),
+						container_commas: state.container_commas,
+					},
+				)
+
+			encode_u8 : U8, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_u8 = |value, state| Json.encode_json_number(json_u8_to_str(value), state)
+
+			encode_i8 : I8, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_i8 = |value, state| Json.encode_json_number(json_i8_to_str(value), state)
+
+			encode_u16 : U16, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_u16 = |value, state| Json.encode_json_number(json_u16_to_str(value), state)
+
+			encode_i16 : I16, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_i16 = |value, state| Json.encode_json_number(json_i16_to_str(value), state)
+
+			encode_u32 : U32, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_u32 = |value, state| Json.encode_json_number(json_u32_to_str(value), state)
+
+			encode_i32 : I32, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_i32 = |value, state| Json.encode_json_number(json_i32_to_str(value), state)
+
+			encode_u64 : U64, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_u64 = |value, state|
+				Ok(
+					JsonEncodeState.{
+						output: Json.append_json_string_bytes(state.output, json_u64_to_str(value)),
+						container_commas: state.container_commas,
+					},
+				)
+
+			encode_i64 : I64, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_i64 = |value, state| Json.encode_json_number(json_i64_to_str(value), state)
+
+			encode_u128 : U128, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_u128 = |value, state| Json.encode_json_number(json_u128_to_str(value), state)
+
+			encode_i128 : I128, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_i128 = |value, state| Json.encode_json_number(json_i128_to_str(value), state)
+
+			encode_dec : Dec, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_dec = |value, state| Json.encode_json_number(json_dec_to_str(value), state)
+
+			encode_f32 : F32, JsonEncodeState -> Try(JsonEncodeState, [Infinity, NaN, NegativeInfinity])
+			encode_f32 = |value, state| {
+				if json_f32_is_nan(value) {
+					Err(NaN)
+				} else if json_f32_is_infinite(value) {
+					if json_f32_is_negative(value) {
+						Err(NegativeInfinity)
+					} else {
+						Err(Infinity)
+					}
+				} else {
+					Json.encode_json_number(json_f32_to_str(value), state)
+				}
+			}
+
+			encode_f64 : F64, JsonEncodeState -> Try(JsonEncodeState, [Infinity, NaN, NegativeInfinity])
+			encode_f64 = |value, state| {
+				if json_f64_is_nan(value) {
+					Err(NaN)
+				} else if json_f64_is_infinite(value) {
+					if json_f64_is_negative(value) {
+						Err(NegativeInfinity)
+					} else {
+						Err(Infinity)
+					}
+				} else {
+					Json.encode_json_number(json_f64_to_str(value), state)
+				}
+			}
+
+			encode_null : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			encode_null = |state|
+				Ok(
+					JsonEncodeState.{
+						output: Json.append_json_string_bytes(state.output, "null"),
+						container_commas: state.container_commas,
+					},
+				)
+
+			parse_key_str : JsonEncoding, Str -> Try(Str, Json.ParseErr)
+			parse_key_str = |_, key| Ok(key)
+
+			parse_key_bool : JsonEncoding, Str -> Try(Bool, Json.ParseErr)
+			parse_key_bool = |_, key|
+				if Str.is_eq(key, "true") {
+					Ok(True)
+				} else if Str.is_eq(key, "false") {
+					Ok(False)
+				} else {
+					Err(Json.invalid_json)
+				}
+
+			parse_key_u8 : JsonEncoding, Str -> Try(U8, Json.ParseErr)
+			parse_key_u8 = |_, key| Json.parse_json_key_unsigned_int(key, u8_from_str)
+
+			parse_key_i8 : JsonEncoding, Str -> Try(I8, Json.ParseErr)
+			parse_key_i8 = |_, key| Json.parse_json_key_signed_int(key, i8_from_str)
+
+			parse_key_u16 : JsonEncoding, Str -> Try(U16, Json.ParseErr)
+			parse_key_u16 = |_, key| Json.parse_json_key_unsigned_int(key, u16_from_str)
+
+			parse_key_i16 : JsonEncoding, Str -> Try(I16, Json.ParseErr)
+			parse_key_i16 = |_, key| Json.parse_json_key_signed_int(key, i16_from_str)
+
+			parse_key_u32 : JsonEncoding, Str -> Try(U32, Json.ParseErr)
+			parse_key_u32 = |_, key| Json.parse_json_key_unsigned_int(key, u32_from_str)
+
+			parse_key_i32 : JsonEncoding, Str -> Try(I32, Json.ParseErr)
+			parse_key_i32 = |_, key| Json.parse_json_key_signed_int(key, i32_from_str)
+
+			parse_key_u64 : JsonEncoding, Str -> Try(U64, Json.ParseErr)
+			parse_key_u64 = |_, key| Json.parse_json_key_unsigned_int(key, u64_from_str)
+
+			parse_key_i64 : JsonEncoding, Str -> Try(I64, Json.ParseErr)
+			parse_key_i64 = |_, key| Json.parse_json_key_signed_int(key, i64_from_str)
+
+			parse_key_u128 : JsonEncoding, Str -> Try(U128, Json.ParseErr)
+			parse_key_u128 = |_, key| Json.parse_json_key_unsigned_int(key, u128_from_str)
+
+			parse_key_i128 : JsonEncoding, Str -> Try(I128, Json.ParseErr)
+			parse_key_i128 = |_, key| Json.parse_json_key_signed_int(key, i128_from_str)
+
+			parse_key_dec : JsonEncoding, Str -> Try(Dec, Json.ParseErr)
+			parse_key_dec = |_, key| Json.parse_json_key_number(key, Json.dec_from_json_number)
+
+			parse_key_f32 : JsonEncoding, Str -> Try(F32, Json.ParseErr)
+			parse_key_f32 = |_, key| Json.parse_json_key_number(key, f32_from_str)
+
+			parse_key_f64 : JsonEncoding, Str -> Try(F64, Json.ParseErr)
+			parse_key_f64 = |_, key| Json.parse_json_key_number(key, f64_from_str)
+
+			encode_key_str : JsonEncoding, Str -> Try(Str, _never_fails)
+			encode_key_str = |_, key| Ok(key)
+
+			encode_key_bool : JsonEncoding, Bool -> Try(Str, _never_fails)
+			encode_key_bool = |_, key| Ok(if key "true" else "false")
+
+			encode_key_u8 : JsonEncoding, U8 -> Try(Str, _never_fails)
+			encode_key_u8 = |_, key| Ok(json_u8_to_str(key))
+
+			encode_key_i8 : JsonEncoding, I8 -> Try(Str, _never_fails)
+			encode_key_i8 = |_, key| Ok(json_i8_to_str(key))
+
+			encode_key_u16 : JsonEncoding, U16 -> Try(Str, _never_fails)
+			encode_key_u16 = |_, key| Ok(json_u16_to_str(key))
+
+			encode_key_i16 : JsonEncoding, I16 -> Try(Str, _never_fails)
+			encode_key_i16 = |_, key| Ok(json_i16_to_str(key))
+
+			encode_key_u32 : JsonEncoding, U32 -> Try(Str, _never_fails)
+			encode_key_u32 = |_, key| Ok(json_u32_to_str(key))
+
+			encode_key_i32 : JsonEncoding, I32 -> Try(Str, _never_fails)
+			encode_key_i32 = |_, key| Ok(json_i32_to_str(key))
+
+			encode_key_u64 : JsonEncoding, U64 -> Try(Str, _never_fails)
+			encode_key_u64 = |_, key| Ok(json_u64_to_str(key))
+
+			encode_key_i64 : JsonEncoding, I64 -> Try(Str, _never_fails)
+			encode_key_i64 = |_, key| Ok(json_i64_to_str(key))
+
+			encode_key_u128 : JsonEncoding, U128 -> Try(Str, _never_fails)
+			encode_key_u128 = |_, key| Ok(json_u128_to_str(key))
+
+			encode_key_i128 : JsonEncoding, I128 -> Try(Str, _never_fails)
+			encode_key_i128 = |_, key| Ok(json_i128_to_str(key))
+
+			encode_key_dec : JsonEncoding, Dec -> Try(Str, _never_fails)
+			encode_key_dec = |_, key| Ok(json_dec_to_str(key))
+
+			encode_key_f32 : JsonEncoding, F32 -> Try(Str, [Infinity, NaN, NegativeInfinity])
+			encode_key_f32 = |_, key| {
+				if json_f32_is_nan(key) {
+					Err(NaN)
+				} else if json_f32_is_infinite(key) {
+					if json_f32_is_negative(key) {
+						Err(NegativeInfinity)
+					} else {
+						Err(Infinity)
+					}
+				} else {
+					Ok(json_f32_to_str(key))
+				}
+			}
+
+			encode_key_f64 : JsonEncoding, F64 -> Try(Str, [Infinity, NaN, NegativeInfinity])
+			encode_key_f64 = |_, key| {
+				if json_f64_is_nan(key) {
+					Err(NaN)
+				} else if json_f64_is_infinite(key) {
+					if json_f64_is_negative(key) {
+						Err(NegativeInfinity)
+					} else {
+						Err(Infinity)
+					}
+				} else {
+					Ok(json_f64_to_str(key))
+				}
+			}
+		}
+
+		HttpHeaderState :: { raw : Str }
+
+		HttpHeaderEncoding :: [Caseless].{
+			rename_field : HttpHeaderEncoding, Str -> Str
+			rename_field = |_, name| HttpHeader.underscores_to_dashes(name)
+
+			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, HttpHeader)
+			parse_str = |_, state| {
+				value_parts = HttpHeader.take_header_value(state.raw)?
+				Ok({ value: value_parts.value, rest: HttpHeaderState.{ raw: value_parts.after } })
+			}
+
+			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, HttpHeader)
+			parse_u64 = |_, state| {
+				value_parts = HttpHeader.take_header_value(state.raw)?
+
+				match u64_from_str(value_parts.value) {
+					Ok(value) => Ok({ value, rest: HttpHeaderState.{ raw: value_parts.after } })
+					Err(_) => Err(HttpHeader.BadHeader)
+				}
+			}
+
+			parse_record_field : HttpHeaderEncoding,
+			FieldName.FieldNames(_shape),
+			HttpHeaderState -> Try(
+				[
+					Field({ field : FieldName(_shape), rest : HttpHeaderState }),
+					TryField({ name : Str, rest : HttpHeaderState }),
+					TryFieldCaseless({ name : Str, rest : HttpHeaderState }),
+					Continue({ rest : HttpHeaderState }),
+					Done({ rest : HttpHeaderState }),
+				],
+				HttpHeader,
+			)
+			parse_record_field = |_, fields, state|
+				HttpHeader.parse_record_field_from_headers(fields, state.raw)
+
+			skip_record_field : HttpHeaderEncoding, HttpHeaderState -> Try(HttpHeaderState, HttpHeader)
+			skip_record_field = |_, state| {
+				parts = HttpHeader.take_header_value(state.raw)?
+				Ok(HttpHeaderState.{ raw: parts.after })
+			}
+
+			missing_record_field : HttpHeaderEncoding, Str, HttpHeaderState -> HttpHeader
+			missing_record_field = |_, _, _| HttpHeader.MissingRequired
+
+			missing_optional_field : HttpHeaderEncoding, Str, HttpHeaderState -> [Missing]
+			missing_optional_field = |_, _, _| Missing
 		}
 
 		HttpHeader := [MissingRequired, BadHeader].{

@@ -1,31 +1,31 @@
 JsonEncodeNullContainerEdgeCases :: [].{}
 
 expect {
-	result : Try(Str, Json)
+	result : Try(Str, Json.ParseErr)
 	result = Json.parse("null")
 	result == Err(Json.invalid_json)
 }
 
 expect {
-	result : Try(List(Str), Json)
+	result : Try(List(Str), Json.ParseErr)
 	result = Json.parse("[\"a\",null]")
 	result == Err(Json.invalid_json)
 }
 
 expect {
-	result : Try(List(Try(Str, [Null])), Json)
+	result : Try(List(Try(Str, [Null])), Json.ParseErr)
 	result = Json.parse("[\"a\",null]")
 	result == Ok([Ok("a"), Err(Null)])
 }
 
 expect {
-	result : Try({ optional : Try(Str, [Missing]) }, Json)
+	result : Try({ optional : Try(Str, [Missing]) }, Json.ParseErr)
 	result = Json.parse("{}")
 	result == Ok({ optional: Err(Missing) })
 }
 
 expect {
-	result : Try({ optional : Try(Str, [Missing]) }, Json)
+	result : Try({ optional : Try(Str, [Missing]) }, Json.ParseErr)
 	result = Json.parse("{\"optional\":null}")
 	result == Err(Json.invalid_json)
 }
@@ -38,13 +38,13 @@ expect {
 }
 
 expect {
-	missing_result : Try({ field : Try(Str, [Missing, Null]) }, Json)
+	missing_result : Try({ field : Try(Str, [Missing, Null]) }, Json.ParseErr)
 	missing_result = Json.parse("{}")
 
-	null_result : Try({ field : Try(Str, [Missing, Null]) }, Json)
+	null_result : Try({ field : Try(Str, [Missing, Null]) }, Json.ParseErr)
 	null_result = Json.parse("{\"field\":null}")
 
-	value_result : Try({ field : Try(Str, [Missing, Null]) }, Json)
+	value_result : Try({ field : Try(Str, [Missing, Null]) }, Json.ParseErr)
 	value_result = Json.parse("{\"field\":\"value\"}")
 
 	missing_result == Ok({ field: Err(Missing) })
@@ -60,13 +60,13 @@ expect {
 }
 
 expect {
-	result : Try({ field : Try(Str, [Null]) }, Json)
+	result : Try({ field : Try(Str, [Null]) }, Json.ParseErr)
 	result = Json.parse("{}")
-	result == Err(Json.MissingRequired)
+	result == Err(MissingRequired)
 }
 
 expect {
-	result : Try({}, Json)
+	result : Try({}, Json.ParseErr)
 	result = Json.parse("{}")
 	result == Ok({})
 }
