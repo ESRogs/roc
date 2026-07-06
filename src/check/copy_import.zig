@@ -345,6 +345,12 @@ fn copyStaticDispatchConstraints(
         var dest_constraint = source_constraint;
         dest_constraint.fn_name = translated_fn_name;
         dest_constraint.fn_var = try copyVarCtx(ctx, source_constraint.fn_var);
+        // Provenance (introducing expression + expect region) is module-scoped:
+        // its indices refer to the SOURCE module's CIR and are meaningless here.
+        // Clear it on the boundary crossing so a consumer never dereferences a
+        // foreign expr index against the destination module (the old module-local
+        // side tables likewise had no entry for an imported constraint).
+        dest_constraint.provenance = .{};
 
         try dest_constraints.append(dest_constraint);
     }
