@@ -28168,6 +28168,8 @@ fn expectProvidedExportKind(
     var builtin_body_builder = try CheckedBodyStoreBuilder.fromModule(allocator, builtin_module, &builtin_names, &builtin_checked_type_publication, &builtin_pub_source_nodes);
     defer builtin_body_builder.deinit(allocator);
     const builtin_bodies = builtin_body_builder.storePtr();
+    var builtin_relation_type_substitutions = PlatformRelationTypeSubstitutions{};
+    defer builtin_relation_type_substitutions.deinit(allocator);
     var builtin_intrinsic_wrappers = IntrinsicWrapperTable{};
     defer builtin_intrinsic_wrappers.deinit(allocator);
     var builtin_templates = try CheckedProcedureTemplateTable.fromModule(
@@ -28177,6 +28179,7 @@ fn expectProvidedExportKind(
         &builtin_names,
         artifactRef(builtin_key),
         &builtin_checked_type_publication,
+        &builtin_relation_type_substitutions,
         builtin_bodies,
         &builtin_intrinsic_wrappers,
     );
