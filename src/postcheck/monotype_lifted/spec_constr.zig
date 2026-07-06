@@ -3400,7 +3400,7 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
         .def_ref,
         .fn_def,
         => false,
-        .fn_ref => |fn_ref| exprSpanContainsReturn(program, fn_ref.captures),
+        .fn_ref => |fn_ref| captureOperandSpanContainsReturn(program, fn_ref.captures),
         .return_ => true,
         .list,
         .tuple,
@@ -3420,7 +3420,7 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
         .comptime_branch_taken => |taken| exprContainsReturn(program, taken.body),
         .let_ => |let_| exprContainsReturn(program, let_.value) or exprContainsReturn(program, let_.rest),
         .call_value => |call| exprContainsReturn(program, call.callee) or exprSpanContainsReturn(program, call.args),
-        .call_proc => |call| exprSpanContainsReturn(program, call.args) or exprSpanContainsReturn(program, call.captures),
+        .call_proc => |call| exprSpanContainsReturn(program, call.args) or captureOperandSpanContainsReturn(program, call.captures),
         .low_level => |call| exprSpanContainsReturn(program, call.args),
         .field_access => |field| exprContainsReturn(program, field.receiver),
         .tuple_access => |access| exprContainsReturn(program, access.tuple),
@@ -3467,6 +3467,13 @@ fn exprSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.ExprId
     return false;
 }
 
+fn captureOperandSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.CaptureOperand)) bool {
+    for (program.captureOperandSpan(span)) |operand| {
+        if (exprContainsReturn(program, operand.value)) return true;
+    }
+    return false;
+}
+
 fn stmtContainsReturn(program: *const Ast.Program, stmt_id: Ast.StmtId) bool {
     return switch (program.stmts.items[@intFromEnum(stmt_id)]) {
         .return_ => true,
@@ -3496,7 +3503,7 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
         .uninitialized,
         .uninitialized_payload,
         => 0,
-        .fn_ref => |fn_ref| localUseCountInExprSpan(program, local, fn_ref.captures),
+        .fn_ref => |fn_ref| localUseCountInCaptureOperandSpan(program, local, fn_ref.captures),
         .list,
         .tuple,
         => |items| localUseCountInExprSpan(program, local, items),
@@ -3519,7 +3526,7 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
         .fn_def,
         => 0,
         .call_value => |call| localUseCountInExpr(program, local, call.callee) + localUseCountInExprSpan(program, local, call.args),
-        .call_proc => |call| localUseCountInExprSpan(program, local, call.args) + localUseCountInExprSpan(program, local, call.captures),
+        .call_proc => |call| localUseCountInExprSpan(program, local, call.args) + localUseCountInCaptureOperandSpan(program, local, call.captures),
         .low_level => |call| localUseCountInExprSpan(program, local, call.args),
         .field_access => |field| localUseCountInExpr(program, local, field.receiver),
         .tuple_access => |access| localUseCountInExpr(program, local, access.tuple),
@@ -3565,6 +3572,12 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
 fn localUseCountInExprSpan(program: *const Ast.Program, local: Ast.LocalId, span: Ast.Span(Ast.ExprId)) usize {
     var count: usize = 0;
     for (program.exprSpan(span)) |expr| count += localUseCountInExpr(program, local, expr);
+    return count;
+}
+
+fn localUseCountInCaptureOperandSpan(program: *const Ast.Program, local: Ast.LocalId, span: Ast.Span(Ast.CaptureOperand)) usize {
+    var count: usize = 0;
+    for (program.captureOperandSpan(span)) |operand| count += localUseCountInExpr(program, local, operand.value);
     return count;
 }
 
@@ -3615,7 +3628,7 @@ fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: 
         .uninitialized,
         .uninitialized_payload,
         => {},
-        .fn_ref => |fn_ref| scanLocalUseInExprSpan(program, local, fn_ref.captures, scan),
+        .fn_ref => |fn_ref| scanLocalUseInCaptureOperandSpan(program, local, fn_ref.captures, scan),
         .crash, .comptime_exhaustiveness_failed => scan.seen_effect = true,
         .list,
         .tuple,
@@ -3655,7 +3668,7 @@ fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: 
         },
         .call_proc => |call| {
             scanLocalUseInExprSpan(program, local, call.args, scan);
-            scanLocalUseInExprSpan(program, local, call.captures, scan);
+            scanLocalUseInCaptureOperandSpan(program, local, call.captures, scan);
             scan.seen_effect = true;
         },
         .low_level => |call| {
@@ -3756,6 +3769,15 @@ fn scanLocalUseInExprSpan(
     scan: *LocalUseScan,
 ) void {
     for (program.exprSpan(span)) |expr| scanLocalUseInExpr(program, local, expr, scan);
+}
+
+fn scanLocalUseInCaptureOperandSpan(
+    program: *const Ast.Program,
+    local: Ast.LocalId,
+    span: Ast.Span(Ast.CaptureOperand),
+    scan: *LocalUseScan,
+) void {
+    for (program.captureOperandSpan(span)) |operand| scanLocalUseInExpr(program, local, operand.value, scan);
 }
 
 fn scanLocalUseInStmt(program: *const Ast.Program, local: Ast.LocalId, stmt_id: Ast.StmtId, scan: *LocalUseScan) void {
@@ -3992,6 +4014,77 @@ fn tupleFromValue(value: Value) ?TupleValue {
         .nominal => |nominal| tupleFromValue(nominal.backing.*),
         else => null,
     };
+}
+
+fn emptyLiftedProgramForTest(allocator: Allocator) Ast.Program {
+    return Ast.Program.init(
+        allocator,
+        names.NameStore.init(allocator),
+        Type.Store.init(allocator),
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        Mono.ProcDebugNameMap.init(allocator),
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        0,
+    );
+}
+
+test "call-pattern scans direct call and function reference capture operands" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const unit_ty = try program.types.add(.zst);
+    const local = try program.addLocal(@enumFromInt(1), unit_ty);
+    const unit_expr = try program.addExpr(.{ .ty = unit_ty, .data = .unit });
+    _ = try program.addExprSpan(&.{unit_expr});
+    const local_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .local = local } });
+
+    const return_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .return_ = .{
+        .value = local_expr,
+        .target = unit_ty,
+    } } });
+    const captures = try program.addCaptureOperandSpan(&.{.{
+        .id = check.CheckedModule.CaptureId.generatedLift(0),
+        .value = return_expr,
+    }});
+    const fn_ref = try program.addExpr(.{ .ty = unit_ty, .data = .{ .fn_ref = .{
+        .fn_id = @enumFromInt(0),
+        .captures = captures,
+    } } });
+    const call_proc = try program.addExpr(.{ .ty = unit_ty, .data = .{ .call_proc = .{
+        .callee = .{ .lifted = @enumFromInt(0) },
+        .args = Ast.Span(Ast.ExprId).empty(),
+        .captures = captures,
+    } } });
+
+    try std.testing.expect(exprContainsReturn(&program, fn_ref));
+    try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, local, fn_ref));
+    try std.testing.expect(localUseBeforeEffect(&program, local, fn_ref));
+    try std.testing.expect(exprContainsReturn(&program, call_proc));
+    try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, local, call_proc));
+    try std.testing.expect(localUseBeforeEffect(&program, local, call_proc));
 }
 
 test "call-pattern specialization preserves imported direct calls" {
