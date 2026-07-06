@@ -70,25 +70,7 @@ pub const Options = struct {
 };
 
 /// Deterministic counters used by specialization-shape tests.
-pub const SpecializationCounters = struct {
-    template_requests: u64 = 0,
-    template_hits: u64 = 0,
-    template_misses: u64 = 0,
-    nested_requests: u64 = 0,
-    nested_hits: u64 = 0,
-    nested_misses: u64 = 0,
-    template_lookup_candidates: u64 = 0,
-    nested_lookup_candidates: u64 = 0,
-    specialization_type_digest_requests: u64 = 0,
-    specialization_type_digest_cache_hits: u64 = 0,
-    specialization_type_digest_cache_misses: u64 = 0,
-    specialization_type_digest_nodes_visited: u64 = 0,
-    exact_type_checks: u64 = 0,
-    /// Total-dispatch migration audit: requirements still resolved by owner
-    /// derivation instead of checked evidence. Must reach zero before the
-    /// derivation path is deleted.
-    evidence_missing: u64 = 0,
-};
+pub const SpecializationCounters = specialize.Counters;
 
 /// Lower checked modules and explicit roots into Monotype IR.
 pub fn run(
@@ -128,9 +110,22 @@ pub fn run(
         verifyMonotypeCompletedTypeIds(&program);
         verifyMonotypeCallTargets(&program);
         builder.countBy("evidence_missing", builder.evidence_missing_count);
+        builder.spec_store.validateLookupIntegrity();
+        verifyMonotypeSpecsReady(&program);
     }
 
     return program;
+}
+
+/// Every specialization record must have finished lowering by the time the
+/// program completes: reservations are drained by the graph that made them,
+/// and `SpecBuilder` owns the only `reserved → lowering → ready` transitions.
+fn verifyMonotypeSpecsReady(program: *const Ast.Program) void {
+    for (program.specs.items) |record| {
+        if (record.status != .ready) {
+            Common.invariant("completed Monotype program contained an unfinished specialization record");
+        }
+    }
 }
 
 const ModuleView = struct {
@@ -340,53 +335,20 @@ const LocalProcContext = struct {
     entries: []LexicalBinderEntry,
 };
 
-const LoweredTemplateStatus = enum {
-    reserved,
-    lowering,
-    ready,
-};
-
-/// A procedure template specialization together with both the Monotype function
-/// type requested by the call site that reserved it and the solved function type
-/// produced after lowering the body. The request type remains a valid cache key
-/// after the body solves previously-unresolved slots; recursive requests made
-/// from another graph can still arrive with the same request shape.
+/// Pass-local lowering state for one procedure template specialization,
+/// keyed by the specialization's function id. Its identity, type views, and
+/// status live on the `Ast.SpecRecord` owned by `spec_store`; this entry only
+/// remembers which definition receives the body. Every path that reserves a
+/// proc-template record in `spec_store` must register its entry here, or the
+/// next reuse lookup hits the missing-lowering-state invariant.
 const LoweredTemplate = struct {
     def: Ast.DefId,
-    fn_id: Ast.FnId,
     spec: Ast.SpecId,
-    request_fn_ty: Type.TypeId,
-    request_digest: names.TypeDigest,
-    solved_fn_ty: Type.TypeId,
-    solved_digest: names.TypeDigest,
-    status: LoweredTemplateStatus,
     /// Evidence for the template scheme's dispatch requirements, in enumeration
     /// evidence-param order, supplied by the first requesting edge. Reused
     /// specializations debug-assert later edges agree (evidence is a function
     /// of the monomorphic type, so agreement is an invariant, not a choice).
     evidence: []const SpecEvidence = &.{},
-};
-
-const LoweredNestedStatus = enum {
-    lowering,
-    ready,
-};
-
-/// A nested function specialization together with the Monotype function type
-/// its body is being lowered or was lowered at.
-const LoweredNestedFn = struct {
-    fn_id: Ast.FnId,
-    spec: Ast.SpecId,
-    request_fn_ty: Type.TypeId,
-    request_digest: names.TypeDigest,
-    solved_fn_ty: Type.TypeId,
-    solved_digest: names.TypeDigest,
-    status: LoweredNestedStatus,
-};
-
-const SpecLookupKind = enum {
-    request,
-    solved,
 };
 
 const FinalBodyOutputCounts = struct {
@@ -416,44 +378,6 @@ const FinalBodyOutputCounts = struct {
         self.layout_requests += after.layout_requests - before.layout_requests;
         self.runtime_schema_requests += after.runtime_schema_requests - before.runtime_schema_requests;
     }
-};
-
-const TemplateSpecLookup = struct {
-    family: TemplateFamily,
-    kind: SpecLookupKind,
-    digest_bytes: [32]u8,
-
-    fn from(family: TemplateFamily, kind: SpecLookupKind, digest: names.TypeDigest) TemplateSpecLookup {
-        return .{
-            .family = family,
-            .kind = kind,
-            .digest_bytes = digest.bytes,
-        };
-    }
-};
-
-const NestedSpecLookup = struct {
-    family: NestedFnFamily,
-    kind: SpecLookupKind,
-    digest_bytes: [32]u8,
-
-    fn from(family: NestedFnFamily, kind: SpecLookupKind, digest: names.TypeDigest) NestedSpecLookup {
-        return .{
-            .family = family,
-            .kind = kind,
-            .digest_bytes = digest.bytes,
-        };
-    }
-};
-
-const LoweredTemplateMatch = struct {
-    index: usize,
-    match_ty: Type.TypeId,
-};
-
-const LoweredNestedMatch = struct {
-    index: usize,
-    match_ty: Type.TypeId,
 };
 
 const ReservedTemplate = struct {
@@ -532,6 +456,12 @@ const ConstExprAddress = struct {
 /// Key for a memoized structural-derivation helper def. `value_ty` is the type
 /// being derived over; `result_ty` is the derivation's auxiliary type (the
 /// produced Str for inspect, the Bool for equality, the Hasher for hashing).
+///
+/// These memos are deliberately NOT specialization records in `spec_store`:
+/// helper defs have no `FnId` (they are `def_ref` targets, not callable
+/// specializations), and their keys are process-local interned type ids with
+/// no durable digest, so they cannot participate in cross-shard reuse. The
+/// specialization identity story lives entirely in `specialize.SpecBuilder`.
 const GeneratedHelperDefAddress = struct {
     value_ty: u32,
     result_ty: u32,
@@ -567,8 +497,8 @@ const DraftGeneratedHelperDefEntry = union(enum) {
 fn templateSpecIdentity(
     template_ref: names.ProcTemplate,
     source_fn_key: names.TypeDigest,
-    mono_fn_ty: Type.TypeId,
-    mono_fn_ty_digest: names.TypeDigest,
+    request_fn_ty: Type.TypeId,
+    request_fn_ty_digest: names.TypeDigest,
 ) Ast.SpecIdentity {
     return .{
         .callable = .{ .proc_template = .{
@@ -577,8 +507,28 @@ fn templateSpecIdentity(
             .template = @intFromEnum(template_ref.template),
         } },
         .source_fn_ty_digest = source_fn_key,
-        .mono_fn_ty_digest = mono_fn_ty_digest,
-        .mono_fn_ty = mono_fn_ty,
+        .request_fn_ty_digest = request_fn_ty_digest,
+        .request_fn_ty = request_fn_ty,
+    };
+}
+
+fn nestedSpecIdentity(
+    nested: Ast.NestedFn,
+    source_fn_key: names.TypeDigest,
+    request_fn_ty: Type.TypeId,
+    request_fn_ty_digest: names.TypeDigest,
+) Ast.SpecIdentity {
+    return .{
+        .callable = .{ .nested_site = .{
+            .module = names.procTemplateModuleDigest(nested.owner),
+            .owner_proc_base = @intFromEnum(nested.owner.proc_base),
+            .owner_template = @intFromEnum(nested.owner.template),
+            .owner_fn_digest = nested.context_fn_key,
+            .site = @intFromEnum(nested.site),
+        } },
+        .source_fn_ty_digest = source_fn_key,
+        .request_fn_ty_digest = request_fn_ty_digest,
+        .request_fn_ty = request_fn_ty,
     };
 }
 
@@ -599,13 +549,10 @@ const Builder = struct {
     /// without body evidence, so empty tag unions inside them are unresolved
     /// slots rather than solved uninhabited types.
     unsolved_monos: std.AutoHashMap(Type.TypeId, void),
-    lowered_templates: std.ArrayList(LoweredTemplate),
-    lowered_template_by_fn: std.AutoHashMap(Ast.FnId, u32),
-    lowered_template_by_def: std.AutoHashMap(Ast.DefId, u32),
-    lowered_template_lookup: std.AutoHashMap(TemplateSpecLookup, std.ArrayList(u32)),
-    lowered_nested_fns: std.ArrayList(LoweredNestedFn),
-    lowered_nested_by_fn: std.AutoHashMap(Ast.FnId, u32),
-    lowered_nested_lookup: std.AutoHashMap(NestedSpecLookup, std.ArrayList(u32)),
+    lowered_templates: std.AutoHashMap(Ast.FnId, LoweredTemplate),
+    /// Nested-fn specialization records keyed by function id; the durable
+    /// identity and status live on the `Ast.SpecRecord`.
+    lowered_nested_by_fn: std.AutoHashMap(Ast.FnId, Ast.SpecId),
     nested_site_cache: std.AutoHashMap(NestedSiteAddress, names.ProcSiteId),
     const_expr_cache: std.AutoHashMap(ConstExprAddress, Ast.ExprId),
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
@@ -635,6 +582,8 @@ const Builder = struct {
     evidence_missing_count: usize = 0,
 
     fn init(allocator: Allocator, modules: Common.CheckedModules, program: *Ast.Program, options: Options) Builder {
+        var spec_store = specialize.SpecBuilder.init(allocator, &program.names, &program.types, &program.specs);
+        spec_store.counters = options.specialization_counters;
         return .{
             .allocator = allocator,
             .modules = modules,
@@ -646,15 +595,10 @@ const Builder = struct {
             .counters = options.specialization_counters,
             .inline_expects = options.inline_expects,
             .type_cache = std.AutoHashMap(CheckedTypeAddress, Type.TypeId).init(allocator),
-            .spec_store = specialize.SpecBuilder.init(allocator, &program.names, &program.types, &program.specs),
+            .spec_store = spec_store,
             .unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(allocator),
-            .lowered_templates = .empty,
-            .lowered_template_by_fn = std.AutoHashMap(Ast.FnId, u32).init(allocator),
-            .lowered_template_by_def = std.AutoHashMap(Ast.DefId, u32).init(allocator),
-            .lowered_template_lookup = std.AutoHashMap(TemplateSpecLookup, std.ArrayList(u32)).init(allocator),
-            .lowered_nested_fns = .empty,
-            .lowered_nested_by_fn = std.AutoHashMap(Ast.FnId, u32).init(allocator),
-            .lowered_nested_lookup = std.AutoHashMap(NestedSpecLookup, std.ArrayList(u32)).init(allocator),
+            .lowered_templates = std.AutoHashMap(Ast.FnId, LoweredTemplate).init(allocator),
+            .lowered_nested_by_fn = std.AutoHashMap(Ast.FnId, Ast.SpecId).init(allocator),
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
             .const_expr_cache = std.AutoHashMap(ConstExprAddress, Ast.ExprId).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
@@ -692,21 +636,8 @@ const Builder = struct {
         self.inspect_defs.deinit();
         self.const_expr_cache.deinit();
         self.nested_site_cache.deinit();
-        var nested_lookup_lists = self.lowered_nested_lookup.valueIterator();
-        while (nested_lookup_lists.next()) |list| {
-            list.deinit(self.allocator);
-        }
-        self.lowered_nested_lookup.deinit();
         self.lowered_nested_by_fn.deinit();
-        self.lowered_nested_fns.deinit(self.allocator);
-        var template_lookup_lists = self.lowered_template_lookup.valueIterator();
-        while (template_lookup_lists.next()) |list| {
-            list.deinit(self.allocator);
-        }
-        self.lowered_template_lookup.deinit();
-        self.lowered_template_by_def.deinit();
-        self.lowered_template_by_fn.deinit();
-        self.lowered_templates.deinit(self.allocator);
+        self.lowered_templates.deinit();
         self.spec_store.deinit();
         self.unsolved_monos.deinit();
         self.type_cache.deinit();
@@ -1326,54 +1257,50 @@ const Builder = struct {
         source_region_override: ?base.Region,
         current_entry_root: ?checked.ComptimeRootId,
     ) Allocator.Error!Ast.DefId {
-        const family = TemplateFamily.from(template_ref, source_fn_key);
         self.count("template_requests");
         var reserved_def: ?Ast.DefId = null;
         var lower_fn_ty = fn_ty;
         var spec_evidence = evidence;
+        var request_digest: ?names.TypeDigest = null;
         if (reserved_fn_id) |fn_id| {
-            const index = self.lowered_template_by_fn.get(fn_id) orelse
+            const existing = self.lowered_templates.get(fn_id) orelse
                 Common.invariant("deferred Monotype procedure template request referenced a missing reservation");
-            const existing = &self.lowered_templates.items[index];
-            switch (existing.status) {
+            const record = &self.program.specs.items[@intFromEnum(existing.spec)];
+            switch (record.status) {
                 .ready,
                 .lowering,
                 => return existing.def,
                 .reserved => {
                     reserved_def = existing.def;
-                    lower_fn_ty = existing.request_fn_ty;
+                    lower_fn_ty = record.request_fn_ty;
                     // The reserving edge supplied this specialization's
                     // evidence.
                     spec_evidence = existing.evidence;
-                    existing.status = .lowering;
-                    self.program.specs.items[@intFromEnum(existing.spec)].status = .lowering;
+                    self.spec_store.markLowering(existing.spec);
                 },
             }
         } else {
             const fn_ty_digest = self.specializationTypeDigest(fn_ty);
-            if (try self.findLoweredTemplate(family, fn_ty, fn_ty_digest)) |match| {
+            request_digest = fn_ty_digest;
+            if (try self.spec_store.findLocal(templateSpecIdentity(template_ref, source_fn_key, fn_ty, fn_ty_digest))) |hit| {
                 self.count("template_hits");
-                const existing = &self.lowered_templates.items[match.index];
-                const match_ty = match.match_ty;
+                const existing = self.lowered_templates.get(hit.fn_id) orelse
+                    Common.invariant("Monotype specialization index found a local template missing from lowering state");
                 if (requester) |graph| {
-                    if (match_ty != fn_ty) {
-                        try graph.unify(try graph.importMono(fn_ty), try graph.importMono(match_ty));
-                    }
-                    if (existing.status == .ready and existing.solved_fn_ty != fn_ty) {
-                        try graph.unify(try graph.importMono(fn_ty), try graph.importMono(existing.solved_fn_ty));
-                    }
-                    try graph.drainDirty();
+                    try unifyRequestWithLocalHit(graph, fn_ty, hit);
                 }
-                switch (existing.status) {
+                switch (hit.status) {
                     .ready,
                     .lowering,
                     => return existing.def,
                     .reserved => {
                         reserved_def = existing.def;
-                        lower_fn_ty = existing.request_fn_ty;
+                        // A reserved record can only have matched through its
+                        // request view, so the matched type is the record's
+                        // current request view — the type the body lowers at.
+                        lower_fn_ty = hit.match_ty;
                         if (existing.evidence.len > 0) spec_evidence = existing.evidence;
-                        existing.status = .lowering;
-                        self.program.specs.items[@intFromEnum(existing.spec)].status = .lowering;
+                        self.spec_store.markLowering(hit.spec);
                     },
                 }
             } else {
@@ -1417,23 +1344,16 @@ const Builder = struct {
                 .body = .hosted,
                 .ret = self.functionShape(lower_fn_ty, "procedure template root type was not a function").ret,
             });
-            const entry_index: u32 = @intCast(self.lowered_templates.items.len);
-            const request_digest = self.specializationTypeDigest(lower_fn_ty);
-            const spec = try self.addTemplateSpecRecord(template_ref, source_fn_key, lower_fn_ty, request_digest, fn_id, .lowering);
-            try self.lowered_templates.append(self.allocator, .{
+            // A fresh reservation is only reachable through the lookup-miss
+            // path above, which already digested the requested type.
+            const fresh_request_digest = request_digest orelse
+                Common.invariant("fresh Monotype procedure template reservation was missing its request digest");
+            const spec = try self.addTemplateSpecRecord(template_ref, source_fn_key, lower_fn_ty, fresh_request_digest, fn_id, .lowering);
+            try self.lowered_templates.put(fn_id, .{
                 .def = def_id,
-                .fn_id = fn_id,
                 .spec = spec,
-                .request_fn_ty = lower_fn_ty,
-                .request_digest = request_digest,
-                .solved_fn_ty = lower_fn_ty,
-                .solved_digest = request_digest,
-                .status = .lowering,
                 .evidence = spec_evidence,
             });
-            try self.lowered_template_by_fn.put(fn_id, entry_index);
-            try self.lowered_template_by_def.put(def_id, entry_index);
-            try self.appendTemplateLookup(family, .request, request_digest, entry_index);
             break :blk .{
                 .def = def_id,
                 .fn_id = fn_id,
@@ -1454,7 +1374,7 @@ const Builder = struct {
                     .ret = fn_data.ret,
                 };
                 self.program.fns.items[@intFromEnum(reservation.fn_id)].source = fn_template;
-                try self.markTemplateReady(family, reservation.def, lower_fn_ty);
+                try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
                 return reservation.def;
             },
             .roc,
@@ -1586,7 +1506,7 @@ const Builder = struct {
             .body = .{ .roc = body_ids.expr(lowered.body) },
             .ret = sealed_fn_data.ret,
         };
-        try self.markTemplateReady(family, reservation.def, final_fn_ty);
+        try self.markTemplateReady(reservation.fn_id, final_fn_ty);
         return reservation.def;
     }
 
@@ -1599,54 +1519,46 @@ const Builder = struct {
         evidence: []const SpecEvidence,
         requester: *InstGraph,
     ) Allocator.Error!ReservedTemplate {
-        const family = TemplateFamily.from(template_ref, source_fn_key);
         self.count("template_requests");
         const request_has_generated_evidence = try self.monoTypeHasGeneratedOpaqueEvidence(fn_ty);
         if (!request_has_generated_evidence) {
             try requester.addMonoView(try requester.importMono(fn_ty), fn_ty);
         }
         const fn_ty_digest = self.specializationTypeDigest(fn_ty);
-        if (try self.findLoweredTemplate(family, fn_ty, fn_ty_digest)) |match| {
+        const identity = templateSpecIdentity(template_ref, source_fn_key, fn_ty, fn_ty_digest);
+        if (try self.spec_store.find(identity)) |found| {
             self.count("template_hits");
-            const existing = self.lowered_templates.items[match.index];
-            // Evidence is a function of the monomorphic type; two edges
-            // requesting the same specialization must agree wherever both
-            // resolved their requirements.
-            if (@import("builtin").mode == .Debug and
-                existing.evidence.len == evidence.len and
-                !evidenceVectorsHaveGaps(existing.evidence, evidence) and
-                !specEvidenceVectorEql(existing.evidence, evidence))
-            {
-                Common.invariant("specialization edges disagreed on dispatch evidence");
+            switch (found) {
+                .local => |hit| {
+                    // Evidence is a function of the monomorphic type; two edges
+                    // requesting the same specialization must agree wherever both
+                    // resolved their requirements.
+                    if (@import("builtin").mode == .Debug) {
+                        const existing = self.lowered_templates.get(hit.fn_id) orelse
+                            Common.invariant("Monotype specialization index found a local template missing from lowering state");
+                        if (existing.evidence.len == evidence.len and
+                            !evidenceVectorsHaveGaps(existing.evidence, evidence) and
+                            !specEvidenceVectorEql(existing.evidence, evidence))
+                        {
+                            Common.invariant("specialization edges disagreed on dispatch evidence");
+                        }
+                    }
+                    try unifyRequestWithLocalHit(requester, fn_ty, hit);
+                    return .{
+                        .target = .{ .local = hit.fn_id },
+                        .needs_lowering = hit.status == .reserved,
+                    };
+                },
+                // A loaded record only matches at its solved shape, so the
+                // requester's type already equals the imported body's type
+                // and no solved-evidence unification is needed.
+                .loaded => |imported| return .{
+                    .target = .{ .imported = imported },
+                    .needs_lowering = false,
+                },
             }
-            const match_ty = match.match_ty;
-            if (match_ty != fn_ty) {
-                try requester.unify(try requester.importMono(fn_ty), try requester.importMono(match_ty));
-            }
-            if (existing.status == .ready and existing.solved_fn_ty != fn_ty) {
-                try requester.unify(try requester.importMono(fn_ty), try requester.importMono(existing.solved_fn_ty));
-            }
-            try requester.drainDirty();
-            const def = self.program.defs.items[@intFromEnum(existing.def)];
-            return .{
-                .target = .{ .local = def.fn_id orelse
-                    Common.invariant("reserved Monotype procedure template definition had no function id") },
-                .needs_lowering = existing.status == .reserved,
-            };
-        } else {
-            const identity = templateSpecIdentity(template_ref, source_fn_key, fn_ty, fn_ty_digest);
-            if (try self.spec_store.find(identity)) |loaded| {
-                self.count("template_hits");
-                switch (loaded.target) {
-                    .local => Common.invariant("Monotype specialization index found a local template missing from lowering state"),
-                    .imported => return .{
-                        .target = loaded.target,
-                        .needs_lowering = false,
-                    },
-                }
-            }
-            self.count("template_misses");
         }
+        self.count("template_misses");
 
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, fn_ty);
@@ -1662,111 +1574,39 @@ const Builder = struct {
             .body = .hosted,
             .ret = self.functionShape(fn_ty, "procedure template root type was not a function").ret,
         });
-        const entry_index: u32 = @intCast(self.lowered_templates.items.len);
         const spec = try self.addTemplateSpecRecord(template_ref, source_fn_key, fn_ty, fn_ty_digest, fn_id, .reserved);
-        try self.lowered_templates.append(self.allocator, .{
+        try self.lowered_templates.put(fn_id, .{
             .def = def_id,
-            .fn_id = fn_id,
             .spec = spec,
-            .request_fn_ty = fn_ty,
-            .request_digest = fn_ty_digest,
-            .solved_fn_ty = fn_ty,
-            .solved_digest = fn_ty_digest,
-            .status = .reserved,
             .evidence = evidence,
         });
-        try self.lowered_template_by_fn.put(fn_id, entry_index);
-        try self.lowered_template_by_def.put(def_id, entry_index);
-        try self.appendTemplateLookup(family, .request, fn_ty_digest, entry_index);
         return .{
             .target = .{ .local = fn_id },
             .needs_lowering = true,
         };
     }
 
-    fn markTemplateReady(self: *Builder, family: TemplateFamily, def: Ast.DefId, fn_ty: Type.TypeId) Allocator.Error!void {
-        const index = self.lowered_template_by_def.get(def) orelse
-            Common.invariant("lowered procedure template definition disappeared before completion");
-        const entry = &self.lowered_templates.items[index];
-        entry.solved_fn_ty = fn_ty;
-        entry.solved_digest = self.specializationTypeDigest(fn_ty);
-        var identity = self.program.specs.items[@intFromEnum(entry.spec)].identity;
-        identity.mono_fn_ty = fn_ty;
-        identity.mono_fn_ty_digest = entry.solved_digest;
-        try self.spec_store.updateLocalIdentity(entry.spec, identity);
-        try self.appendTemplateLookup(family, .solved, entry.solved_digest, index);
-        entry.status = .ready;
-        self.spec_store.markReady(entry.spec, entry.fn_id);
-    }
-
-    fn appendTemplateLookup(
-        self: *Builder,
-        family: TemplateFamily,
-        kind: SpecLookupKind,
-        digest: names.TypeDigest,
-        index: u32,
+    /// Unify a requester's type with the record view that matched and, once
+    /// the record is ready, with its solved type, so the requester adopts the
+    /// specialization's evidence.
+    fn unifyRequestWithLocalHit(
+        graph: *InstGraph,
+        fn_ty: Type.TypeId,
+        hit: specialize.LocalHit,
     ) Allocator.Error!void {
-        const lookup = TemplateSpecLookup.from(family, kind, digest);
-        const gop = try self.lowered_template_lookup.getOrPut(lookup);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(self.allocator, index);
-    }
-
-    fn findLoweredTemplate(
-        self: *Builder,
-        family: TemplateFamily,
-        requested_ty: Type.TypeId,
-        requested_digest: names.TypeDigest,
-    ) Allocator.Error!?LoweredTemplateMatch {
-        if (try self.findLoweredTemplateInLookup(family, .request, requested_ty, requested_digest)) |match| {
-            return match;
+        if (hit.match_ty != fn_ty) {
+            try graph.unify(try graph.importMono(fn_ty), try graph.importMono(hit.match_ty));
         }
-        return try self.findLoweredTemplateInLookup(family, .solved, requested_ty, requested_digest);
-    }
-
-    fn findLoweredTemplateInLookup(
-        self: *Builder,
-        family: TemplateFamily,
-        kind: SpecLookupKind,
-        requested_ty: Type.TypeId,
-        requested_digest: names.TypeDigest,
-    ) Allocator.Error!?LoweredTemplateMatch {
-        const lookup = TemplateSpecLookup.from(family, kind, requested_digest);
-        const indices = self.lowered_template_lookup.get(lookup) orelse return null;
-        self.countBy("template_lookup_candidates", indices.items.len);
-        for (indices.items) |raw_index| {
-            const index: usize = @intCast(raw_index);
-            if (index >= self.lowered_templates.items.len) Common.invariant("lowered template lookup index was out of bounds");
-            const existing = self.lowered_templates.items[index];
-            const candidate_ty = switch (kind) {
-                .request => existing.request_fn_ty,
-                .solved => existing.solved_fn_ty,
-            };
-            const candidate_digest = switch (kind) {
-                .request => existing.request_digest,
-                .solved => existing.solved_digest,
-            };
-            if (kind == .solved and existing.status != .ready) continue;
-            if (!try self.specializationTypeMatches(candidate_ty, candidate_digest, requested_ty, requested_digest)) continue;
-            return .{
-                .index = index,
-                .match_ty = candidate_ty,
-            };
+        if (hit.status == .ready and hit.solved_fn_ty != fn_ty) {
+            try graph.unify(try graph.importMono(fn_ty), try graph.importMono(hit.solved_fn_ty));
         }
-        return null;
+        try graph.drainDirty();
     }
 
-    fn specializationTypeMatches(
-        self: *Builder,
-        existing_ty: Type.TypeId,
-        existing_digest: names.TypeDigest,
-        requested_ty: Type.TypeId,
-        requested_digest: names.TypeDigest,
-    ) Allocator.Error!bool {
-        if (existing_ty == requested_ty) return true;
-        if (!digestEql(existing_digest, requested_digest)) return false;
-        self.count("exact_type_checks");
-        return try self.program.types.typeEql(&self.program.names, existing_ty, requested_ty);
+    fn markTemplateReady(self: *Builder, fn_id: Ast.FnId, fn_ty: Type.TypeId) Allocator.Error!void {
+        const entry = self.lowered_templates.get(fn_id) orelse
+            Common.invariant("lowered procedure template definition disappeared before completion");
+        try self.spec_store.markReady(entry.spec, fn_ty, self.specializationTypeDigest(fn_ty));
     }
 
     fn typedLocalsForArgs(self: *Builder, arg_tys: []const Type.TypeId) Allocator.Error!Ast.Span(Ast.TypedLocal) {
@@ -1816,34 +1656,23 @@ const Builder = struct {
         self: *Builder,
         template_ref: names.ProcTemplate,
         source_fn_key: names.TypeDigest,
-        mono_fn_ty: Type.TypeId,
-        mono_fn_ty_digest: names.TypeDigest,
+        request_fn_ty: Type.TypeId,
+        request_fn_ty_digest: names.TypeDigest,
         fn_id: Ast.FnId,
         status: Ast.SpecStatus,
     ) Allocator.Error!Ast.SpecId {
-        return try self.addSpecRecord(templateSpecIdentity(template_ref, source_fn_key, mono_fn_ty, mono_fn_ty_digest), fn_id, status);
+        return try self.addSpecRecord(templateSpecIdentity(template_ref, source_fn_key, request_fn_ty, request_fn_ty_digest), fn_id, status);
     }
 
     fn addNestedSpecRecord(
         self: *Builder,
         nested: Ast.NestedFn,
         source_fn_key: names.TypeDigest,
-        mono_fn_ty: Type.TypeId,
-        mono_fn_ty_digest: names.TypeDigest,
+        request_fn_ty: Type.TypeId,
+        request_fn_ty_digest: names.TypeDigest,
         fn_id: Ast.FnId,
     ) Allocator.Error!Ast.SpecId {
-        return try self.addSpecRecord(.{
-            .callable = .{ .nested_site = .{
-                .module = names.procTemplateModuleDigest(nested.owner),
-                .owner_proc_base = @intFromEnum(nested.owner.proc_base),
-                .owner_template = @intFromEnum(nested.owner.template),
-                .owner_fn_digest = nested.context_fn_key,
-                .site = @intFromEnum(nested.site),
-            } },
-            .source_fn_ty_digest = source_fn_key,
-            .mono_fn_ty_digest = mono_fn_ty_digest,
-            .mono_fn_ty = mono_fn_ty,
-        }, fn_id, .lowering);
+        return try self.addSpecRecord(nestedSpecIdentity(nested, source_fn_key, request_fn_ty, request_fn_ty_digest), fn_id, .lowering);
     }
 
     fn addSpecRecord(
@@ -1858,7 +1687,7 @@ const Builder = struct {
         switch (status) {
             .reserved => {},
             .lowering => self.spec_store.markLowering(spec),
-            .ready => self.spec_store.markReady(spec, fn_id),
+            .ready => Common.invariant("fresh Monotype specialization record cannot be created ready"),
         }
         return spec;
     }
@@ -2940,52 +2769,24 @@ const Builder = struct {
             .nested => |nested| nested,
             else => Common.invariant("local procedure specialization did not have a nested function identity"),
         };
-        const family = NestedFnFamily.from(nested, fn_template.source_fn_key);
         self.count("nested_requests");
         const fn_ty_digest = self.specializationTypeDigest(fn_template.mono_fn_ty);
-        if (try self.findLoweredNested(family, fn_template.mono_fn_ty, fn_ty_digest)) |match| {
+        if (try self.spec_store.findLocal(nestedSpecIdentity(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest))) |hit| {
             self.count("nested_hits");
-            const existing = self.lowered_nested_fns.items[match.index];
-            const match_ty = match.match_ty;
-            var unified = false;
-            if (match_ty != fn_template.mono_fn_ty) {
-                try request.ctx.graph.unify(
-                    try request.ctx.graph.importMono(fn_template.mono_fn_ty),
-                    try request.ctx.graph.importMono(match_ty),
-                );
-                unified = true;
-            }
-            if (existing.status == .ready and existing.solved_fn_ty != fn_template.mono_fn_ty) {
-                try request.ctx.graph.unify(
-                    try request.ctx.graph.importMono(fn_template.mono_fn_ty),
-                    try request.ctx.graph.importMono(existing.solved_fn_ty),
-                );
-                unified = true;
-            }
-            if (unified) try request.ctx.graph.drainDirty();
-            switch (existing.status) {
+            try unifyRequestWithLocalHit(request.ctx.graph, fn_template.mono_fn_ty, hit);
+            switch (hit.status) {
                 .ready,
                 .lowering,
-                => return existing.fn_id,
+                => return hit.fn_id,
+                .reserved => Common.invariant("Monotype nested function specialization was reserved without lowering"),
             }
         } else {
             self.count("nested_misses");
         }
 
         const fn_id = try self.program.addFn(fn_template);
-        const entry_index: u32 = @intCast(self.lowered_nested_fns.items.len);
         const spec = try self.addNestedSpecRecord(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest, fn_id);
-        try self.lowered_nested_fns.append(self.allocator, .{
-            .fn_id = fn_id,
-            .spec = spec,
-            .request_fn_ty = fn_template.mono_fn_ty,
-            .request_digest = fn_ty_digest,
-            .solved_fn_ty = fn_template.mono_fn_ty,
-            .solved_digest = fn_ty_digest,
-            .status = .lowering,
-        });
-        try self.lowered_nested_by_fn.put(fn_id, entry_index);
-        try self.appendNestedLookup(family, .request, fn_ty_digest, entry_index);
+        try self.lowered_nested_by_fn.put(fn_id, spec);
 
         const public_constraint_fn_ty = try request.ctx.publicOpaqueFunctionUnificationType(fn_template.mono_fn_ty);
         try request.ctx.constrainTypeToMono(fn_template.source_fn_ty, public_constraint_fn_ty);
@@ -3023,76 +2824,10 @@ const Builder = struct {
         return fn_id;
     }
 
-    fn markNestedFnReady(self: *Builder, family: NestedFnFamily, fn_id: Ast.FnId, fn_ty: Type.TypeId) Allocator.Error!void {
-        const index = self.lowered_nested_by_fn.get(fn_id) orelse
+    fn markNestedFnReady(self: *Builder, fn_id: Ast.FnId, fn_ty: Type.TypeId) Allocator.Error!void {
+        const spec = self.lowered_nested_by_fn.get(fn_id) orelse
             Common.invariant("lowered nested function disappeared before completion");
-        const entry = &self.lowered_nested_fns.items[index];
-        entry.solved_fn_ty = fn_ty;
-        entry.solved_digest = self.specializationTypeDigest(fn_ty);
-        var identity = self.program.specs.items[@intFromEnum(entry.spec)].identity;
-        identity.mono_fn_ty = fn_ty;
-        identity.mono_fn_ty_digest = entry.solved_digest;
-        try self.spec_store.updateLocalIdentity(entry.spec, identity);
-        try self.appendNestedLookup(family, .solved, entry.solved_digest, index);
-        entry.status = .ready;
-        self.spec_store.markReady(entry.spec, entry.fn_id);
-    }
-
-    fn appendNestedLookup(
-        self: *Builder,
-        family: NestedFnFamily,
-        kind: SpecLookupKind,
-        digest: names.TypeDigest,
-        index: u32,
-    ) Allocator.Error!void {
-        const lookup = NestedSpecLookup.from(family, kind, digest);
-        const gop = try self.lowered_nested_lookup.getOrPut(lookup);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(self.allocator, index);
-    }
-
-    fn findLoweredNested(
-        self: *Builder,
-        family: NestedFnFamily,
-        requested_ty: Type.TypeId,
-        requested_digest: names.TypeDigest,
-    ) Allocator.Error!?LoweredNestedMatch {
-        if (try self.findLoweredNestedInLookup(family, .request, requested_ty, requested_digest)) |match| {
-            return match;
-        }
-        return try self.findLoweredNestedInLookup(family, .solved, requested_ty, requested_digest);
-    }
-
-    fn findLoweredNestedInLookup(
-        self: *Builder,
-        family: NestedFnFamily,
-        kind: SpecLookupKind,
-        requested_ty: Type.TypeId,
-        requested_digest: names.TypeDigest,
-    ) Allocator.Error!?LoweredNestedMatch {
-        const lookup = NestedSpecLookup.from(family, kind, requested_digest);
-        const indices = self.lowered_nested_lookup.get(lookup) orelse return null;
-        self.countBy("nested_lookup_candidates", indices.items.len);
-        for (indices.items) |raw_index| {
-            const index: usize = @intCast(raw_index);
-            if (index >= self.lowered_nested_fns.items.len) Common.invariant("lowered nested lookup index was out of bounds");
-            const existing = self.lowered_nested_fns.items[index];
-            const candidate_ty = switch (kind) {
-                .request => existing.request_fn_ty,
-                .solved => existing.solved_fn_ty,
-            };
-            const candidate_digest = switch (kind) {
-                .request => existing.request_digest,
-                .solved => existing.solved_digest,
-            };
-            if (kind == .solved and existing.status != .ready) continue;
-            if (!try self.specializationTypeMatches(candidate_ty, candidate_digest, requested_ty, requested_digest)) continue;
-            return .{
-                .index = index,
-                .match_ty = candidate_ty,
-            };
-        }
-        return null;
+        try self.spec_store.markReady(spec, fn_ty, self.specializationTypeDigest(fn_ty));
     }
 
     fn sealDeferredSpecRequestsFrom(self: *Builder, graph: *InstGraph, start_len: usize) Allocator.Error!void {
@@ -3106,41 +2841,23 @@ const Builder = struct {
             const sealed_fn_ty = try sealer.sealType(request.fn_ty);
             if (sealed_fn_ty == request.fn_ty) continue;
             request.fn_ty = sealed_fn_ty;
-            try self.updateReservedTemplateRequestType(
-                TemplateFamily.from(request.template_ref, request.source_fn_key),
-                request.fn_id,
-                sealed_fn_ty,
-            );
+            try self.updateReservedTemplateRequestType(request.fn_id, sealed_fn_ty);
         }
     }
 
+    /// A deferred request's graph sealed its request type into a more specific
+    /// closed shape before the reserved body lowers. The record's identity is
+    /// untouched; `SpecBuilder.refineRequest` updates the record's request
+    /// view and registers the sealed shape as an alias lookup entry.
     fn updateReservedTemplateRequestType(
         self: *Builder,
-        family: TemplateFamily,
         fn_id: Ast.FnId,
         fn_ty: Type.TypeId,
     ) Allocator.Error!void {
-        const index = self.lowered_template_by_fn.get(fn_id) orelse
+        const entry = self.lowered_templates.get(fn_id) orelse
             Common.invariant("deferred Monotype procedure template request referenced a missing reservation");
-        const entry = &self.lowered_templates.items[index];
-        switch (entry.status) {
-            .reserved => {},
-            .lowering,
-            .ready,
-            => Common.invariant("deferred Monotype procedure template request was already lowering"),
-        }
 
-        const digest = self.specializationTypeDigest(fn_ty);
-        entry.request_fn_ty = fn_ty;
-        entry.request_digest = digest;
-        entry.solved_fn_ty = fn_ty;
-        entry.solved_digest = digest;
-        try self.appendTemplateLookup(family, .request, digest, @intCast(index));
-
-        var identity = self.program.specs.items[@intFromEnum(entry.spec)].identity;
-        identity.mono_fn_ty = fn_ty;
-        identity.mono_fn_ty_digest = digest;
-        try self.spec_store.updateLocalIdentity(entry.spec, identity);
+        try self.spec_store.refineRequest(entry.spec, fn_ty, self.specializationTypeDigest(fn_ty));
 
         const fn_template = &self.program.fns.items[@intFromEnum(fn_id)].source;
         fn_template.mono_fn_ty = fn_ty;
@@ -3235,11 +2952,11 @@ const Builder = struct {
         for (body_draft.nested_defs.items) |def| {
             const fn_id = ids.fnTarget(def.fn_id);
             const fn_template = self.program.fns.items[@intFromEnum(fn_id)].source;
-            const nested = switch (fn_template.fn_def) {
-                .nested => |nested| nested,
+            switch (fn_template.fn_def) {
+                .nested => {},
                 else => Common.invariant("nested draft definition did not reference a nested function"),
-            };
-            try self.markNestedFnReady(NestedFnFamily.from(nested, fn_template.source_fn_key), fn_id, fn_template.mono_fn_ty);
+            }
+            try self.markNestedFnReady(fn_id, fn_template.mono_fn_ty);
         }
     }
 
@@ -24633,10 +24350,6 @@ fn moduleBytesEqual(a: [32]u8, b: [32]u8) bool {
     return std.mem.eql(u8, a[0..], b[0..]);
 }
 
-fn digestEql(a: names.TypeDigest, b: names.TypeDigest) bool {
-    return std.mem.eql(u8, a.bytes[0..], b.bytes[0..]);
-}
-
 fn verifyMonotypeTypeStore(program: *const Ast.Program) void {
     if (program.types.verify(&program.names)) |err| switch (err) {
         .type_digest_count_mismatch => Common.invariant("Monotype type digest section length differed from type node count"),
@@ -24697,22 +24410,6 @@ fn checkedTypeAddress(view: ModuleView, checked_ty: checked.CheckedTypeId) Check
     };
 }
 
-const TemplateFamily = struct {
-    module_bytes: [32]u8,
-    proc_base: u32,
-    template: u32,
-    source_fn_key_bytes: [32]u8,
-
-    fn from(template: names.ProcTemplate, source_fn_key: names.TypeDigest) TemplateFamily {
-        return .{
-            .module_bytes = names.procTemplateModuleDigest(template).bytes,
-            .proc_base = @intFromEnum(template.proc_base),
-            .template = @intFromEnum(template.template),
-            .source_fn_key_bytes = source_fn_key.bytes,
-        };
-    }
-};
-
 const NestedSiteAddress = struct {
     module_bytes: [32]u8,
     owner_proc_base: u32,
@@ -24729,26 +24426,6 @@ const NestedSiteAddress = struct {
             .owner_proc_base = @intFromEnum(owner.proc_base),
             .owner_template = @intFromEnum(owner.template),
             .expr = @intFromEnum(expr_id),
-        };
-    }
-};
-
-const NestedFnFamily = struct {
-    module_bytes: [32]u8,
-    owner_proc_base: u32,
-    owner_template: u32,
-    site: u32,
-    context_fn_key_bytes: [32]u8,
-    source_fn_key_bytes: [32]u8,
-
-    fn from(nested: Ast.NestedFn, source_fn_key: names.TypeDigest) NestedFnFamily {
-        return .{
-            .module_bytes = names.procTemplateModuleDigest(nested.owner).bytes,
-            .owner_proc_base = @intFromEnum(nested.owner.proc_base),
-            .owner_template = @intFromEnum(nested.owner.template),
-            .site = @intFromEnum(nested.site),
-            .context_fn_key_bytes = nested.context_fn_key.bytes,
-            .source_fn_key_bytes = source_fn_key.bytes,
         };
     }
 };

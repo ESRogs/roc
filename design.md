@@ -2612,8 +2612,8 @@ lowering a body. A specialization request is identified by:
 const SpecIdentity = struct {
     callable: CallableIdentity,
     source_fn_ty_digest: TypeDigest,
-    mono_fn_ty_digest: TypeDigest,
-    mono_fn_ty: TypeId,
+    request_fn_ty_digest: TypeDigest,
+    request_fn_ty: TypeId,
 };
 
 const CallableIdentity = union(enum) {
@@ -2639,19 +2639,39 @@ const SpecStatus = enum {
 
 const SpecRecord = struct {
     identity: SpecIdentity,
+    request_fn_ty: TypeId,
+    request_fn_ty_digest: TypeDigest,
+    solved_fn_ty: TypeId,
+    solved_fn_ty_digest: TypeDigest,
     fn: FnId,
     status: SpecStatus,
 };
 ```
 
 `source_fn_ty_digest` records the checked source function type after
-instantiation into the requesting graph. `mono_fn_ty_digest` records the closed
-requested function type. The digests make lookup fast, but they are not the only
-correctness check. When a digest match is found, the store must also verify
-the checked callable identity and exact structural equality of the closed
-Monotype function type. Digest collisions are therefore harmless.
+instantiation into the requesting graph. `request_fn_ty_digest` records the
+closed function type REQUESTED by the call site that reserved the record. The
+digests make lookup fast, but they are not the only correctness check. When a
+digest match is found, the store must also verify the checked callable identity
+and exact structural equality of the closed Monotype function type. Digest
+collisions are therefore harmless.
 
-The in-memory builder owns a transient hash table from `SpecIdentity` to
+The identity is immutable: it is written once when the record is reserved and
+never rewritten, so no structure that indexes by identity ever needs a rekey or
+a second synchronized entry. Later refinements are data on the record. The
+request view may be refined while the record is still `reserved` — once per
+deferring graph that seals its view of the request; the solved view records the
+body's solved type when the record becomes `ready`. Each refinement registers
+an *alias* lookup entry (the new digest also reaches the same record), so a
+request shaped like the current request reuses the record even after the body
+solved a more specific type — the record is never widened (the one-way snapshot
+rule above). Status transitions (`reserved → lowering → ready`) and both
+refinements happen only through the specialization store's API. A record
+loaded from another shard's cache is a finished snapshot and matches only at
+its solved shape: a requester that matches it already has the solved type, so
+no evidence needs to flow back.
+
+The in-memory builder owns a transient hash table from lookup keys to
 `SpecId`, plus the append-only `SpecRecord` array. The output program owns the
 records and the function bodies, not the hash table. A loaded cache file may
 build a transient hash table over the mapped records, but the file itself stores
