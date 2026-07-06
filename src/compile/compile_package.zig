@@ -2183,6 +2183,16 @@ pub const PackageEnv = struct {
 
             try views.append(self.gpa, view);
 
+            for (view.direct_import_artifact_keys) |dependency_key| {
+                const dependency = self.availableArtifactViewByKey(imported_artifacts, dependency_key) orelse {
+                    if (builtin.mode == .Debug) {
+                        std.debug.panic("compile.PackageEnv missing direct dependency checked artifact", .{});
+                    }
+                    unreachable;
+                };
+                try pending.append(self.gpa, dependency);
+            }
+
             for (view.public_api_dependencies.type_owner_artifacts) |dependency_key| {
                 const dependency = self.availableArtifactViewByKey(imported_artifacts, dependency_key) orelse {
                     if (builtin.mode == .Debug) {
