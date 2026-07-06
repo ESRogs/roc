@@ -7272,6 +7272,28 @@ test "RC alias into set_local moves the leader unit" {
     try testing.expectEqual(@as(usize, 0), f.countAllRc());
 }
 
+test "RC alias passed as a dying call argument moves the leader unit" {
+    // Issue 9703's keying class, through the call-argument transfer path:
+    // the pure alias is borrowed, so its ownership unit lives on the source
+    // local. Passing the alias as a dying owned call argument must move the
+    // *source's* unit (no retain before the call, no release after), keyed
+    // through unitOf — testing or clearing the OwnedSet by the alias's own
+    // id would leak the source's unit. The debug certifier re-checks the
+    // emitted schedule during `run`.
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const value = try f.local(.str);
+    const alias = try f.local(.str);
+    const result = try f.local(.i64);
+    const ret = try f.ret(result);
+    const call = try f.assignCall(result, &.{alias}, ret);
+    const alias_assign = try f.assignRefLocal(alias, value, call);
+    const body = try f.assignStr(value, "through-call-arg", alias_assign);
+    _ = try f.addProc(&.{}, body, .i64);
+    try f.run();
+    try testing.expectEqual(@as(usize, 0), f.countAllRc());
+}
+
 test "RC alias of a parameter consumed in the body solves the parameter owned" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();

@@ -3493,3 +3493,207 @@ test "certify accepts agreeing jumps through a join" {
     _ = try f.addProc(&.{}, body, .i64);
     try f.certify();
 }
+
+/// Builds the issue-9658 loop shape: `k` refcounted mutable locals whose
+/// alias groups merge and re-split across nested loop iterations. Branch i
+/// of the loop body retains x[i], releases x[i+1]'s old binding, re-aliases
+/// x[i+1] onto x[i], and jumps back, so every name always carries one unit
+/// and every alias class's balance equals its size — valid on every path,
+/// but the distinct must-alias partitions reaching the join grow like the
+/// Bell number of `k` when enumerated. The default branch releases every
+/// name once and returns.
+const AliasLoopInjection = enum {
+    none,
+    /// Branch 0 drops the release of x[1]'s old binding before re-aliasing:
+    /// a per-iteration leak (the orphaned unit cannot reach the join).
+    leak_on_rebind,
+    /// The exit path releases x[0] twice.
+    double_release_on_exit,
+    /// The exit path uses x[0] after releasing every name.
+    use_after_release_on_exit,
+};
+
+fn buildAliasLoop(f: *CertifyTest, comptime k: usize, injection: AliasLoopInjection) Allocator.Error!void {
+    var locals: [k]LIR.LocalId = undefined;
+    for (&locals) |*local| local.* = try f.local(.str);
+    const cond = try f.local(.i64);
+    const result = try f.local(.i64);
+    const join_id = f.freshJoinPointId();
+
+    // Exit path: release every name once, then return.
+    const ret = try f.ret(result);
+    var exit_head = try f.assignI64(result, ret);
+    if (injection == .use_after_release_on_exit) {
+        exit_head = try f.store.addCFStmt(.{ .expect = .{ .condition = locals[0], .next = exit_head } });
+    }
+    var index: usize = k;
+    while (index > 0) {
+        index -= 1;
+        exit_head = try f.decrefStmt(locals[index], .str, exit_head);
+    }
+    if (injection == .double_release_on_exit) {
+        exit_head = try f.decrefStmt(locals[0], .str, exit_head);
+    }
+
+    // Loop branches: branch i re-aliases x[i+1] onto x[i].
+    var branches: [k - 1]LIR.CFSwitchBranch = undefined;
+    for (&branches, 0..) |*branch, i| {
+        const jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+        const rebind = try f.store.addCFStmt(.{ .assign_ref = .{
+            .target = locals[i + 1],
+            .op = .{ .local = locals[i] },
+            .next = jump,
+        } });
+        const release_old = if (injection == .leak_on_rebind and i == 0)
+            rebind
+        else
+            try f.decrefStmt(locals[i + 1], .str, rebind);
+        const retain = try f.increfStmt(locals[i], .str, release_old);
+        branch.* = .{ .value = @intCast(i + 1), .body = retain };
+    }
+
+    const switch_stmt = try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = cond,
+        .branches = try f.store.addCFSwitchBranches(&branches),
+        .default_branch = exit_head,
+    } });
+    const first_jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const join_stmt = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = switch_stmt,
+        .remainder = first_jump,
+    } });
+    const cond_assign = try f.assignI64(cond, join_stmt);
+    var body = cond_assign;
+    index = k;
+    while (index > 0) {
+        index -= 1;
+        body = try f.assignStr(locals[index], body);
+    }
+    _ = try f.addProc(&.{}, body, .i64);
+}
+
+test "certify converges on issue-9658 alias-merging loop over 6 locals" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    try buildAliasLoop(&f, 6, .none);
+    try f.certify();
+}
+
+test "certify converges on a join-heavy alias-merging loop over 12 locals" {
+    // Enumerating distinct entry summaries here would need on the order of
+    // Bell(12) = 4.2 million body walks (the old certifier gave up at
+    // 4096 and left the proc unverified); the lattice join must converge in
+    // a handful of walks.
+    // There is no explicit timing assertion: enumeration at this size does
+    // not finish in any tolerable test budget, so completing at all is the
+    // bound.
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    try buildAliasLoop(&f, 12, .none);
+    try f.certify();
+}
+
+test "certify flags a per-iteration leak inside a state-complex loop" {
+    // The shape the old capacity cap could have skipped: the leak is only
+    // reachable through the alias-merging loop.
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    try buildAliasLoop(&f, 6, .leak_on_rebind);
+    try testing.expectError(error.Certification, f.certify());
+    try testing.expect(std.mem.find(u8, f.diag.message(), "not carried into join") != null);
+}
+
+test "certify flags a double release inside a state-complex loop" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    try buildAliasLoop(&f, 6, .double_release_on_exit);
+    try testing.expectError(error.Certification, f.certify());
+    try testing.expect(std.mem.find(u8, f.diag.message(), "without an ownership unit") != null);
+}
+
+test "certify flags a use after release inside a state-complex loop" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    try buildAliasLoop(&f, 6, .use_after_release_on_exit);
+    try testing.expectError(error.Certification, f.certify());
+    try testing.expect(std.mem.find(u8, f.diag.message(), "dead refcounted local") != null);
+}
+
+test "certify joins entries whose partitions differ but balances agree" {
+    // Jump A reaches the join with x and y as separate values carrying one
+    // unit each; jump B re-aliases y onto x with the shared value carrying
+    // two units. The shared body releases through each name once — valid on
+    // both edges. The lattice join must absorb both into one group (meet
+    // partition = singletons, balances attributed 2 = 1 + 1) and certify
+    // with a single body walk.
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    const x = try f.local(.str);
+    const y = try f.local(.str);
+    const cond = try f.local(.i64);
+    const result = try f.local(.i64);
+    const join_id = f.freshJoinPointId();
+
+    const ret = try f.ret(result);
+    const result_assign = try f.assignI64(result, ret);
+    const release_y = try f.decrefStmt(y, .str, result_assign);
+    const release_x = try f.decrefStmt(x, .str, release_y);
+
+    const jump_separate = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const jump_aliased = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const rebind = try f.store.addCFStmt(.{ .assign_ref = .{
+        .target = y,
+        .op = .{ .local = x },
+        .next = jump_aliased,
+    } });
+    const release_old_y = try f.decrefStmt(y, .str, rebind);
+    const retain_x = try f.increfStmt(x, .str, release_old_y);
+
+    const switch_stmt = try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = cond,
+        .branches = try f.store.addCFSwitchBranches(&[_]LIR.CFSwitchBranch{
+            .{ .value = 1, .body = jump_separate },
+        }),
+        .default_branch = retain_x,
+    } });
+    const join_stmt = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = release_x,
+        .remainder = switch_stmt,
+    } });
+    const cond_assign = try f.assignI64(cond, join_stmt);
+    const assign_y = try f.assignStr(y, cond_assign);
+    const body = try f.assignStr(x, assign_y);
+    _ = try f.addProc(&.{}, body, .i64);
+    try f.certify();
+}
+
+test "certify flags unbounded per-iteration balance accumulation" {
+    // A loop whose only effect is retaining one more unit per iteration,
+    // with no exit: entry balances grow 1, 2, 3, ... forever. The old
+    // certifier enumerated these summaries until its capacity cap and then
+    // skipped the whole procedure; the fixpoint reports the growth itself
+    // as a finding, because mode- and partition-identical entries with
+    // diverging balances can never all certify against one shared body.
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    const value = try f.local(.str);
+    const join_id = f.freshJoinPointId();
+
+    const jump_back = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const retain = try f.increfStmt(value, .str, jump_back);
+    const first_jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const join_stmt = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = retain,
+        .remainder = first_jump,
+    } });
+    const body = try f.assignStr(value, join_stmt);
+    _ = try f.addProc(&.{}, body, .i64);
+    try testing.expectError(error.Certification, f.certify());
+    try testing.expect(std.mem.find(u8, f.diag.message(), "accumulation") != null);
+}
