@@ -784,6 +784,350 @@ pub fn getConstantsInDependencyOrder(
     return result;
 }
 
+/// Collect every top-level def referenced anywhere in `root_expr`'s expression
+/// tree — including nested lambda bodies and blocks — into `out` (deduplicated).
+///
+/// This is the *name-reference* relation used to order type checking, not the
+/// demand relation used to order compile-time constant evaluation: a reference
+/// under an uncalled lambda still creates an edge here, because checking the
+/// def's body needs the referenced def's type regardless of whether evaluation
+/// would ever demand its value.
+///
+/// Type-qualified method calls (`U.method(..)`) resolve their owner statement
+/// during canonicalization, so their target defs are statically known and
+/// contribute edges too. Value-receiver dispatch (`u.method()`) is inherently
+/// type-directed and contributes no edge; the checker discovers those
+/// dependencies during inference and resolves them at group boundaries.
+///
+/// The walk is an explicit worklist (zero-recursion policy).
+fn collectNameReferences(
+    cir: *const ModuleEnv,
+    pattern_to_def: *const std.AutoHashMapUnmanaged(CIR.Pattern.Idx, CIR.Def.Idx),
+    root_expr: CIR.Expr.Idx,
+    out: *std.AutoHashMapUnmanaged(CIR.Def.Idx, void),
+    scratch_stack: *std.ArrayList(CIR.Expr.Idx),
+    allocator: std.mem.Allocator,
+) std.mem.Allocator.Error!void {
+    scratch_stack.clearRetainingCapacity();
+    try scratch_stack.append(allocator, root_expr);
+
+    while (scratch_stack.pop()) |expr_idx| {
+        switch (cir.store.getExpr(expr_idx)) {
+            .e_lookup_local => |lookup| {
+                if (pattern_to_def.get(lookup.pattern_idx)) |def_idx| {
+                    try out.put(allocator, def_idx, {});
+                }
+            },
+            .e_type_method_call => |call| {
+                if (cir.lookupMethodBindingForOwnerConst(call.type_dispatch_stmt, call.method_name)) |binding| {
+                    try out.put(allocator, binding.def_idx, {});
+                }
+                for (cir.store.sliceExpr(call.args)) |arg| try scratch_stack.append(allocator, arg);
+            },
+            .e_type_dispatch_call => |call| {
+                if (cir.lookupMethodBindingForOwnerConst(call.type_dispatch_stmt, call.method_name)) |binding| {
+                    try out.put(allocator, binding.def_idx, {});
+                }
+                for (cir.store.sliceExpr(call.args)) |arg| try scratch_stack.append(allocator, arg);
+            },
+            .e_lambda => |lambda| try scratch_stack.append(allocator, lambda.body),
+            .e_closure => |closure| {
+                try scratch_stack.append(allocator, closure.lambda_idx);
+                for (cir.store.sliceCaptures(closure.captures)) |capture_idx| {
+                    const capture = cir.store.getCapture(capture_idx);
+                    if (pattern_to_def.get(capture.pattern_idx)) |def_idx| {
+                        try out.put(allocator, def_idx, {});
+                    }
+                }
+            },
+            .e_call => |call| {
+                try scratch_stack.append(allocator, call.func);
+                for (cir.store.sliceExpr(call.args)) |arg| try scratch_stack.append(allocator, arg);
+            },
+            .e_if => |if_expr| {
+                try scratch_stack.append(allocator, if_expr.final_else);
+                for (cir.store.sliceIfBranches(if_expr.branches)) |branch_idx| {
+                    const branch = cir.store.getIfBranch(branch_idx);
+                    try scratch_stack.append(allocator, branch.cond);
+                    try scratch_stack.append(allocator, branch.body);
+                }
+            },
+            .e_match => |match_expr| {
+                try scratch_stack.append(allocator, match_expr.cond);
+                for (cir.store.sliceMatchBranches(match_expr.branches)) |branch_idx| {
+                    const branch = cir.store.getMatchBranch(branch_idx);
+                    if (branch.guard) |guard_idx| try scratch_stack.append(allocator, guard_idx);
+                    try scratch_stack.append(allocator, branch.value);
+                }
+            },
+            .e_list => |list| {
+                for (cir.store.sliceExpr(list.elems)) |elem| try scratch_stack.append(allocator, elem);
+            },
+            .e_record => |record| {
+                if (record.ext) |ext_idx| try scratch_stack.append(allocator, ext_idx);
+                for (cir.store.sliceRecordFields(record.fields)) |field_idx| {
+                    const field = cir.store.getRecordField(field_idx);
+                    try scratch_stack.append(allocator, field.value);
+                }
+            },
+            .e_field_access => |access| try scratch_stack.append(allocator, access.receiver),
+            .e_method_call => |call| {
+                try scratch_stack.append(allocator, call.receiver);
+                for (cir.store.sliceExpr(call.args)) |arg| try scratch_stack.append(allocator, arg);
+            },
+            .e_dispatch_call => |call| {
+                try scratch_stack.append(allocator, call.receiver);
+                for (cir.store.sliceExpr(call.args)) |arg| try scratch_stack.append(allocator, arg);
+            },
+            .e_interpolation => |interpolation| {
+                try scratch_stack.append(allocator, interpolation.first);
+                for (cir.store.sliceExpr(interpolation.parts)) |part| try scratch_stack.append(allocator, part);
+            },
+            .e_structural_eq => |eq| {
+                try scratch_stack.append(allocator, eq.lhs);
+                try scratch_stack.append(allocator, eq.rhs);
+            },
+            .e_structural_hash => |h| {
+                try scratch_stack.append(allocator, h.hasher);
+                try scratch_stack.append(allocator, h.value);
+            },
+            .e_method_eq => |eq| {
+                try scratch_stack.append(allocator, eq.lhs);
+                try scratch_stack.append(allocator, eq.rhs);
+            },
+            .e_tuple_access => |tuple_access| try scratch_stack.append(allocator, tuple_access.tuple),
+            .e_tuple => |tuple| {
+                for (cir.store.sliceExpr(tuple.elems)) |elem| try scratch_stack.append(allocator, elem);
+            },
+            .e_binop => |binop| {
+                try scratch_stack.append(allocator, binop.lhs);
+                try scratch_stack.append(allocator, binop.rhs);
+            },
+            .e_unary_minus => |unop| try scratch_stack.append(allocator, unop.expr),
+            .e_unary_not => |unop| try scratch_stack.append(allocator, unop.expr),
+            .e_block => |block| {
+                for (cir.store.sliceStatements(block.stmts)) |stmt_idx| {
+                    switch (cir.store.getStatement(stmt_idx)) {
+                        .s_decl => |decl| try scratch_stack.append(allocator, decl.expr),
+                        .s_var => |var_stmt| try scratch_stack.append(allocator, var_stmt.expr),
+                        .s_var_uninitialized => {},
+                        .s_reassign => |reassign| try scratch_stack.append(allocator, reassign.expr),
+                        .s_dbg => |dbg| try scratch_stack.append(allocator, dbg.expr),
+                        .s_expr => |expr_stmt| try scratch_stack.append(allocator, expr_stmt.expr),
+                        .s_expect => |expect| try scratch_stack.append(allocator, expect.body),
+                        .s_for => |for_stmt| {
+                            try scratch_stack.append(allocator, for_stmt.expr);
+                            try scratch_stack.append(allocator, for_stmt.body);
+                        },
+                        .s_while => |while_stmt| {
+                            try scratch_stack.append(allocator, while_stmt.cond);
+                            try scratch_stack.append(allocator, while_stmt.body);
+                        },
+                        .s_infinite_loop => |loop_stmt| {
+                            try scratch_stack.append(allocator, loop_stmt.cond);
+                            try scratch_stack.append(allocator, loop_stmt.body);
+                        },
+                        .s_breakable_loop => |loop_stmt| {
+                            try scratch_stack.append(allocator, loop_stmt.cond);
+                            try scratch_stack.append(allocator, loop_stmt.body);
+                        },
+                        .s_return => |ret| try scratch_stack.append(allocator, ret.expr),
+                        .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_type_var_alias, .s_crash, .s_runtime_error, .s_break => {},
+                    }
+                }
+                try scratch_stack.append(allocator, block.final_expr);
+            },
+            .e_tag => |tag| {
+                for (cir.store.sliceExpr(tag.args)) |arg| try scratch_stack.append(allocator, arg);
+            },
+            .e_nominal => |nominal| try scratch_stack.append(allocator, nominal.backing_expr),
+            .e_nominal_external => |nominal| try scratch_stack.append(allocator, nominal.backing_expr),
+            .e_run_low_level => |run_ll| {
+                for (cir.store.sliceExpr(run_ll.args)) |arg| try scratch_stack.append(allocator, arg);
+            },
+            .e_dbg => |dbg| try scratch_stack.append(allocator, dbg.expr),
+            .e_expect_err => |expect_err| try scratch_stack.append(allocator, expect_err.expr),
+            .e_expect => |expect| try scratch_stack.append(allocator, expect.body),
+            // NOTE: `ret.lambda` is a back-reference to the enclosing lambda,
+            // not a child; walking it would loop.
+            .e_return => |ret| try scratch_stack.append(allocator, ret.expr),
+            .e_for => |for_expr| {
+                try scratch_stack.append(allocator, for_expr.expr);
+                try scratch_stack.append(allocator, for_expr.body);
+            },
+            .e_break,
+            .e_num,
+            .e_frac_f32,
+            .e_frac_f64,
+            .e_dec,
+            .e_dec_small,
+            .e_num_from_numeral,
+            .e_typed_int,
+            .e_typed_frac,
+            .e_typed_num_from_numeral,
+            .e_str,
+            .e_str_segment,
+            .e_bytes_literal,
+            .e_empty_list,
+            .e_empty_record,
+            .e_zero_argument_tag,
+            .e_ellipsis,
+            .e_anno_only,
+            .e_hosted_lambda,
+            .e_lookup_external,
+            .e_lookup_required,
+            .e_crash,
+            .e_runtime_error,
+            => {},
+        }
+    }
+}
+
+/// Compute the order in which type checking processes top-level defs: the SCC
+/// condensation of the name-reference graph, in deterministic topological
+/// order.
+///
+/// Determinism rule: among groups whose dependencies are all emitted, the
+/// group whose first member appears earliest in source order goes next;
+/// members within a group are in source order. This keeps diagnostic order as
+/// close to source order as the dependency relation allows.
+///
+/// The result is a transient checking artifact: Check consumes it for the
+/// duration of one module's checking and frees it; it is never part of the
+/// checked module (see design.md, "Checked module boundaries").
+pub fn computeCheckOrder(
+    cir: *const ModuleEnv,
+    all_defs: CIR.Def.Span,
+    allocator: std.mem.Allocator,
+) std.mem.Allocator.Error!EvaluationOrder {
+    const defs_slice = cir.store.sliceDefs(all_defs);
+
+    var pattern_to_def: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, CIR.Def.Idx) = .{};
+    defer pattern_to_def.deinit(allocator);
+    // Source position of each def, for the deterministic tie-break.
+    var def_position: std.AutoHashMapUnmanaged(CIR.Def.Idx, u32) = .{};
+    defer def_position.deinit(allocator);
+    for (defs_slice, 0..) |def_idx, position| {
+        const def = cir.store.getDef(def_idx);
+        try pattern_to_def.put(allocator, def.pattern, def_idx);
+        try def_position.put(allocator, def_idx, @intCast(position));
+    }
+
+    var graph = DependencyGraph.init(allocator, defs_slice);
+    defer graph.deinit();
+
+    var refs: std.AutoHashMapUnmanaged(CIR.Def.Idx, void) = .{};
+    defer refs.deinit(allocator);
+    var scratch_stack: std.ArrayList(CIR.Expr.Idx) = .empty;
+    defer scratch_stack.deinit(allocator);
+
+    for (defs_slice) |def_idx| {
+        refs.clearRetainingCapacity();
+        const def = cir.store.getDef(def_idx);
+        try collectNameReferences(cir, &pattern_to_def, def.expr, &refs, &scratch_stack, allocator);
+        var ref_iter = refs.keyIterator();
+        while (ref_iter.next()) |ref_def_idx| {
+            try graph.addEdge(def_idx, ref_def_idx.*);
+        }
+    }
+
+    var tarjan_order = try computeSCCs(&graph, allocator);
+    defer tarjan_order.deinit();
+
+    // Sort members within each group by source position.
+    const MemberSort = struct {
+        fn lessThan(ctx: *const std.AutoHashMapUnmanaged(CIR.Def.Idx, u32), a: CIR.Def.Idx, b: CIR.Def.Idx) bool {
+            return ctx.get(a).? < ctx.get(b).?;
+        }
+    };
+    for (tarjan_order.sccs) |scc| {
+        std.mem.sort(CIR.Def.Idx, scc.defs, &def_position, MemberSort.lessThan);
+    }
+
+    // Deterministic topological order over the condensation: Kahn's algorithm,
+    // always emitting the ready group with the earliest first member.
+    const group_count = tarjan_order.sccs.len;
+    var def_to_group: std.AutoHashMapUnmanaged(CIR.Def.Idx, u32) = .{};
+    defer def_to_group.deinit(allocator);
+    for (tarjan_order.sccs, 0..) |scc, group_index| {
+        for (scc.defs) |def_idx| {
+            try def_to_group.put(allocator, def_idx, @intCast(group_index));
+        }
+    }
+
+    var successors = try allocator.alloc(std.ArrayList(u32), group_count);
+    defer {
+        for (successors) |*list| list.deinit(allocator);
+        allocator.free(successors);
+    }
+    for (successors) |*list| list.* = .empty;
+    const indegree = try allocator.alloc(u32, group_count);
+    defer allocator.free(indegree);
+    @memset(indegree, 0);
+
+    // Dedup cross-group edges so indegrees count each predecessor group once.
+    var seen_edges: std.AutoHashMapUnmanaged(u64, void) = .{};
+    defer seen_edges.deinit(allocator);
+    for (tarjan_order.sccs, 0..) |scc, group_index| {
+        for (scc.defs) |def_idx| {
+            for (graph.getDependencies(def_idx)) |dep_def_idx| {
+                const dep_group = def_to_group.get(dep_def_idx).?;
+                if (dep_group == group_index) continue;
+                // Group depends on dep_group: dep_group must be emitted first.
+                const edge_key = (@as(u64, dep_group) << 32) | @as(u64, @intCast(group_index));
+                const gop = try seen_edges.getOrPut(allocator, edge_key);
+                if (gop.found_existing) continue;
+                try successors[dep_group].append(allocator, @intCast(group_index));
+                indegree[group_index] += 1;
+            }
+        }
+    }
+
+    // Priority = source position of the group's first (earliest) member.
+    const group_priority = try allocator.alloc(u32, group_count);
+    defer allocator.free(group_priority);
+    for (tarjan_order.sccs, 0..) |scc, group_index| {
+        group_priority[group_index] = def_position.get(scc.defs[0]).?;
+    }
+    const ReadyContext = struct {
+        priorities: []const u32,
+        fn compare(ctx: @This(), a: u32, b: u32) std.math.Order {
+            return std.math.order(ctx.priorities[a], ctx.priorities[b]);
+        }
+    };
+    var ready = std.PriorityQueue(u32, ReadyContext, ReadyContext.compare).initContext(.{ .priorities = group_priority });
+    defer ready.deinit(allocator);
+    for (0..group_count) |group_index| {
+        if (indegree[group_index] == 0) try ready.push(allocator, @intCast(group_index));
+    }
+
+    var ordered_sccs: std.ArrayList(SCC) = .empty;
+    errdefer {
+        for (ordered_sccs.items) |scc| allocator.free(scc.defs);
+        ordered_sccs.deinit(allocator);
+    }
+    try ordered_sccs.ensureTotalCapacityPrecise(allocator, group_count);
+
+    while (ready.pop()) |group_index| {
+        const scc = tarjan_order.sccs[group_index];
+        ordered_sccs.appendAssumeCapacity(.{
+            .defs = try allocator.dupe(CIR.Def.Idx, scc.defs),
+            .is_recursive = scc.is_recursive,
+        });
+        for (successors[group_index].items) |successor| {
+            indegree[successor] -= 1;
+            if (indegree[successor] == 0) try ready.push(allocator, successor);
+        }
+    }
+    // Tarjan produced an acyclic condensation, so Kahn must emit every group.
+    std.debug.assert(ordered_sccs.items.len == group_count);
+
+    return EvaluationOrder{
+        .sccs = try ordered_sccs.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
 const TarjanState = struct {
     /// Current DFS index
     index: u32,
