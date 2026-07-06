@@ -13,6 +13,7 @@ const check = @import("check");
 const collections = @import("collections");
 const layout = @import("layout");
 const Common = @import("common.zig");
+const match_tree = @import("match_tree.zig");
 const Mono = @import("monotype/ast.zig");
 const Lifted = @import("monotype_lifted/ast.zig");
 const SolvedInline = @import("solved_inline.zig");
@@ -3745,7 +3746,10 @@ const Lowerer = struct {
         const scrutinee_local = try self.addTemp(scrutinee_ty);
         const branches = self.solved.lifted.branchSpan(branches_span);
         const done = self.freshJoinPointId();
-        const branch_chain = try self.lowerBranchChain(scrutinee_local, scrutinee_ty, branches, target, result_ty, done, comptime_site);
+        const branch_chain = if (match_tree.lowering_mode == .tree)
+            try self.lowerBranchTree(scrutinee_local, scrutinee_ty, branches, target, result_ty, done, comptime_site)
+        else
+            try self.lowerBranchChain(scrutinee_local, scrutinee_ty, branches, target, result_ty, done, comptime_site);
         const remainder = try self.lowerExprIntoAtType(scrutinee_local, scrutinee, scrutinee_ty, branch_chain);
         return try self.result.store.addCFStmt(.{ .join = .{
             .id = done,
@@ -4270,6 +4274,563 @@ const Lowerer = struct {
 
     const PatternMiss = struct {
         join_id: LIR.JoinPointId,
+    };
+
+    /// Lower a match through the shared decision-tree compiler
+    /// (src/postcheck/match_tree.zig). Replaces the per-branch backtracking
+    /// chain: one multiway test per tested occurrence, one discriminant/
+    /// length/field read per position, and branch bodies lowered exactly once.
+    fn lowerBranchTree(
+        self: *Lowerer,
+        scrutinee: LIR.LocalId,
+        scrutinee_ty: Type.TypeId,
+        branches: []const Lifted.Branch,
+        target: LIR.LocalId,
+        result_ty: Type.TypeId,
+        done: LIR.JoinPointId,
+        comptime_site: ?Lifted.ComptimeSiteId,
+    ) Common.LowerError!LIR.CFStmtId {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var shapes = MatchTreeCtx.ShapeInterner{ .map = .init(arena) };
+        const ctx = MatchTreeCtx{
+            .l = self,
+            .arena = arena,
+            .target = target,
+            .result_ty = result_ty,
+            .comptime_site = comptime_site,
+            .shapes = &shapes,
+        };
+
+        const MT = match_tree.Compiler(MatchTreeCtx);
+        const mt_branches = try arena.alloc(MT.Branch, branches.len);
+        for (branches, mt_branches, 0..) |branch, *out, i| {
+            out.* = .{
+                .pat = branch.pat,
+                .guard = branch.guard,
+                .body = branch.body,
+                .branch_index = @intCast(i),
+            };
+        }
+        const built = try MT.build(arena, ctx, scrutinee_ty, mt_branches);
+        return try MT.Emitter.emitMatch(arena, ctx, built, scrutinee, done);
+    }
+
+    /// Accessor/emission context adapting this lowerer to the shared
+    /// decision-tree match compiler. Construction methods answer pattern and
+    /// type queries; emission methods delegate to the same primitives the
+    /// chain used, so the tree and chain produce identical leaf-level LIR.
+    const MatchTreeCtx = struct {
+        l: *Lowerer,
+        arena: std.mem.Allocator,
+        target: LIR.LocalId,
+        result_ty: Type.TypeId,
+        comptime_site: ?Lifted.ComptimeSiteId,
+        shapes: *ShapeInterner,
+
+        pub const PatId = Lifted.PatId;
+        pub const TypeId = Type.TypeId;
+        pub const ExprId = Lifted.ExprId;
+        pub const LocalId = Lifted.LocalId;
+        pub const LirLocal = LIR.LocalId;
+        pub const CFStmtId = LIR.CFStmtId;
+        pub const JoinPointId = LIR.JoinPointId;
+        pub const StrArm = LIR.StrMatchArm;
+        pub const LowerError = Common.LowerError;
+
+        /// One sub-pattern of a destructuring pattern, at its committed index.
+        pub const SubPat = struct { index: u16, ty: Type.TypeId, pat: Lifted.PatId };
+
+        /// Assigns dense u32 ids to structurally-distinct string shapes
+        /// (prefix, delimiters, end) so equal string arms merge and captures
+        /// intern consistently. A `str_lit` is the shape with no steps and an
+        /// exact end, which is exactly string equality.
+        pub const ShapeInterner = struct {
+            map: std.StringHashMap(u32),
+
+            fn internShape(interner: *ShapeInterner, arena: std.mem.Allocator, encoded: []const u8) error{OutOfMemory}!u32 {
+                const gop = try interner.map.getOrPut(encoded);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try arena.dupe(u8, encoded);
+                    gop.value_ptr.* = @intCast(interner.map.count() - 1);
+                }
+                return gop.value_ptr.*;
+            }
+        };
+
+        pub fn patKind(self: MatchTreeCtx, pat_id: Lifted.PatId) match_tree.PatKind {
+            return switch (self.l.pat(pat_id).data) {
+                .bind => .bind,
+                .wildcard => .wildcard,
+                .as => .as_pattern,
+                .record => .record,
+                .tuple => .tuple,
+                .list => .list,
+                .nominal => .nominal,
+                .tag => .tag,
+                .int_lit => .int_lit,
+                .dec_lit => .dec_lit,
+                .frac_f32_lit => .frac_f32_lit,
+                .frac_f64_lit => .frac_f64_lit,
+                .str_lit => .str_lit,
+                .str_pattern => .str_pattern,
+            };
+        }
+
+        pub fn bindLocal(self: MatchTreeCtx, pat_id: Lifted.PatId) Lifted.LocalId {
+            return self.l.pat(pat_id).data.bind;
+        }
+
+        pub fn asInfo(self: MatchTreeCtx, pat_id: Lifted.PatId) struct { pattern: Lifted.PatId, local: Lifted.LocalId } {
+            const info = self.l.pat(pat_id).data.as;
+            return .{ .pattern = info.pattern, .local = info.local };
+        }
+
+        pub fn recordDestructCount(self: MatchTreeCtx, pat_id: Lifted.PatId) u16 {
+            return @intCast(self.l.solved.lifted.recordDestructSpan(self.l.pat(pat_id).data.record).len);
+        }
+
+        pub fn recordDestruct(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId, i: u16) Common.LowerError!SubPat {
+            const destruct = self.l.solved.lifted.recordDestructSpan(self.l.pat(pat_id).data.record)[i];
+            const index = self.l.recordFieldIndex(ty, destruct.name);
+            return .{
+                .index = index,
+                .ty = self.l.recordFields(ty)[@as(usize, @intCast(index))].ty,
+                .pat = destruct.pattern,
+            };
+        }
+
+        pub fn tupleItemCount(self: MatchTreeCtx, pat_id: Lifted.PatId) u16 {
+            return @intCast(self.l.solved.lifted.patSpan(self.l.pat(pat_id).data.tuple).len);
+        }
+
+        pub fn tupleItem(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId, i: u16) Common.LowerError!SubPat {
+            const items = self.l.solved.lifted.patSpan(self.l.pat(pat_id).data.tuple);
+            const item_tys = self.l.tupleItemTypes(ty);
+            if (items.len != item_tys.len) Common.invariant("tuple pattern arity differed from target tuple type");
+            return .{ .index = i, .ty = item_tys[i], .pat = items[i] };
+        }
+
+        pub fn nominalInner(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) Common.LowerError!SubPat {
+            const inner = self.l.pat(pat_id).data.nominal;
+            return .{ .index = 0, .ty = try self.l.nominalPatternBackingType(ty, inner), .pat = inner };
+        }
+
+        pub fn tagVariant(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) u16 {
+            return self.l.tagIndex(ty, self.l.pat(pat_id).data.tag.name);
+        }
+
+        pub fn tagPayloadCount(self: MatchTreeCtx, pat_id: Lifted.PatId) u16 {
+            return @intCast(self.l.solved.lifted.patSpan(self.l.pat(pat_id).data.tag.payloads).len);
+        }
+
+        pub fn tagPayload(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId, i: u16) Common.LowerError!SubPat {
+            const tag = self.l.pat(pat_id).data.tag;
+            const payloads = self.l.solved.lifted.patSpan(tag.payloads);
+            const payload_tys = self.l.tagPayloadTypesByIndex(ty, self.l.tagIndex(ty, tag.name));
+            if (payloads.len != payload_tys.len) Common.invariant("tag pattern payload arity differed from target tag type");
+            return .{ .index = i, .ty = payload_tys[i], .pat = payloads[i] };
+        }
+
+        pub fn tagVariantCount(self: MatchTreeCtx, ty: Type.TypeId) ?u32 {
+            return switch (self.l.types.get(ty)) {
+                .tag_union => |tags| @intCast(self.l.types.tagSpan(tags).len),
+                .named => |named| if (named.backing) |backing| self.tagVariantCount(backing.ty) else null,
+                else => null,
+            };
+        }
+
+        pub fn callableVariant(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) u16 {
+            _ = self;
+            _ = pat_id;
+            _ = ty;
+            Common.invariant("callable pattern reached solved match lowering");
+        }
+
+        pub fn callablePayload(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) Common.LowerError!?SubPat {
+            _ = self;
+            _ = pat_id;
+            _ = ty;
+            Common.invariant("callable pattern reached solved match lowering");
+        }
+
+        pub fn callableVariantCount(self: MatchTreeCtx, ty: Type.TypeId) ?u32 {
+            _ = self;
+            _ = ty;
+            return null;
+        }
+
+        /// Neutral view of a list pattern's shape.
+        pub const ListPatView = struct {
+            fixed_count: u32,
+            rest: ?struct { index: u32, pattern: ?Lifted.PatId },
+        };
+
+        pub fn listView(self: MatchTreeCtx, pat_id: Lifted.PatId) ListPatView {
+            const list = self.l.pat(pat_id).data.list;
+            return .{
+                .fixed_count = @intCast(list.patterns.len),
+                .rest = if (list.rest) |rest| .{ .index = rest.index, .pattern = rest.pattern } else null,
+            };
+        }
+
+        pub fn listElemPat(self: MatchTreeCtx, pat_id: Lifted.PatId, i: u32) Lifted.PatId {
+            return self.l.solved.lifted.patSpan(self.l.pat(pat_id).data.list.patterns)[i];
+        }
+
+        pub fn listElemTy(self: MatchTreeCtx, ty: Type.TypeId) Type.TypeId {
+            return self.l.listElemType(ty);
+        }
+
+        pub fn ctorKey(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) Common.LowerError!u128 {
+            return switch (self.l.pat(pat_id).data) {
+                .tag => |tag| self.l.tagIndex(ty, tag.name),
+                .int_lit => |value| @bitCast(value.toI128()),
+                .dec_lit => |value| @bitCast(value.num),
+                // IEEE equality semantics: +0.0 and -0.0 are the same
+                // constructor; NaN arms never match but stay distinct.
+                .frac_f32_lit => |value| @as(u32, @bitCast(if (value == 0.0) @as(f32, 0.0) else value)),
+                .frac_f64_lit => |value| @as(u64, @bitCast(if (value == 0.0) @as(f64, 0.0) else value)),
+                .str_lit => |lit| try self.strShapeKey(self.l.stringLiteralText(lit), &.{}, .exact),
+                .str_pattern => |str| blk: {
+                    const steps = self.l.solved.lifted.strPatternStepSpan(str.steps);
+                    break :blk try self.strShapeKey(self.l.stringLiteralText(str.prefix), steps, str.end);
+                },
+                .list => |list| list.patterns.len,
+                else => Common.invariant("constructor key requested for non-constructor pattern"),
+            };
+        }
+
+        fn strShapeKey(
+            self: MatchTreeCtx,
+            prefix: []const u8,
+            steps: []const Lifted.StrPatternStep,
+            end: Lifted.StrPatternEnd,
+        ) Common.LowerError!u128 {
+            var encoded: std.ArrayList(u8) = .empty;
+            const writer = &encoded;
+            try appendLenPrefixed(writer, self.arena, prefix);
+            for (steps) |step| {
+                try appendLenPrefixed(writer, self.arena, self.l.stringLiteralText(step.delimiter));
+            }
+            try writer.append(self.arena, switch (end) {
+                .exact => 0,
+                .tail => 1,
+            });
+            return try self.shapes.internShape(self.arena, encoded.items);
+        }
+
+        fn appendLenPrefixed(list: *std.ArrayList(u8), arena: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!void {
+            var len_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_bytes, @intCast(bytes.len), .little);
+            try list.appendSlice(arena, &len_bytes);
+            try list.appendSlice(arena, bytes);
+        }
+
+        pub fn intSwitchValue(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) ?u64 {
+            const value: i128 = switch (self.l.pat(pat_id).data) {
+                .int_lit => |value| value.toI128(),
+                else => return null,
+            };
+            // Executors disagree on how a narrow signed condition widens to
+            // the u64 the switch compares (the interpreter zero-extends the
+            // stored bytes; the dev backend loads sign-extended), so narrow
+            // signed layouts may only switch on sign-bit-clear values — for
+            // those the two widenings coincide. Everything else keeps the
+            // equality-chain lowering.
+            const width: u16 = switch (self.intPrimitive(ty) orelse return null) {
+                .u8 => 8,
+                .u16 => 16,
+                .u32 => 32,
+                .u64, .i64 => 64,
+                .i8 => if (value < 0 or value > std.math.maxInt(i8)) return null else 8,
+                .i16 => if (value < 0 or value > std.math.maxInt(i16)) return null else 16,
+                .i32 => if (value < 0 or value > std.math.maxInt(i32)) return null else 32,
+                // 128-bit integers exceed switch_stmt's condition width; Dec,
+                // floats, bool, and str never take this path.
+                .u128, .i128, .bool, .str, .f32, .f64, .dec => return null,
+            };
+            // Encode as the value's bits zero-extended at layout width — the
+            // read every executor performs on an unsigned or sign-bit-clear
+            // condition.
+            const bits: u128 = @bitCast(value);
+            const mask: u128 = if (width == 64) std.math.maxInt(u64) else (@as(u128, 1) << @intCast(width)) - 1;
+            return @intCast(bits & mask);
+        }
+
+        fn intPrimitive(self: MatchTreeCtx, ty: Type.TypeId) ?MonoType.Primitive {
+            return switch (self.l.types.get(ty)) {
+                .primitive => |primitive| primitive,
+                .named => |named| if (named.backing) |backing| self.intPrimitive(backing.ty) else null,
+                else => null,
+            };
+        }
+
+        pub fn strLitIsSetArm(self: MatchTreeCtx) bool {
+            _ = self;
+            // A str_match arm with no steps and an exact end is byte equality,
+            // which is exactly Str equality (see execStrMatchArm).
+            return true;
+        }
+
+        pub fn strCaptureCount(self: MatchTreeCtx, pat_id: Lifted.PatId) u16 {
+            return switch (self.l.pat(pat_id).data) {
+                .str_pattern => |str| @intCast(self.l.solved.lifted.strPatternStepSpan(str.steps).len),
+                else => 0,
+            };
+        }
+
+        pub fn strCapturePat(self: MatchTreeCtx, pat_id: Lifted.PatId, i: u16) ?Lifted.PatId {
+            const str = self.l.pat(pat_id).data.str_pattern;
+            return self.l.solved.lifted.strPatternStepSpan(str.steps)[i].capture;
+        }
+
+        pub fn stmtCount(self: MatchTreeCtx) usize {
+            return self.l.result.store.cf_stmts.items.len;
+        }
+
+        pub fn freshJoinPointId(self: MatchTreeCtx) LIR.JoinPointId {
+            return self.l.freshJoinPointId();
+        }
+
+        pub fn joinJump(self: MatchTreeCtx, id: LIR.JoinPointId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.joinJump(id);
+        }
+
+        pub fn addExitJoin(self: MatchTreeCtx, id: LIR.JoinPointId, body: LIR.CFStmtId, remainder: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.result.store.addCFStmt(.{ .join = .{
+                .id = id,
+                .params = LIR.LocalSpan.empty(),
+                .body = body,
+                .remainder = remainder,
+            } });
+        }
+
+        pub fn failTerminal(self: MatchTreeCtx) Common.LowerError!LIR.CFStmtId {
+            if (self.comptime_site) |site| {
+                return try self.l.result.store.addCFStmt(.{ .comptime_exhaustiveness_failed = .{ .site = try self.l.lowerComptimeSite(site) } });
+            }
+            return try self.l.result.store.addCFStmt(.{ .runtime_error = {} });
+        }
+
+        pub fn lirTempForType(self: MatchTreeCtx, ty: Type.TypeId) Common.LowerError!LIR.LocalId {
+            return try self.l.addTemp(ty);
+        }
+
+        pub fn lirLocalU16(self: MatchTreeCtx) Common.LowerError!LIR.LocalId {
+            return try self.l.addLocalForLayout(.u16);
+        }
+
+        pub fn lirLocalU64(self: MatchTreeCtx) Common.LowerError!LIR.LocalId {
+            return try self.l.addLocalForLayout(.u64);
+        }
+
+        pub fn isZstLirLocal(self: MatchTreeCtx, local: LIR.LocalId) bool {
+            return self.l.isZstLocal(local);
+        }
+
+        pub fn readDiscriminant(self: MatchTreeCtx, disc: LIR.LocalId, source: LIR.LocalId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.result.store.addCFStmt(.{ .assign_ref = .{
+                .target = disc,
+                .op = .{ .discriminant = .{ .source = source } },
+                .next = next,
+            } });
+        }
+
+        pub fn readField(self: MatchTreeCtx, dest: LIR.LocalId, ty: Type.TypeId, source: LIR.LocalId, index: u16, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.assignTypedRefRead(
+                dest,
+                ty,
+                ty,
+                self.l.localFieldLayout(source, index),
+                .{ .field = .{ .source = source, .field_idx = index } },
+                next,
+            );
+        }
+
+        pub fn readTagPayload(self: MatchTreeCtx, dest: LIR.LocalId, ty: Type.TypeId, source: LIR.LocalId, variant: u16, index: u16, single: bool, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            if (single) {
+                return try self.l.assignTypedRefRead(
+                    dest,
+                    ty,
+                    ty,
+                    self.l.localTagPayloadLayout(source, variant, null),
+                    .{ .tag_payload_struct = .{
+                        .source = source,
+                        .variant_index = variant,
+                        .tag_discriminant = variant,
+                    } },
+                    next,
+                );
+            }
+            return try self.l.assignTypedRefRead(
+                dest,
+                ty,
+                ty,
+                self.l.localTagPayloadLayout(source, variant, index),
+                .{ .tag_payload = .{
+                    .source = source,
+                    .payload_idx = index,
+                    .variant_index = variant,
+                    .tag_discriminant = variant,
+                } },
+                next,
+            );
+        }
+
+        pub fn readCallablePayload(self: MatchTreeCtx, dest: LIR.LocalId, ty: Type.TypeId, source: LIR.LocalId, variant: u16, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            _ = self;
+            _ = dest;
+            _ = ty;
+            _ = source;
+            _ = variant;
+            _ = next;
+            Common.invariant("callable pattern reached solved match lowering");
+        }
+
+        pub fn readListLen(self: MatchTreeCtx, dest: LIR.LocalId, source: LIR.LocalId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.assignUnaryLowLevel(dest, .list_len, source, next);
+        }
+
+        pub fn readListElemFront(self: MatchTreeCtx, dest: LIR.LocalId, source: LIR.LocalId, index: u64, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            const index_local = try self.l.addLocalForLayout(.u64);
+            const get = try self.l.assignBinaryLowLevel(dest, .list_get_unsafe, source, index_local, next);
+            return try self.l.assignU64Literal(index_local, @intCast(index), get);
+        }
+
+        pub fn readListElemBack(self: MatchTreeCtx, dest: LIR.LocalId, source: LIR.LocalId, len_local: LIR.LocalId, back: u64, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            const index_local = try self.l.addLocalForLayout(.u64);
+            const get = try self.l.assignBinaryLowLevel(dest, .list_get_unsafe, source, index_local, next);
+            return try self.l.lenMinusConst(index_local, len_local, @intCast(back), get);
+        }
+
+        pub fn readListRest(self: MatchTreeCtx, dest: LIR.LocalId, source: LIR.LocalId, len_local: LIR.LocalId, front: u64, back: u64, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            // rest = take_first(take_last(source, len - front), len - (front + back))
+            const front_dropped = try self.l.addLocalForLayout(self.l.result.store.getLocal(source).layout_idx);
+            const keep_len = try self.l.addLocalForLayout(.u64);
+            var current = try self.l.assignBinaryLowLevel(dest, .list_take_first, front_dropped, keep_len, next);
+            current = try self.l.lenMinusConst(keep_len, len_local, @intCast(front + back), current);
+            const keep_after_front = try self.l.addLocalForLayout(.u64);
+            current = try self.l.assignBinaryLowLevel(front_dropped, .list_take_last, source, keep_after_front, current);
+            return try self.l.lenMinusConst(keep_after_front, len_local, @intCast(front), current);
+        }
+
+        pub fn readNominalBacking(self: MatchTreeCtx, dest: LIR.LocalId, backing_ty: Type.TypeId, source: LIR.LocalId, nominal_ty: Type.TypeId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            const source_layout = self.l.result.store.getLocal(source).layout_idx;
+            return try self.l.assignNominalPatternBoundaryAtTypes(dest, backing_ty, source, nominal_ty, source_layout, next);
+        }
+
+        pub fn switchStmt(self: MatchTreeCtx, cond: LIR.LocalId, values: []const u64, bodies: []const LIR.CFStmtId, default: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            const branches = try self.arena.alloc(LIR.CFSwitchBranch, values.len);
+            for (branches, values, bodies) |*branch, value, body| {
+                branch.* = .{ .value = value, .body = body };
+            }
+            return try self.l.result.store.addCFStmt(.{ .switch_stmt = .{
+                .cond = cond,
+                .branches = try self.l.result.store.addCFSwitchBranches(branches),
+                .default_branch = default,
+                .continuation = null,
+            } });
+        }
+
+        pub fn lenGteTest(self: MatchTreeCtx, len_local: LIR.LocalId, min: u64, then: LIR.CFStmtId, els: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            const required = try self.l.addLocalForLayout(.u64);
+            const cond = try self.l.addLocalForLayout(.bool);
+            const length_check = try self.l.boolSwitchNoContinuation(cond, then, els);
+            const compare = try self.l.assignBinaryLowLevel(cond, .num_is_gte, len_local, required, length_check);
+            return try self.l.assignU64Literal(required, @intCast(min), compare);
+        }
+
+        pub fn literalEqTest(self: MatchTreeCtx, source: LIR.LocalId, ty: Type.TypeId, pat_id: Lifted.PatId, on_match: LIR.CFStmtId, on_miss: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            const literal: LiteralPattern = switch (self.l.pat(pat_id).data) {
+                .int_lit => |value| .{ .int_lit = value },
+                .dec_lit => |value| .{ .dec_lit = value },
+                .frac_f32_lit => |value| .{ .frac_f32_lit = value },
+                .frac_f64_lit => |value| .{ .frac_f64_lit = value },
+                .str_lit => |value| .{ .str_lit = value },
+                else => Common.invariant("equality arm requested for non-literal pattern"),
+            };
+            const lit_local = try self.l.addTemp(ty);
+            const eq_local = try self.l.addLocalForLayout(.bool);
+            const branch = try self.l.boolSwitchNoContinuation(eq_local, on_match, on_miss);
+            const compare = try self.l.lowerEqLocalsInto(eq_local, source, lit_local, ty, false, branch);
+            return try self.l.lowerLiteralInto(lit_local, literal, compare);
+        }
+
+        pub fn strArmCaptureLocals(self: MatchTreeCtx, pat_id: Lifted.PatId) Common.LowerError![]const ?LIR.LocalId {
+            const str = switch (self.l.pat(pat_id).data) {
+                .str_pattern => |str| str,
+                .str_lit => return &.{},
+                else => Common.invariant("string arm requested for non-string pattern"),
+            };
+            const steps = self.l.solved.lifted.strPatternStepSpan(str.steps);
+            const locals = try self.arena.alloc(?LIR.LocalId, steps.len);
+            for (steps, locals) |step, *out| {
+                out.* = if (step.capture) |capture| try self.l.addTemp(try self.l.lowerPatTy(capture)) else null;
+            }
+            return locals;
+        }
+
+        pub fn buildStrArm(self: MatchTreeCtx, pat_id: Lifted.PatId, capture_locals: []const ?LIR.LocalId, on_match: LIR.CFStmtId) Common.LowerError!LIR.StrMatchArm {
+            switch (self.l.pat(pat_id).data) {
+                .str_lit => |lit| return .{
+                    .prefix = try self.l.lirStrLiteral(lit),
+                    .steps = try self.l.result.store.addStrMatchSteps(&.{}),
+                    .end = .exact,
+                    .on_match = on_match,
+                },
+                .str_pattern => |str| {
+                    const input_steps = self.l.solved.lifted.strPatternStepSpan(str.steps);
+                    const lir_steps = try self.arena.alloc(LIR.StrMatchStep, input_steps.len);
+                    for (input_steps, lir_steps, capture_locals) |input_step, *lir_step, capture| {
+                        lir_step.* = .{
+                            .capture = if (capture) |local| .{ .view = local } else .discard,
+                            .delimiter = try self.l.lirStrLiteral(input_step.delimiter),
+                        };
+                    }
+                    return .{
+                        .prefix = try self.l.lirStrLiteral(str.prefix),
+                        .steps = try self.l.result.store.addStrMatchSteps(lir_steps),
+                        .end = switch (str.end) {
+                            .exact => .exact,
+                            .tail => .tail,
+                        },
+                        .on_match = on_match,
+                    };
+                },
+                else => Common.invariant("string arm requested for non-string pattern"),
+            }
+        }
+
+        pub fn strMatchSet(self: MatchTreeCtx, source: LIR.LocalId, arms: []const LIR.StrMatchArm, on_miss: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.result.store.addCFStmt(.{ .str_match_set = .{
+                .source = source,
+                .arms = try self.l.result.store.addStrMatchArms(arms),
+                .on_miss = on_miss,
+            } });
+        }
+
+        pub fn bindPatternLocal(self: MatchTreeCtx, local: Lifted.LocalId, ty: Type.TypeId, source: LIR.LocalId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.bindLocalFromTyped(local, ty, source, next);
+        }
+
+        pub fn lowerBody(self: MatchTreeCtx, body: Lifted.ExprId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.lowerExprIntoAtType(self.target, body, self.result_ty, next);
+        }
+
+        pub fn guardTemp(self: MatchTreeCtx, guard: Lifted.ExprId) Common.LowerError!LIR.LocalId {
+            return try self.l.addTemp(try self.l.lowerExprTy(guard));
+        }
+
+        pub fn lowerGuard(self: MatchTreeCtx, cond: LIR.LocalId, guard: Lifted.ExprId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.lowerExprInto(cond, guard, next);
+        }
+
+        pub fn boolSwitch(self: MatchTreeCtx, cond: LIR.LocalId, then: LIR.CFStmtId, els: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+            return try self.l.boolSwitchNoContinuation(cond, then, els);
+        }
     };
 
     fn lowerBranchChain(
