@@ -31,7 +31,6 @@ const Ident = base.Ident;
 pub const DeferredTemplate = struct {
     fn_id: Ast.FnId,
     template_ref: names.ProcTemplate,
-    module: checked.ModuleId,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     fn_ty: Type.TypeId,
