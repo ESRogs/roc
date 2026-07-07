@@ -807,6 +807,9 @@ fn parseRecordFieldTokens(self: *Parser) std.mem.Allocator.Error!AST.RecordField
     self.expect(.LowerIdent) catch {
         return try self.pushMalformed(AST.RecordField.Idx, .expected_expr_record_field_name, start);
     };
+    if (self.isVarIdent(start)) {
+        try self.pushDiagnostic(.record_field_name_cannot_be_var, .{ .start = start, .end = start + 1 });
+    }
     const name = start;
     var value: ?AST.Expr.Idx = null;
     if (self.peek() == .OpColon) {
@@ -1215,6 +1218,9 @@ fn parseAppHeaderTokens(self: *Parser) std.mem.Allocator.Error!AST.Header.Idx {
             return try self.pushMalformed(AST.Header.Idx, .expected_package_or_platform_name, start);
         }
         const name_tok = self.pos;
+        if (self.isVarIdent(name_tok)) {
+            try self.pushDiagnostic(.record_field_name_cannot_be_var, .{ .start = name_tok, .end = name_tok + 1 });
+        }
         self.advance();
         if (self.peek() != .OpColon) {
             self.store.clearScratchRecordFieldsFrom(fields_scratch_top);
@@ -1773,9 +1779,10 @@ fn parseSymbolMapCollectionTokens(
     open_tag: AST.Diagnostic.Tag,
     close_tag: AST.Diagnostic.Tag,
 ) std.mem.Allocator.Error!AST.SymbolMapEntry.Span {
+    const start = self.pos;
     self.expect(.OpenCurly) catch {
         _ = try self.pushMalformed(AST.SymbolMapEntry.Idx, open_tag, self.pos);
-        return .{ .span = .{ .start = 0, .len = 0 } };
+        return .{ .span = .{ .start = 0, .len = 0 }, .region = .{ .start = start, .end = self.pos } };
     };
     const top = self.store.scratchSymbolMapEntryTop();
     while (self.peek() != .CloseCurly and self.peek() != .EndOfFile) {
@@ -1787,9 +1794,9 @@ fn parseSymbolMapCollectionTokens(
     self.expect(.CloseCurly) catch {
         self.store.clearScratchSymbolMapEntriesFrom(top);
         _ = try self.pushMalformed(AST.SymbolMapEntry.Idx, close_tag, self.pos);
-        return .{ .span = .{ .start = 0, .len = 0 } };
+        return .{ .span = .{ .start = 0, .len = 0 }, .region = .{ .start = start, .end = self.pos } };
     };
-    return try self.store.symbolMapEntrySpanFrom(top);
+    return try self.store.symbolMapEntrySpanFrom(top, .{ .start = start, .end = self.pos });
 }
 
 fn parsePlatformHeaderTokens(self: *Parser) std.mem.Allocator.Error!AST.Header.Idx {
@@ -4179,6 +4186,9 @@ fn runExprStatementKernel(
             .CloseCurly => continue :expr_kernel .record_finish,
             .LowerIdent => {
                 const field_start = self.pos;
+                if (self.isVarIdent(field_start)) {
+                    try self.pushDiagnostic(.record_field_name_cannot_be_var, .{ .start = field_start, .end = field_start + 1 });
+                }
                 self.advance();
                 const name = field_start;
                 if (self.peek() == .OpColon) {
@@ -4827,6 +4837,9 @@ fn runExprStatementKernel(
             // record types. They parse like any other field name.
             .LowerIdent, .Underscore, .NamedUnderscore => {
                 const field_start = self.pos;
+                if (self.peek() == .LowerIdent and self.isVarIdent(field_start)) {
+                    try self.pushDiagnostic(.record_field_name_cannot_be_var, .{ .start = field_start, .end = field_start + 1 });
+                }
                 const name = self.pos;
                 self.advance();
                 if (self.peek() != .OpColon) {
@@ -6104,6 +6117,9 @@ fn runExprStatementKernel(
             },
             .LowerIdent => {
                 const field_start = self.pos;
+                if (self.isVarIdent(field_start)) {
+                    try self.pushDiagnostic(.record_field_name_cannot_be_var, .{ .start = field_start, .end = field_start + 1 });
+                }
                 const name = self.pos;
                 self.advance();
                 if (self.peek() == .Comma or self.peek() == .CloseCurly) {

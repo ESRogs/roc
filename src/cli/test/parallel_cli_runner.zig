@@ -1014,7 +1014,9 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc test expect with unannotated helper returning Try (issue 9691, dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "test", "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue_9691_expect_helper_returning_try.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test expect matches Ok arm of unannotated Try helper (issue 9691, interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "test", "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/issue_9691_expect_try_tag_discriminant.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test expect matches Ok arm of unannotated Try helper (issue 9691, dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "test", "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue_9691_expect_try_tag_discriminant.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test recursive nested-list accumulator passes (issue 9742, interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "test", "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/issue_9742_recursive_nested_list_accumulator.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test recursive nested-list accumulator passes (issue 9742, dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "test", "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue_9742_recursive_nested_list_accumulator.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test recursive nested-list accumulator passes (issue 9742, llvm)", .backend = .speed, .body = .{ .command = .{ .args = &.{ "test", "--opt=speed", "--no-cache" }, .roc_file = "test/cli/issue_9742_recursive_nested_list_accumulator.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stdout, .text = "failed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check succeeds on string interpolation in Try.map_err (issue 9650)", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9650_checked_interpolation_map_err.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "ordinary method call reached artifact publication" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9879: roc check succeeds when package function accepts List of imported tag union", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9879_imported_tag_app/main.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "SIGSEGV" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc default app numeric addition lowers without postcheck panic (issue 9706)", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9706_dispatch_plan_addition.roc", .exit = .success, .not_contains = &.{.{ .stream = .stderr, .text = "dispatch plan had no method owner" }} } } },
@@ -5611,7 +5613,7 @@ fn customGlueZig(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *
         "pub fn decrefHostTree(value: HostTree, roc_host: *RocHost) void",
         "fn decrefBoxPayloadType",
         "pub extern fn roc_alloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque;",
-        "pub const BuilderPrint_valueArgs = extern struct",
+        "pub const BuilderPrint_valueArgs = if (@sizeOf(usize) == 4) extern struct",
         "pub extern fn roc_stdout_line(arg0: RocStr) callconv(.c) void;",
         "pub extern fn roc_main() callconv(.c) void;",
     }) |needle| {
@@ -5940,7 +5942,7 @@ fn customGlueZigBangRecordFieldNames(io: std.Io, allocator: Allocator, env: *con
     for ([_][]const u8{
         "@\"init!\": *anyopaque",
         "@\"render!\": *anyopaque",
-        "pub const HostSet_mouseArgs = extern struct",
+        "pub const HostSet_mouseArgs = if (@sizeOf(usize) == 4) extern struct",
         "pub extern fn roc_host_set_mouse(arg0: HostSet_mouseArgs) callconv(.c) void;",
     }) |needle| {
         if (std.mem.find(u8, generated, needle) == null) {

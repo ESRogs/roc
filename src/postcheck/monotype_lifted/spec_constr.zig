@@ -5979,7 +5979,7 @@ fn exprSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.ExprId
 
 fn captureOperandSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.CaptureOperand)) bool {
     const operands = program.captureOperandSpan(span);
-    for (0..operands.len) |index| {
+    for (0..GuardedList.borrowLen(operands)) |index| {
         const operand = GuardedList.at(operands, index);
         if (exprContainsReturn(program, operand.value)) return true;
     }
@@ -6106,8 +6106,9 @@ fn localUseCountInExprSpan(program: *const Ast.Program, local: Ast.LocalId, span
 fn localUseCountInCaptureOperandSpan(program: *const Ast.Program, local: Ast.LocalId, span: Ast.Span(Ast.CaptureOperand)) usize {
     var count: usize = 0;
     const operands = program.captureOperandSpan(span);
-    for (0..operands.len) |index| {
-        count += localUseCountInExpr(program, local, GuardedList.at(operands, index).value);
+    for (0..GuardedList.borrowLen(operands)) |index| {
+        const operand = GuardedList.at(operands, index);
+        count += localUseCountInExpr(program, local, operand.value);
     }
     return count;
 }
@@ -6465,7 +6466,10 @@ fn scanLocalUseInCaptureOperandSpan(
     scan: *LocalUseScan,
 ) void {
     const operands = program.captureOperandSpan(span);
-    for (0..operands.len) |index| scanLocalUseInExpr(program, local, GuardedList.at(operands, index).value, scan);
+    for (0..GuardedList.borrowLen(operands)) |index| {
+        const operand = GuardedList.at(operands, index);
+        scanLocalUseInExpr(program, local, operand.value, scan);
+    }
 }
 
 fn scanLocalUseInStmt(program: *const Ast.Program, local: Ast.LocalId, stmt_id: Ast.StmtId, scan: *LocalUseScan) void {
@@ -6703,6 +6707,87 @@ fn tupleFromValue(value: Value) ?TupleValue {
         .nominal => |nominal| tupleFromValue(nominal.backing.*),
         else => null,
     };
+}
+
+fn emptyLiftedProgramForTest(allocator: Allocator) Ast.Program {
+    return Ast.Program.init(
+        allocator,
+        names.NameStore.init(allocator),
+        Type.Store.init(allocator),
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        Mono.ProcDebugNameMap.init(allocator),
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+        0,
+    );
+}
+
+test "call-pattern scans direct call and function reference capture operands" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const unit_ty = try program.types.add(.zst);
+    const local = try program.addLocal(@enumFromInt(1), unit_ty);
+    const unit_expr = try program.addExpr(.{ .ty = unit_ty, .data = .unit });
+    _ = try program.addExprSpan(&.{unit_expr});
+    const local_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .local = local } });
+
+    const return_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .return_ = .{
+        .value = local_expr,
+        .target = unit_ty,
+    } } });
+    const captures = try program.addCaptureOperandSpan(&.{.{
+        .id = check.CheckedModule.CaptureId.generatedLift(0),
+        .value = return_expr,
+    }});
+    const fn_ref = try program.addExpr(.{
+        .ty = unit_ty,
+        .data = .{
+            .fn_ref = .{
+                .fn_id = undefined, // not read by the call-pattern scanners under test
+                .captures = captures,
+            },
+        },
+    });
+    const call_proc = try program.addExpr(.{
+        .ty = unit_ty,
+        .data = .{
+            .call_proc = .{
+                .callee = undefined, // not read by the call-pattern scanners under test
+                .args = Ast.Span(Ast.ExprId).empty(),
+                .captures = captures,
+            },
+        },
+    });
+
+    try std.testing.expect(exprContainsReturn(&program, fn_ref));
+    try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, local, fn_ref));
+    try std.testing.expect(localUseBeforeEffect(&program, local, fn_ref));
+    try std.testing.expect(exprContainsReturn(&program, call_proc));
+    try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, local, call_proc));
+    try std.testing.expect(localUseBeforeEffect(&program, local, call_proc));
 }
 
 test "call-pattern specialization preserves imported direct calls" {

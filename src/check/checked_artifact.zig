@@ -13130,8 +13130,7 @@ fn sealCheckedProcedureTemplateRefs(
 
 /// Resolve every static-dispatch plan and instantiation-site obligation to an
 /// explicit `direct` / `constraint(k)` / `structural` / `checked_error`
-/// resolution, and publish each template's evidence params
-/// (projects/big/total-dispatch-plans.md).
+/// resolution, and publish each template's evidence params.
 ///
 /// Runs after `sealCheckedProcedureTemplateRefs` so plans and value refs are
 /// grouped per template: `constraint(k)` indexes the enclosing template's
@@ -25864,6 +25863,19 @@ pub const CheckedModuleArtifact = struct {
         const_store: ConstStore.Serialized,
 
         comptime {
+            const owner_only_fields = [_][]const u8{
+                "module_env", // Written as the checked-cache env blob and injected during artifact deserialize.
+                "serialized_backing", // Runtime ownership for relocated cache/static bytes, not checked data.
+                "serialized_backing_is_static", // Runtime ownership mode for `serialized_backing`.
+            };
+            collections.serde_validation.assertBidirectionalFieldSet(
+                CheckedModuleArtifact,
+                Serialized,
+                &owner_only_fields,
+                &.{},
+                &.{},
+            );
+
             // The TRUE total relocation fixup count: 1 (`direct_import_artifact_keys`)
             // + the recursive sum of every sub-store, now including the `SafeList`/
             // interner base pointers (`canonical_names` = 22 via its 7 interners +

@@ -957,13 +957,21 @@ const Formatter = struct {
     };
 
     fn formatCollection(fmt: *Formatter, region: AST.TokenizedRegion, braces: Braces, comptime T: type, items: []T, formatter: fn (*Formatter, T) FormatAstError!AST.TokenizedRegion) FormatAstError!void {
-        const multiline = fmt.ast.regionIsMultiline(region) or fmt.nodesWillBeMultiline(T, items);
+        const empty_has_comment = items.len == 0 and fmt.regionHasInteriorComment(region);
+        const multiline = fmt.ast.regionIsMultiline(region) or fmt.nodesWillBeMultiline(T, items) or empty_has_comment;
         const curr_indent = fmt.curr_indent;
         defer {
             fmt.curr_indent = curr_indent;
         }
         try fmt.push(braces.start());
         if (items.len == 0) {
+            if (empty_has_comment) {
+                fmt.curr_indent += 1;
+                try fmt.flushCommentsBeforeDiscard(fmt.regionClosingToken(region).?);
+                fmt.curr_indent -= 1;
+                try fmt.ensureNewline();
+                try fmt.pushIndent();
+            }
             try fmt.push(braces.end());
             return;
         }
@@ -1523,6 +1531,7 @@ const Formatter = struct {
 
                 const fields = fmt.ast.store.recordFieldSlice(r.fields);
                 var has_extension = false;
+                const empty_has_comment = r.ext == null and fields.len == 0 and fmt.regionHasInteriorComment(r.region);
 
                 // Handle extension if present
                 if (r.ext) |ext| {
@@ -1574,6 +1583,14 @@ const Formatter = struct {
                     } else if (i < fields.len - 1) {
                         try fmt.pushAll(",");
                     }
+                }
+
+                if (empty_has_comment) {
+                    fmt.curr_indent += 1;
+                    try fmt.flushCommentsBeforeDiscard(fmt.regionClosingToken(r.region).?);
+                    fmt.curr_indent -= 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
                 }
 
                 if ((has_extension or fields.len > 0) and !multiline) {
@@ -2198,11 +2215,22 @@ const Formatter = struct {
     /// Format a symbol map section: { "roc_main": main_for_host!, ... }
     fn formatSymbolMapSection(fmt: *Formatter, span: AST.SymbolMapEntry.Span, base_indent: u32) (Allocator.Error || error{WriteFailed})!void {
         const entries = fmt.ast.store.symbolMapEntrySlice(span);
+        const has_comments = fmt.regionHasInteriorComment(span.region);
         if (entries.len == 0) {
+            if (has_comments) {
+                try fmt.push('{');
+                fmt.curr_indent = base_indent + 1;
+                try fmt.flushCommentsBeforeDiscard(fmt.regionClosingToken(span.region).?);
+                fmt.curr_indent = base_indent;
+                try fmt.ensureNewline();
+                try fmt.pushIndent();
+                try fmt.push('}');
+                return;
+            }
             try fmt.pushAll("{}");
             return;
         }
-        if (entries.len <= 2) {
+        if (entries.len <= 2 and !has_comments) {
             try fmt.pushAll("{ ");
             for (entries, 0..) |entry_idx, i| {
                 if (i > 0) {
@@ -2215,12 +2243,15 @@ const Formatter = struct {
         }
         try fmt.push('{');
         for (entries) |entry_idx| {
+            const entry = fmt.ast.store.getSymbolMapEntry(entry_idx);
+            try fmt.flushCommentsBeforeDiscard(entry.region.start);
             try fmt.ensureNewline();
             fmt.curr_indent = base_indent + 1;
             try fmt.pushIndent();
             try fmt.formatSymbolMapEntry(entry_idx);
             try fmt.push(',');
         }
+        try fmt.flushCommentsBeforeDiscard(fmt.regionClosingToken(span.region).?);
         try fmt.ensureNewline();
         fmt.curr_indent = base_indent;
         try fmt.pushIndent();
@@ -2643,7 +2674,7 @@ const Formatter = struct {
                 try fmt.pushAll("provides ");
                 try fmt.formatSymbolMapSection(p.provides, start_indent + 1);
 
-                if (p.hosted.span.len > 0) {
+                if (p.hosted.span.len > 0 or fmt.regionHasInteriorComment(p.hosted.region)) {
                     try fmt.ensureNewline();
                     fmt.curr_indent = start_indent + 1;
                     try fmt.pushIndent();
@@ -2686,6 +2717,14 @@ const Formatter = struct {
             }
             try fmt.ensureNewline();
             fmt.curr_indent -= 1;
+            try fmt.pushIndent();
+            try fmt.push('}');
+        } else if (fmt.regionHasInteriorComment(block.region)) {
+            try fmt.push('{');
+            fmt.curr_indent += 1;
+            try fmt.flushCommentsBeforeDiscard(fmt.regionClosingToken(block.region).?);
+            fmt.curr_indent -= 1;
+            try fmt.ensureNewline();
             try fmt.pushIndent();
             try fmt.push('}');
         } else {
@@ -2897,7 +2936,7 @@ const Formatter = struct {
                             try fmt.pushAll(", ");
                         }
                     }
-                    // Handle open tag unions - always format as just ".." (silently drop any named extension)
+                    // Handle open tag unions.
                     if (is_open) {
                         // Get the token position for flushing comments before the ..
                         const double_dot_token: Token.Idx = switch (t.ext) {
@@ -2911,6 +2950,11 @@ const Formatter = struct {
                             try fmt.pushIndent();
                         }
                         try fmt.pushAll("..");
+                        switch (t.ext) {
+                            .named => |named| try fmt.formatTypeAnnoDiscard(named.anno),
+                            .open => {},
+                            .closed => unreachable,
+                        }
                         if (tag_multiline) {
                             try fmt.push(',');
                         }
@@ -3009,6 +3053,41 @@ const Formatter = struct {
         const start = if (tokenIdx == 0) 0 else fmt.ast.tokens.resolve(tokenIdx - 1).end.offset;
         const end = fmt.ast.tokens.resolve(tokenIdx).start.offset;
         return std.mem.findScalar(u8, fmt.ast.env.source[start..end], '#') != null;
+    }
+
+    fn regionHasInteriorComment(fmt: *Formatter, region: AST.TokenizedRegion) bool {
+        const close_token = fmt.regionClosingToken(region) orelse return false;
+        if (close_token <= region.start) return false;
+        const start = fmt.ast.tokens.resolve(region.start).end.offset;
+        const end = fmt.ast.tokens.resolve(close_token).start.offset;
+        if (start >= end) {
+            return false;
+        }
+        return std.mem.findScalar(u8, fmt.ast.env.source[start..end], '#') != null;
+    }
+
+    fn regionClosingToken(fmt: *Formatter, region: AST.TokenizedRegion) ?Token.Idx {
+        const tags = fmt.ast.tokens.tokens.items(.tag);
+
+        if (region.end > region.start) {
+            const previous = region.end - 1;
+            if (Formatter.isClosingDelimiter(tags[previous])) {
+                return previous;
+            }
+        }
+
+        if (region.end < tags.len and Formatter.isClosingDelimiter(tags[region.end])) {
+            return region.end;
+        }
+
+        return null;
+    }
+
+    fn isClosingDelimiter(tag: Token.Tag) bool {
+        return switch (tag) {
+            .CloseRound, .CloseSquare, .CloseCurly => true,
+            else => false,
+        };
     }
 
     /// Like `flushCommentsBefore`, but ensures at least `min_leading_newlines` newlines
@@ -3703,6 +3782,82 @@ test "single multiline collection literal method args keep call paren tight" {
         "\t\tx: 1,\n" ++
         "\t\ty: 2,\n" ++
         "\t})\n";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "issue 9939: named open tag union type variable is preserved" {
+    const result = try moduleFmtsStable(std.testing.allocator, "T(a) : [..a]", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("T(a) : [..a]\n", result);
+}
+
+test "issue 9940: comments in empty collections and blocks are preserved" {
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\test = |{}| {
+        \\    # Some informational comment on why this is empty
+        \\}
+        \\empty_list = [
+        \\    # Keeping this list item disabled
+        \\]
+        \\empty_record = {
+        \\    # Keeping this record field disabled
+        \\}
+    , false);
+    defer std.testing.allocator.free(result);
+
+    const expected =
+        "test = |{}| {\n" ++
+        "\t# Some informational comment on why this is empty\n" ++
+        "}\n" ++
+        "\n" ++
+        "empty_list = [\n" ++
+        "\t# Keeping this list item disabled\n" ++
+        "]\n" ++
+        "\n" ++
+        "empty_record = {\n" ++
+        "\t# Keeping this record field disabled\n" ++
+        "}\n";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "issue 9940: comments in platform header sections are preserved" {
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\platform "pf"
+        \\    requires {}
+        \\    exposes [
+        \\        # Stderr,
+        \\    ]
+        \\    packages {
+        \\        # This is where all the package stuff goes
+        \\    }
+        \\    provides {
+        \\        "roc_init": init_for_host!,
+        \\        # "roc_generate": generate_for_host!,
+        \\    }
+        \\    hosted {
+        \\        "hosted_stderr_line": Stderr.line!,
+        \\        # "hosted_event_queue_enqueue": EventQueue.enqueue!
+        \\    }
+    , false);
+    defer std.testing.allocator.free(result);
+
+    const expected =
+        "platform \"pf\"\n" ++
+        "\trequires {}\n" ++
+        "\texposes [\n" ++
+        "\t\t# Stderr,\n" ++
+        "\t]\n" ++
+        "\tpackages {\n" ++
+        "\t\t# This is where all the package stuff goes\n" ++
+        "\t}\n" ++
+        "\tprovides {\n" ++
+        "\t\t\"roc_init\": init_for_host!,\n" ++
+        "\t\t# \"roc_generate\": generate_for_host!,\n" ++
+        "\t}\n" ++
+        "\thosted {\n" ++
+        "\t\t\"hosted_stderr_line\": Stderr.line!,\n" ++
+        "\t\t# \"hosted_event_queue_enqueue\": EventQueue.enqueue!\n" ++
+        "\t}\n";
     try std.testing.expectEqualStrings(expected, result);
 }
 
