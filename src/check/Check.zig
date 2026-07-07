@@ -148,8 +148,6 @@ u64_var: Var,
 builtin_types_copied: bool,
 /// Map representation of Ident -> Var, used in checking static dispatch constraints
 ident_to_var_map: std.AutoHashMap(Ident.Idx, Var),
-/// Checker-local source-site mapping for method/equality rewrites.
-constraint_expr_by_fn_var: std.AutoHashMap(Var, CIR.Expr.Idx),
 /// Hidden field-access expressions preallocated for method-call nodes. If a
 /// method call resolves to a record field function, the checker rewrites the
 /// method call to an ordinary call using this field access as the callee.
@@ -163,8 +161,10 @@ interpolation_constraint_metadata: std.ArrayListUnmanaged(InterpolationConstrain
 /// constraint failing in multiple passes (or reachable through several aliased
 /// type variables) is reported once.
 reported_constraint_errors: std.AutoHashMap(ReportedConstraintError, void),
-/// Static dispatch constraints created while checking an expect body.
-expect_region_by_constraint_fn_var: std.AutoHashMap(Var, Region),
+/// Constraint fn vars already reported as effectful dispatches in an expect
+/// body, so a constraint revisited across passes is reported once (replaces the
+/// old expect_region side table's fetchRemove dedup).
+reported_effectful_expect: std.AutoHashMap(Var, void),
 /// Region of the expect body currently being checked, if any.
 current_expect_region: ?Region,
 /// Map representation all top level patterns, and if we've processed them yet
@@ -322,40 +322,58 @@ executable_root_defs: std.ArrayListUnmanaged(CIR.Def.Idx),
 /// statement checking record a local binding candidate without storing a result
 /// on the checked expression itself.
 last_hoist_result: ?CompletedHoistResult,
-/// Nonzero while checking a body that is already evaluated as an ordinary
-/// top-level compile-time root. Nested hoisted roots there would only add
-/// metadata and duplicate compile-time work.
-hoist_suppressed_depth: u32,
-/// Nonzero while checking a conditionally evaluated expression whose own
-/// eligibility still contributes to an enclosing expression, but whose child
-/// expressions must not become independent compile-time roots.
-hoist_selection_suppressed_depth: u32,
 /// True when canonicalization already recorded diagnostics before type checking.
 /// In that case, we avoid adding "erroneous value" diagnostics during checking
 /// to prevent cascading errors from malformed nodes.
 has_can_diagnostics: bool,
 /// Per-instantiation static-dispatch receivers, recorded so the end-of-check
-/// ambiguity sweep can revisit dispatches hidden inside polymorphic helpers — the
-/// expression-keyed def-site sweep never sees these instantiated receiver vars.
-/// Every time a generalized scheme carrying a non-literal static-dispatch
-/// constraint is instantiated, the freshly created receiver var is recorded here.
-/// After all solving, a recorded receiver that is still flex/rigid, carries a real
-/// non-literal/non-`is_eq` dispatch constraint, and does not resolve into the
-/// pinnable set can never be pinned, so its dispatch is reported as ambiguous.
+/// constraint fixpoint (`checkInstantiatedStaticDispatchConstraints`) can
+/// re-validate instantiated `where`-clause contracts once later call-site
+/// evidence has had its chance to pin them. Every time a generalized scheme
+/// carrying a non-literal static-dispatch constraint is instantiated, the
+/// freshly created receiver var is recorded here (and, separately, on the
+/// ambiguity worklist below).
 instantiation_dispatchers: std.ArrayListUnmanaged(InstantiationDispatcher),
-/// How many `instantiation_dispatchers` the end-of-check sweep has already
+/// Worklist for the local ambiguity judgment. Every dispatch-constrained
+/// receiver var enters this list at the moment it acquires a constraint —
+/// either at a creation site (method call, desugared binop/unaryop,
+/// pattern-literal equality) or when instantiating a constrained scheme
+/// created it. The judgment consumes entries locally: candidates whose var
+/// generalizes are judged at that generalization event (the var is frozen
+/// from then on); candidates left non-generalized (value-restricted bindings,
+/// pre-def instantiations) are judged once at end of check, after the final
+/// constraint fixpoint has had its chance to pin them.
+ambiguity_candidates: std.ArrayListUnmanaged(AmbiguityCandidate),
+/// Index into `ambiguity_candidates` where the currently-processing top-level
+/// def's entries begin. Generalization events scan only from here: entries
+/// below the cursor belong to earlier defs and are either already judged or
+/// awaiting the end-of-check residual judgment.
+ambiguity_candidates_def_start: usize = 0,
+/// Ambiguity verdicts produced by the local judgment, applied (problem
+/// reports + runtime-error poisoning) in one batch at end of check so that
+/// problem order and CIR mutation timing match the settled-state contract the
+/// old end-of-check sweeps established.
+ambiguity_verdicts: std.ArrayListUnmanaged(AmbiguityVerdict),
+/// Cursor into `checked_lambda_params` marking the currently-processing
+/// top-level def's first lambda, so a generalization event's pinnable set
+/// includes exactly this def's lambda parameters.
+checked_lambda_params_def_start: usize = 0,
+/// Cursor into `open_literal_vars` marking the currently-processing top-level
+/// def's first open literal, mirroring `checked_lambda_params_def_start`.
+open_literal_vars_def_start: usize = 0,
+/// How many `instantiation_dispatchers` the end-of-check fixpoint has already
 /// enqueued for validation. Discharging one instantiated constraint can
 /// instantiate further constrained schemes (a generic method target with its
-/// own where clauses); the sweep loops from this cursor until no new
-/// dispatchers appear, so nested obligations are validated to a fixpoint
+/// own where clauses); the fixpoint loops from this cursor until no new
+/// dispatchers appear, so nested obligations are validated to completion
 /// (issue 9892's inner `a.decode` on a concrete type).
 instantiation_dispatchers_checked: usize = 0,
 /// The expression currently being checked (`checkExpr` sets this on entry and
-/// restores it on exit). When `instantiateVarHelp` records an
-/// `InstantiationDispatcher`, it stamps this expression onto it, so the
-/// end-of-check ambiguity sweep can point a body-forced where-clause error at
-/// the exact expression whose instantiation created the unsatisfiable
-/// obligation — without scanning the module to rediscover it.
+/// restores it on exit). When `instantiateVarHelp` records an ambiguity
+/// candidate, it stamps this expression onto it, so an ambiguity verdict can
+/// point a body-forced where-clause error at the exact expression whose
+/// instantiation created the unsatisfiable obligation — without scanning the
+/// module to rediscover it.
 instantiation_source_expr: ?CIR.Expr.Idx = null,
 /// While discharging a static-dispatch constraint, the site that constraint
 /// originated at. Scheme instantiations that copy constrained vars are then
@@ -383,18 +401,21 @@ open_numeral_literals: std.ArrayListUnmanaged(OpenNumeralLiteral),
 /// A later call-site or annotation may resolve the receiver to a concrete tuple;
 /// otherwise the final sweep reports that the tuple arity needs an annotation.
 pending_tuple_accesses: std.ArrayListUnmanaged(PendingTupleAccess),
-/// Scratch for the end-of-check ambiguity sweep: the pinnable set (every
-/// resolved var some caller can still pin). Init-allocated; cleared and reused
-/// each `checkFile`.
+/// Scratch for the ambiguity judgment: the pinnable set (every resolved var
+/// some caller can still pin) of one judgment event. Init-allocated; cleared
+/// and rebuilt per event.
 pinnable_vars: std.AutoHashMap(Var, void),
-/// Scratch for the ambiguity sweep: dispatcher vars already reported, shared
-/// by the per-instantiation and def-site sweeps to avoid double-reporting.
+/// Scratch for the ambiguity verdict apply: dispatcher vars already reported,
+/// shared by the instantiation and creation applies to avoid double-reporting.
 reported_dispatch_vars: std.AutoHashMap(Var, void),
+/// Scratch for the ambiguity verdict apply: the re-validated creation-verdict
+/// receiver vars the node walk flags expressions against.
+ambiguity_verdict_vars: std.AutoHashMap(Var, void),
 /// Scratch for `collectArgPositionVars`: guards its function-ret / alias
 /// spine walk against unbounded recursion.
 pinnable_spine_visited: std.AutoHashMap(Var, void),
-/// Scratch for the ambiguity sweep: vars an outside caller can pin through a
-/// top-level def's argument positions (computed once per `checkFile`).
+/// Scratch for the ambiguity judgment: vars an outside caller can pin through
+/// the judged scheme's argument positions (rebuilt per judgment event).
 external_pinnable: std.AutoHashMap(Var, void),
 /// Scratch for `defaultLiteralsAtGeneralizationBoundary`: reachable-var
 /// closure of the def root(s) being generalized (constraint-signature edges
@@ -444,6 +465,10 @@ bench_probe_refuted: usize = 0,
 /// Union-find roots resolve at consumption time (eager roots would go stale).
 /// Duplicates are harmless — the consumer inserts into a set.
 checked_lambda_params: std.ArrayListUnmanaged(CIR.Pattern.Span),
+/// Lambdas whose bodies actually perform effects. This records direct checker
+/// output so binding-name diagnostics do not infer effectfulness from
+/// annotations that only make a pure body have an effectful function type.
+effectful_lambda_bodies: std.AutoHashMap(CIR.Expr.Idx, void),
 /// Scratch for `beginCommitProbe`: the caller env's var-pool length per rank
 /// at probe start, restored on a failed probe's rollback. One buffer suffices
 /// because commit-probes never nest — but the type store's trail-based
@@ -462,25 +487,69 @@ const DefProcessed = struct {
     status: HasProcessed,
 };
 
-/// A static-dispatch receiver var created by instantiating a constrained scheme.
-/// The end-of-check ambiguity sweep revisits each such receiver: if it is still a
-/// flex/rigid var carrying a real non-literal/non-`is_eq` dispatch constraint and
-/// does not resolve into the pinnable set, no caller can ever pin it, so its
-/// dispatch is ambiguous.
+/// A static-dispatch receiver var created by instantiating a constrained
+/// scheme, recorded for the end-of-check constraint fixpoint
+/// (`checkInstantiatedStaticDispatchConstraints`) to re-validate once later
+/// call-site evidence has had its chance to pin it.
 const InstantiationDispatcher = struct {
     /// The freshly instantiated receiver (dispatcher) var.
     dispatcher_var: Var,
     /// The static-dispatch constraints copied from the generalized scheme.
     constraints: StaticDispatchConstraint.SafeList.Range,
     /// The expression whose checking instantiated this dispatcher (the lookup of
-    /// the constrained scheme). A body-required where-clause whose receiver is
-    /// left unpinnable is reported and marked a runtime error at exactly this
-    /// expression. Null only if the dispatcher was created outside `checkExpr`.
+    /// the constrained scheme). Null only if the dispatcher was created outside
+    /// `checkExpr`.
     instantiation_expr: ?CIR.Expr.Idx,
     /// True when `instantiation_expr` came from the RHS of an explicit discard
-    /// binding (`_ = ...`). A generalized, body-required where-clause created
-    /// there is not an exposed polymorphic obligation; the value has been thrown
-    /// away, so the obligation must be reported and poisoned.
+    /// binding (`_ = ...`). See `AmbiguityCandidate.discarded_binding_rhs`.
+    discarded_binding_rhs: bool,
+};
+
+/// One dispatch-constrained receiver var awaiting the local ambiguity
+/// judgment (see `ambiguity_candidates`).
+const AmbiguityCandidate = struct {
+    /// The receiver (dispatcher) var as recorded at the creation or
+    /// instantiation site. Resolved through the union-find at judgment time —
+    /// unification may have merged it with other receivers since.
+    var_: Var,
+    /// For `.instantiation` candidates: the expression whose checking
+    /// instantiated the constrained scheme (see
+    /// `InstantiationDispatcher.instantiation_expr`). Always null for
+    /// `.creation` candidates.
+    instantiation_expr: ?CIR.Expr.Idx,
+    source: Source,
+    /// See `InstantiationDispatcher.discarded_binding_rhs`.
+    discarded_binding_rhs: bool,
+    /// Set once the candidate has been judged (either verdict or acquittal) so
+    /// later events and the end-of-check residual pass skip it.
+    judged: bool = false,
+
+    const Source = enum(u8) {
+        /// The constraint was created directly at a dispatch expression the
+        /// user wrote (method call, desugared operator, pattern-literal
+        /// equality). Judged under the def-site policy: a declared
+        /// `where_clause` contract or an open literal on the same receiver
+        /// legitimizes it.
+        creation,
+        /// The receiver was created by instantiating a generalized constrained
+        /// scheme. Judged under the per-instantiation policy: an instantiated
+        /// `where_clause` contract is an obligation THIS call had to satisfy,
+        /// gated on an in-module dispatch use or a body-forced contract.
+        instantiation,
+    };
+};
+
+/// A candidate the local judgment found unpinnable at its judgment event. The
+/// verdict is applied — problem report plus runtime-error poisoning — in one
+/// batch at end of check (`applyAmbiguityVerdicts`), where the type store has
+/// fully settled and CIR mutation can no longer perturb later checking.
+const AmbiguityVerdict = struct {
+    /// The receiver var as recorded at its creation/instantiation site (the
+    /// apply step re-resolves; dedup is by resolved root there).
+    var_: Var,
+    /// Copied from the candidate (see `AmbiguityCandidate`).
+    instantiation_expr: ?CIR.Expr.Idx,
+    source: AmbiguityCandidate.Source,
     discarded_binding_rhs: bool,
 };
 
@@ -533,10 +602,30 @@ const LocalRecursiveRef = struct {
     def_name: ?Ident.Idx,
 };
 
+const HoistPosition = enum {
+    /// The expression is inside a body that is already a compile-time root.
+    /// Nested hoisted roots would duplicate compile-time work, and eligibility
+    /// should not feed warnings or enclosing hoist frames.
+    comptime_root,
+    /// The expression may still prove top-level-equivalent for warnings and
+    /// enclosing roots, but it must not become an independent selected root.
+    suppressed,
+    /// The expression is in a structurally unguarded runtime position where
+    /// selected roots may be emitted.
+    eligible,
+
+    fn allowsSelection(self: @This()) bool {
+        return self == .eligible;
+    }
+
+    fn allowsSemanticEligibility(self: @This()) bool {
+        return self != .comptime_root;
+    }
+};
+
 const HoistFrame = struct {
     expr: CIR.Expr.Idx,
-    suppressed: bool,
-    selection_suppressed: bool,
+    hoist_position: HoistPosition,
     binding_rhs: bool,
     binding_pattern: ?CIR.Pattern.Idx,
     candidate_start: usize,
@@ -546,7 +635,7 @@ const HoistFrame = struct {
     has_observable_effect: bool = false,
 
     fn eligible(self: @This()) bool {
-        return !self.suppressed and
+        return self.hoist_position.allowsSemanticEligibility() and
             !self.has_runtime_dependency and
             !self.has_observable_effect;
     }
@@ -557,6 +646,7 @@ const CompletedHoistResult = struct {
     eligible: bool,
     top_level_equivalent: bool,
     has_observable_effect: bool,
+    hoist_position: HoistPosition,
 };
 
 const HoistPatternExtraction = hoist_roots.PatternExtraction;
@@ -1234,12 +1324,11 @@ fn initAssumePrepared(
         .u64_var = undefined,
         .builtin_types_copied = false,
         .ident_to_var_map = std.AutoHashMap(Ident.Idx, Var).init(gpa),
-        .constraint_expr_by_fn_var = std.AutoHashMap(Var, CIR.Expr.Idx).init(gpa),
         .method_field_access_exprs = .{},
         .interpolation_constraint_ids_by_fn_var = std.AutoHashMap(Var, InterpolationConstraintId).init(gpa),
         .interpolation_constraint_metadata = .empty,
         .reported_constraint_errors = std.AutoHashMap(ReportedConstraintError, void).init(gpa),
-        .expect_region_by_constraint_fn_var = std.AutoHashMap(Var, Region).init(gpa),
+        .reported_effectful_expect = std.AutoHashMap(Var, void).init(gpa),
         .current_expect_region = null,
         .top_level_ptrns = std.AutoHashMap(CIR.Pattern.Idx, DefProcessed).init(gpa),
         .platform_requirements = null,
@@ -1268,15 +1357,16 @@ fn initAssumePrepared(
         .selected_hoisted_roots = .empty,
         .executable_root_defs = .empty,
         .last_hoist_result = null,
-        .hoist_suppressed_depth = 0,
-        .hoist_selection_suppressed_depth = 0,
         .has_can_diagnostics = if (cir.store.scratch) |scratch| scratch.diagnostics.top() > 0 else false,
         .instantiation_dispatchers = .empty,
+        .ambiguity_candidates = .empty,
+        .ambiguity_verdicts = .empty,
         .open_literal_vars = .empty,
         .open_numeral_literals = .empty,
         .pending_tuple_accesses = .empty,
         .pinnable_vars = std.AutoHashMap(Var, void).init(gpa),
         .reported_dispatch_vars = std.AutoHashMap(Var, void).init(gpa),
+        .ambiguity_verdict_vars = std.AutoHashMap(Var, void).init(gpa),
         .pinnable_spine_visited = std.AutoHashMap(Var, void).init(gpa),
         .external_pinnable = std.AutoHashMap(Var, void).init(gpa),
         .boundary_reachable_vars = std.AutoHashMap(Var, void).init(gpa),
@@ -1301,6 +1391,7 @@ fn initAssumePrepared(
         .known_empty_payload_vars_destructure = .empty,
         .known_empty_payload_vars_match = .empty,
         .checked_lambda_params = .empty,
+        .effectful_lambda_bodies = std.AutoHashMap(CIR.Expr.Idx, void).init(gpa),
         .probe_var_pool_lens = .empty,
     };
 
@@ -1366,7 +1457,6 @@ pub fn deinit(self: *Self) void {
     self.scratch_deferred_static_dispatch_constraints.deinit();
     self.import_cache.deinit(self.gpa);
     self.ident_to_var_map.deinit();
-    self.constraint_expr_by_fn_var.deinit();
     self.method_field_access_exprs.deinit(self.gpa);
     self.interpolation_constraint_ids_by_fn_var.deinit();
     for (self.interpolation_constraint_metadata.items) |meta| {
@@ -1374,7 +1464,7 @@ pub fn deinit(self: *Self) void {
     }
     self.interpolation_constraint_metadata.deinit(self.gpa);
     self.reported_constraint_errors.deinit();
-    self.expect_region_by_constraint_fn_var.deinit();
+    self.reported_effectful_expect.deinit();
     self.top_level_ptrns.deinit();
     self.platform_required_defs.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
@@ -1383,12 +1473,15 @@ pub fn deinit(self: *Self) void {
     self.deferred_def_unifications.deinit(self.gpa);
     self.deferred_platform_required_unifications.deinit(self.gpa);
     self.instantiation_dispatchers.deinit(self.gpa);
+    self.ambiguity_candidates.deinit(self.gpa);
+    self.ambiguity_verdicts.deinit(self.gpa);
     self.scratch_evidence_pairs.deinit(self.gpa);
     self.open_literal_vars.deinit(self.gpa);
     self.open_numeral_literals.deinit(self.gpa);
     self.pending_tuple_accesses.deinit(self.gpa);
     self.pinnable_vars.deinit();
     self.reported_dispatch_vars.deinit();
+    self.ambiguity_verdict_vars.deinit();
     self.pinnable_spine_visited.deinit();
     self.external_pinnable.deinit();
     self.boundary_reachable_vars.deinit();
@@ -1413,6 +1506,7 @@ pub fn deinit(self: *Self) void {
     self.known_empty_payload_vars_destructure.deinit(self.gpa);
     self.known_empty_payload_vars_match.deinit(self.gpa);
     self.checked_lambda_params.deinit(self.gpa);
+    self.effectful_lambda_bodies.deinit();
     self.probe_var_pool_lens.deinit(self.gpa);
 }
 
@@ -1428,11 +1522,10 @@ pub fn addExecutableRootDef(self: *Self, def_idx: CIR.Def.Idx) Allocator.Error!v
     try self.executable_root_defs.append(self.gpa, def_idx);
 }
 
-fn beginHoistFrame(self: *Self, expr: CIR.Expr.Idx, binding_rhs: bool) Allocator.Error!HoistFrameGuard {
+fn beginHoistFrame(self: *Self, expr: CIR.Expr.Idx, binding_rhs: bool, hoist_position: HoistPosition) Allocator.Error!HoistFrameGuard {
     try self.hoist_frames.append(self.gpa, .{
         .expr = expr,
-        .suppressed = self.hoist_suppressed_depth != 0,
-        .selection_suppressed = self.hoist_selection_suppressed_depth != 0,
+        .hoist_position = hoist_position,
         .binding_rhs = binding_rhs,
         .binding_pattern = if (binding_rhs) self.checking_binding_rhs_pattern else null,
         .candidate_start = self.hoist_expr_candidates.items.len,
@@ -1474,16 +1567,16 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
     const top_level_equivalent = semantically_eligible and !frame.has_contextual_dependency;
     const can_be_root = top_level_equivalent and self.exprCanBeHoistedRoot(expr);
     const can_cover_children = top_level_equivalent and self.exprCanCoverHoistedChildren(expr);
-    const selection_suppressed = frame.suppressed or frame.selection_suppressed;
+    const selection_allowed = frame.hoist_position.allowsSelection();
     const binding_rhs_can_cover_children = frame.binding_rhs and
         top_level_equivalent and
-        !selection_suppressed and
+        selection_allowed and
         self.exprCanBeHoistedBindingRoot(expr) and
         !isFunctionDef(&self.cir.store, self.cir.store.getExpr(expr)) and
         !self.varIsFunctionType(ModuleEnv.varFrom(expr));
     const current_covers_children = (can_cover_children and !frame.binding_rhs) or binding_rhs_can_cover_children;
     const has_child_candidates = self.hoist_expr_candidates.items.len > frame.candidate_start;
-    const action: HoistSelectionAction = if (selection_suppressed)
+    const action: HoistSelectionAction = if (!selection_allowed)
         .suppress_children
     else if (current_covers_children)
         .cover_with_current_root
@@ -1493,14 +1586,14 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         .drop_empty;
     const should_flush_child_candidates = action == .flush_child_candidates;
     const should_bubble_to_parent = frame_index != 0 and
-        can_be_root and !frame.binding_rhs and !selection_suppressed;
+        can_be_root and !frame.binding_rhs and selection_allowed;
     if (should_bubble_to_parent) {
         try self.hoist_expr_candidates.ensureUnusedCapacity(self.gpa, 1);
     }
 
     const should_flush_deferred_binding_dependencies = frame.binding_rhs and
         !binding_rhs_can_cover_children and
-        !selection_suppressed and
+        selection_allowed and
         self.hoist_deferred_binding_dependencies.items.len > frame.deferred_dependency_start;
     if (should_flush_child_candidates or should_flush_deferred_binding_dependencies) {
         var transaction = HoistSelectionTransaction.init(self);
@@ -1540,6 +1633,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         .eligible = semantically_eligible,
         .top_level_equivalent = top_level_equivalent,
         .has_observable_effect = frame.has_observable_effect,
+        .hoist_position = frame.hoist_position,
     };
     self.last_hoist_result = completed;
 
@@ -1547,7 +1641,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         const parent = &self.hoist_frames.items[frame_index - 1];
         if (!completed.eligible) {
             parent.has_runtime_dependency = true;
-        } else if (can_be_root and !frame.binding_rhs and !selection_suppressed) {
+        } else if (can_be_root and !frame.binding_rhs and selection_allowed) {
             self.hoist_expr_candidates.appendAssumeCapacity(expr);
         }
     }
@@ -1564,12 +1658,6 @@ fn markCurrentHoistRuntimeDependency(self: *Self) void {
 fn markCurrentHoistObservableEffect(self: *Self) void {
     if (self.hoist_frames.items.len == 0) return;
     self.hoist_frames.items[self.hoist_frames.items.len - 1].has_observable_effect = true;
-}
-
-fn checkExprWithHoistSelectionSuppressed(self: *Self, expr: CIR.Expr.Idx, env: *Env, expected: Expected) Allocator.Error!bool {
-    self.hoist_selection_suppressed_depth += 1;
-    defer self.hoist_selection_suppressed_depth -= 1;
-    return try self.checkExpr(expr, env, expected);
 }
 
 fn checkedExprBlocksLaterHoists(self: *const Self, expr: CIR.Expr.Idx, does_fx: bool) bool {
@@ -1599,10 +1687,16 @@ fn warnIfComptimeConditionalExpr(
     } });
 }
 
-fn recordHoistBindingCandidate(self: *Self, pattern: CIR.Pattern.Idx, expr: CIR.Expr.Idx) Allocator.Error!void {
-    if (self.hoist_suppressed_depth != 0 or self.hoist_selection_suppressed_depth != 0) return;
+fn recordHoistBindingCandidate(
+    self: *Self,
+    pattern: CIR.Pattern.Idx,
+    expr: CIR.Expr.Idx,
+    hoist_position: HoistPosition,
+) Allocator.Error!void {
     const completed = self.last_hoist_result orelse return;
-    if (completed.expr != expr or !completed.top_level_equivalent) return;
+    if (completed.expr != expr) return;
+    if (builtin.mode == .Debug) std.debug.assert(completed.hoist_position == hoist_position);
+    if (!completed.hoist_position.allowsSelection() or !completed.top_level_equivalent) return;
     if (!self.patternCanOwnHoistedBindingRoot(pattern)) return;
     if (!self.exprCanBeHoistedBindingRoot(expr)) return;
     if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(expr))) return;
@@ -1631,10 +1725,16 @@ fn recordHoistBindingCandidate(self: *Self, pattern: CIR.Pattern.Idx, expr: CIR.
     };
 }
 
-fn recordHoistPatternProvenance(self: *Self, pattern: CIR.Pattern.Idx, expr: CIR.Expr.Idx) Allocator.Error!void {
-    if (self.hoist_suppressed_depth != 0 or self.hoist_selection_suppressed_depth != 0) return;
+fn recordHoistPatternProvenance(
+    self: *Self,
+    pattern: CIR.Pattern.Idx,
+    expr: CIR.Expr.Idx,
+    hoist_position: HoistPosition,
+) Allocator.Error!void {
     const completed = self.last_hoist_result orelse return;
-    if (completed.expr != expr or !completed.top_level_equivalent) return;
+    if (completed.expr != expr) return;
+    if (builtin.mode == .Debug) std.debug.assert(completed.hoist_position == hoist_position);
+    if (!completed.hoist_position.allowsSelection() or !completed.top_level_equivalent) return;
     if (!self.exprCanBeHoistedBindingRoot(expr)) return;
     if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(expr))) return;
     if (self.varIsFunctionType(ModuleEnv.varFrom(expr))) return;
@@ -1690,6 +1790,7 @@ fn recordHoistSingleBranchMatchPatternProvenance(
     match: CIR.Expr.Match,
     branch: CIR.Expr.Match.Branch,
     branch_patterns: []const CIR.Expr.Match.BranchPattern.Idx,
+    hoist_position: HoistPosition,
 ) Allocator.Error!void {
     if (match.is_try_suffix) return;
     if (match.branches.span.len != 1) return;
@@ -1700,7 +1801,7 @@ fn recordHoistSingleBranchMatchPatternProvenance(
     if (branch_pattern.degenerate) return;
     if (!self.patternIsIrrefutableForHoistExtraction(branch_pattern.pattern)) return;
 
-    try self.recordHoistPatternProvenance(branch_pattern.pattern, match.cond);
+    try self.recordHoistPatternProvenance(branch_pattern.pattern, match.cond, hoist_position);
 }
 
 fn patternIsIrrefutableForHoistExtraction(self: *Self, pattern: CIR.Pattern.Idx) bool {
@@ -2358,8 +2459,6 @@ const HoistSelectionTestState = struct {
         checker.hoist_invalidated_exprs = .{};
         checker.selected_hoisted_roots = .empty;
         checker.last_hoist_result = null;
-        checker.hoist_suppressed_depth = 0;
-        checker.hoist_selection_suppressed_depth = 0;
         return .{
             .checker = checker,
             .allocator = allocator,
@@ -2477,7 +2576,7 @@ test "hoist frame finish leaves child candidates unchanged when selection alloca
     defer state.deinit();
     const child_expr = try state.borrowCheckedContext(&test_env.checker);
 
-    var guard = try state.checker.beginHoistFrame(parent_expr, false);
+    var guard = try state.checker.beginHoistFrame(parent_expr, false, .eligible);
     defer guard.deinit();
     try state.checker.hoist_expr_candidates.append(std.testing.allocator, child_expr);
     state.checker.markCurrentHoistRuntimeDependency();
@@ -2503,6 +2602,31 @@ test "hoist frame finish leaves child candidates unchanged when selection alloca
     try std.testing.expectEqual(@as(?CIR.Pattern.Idx, null), state.checker.selected_hoisted_roots.items[0].pattern);
 }
 
+test "fresh expected context suppresses hoist selection by default" {
+    try std.testing.expectEqual(HoistPosition.suppressed, Expected.none().hoist_position);
+
+    const parent_expr: CIR.Expr.Idx = @enumFromInt(1);
+    const TestEnv = @import("test/TestEnv.zig");
+    var test_env = try TestEnv.initExpr("HoistSelection", "1.I64");
+    defer test_env.deinit();
+    try test_env.assertNoErrors();
+
+    var state = HoistSelectionTestState.init(std.testing.allocator);
+    defer state.deinit();
+    const child_expr = try state.borrowCheckedContext(&test_env.checker);
+
+    var guard = try state.checker.beginHoistFrame(parent_expr, false, Expected.none().hoist_position);
+    defer guard.deinit();
+    try state.checker.hoist_expr_candidates.append(std.testing.allocator, child_expr);
+    state.checker.markCurrentHoistRuntimeDependency();
+
+    try guard.finish(false);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.hoist_frames.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.hoist_expr_candidates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.selected_hoisted_roots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.hoist_selected_exprs.count());
+}
+
 test "hoist frame finish is atomic when child flush precedes deferred dependency failure" {
     const parent_expr: CIR.Expr.Idx = @enumFromInt(1);
     const dependency_pattern: CIR.Pattern.Idx = @enumFromInt(2);
@@ -2518,7 +2642,7 @@ test "hoist frame finish is atomic when child flush precedes deferred dependency
         const child_expr = try state.borrowCheckedContext(&test_env.checker);
 
         state.checker.checking_binding_rhs_pattern = null;
-        var guard = try state.checker.beginHoistFrame(parent_expr, true);
+        var guard = try state.checker.beginHoistFrame(parent_expr, true, .eligible);
         defer guard.deinit();
         try state.checker.hoist_expr_candidates.append(std.testing.allocator, child_expr);
         try state.checker.hoist_deferred_binding_dependencies.append(std.testing.allocator, dependency_pattern);
@@ -3313,7 +3437,7 @@ fn tryResolveStructuralRecordFieldDispatch(
     }
 
     const field_var = self.recordTypeFieldVarByName(dispatcher_var, constraint.fn_name) orelse return false;
-    const expr_idx = self.constraintExprForFnVar(constraint.fn_var) orelse return false;
+    const expr_idx = constraintIntroExpr(constraint) orelse return false;
     const expr_region = self.cir.store.getExprRegion(expr_idx);
 
     const dispatch_call = switch (self.cir.store.getExpr(expr_idx)) {
@@ -3586,13 +3710,14 @@ fn instantiateVarHelp(
             // Register newly instantiated open-literal flex vars on the worklist
             // so the defaulting passes see them. Separately, a fresh flex
             // receiver carrying a non-literal static-dispatch constraint is
-            // a per-instantiation dispatcher: record it so the end-of-check sweep
-            // can decide its ambiguity per-instantiation. This hook closes the
-            // holes where a polymorphic helper hides an ambiguous dispatch that
-            // only manifests at an unpinned call site. We only RECORD here, not
-            // enqueue a deferred re-check: the normal constraint solver already
-            // validates the receiver once this call's arguments unify, so an extra
-            // enqueue would only double-process and shift error attribution.
+            // a per-instantiation dispatcher: record it for the end-of-check
+            // constraint fixpoint and as an ambiguity candidate. This hook
+            // closes the holes where a polymorphic helper hides an ambiguous
+            // dispatch that only manifests at an unpinned call site. We only
+            // RECORD here, not enqueue a deferred re-check: the normal
+            // constraint solver already validates the receiver once this
+            // call's arguments unify, so an extra enqueue would only
+            // double-process and shift error attribution.
             if (fresh_resolved.desc.content == .flex) {
                 const flex = fresh_resolved.desc.content.flex;
                 if (flex.constraints.len() > 0) {
@@ -3616,6 +3741,12 @@ fn instantiateVarHelp(
                             .instantiation_expr = self.discarded_binding_rhs_expr orelse self.instantiation_source_expr,
                             .discarded_binding_rhs = self.discarded_binding_rhs_expr != null,
                         });
+                        try self.recordAmbiguityCandidate(
+                            fresh_var,
+                            .instantiation,
+                            self.discarded_binding_rhs_expr orelse self.instantiation_source_expr,
+                            self.discarded_binding_rhs_expr != null,
+                        );
                     }
                 }
             }
@@ -5169,31 +5300,17 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
 
     try self.checkPlatformHostedSection();
 
-    // Two coordinated ambiguity sweeps share a `reported` set keyed by resolved
-    // dispatcher var so a receiver caught per-instantiation is not also reported
-    // by the def-site sweep. The per-instantiation sweep runs first because it
-    // produces the more informative two-region diagnostic; the def-site sweep then
-    // covers the direct cases (`poly().to_i128()`, `poly() == poly()`) where the
-    // dispatch is created at the use site rather than copied by an instantiation.
-    self.reported_dispatch_vars.clearRetainingCapacity();
-
-    // The external pinnable set: every resolved var reachable through a function
-    // ARGUMENT position of a top-level def, including argument positions of
-    // function values returned by that def. These are the vars an outside caller
-    // can still pin after this module is checked.
-    self.external_pinnable.clearRetainingCapacity();
-    try self.collectExternalPinnableVars(&self.external_pinnable);
-
-    // The full pinnable set additionally includes direct lambda parameters. That
-    // remains correct for direct dispatch expressions on uncalled function values:
-    // a future call can pin such a parameter. Instantiated where-clause contracts
-    // use only `external_pinnable`, because the call that instantiated the
-    // contract must satisfy it now.
-    self.pinnable_vars.clearRetainingCapacity();
-    try self.collectPinnableVars(&self.pinnable_vars, &self.external_pinnable);
-
-    try self.reportAmbiguousStaticDispatchPerInstantiation(&self.reported_dispatch_vars, &self.pinnable_vars, &self.external_pinnable);
-    try self.reportAmbiguousStaticDispatch(&self.reported_dispatch_vars, &self.pinnable_vars);
+    // Ambiguity was judged locally as each definition generalized (see
+    // `judgeAmbiguityCandidatesAtGeneralization`). Two steps remain, both
+    // gated on recorded worklist data and skipped entirely for a clean module:
+    // judge the residual candidates that never generalized (value-restricted
+    // bindings stay open to pinning by later defs and the final constraint
+    // fixpoint, so they can only be judged here, at the settled state), then
+    // apply every verdict — problem reports plus runtime-error poisoning — in
+    // one batch so problem order and CIR mutation keep the settled-state
+    // contract the sweeps they replace established.
+    try self.judgeResidualAmbiguityCandidates();
+    try self.applyAmbiguityVerdicts();
 
     try self.reportPolymorphicExecutableRootResults();
 
@@ -6304,84 +6421,379 @@ fn hoistedRootRecordDependenciesAreKept(
     return true;
 }
 
-/// Populate `pinnable` with every resolved var that an outside caller can still
-/// pin through a top-level def's function argument positions. Curried/returned
-/// function arguments count too, because calling the returned function supplies
-/// those arguments later.
-fn collectExternalPinnableVars(self: *Self, pinnable: *std.AutoHashMap(Var, void)) std.mem.Allocator.Error!void {
-    // Shared across all defs of this one-shot pass; arg structure is already
-    // deduped via `pinnable` inside collectReachableVars.
+/// Build the two pinnable sets for one ambiguity-judgment event into
+/// `self.external_pinnable` and `self.pinnable_vars`.
+///
+/// `external_pinnable` holds every resolved var reachable through a function
+/// ARGUMENT position of the given scheme roots — the vars a future caller can
+/// still pin by choosing arguments. `pinnable_vars` additionally includes:
+///
+/// - Everything reachable through a still-open literal's constraint
+///   signatures. Open literals are never dead ends: defaulting resolves them,
+///   the deferred dispatch fires, and the resolved method's signature pins
+///   every var in the constraint fn — return position included. Without this,
+///   an instantiated helper's RETURN var (`add_x(5)` with
+///   `add_x : a -> r where [a.plus : (a, x) -> r]`) was falsely reported
+///   MISSING METHOD. Generalized entries are deliberately NOT skipped: a
+///   generalized literal stays open and resolves per instantiation, which is
+///   exactly why its chain is pinnable.
+/// - Everything reachable from the given lambda parameter spans (recorded as
+///   each lambda was checked — explicit upstream data): a direct dispatch
+///   hidden inside an uncalled function value can still be pinned when that
+///   function is called.
+///
+/// At a generalization event the inputs are the generalizing definition's own
+/// scheme root, open literals, and lambdas (`*_def_start` cursors); at the
+/// end-of-check residual judgment they are every top-level def and the full
+/// recorded lists.
+fn beginAmbiguityPinnableSets(self: *Self) void {
+    self.external_pinnable.clearRetainingCapacity();
+    // Shared across all roots of one event; arg structure is already deduped
+    // via the set inside collectReachableVars.
     self.pinnable_spine_visited.clearRetainingCapacity();
-
-    for (0..self.cir.all_defs.span.len) |def_offset| {
-        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
-        try self.collectArgPositionVars(ModuleEnv.varFrom(def_idx), pinnable, &self.pinnable_spine_visited);
-    }
 }
 
-/// Populate the broader direct-dispatch pinnable set. It starts with external
-/// pinnable vars, then adds every var reachable from lambda parameters because a
-/// direct dispatch hidden inside an uncalled function value can still be pinned
-/// when that function is called.
-fn collectPinnableVars(
+/// Add one scheme root's argument-position closure to `external_pinnable`.
+/// See `finishAmbiguityPinnableSets`.
+fn addAmbiguityPinnableRoot(self: *Self, scheme_root: Var) std.mem.Allocator.Error!void {
+    try self.collectArgPositionVars(scheme_root, &self.external_pinnable, &self.pinnable_spine_visited);
+}
+
+/// Complete the event's pinnable sets after every scheme root has been added.
+fn finishAmbiguityPinnableSets(
     self: *Self,
-    pinnable: *std.AutoHashMap(Var, void),
-    external_pinnable: *std.AutoHashMap(Var, void),
+    open_literal_vars: []const Var,
+    lambda_param_spans: []const CIR.Pattern.Span,
 ) std.mem.Allocator.Error!void {
-    var external_iter = external_pinnable.keyIterator();
+    self.pinnable_vars.clearRetainingCapacity();
+    var external_iter = self.external_pinnable.keyIterator();
     while (external_iter.next()) |var_| {
-        try pinnable.put(var_.*, {});
+        try self.pinnable_vars.put(var_.*, {});
     }
 
-    // Open literals are never dead ends: defaulting resolves them, the deferred
-    // dispatch fires, and the resolved method's signature pins every var in the
-    // constraint fn — return position included. So each still-open literal seeds
-    // the closure with everything reachable through its constraint signatures.
-    // Without this, an instantiated helper's RETURN var (`add_x(5)` with
-    // `add_x : a -> r where [a.plus : (a, x) -> r]`) was falsely reported MISSING
-    // METHOD. Generalized entries are deliberately NOT skipped: a generalized
-    // literal stays open and resolves per instantiation, which is exactly why its
-    // chain is pinnable.
-    for (self.open_literal_vars.items) |literal_var| {
+    for (open_literal_vars) |literal_var| {
         const resolved = self.types.resolveVar(literal_var);
         if (resolved.desc.content != .flex) continue;
         if (self.varLiteralKind(resolved.var_) == null) continue;
-        try self.collectReachableVars(resolved.var_, pinnable);
+        try self.collectReachableVars(resolved.var_, &self.pinnable_vars);
     }
 
-    // Lambda param spans recorded as each lambda was checked — explicit upstream
-    // data; union-find roots resolve here, where it is meaningful.
-    for (self.checked_lambda_params.items) |arg_span| {
+    for (lambda_param_spans) |arg_span| {
         for (self.cir.store.slicePatterns(arg_span)) |pattern_idx| {
-            try self.collectReachableVars(ModuleEnv.varFrom(pattern_idx), pinnable);
+            try self.collectReachableVars(ModuleEnv.varFrom(pattern_idx), &self.pinnable_vars);
         }
     }
 }
 
-fn constraintExprForFnVar(self: *Self, fn_var: Var) ?CIR.Expr.Idx {
-    if (self.constraint_expr_by_fn_var.count() == 0) return null;
-
-    if (self.constraint_expr_by_fn_var.get(fn_var)) |expr_idx| return expr_idx;
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        if (self.constraint_expr_by_fn_var.get(resolved)) |expr_idx| return expr_idx;
-    }
-
-    return null;
+/// The introducing dispatch expression recorded in a constraint's provenance,
+/// or null for a synthetic constraint with no source expression. This replaces
+/// the `constraint_expr_by_fn_var` side table: provenance is set at creation and
+/// copied verbatim by instantiation and unification, so it travels with the
+/// constraint instead of alongside it in a var-keyed map.
+fn constraintIntroExpr(constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
+    const raw = constraint.provenance.intro_expr.get() orelse return null;
+    return @enumFromInt(raw);
 }
 
-fn expectRegionForFnVar(self: *Self, fn_var: Var) ?Region {
-    if (self.expect_region_by_constraint_fn_var.count() == 0) return null;
+/// Record a dispatch-constrained receiver on the ambiguity worklist (see
+/// `ambiguity_candidates`). The var is stored as recorded and resolved through
+/// the union-find at judgment time, so receivers merged by later unification
+/// are deduplicated by the judgment's reported-var set rather than here.
+fn recordAmbiguityCandidate(
+    self: *Self,
+    receiver_var: Var,
+    source: AmbiguityCandidate.Source,
+    instantiation_expr: ?CIR.Expr.Idx,
+    discarded_binding_rhs: bool,
+) std.mem.Allocator.Error!void {
+    try self.ambiguity_candidates.append(self.gpa, .{
+        .var_ = receiver_var,
+        .instantiation_expr = instantiation_expr,
+        .source = source,
+        .discarded_binding_rhs = discarded_binding_rhs,
+    });
+}
 
-    if (self.expect_region_by_constraint_fn_var.get(fn_var)) |region| return region;
+/// The constraint an ambiguity judgment selects for one candidate receiver,
+/// plus the facts about it the verdict's report needs.
+const AmbiguitySelection = struct {
+    constraint: StaticDispatchConstraint,
+    is_instantiated_where_clause: bool,
+    /// The originating scheme's body provably dispatches this method (see
+    /// `body_required` on the `where_clause` origin).
+    body_forced: bool,
+    /// The in-module dispatch expression that uses this constraint, recovered
+    /// from the constraint's provenance.
+    where_dispatch_use: ?StaticDispatchUse,
+};
 
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        if (self.expect_region_by_constraint_fn_var.get(resolved)) |region| return region;
+/// The origin-policy decision table of the ambiguity judgment: decide whether
+/// a flex/rigid dispatch-constrained receiver is even reportable, and if so
+/// select the constraint to report. Pure with respect to checker state.
+///
+/// For an `.instantiation` candidate (a receiver created by instantiating a
+/// generalized constrained scheme):
+///
+/// - A GENERALIZED receiver whose constraints are ALL `where`-clause contracts
+///   is a valid polymorphic obligation, not a dead end: it is a type parameter
+///   of an exposed generic function (e.g. `a` in
+///   `wrap : a -> a where [a.go : a -> a]`), and any caller that pins the
+///   receiver to a concrete type is responsible for — and separately checked
+///   for — satisfying the contract. Reporting it would wrongly reject a helper
+///   merely dispatched through nested generalized let-defs (issue 9632's
+///   recorded receiver is a stale scheme var promoted by an enclosing
+///   generalization). It IS still reported when it also carries a concrete-use
+///   dispatch (a non-`where`-clause origin such as `plus` from `n + 1`): that
+///   use forces the receiver toward a grounding the contract cannot satisfy
+///   (issue 9657). A generalized all-`where` receiver from a discarded
+///   `_ = ...` binding with a body-forced contract is also reported: the value
+///   was thrown away, so no caller can ever supply the owner (issue 9819).
+/// - A receiver carrying any literal-conversion constraint is skipped:
+///   defaulting owns it (at finalize and at generalization boundaries), and a
+///   generalized literal resolves per instantiation. Essential for numeric
+///   helpers like `|x| x + y` whose receiver carries `desugared_binop` plus
+///   `from_numeral`.
+/// - `is_eq` constraints are skipped: lowering compares structurally with no
+///   owner needed, so a flex `is_eq` placeholder left by valid code
+///   (`[1] == [1]`) is not a dead end. A genuinely ambiguous equality on a
+///   bare flex value (`poly() == poly()`) is caught through its `.creation`
+///   candidate instead, which keys on the expression whose OWN type is the
+///   receiver.
+/// - `to_hash` is deliberately NOT skipped: a structural hash on a concrete
+///   key resolves its receiver before judgment, so what reaches here is a
+///   `to_hash` contract on a genuinely undetermined key (issue 9644) — a real
+///   dead end reported via the body-forced path like any other unsatisfiable
+///   contract.
+/// - An instantiated `where`-clause contract gets priority (it is an explicit
+///   obligation copied from a signature), but needs an in-module dispatch use
+///   or a body-forced contract to be a dead end; a phantom `where`-clause the
+///   body never dispatches is not reported.
+///
+/// For a `.creation` candidate (the constraint was created at a dispatch
+/// expression the user wrote): a `where_clause` constraint on the same
+/// receiver means the dispatch is part of a declared polymorphic contract, and
+/// a literal-conversion constraint means defaulting owns it — either
+/// legitimizes the receiver. Only the remaining un-annotated origins
+/// (`method_call`, `desugared_binop`, `desugared_unaryop`) can produce an
+/// unpinnable flex dispatcher at monomorphization.
+fn selectAmbiguityConstraint(
+    self: *Self,
+    resolved_rank: Rank,
+    constraints: []const StaticDispatchConstraint,
+    source: AmbiguityCandidate.Source,
+    discarded_binding_rhs: bool,
+) Allocator.Error!?AmbiguitySelection {
+    switch (source) {
+        .instantiation => {
+            if (resolved_rank == .generalized) {
+                var all_where_clause = true;
+                var any_body_required_where_clause = false;
+                for (constraints) |c| {
+                    if (c.origin != .where_clause) {
+                        all_where_clause = false;
+                        break;
+                    }
+                    if (c.origin.where_clause.body_required) {
+                        any_body_required_where_clause = true;
+                    }
+                }
+                if (all_where_clause and !(discarded_binding_rhs and any_body_required_where_clause)) return null;
+            }
+
+            var first_where_constraint: ?StaticDispatchConstraint = null;
+            var first_nonliteral_constraint: ?StaticDispatchConstraint = null;
+            var has_literal_constraint = false;
+            for (constraints) |c| {
+                if (self.types.resolveVar(c.fn_var).desc.content == .err) continue;
+                if (isLiteralStaticDispatchOrigin(c.origin)) {
+                    has_literal_constraint = true;
+                } else if (c.fn_name.eql(self.cir.idents.is_eq)) {
+                    continue;
+                } else if (c.origin == .where_clause) {
+                    if (first_where_constraint == null) first_where_constraint = c;
+                } else if (first_nonliteral_constraint == null) {
+                    first_nonliteral_constraint = c;
+                }
+            }
+            if (has_literal_constraint) return null;
+            const constraint = first_where_constraint orelse first_nonliteral_constraint orelse return null;
+
+            const is_instantiated_where_clause = constraint.origin == .where_clause;
+            const body_forced = is_instantiated_where_clause and constraint.origin.where_clause.body_required;
+            const where_dispatch_use = if (is_instantiated_where_clause)
+                try self.findStaticDispatchUseForConstraint(constraint)
+            else
+                null;
+            if (is_instantiated_where_clause and where_dispatch_use == null and !body_forced) return null;
+
+            return .{
+                .constraint = constraint,
+                .is_instantiated_where_clause = is_instantiated_where_clause,
+                .body_forced = body_forced,
+                .where_dispatch_use = where_dispatch_use,
+            };
+        },
+        .creation => {
+            var has_excluded_origin = false;
+            var first_constraint: ?StaticDispatchConstraint = null;
+            for (constraints) |c| {
+                switch (c.origin) {
+                    .from_literal, .where_clause => {
+                        has_excluded_origin = true;
+                    },
+                    .method_call, .desugared_binop, .desugared_unaryop => {
+                        if (first_constraint == null) first_constraint = c;
+                    },
+                }
+            }
+            if (has_excluded_origin) return null;
+            const constraint = first_constraint orelse return null;
+
+            return .{
+                .constraint = constraint,
+                .is_instantiated_where_clause = false,
+                .body_forced = false,
+                .where_dispatch_use = null,
+            };
+        },
     }
+}
 
-    return null;
+/// Judge one candidate whose receiver has frozen (generalized, or settled at
+/// the end-of-check residual pass): if the origin policy selects a reportable
+/// constraint and the receiver resolves into neither pinnable set the event
+/// built, no caller can ever pin it — record a verdict for the batch apply.
+///
+/// An instantiated `where`-clause with an IN-MODULE dispatch use is judged
+/// against the stricter `external_pinnable` set: the method is dispatched on
+/// this receiver here, so this call must satisfy the copied contract now —
+/// lambda parameters inside the already-instantiated call do not count, only
+/// external arguments can still pin it (issue 9657: a receiver pinned to a
+/// type that lacks the method). Everything else uses the broader set: its
+/// dispatch lives in another body (the body-forced hole, issue 9644) or is a
+/// direct dispatch on a value a future call can still pin, so an (even
+/// nested) lambda parameter an enclosing caller can pin is not a dead end.
+fn judgeAmbiguityCandidate(
+    self: *Self,
+    candidate: AmbiguityCandidate,
+    resolved_var: Var,
+    resolved_rank: Rank,
+    constraints_range: StaticDispatchConstraint.SafeList.Range,
+) Allocator.Error!void {
+    const constraints = self.types.sliceStaticDispatchConstraints(constraints_range);
+    const selection = (try self.selectAmbiguityConstraint(
+        resolved_rank,
+        constraints,
+        candidate.source,
+        candidate.discarded_binding_rhs,
+    )) orelse return;
+
+    const active_pinnable = if (selection.is_instantiated_where_clause and selection.where_dispatch_use != null)
+        &self.external_pinnable
+    else
+        &self.pinnable_vars;
+    if (active_pinnable.contains(resolved_var)) return;
+
+    try self.ambiguity_verdicts.append(self.gpa, .{
+        // The candidate's recorded var, not the resolved root: the apply step
+        // re-resolves (dedup is by resolved root there), and a body-forced
+        // report with no instantiation expression takes its region from the
+        // var recorded at the site.
+        .var_ = candidate.var_,
+        .instantiation_expr = candidate.instantiation_expr,
+        .source = candidate.source,
+        .discarded_binding_rhs = candidate.discarded_binding_rhs,
+    });
+}
+
+/// The generalization-time ambiguity rule. Runs immediately after a
+/// definition's type variables are promoted to `generalized` rank (and, for a
+/// recursion cycle, after the deferred def unifications have settled — a
+/// constraint on the function's own type variable that unifies with the
+/// definition's scheme is not ambiguous, the issue 9632 lesson): every
+/// candidate receiver recorded while checking this def whose var just froze
+/// is judged here, against a pinnable frontier local to this one scheme —
+/// its argument positions, its own lambdas' parameters, and its still-open
+/// literals. A candidate left non-generalized may still be pinned by later
+/// defs or the final constraint fixpoint, so it stays on the worklist for the
+/// end-of-check residual judgment.
+fn judgeAmbiguityCandidatesAtGeneralization(self: *Self, scheme_root: Var) Allocator.Error!void {
+    var sets_built = false;
+    for (self.ambiguity_candidates.items[self.ambiguity_candidates_def_start..]) |*candidate| {
+        if (candidate.judged) continue;
+        const resolved = self.types.resolveVar(candidate.var_);
+        const constraints_range = switch (resolved.desc.content) {
+            .flex => |flex| flex.constraints,
+            .rigid => |rigid| rigid.constraints,
+            else => {
+                // Grounded to a concrete type (the constraint was or will be
+                // discharged by ordinary solving) or poisoned to an error —
+                // either way, never ambiguous.
+                candidate.judged = true;
+                continue;
+            },
+        };
+        if (constraints_range.len() == 0) {
+            candidate.judged = true;
+            continue;
+        }
+        if (resolved.desc.rank != .generalized) continue;
+
+        candidate.judged = true;
+        if (!sets_built) {
+            self.beginAmbiguityPinnableSets();
+            try self.addAmbiguityPinnableRoot(scheme_root);
+            try self.finishAmbiguityPinnableSets(
+                self.open_literal_vars.items[self.open_literal_vars_def_start..],
+                self.checked_lambda_params.items[self.checked_lambda_params_def_start..],
+            );
+            sets_built = true;
+        }
+        try self.judgeAmbiguityCandidate(candidate.*, resolved.var_, resolved.desc.rank, constraints_range);
+    }
+}
+
+/// End-of-check residual judgment for candidates that never hit a
+/// generalization event: receivers in value-restricted bindings (which stay
+/// open to pinning by later defs and by the final constraint fixpoint, so
+/// judging them at def finalization would be premature) and instantiations
+/// performed outside any def. Judged once here at the settled state, against
+/// the whole module's remaining open surface — every top-level def's argument
+/// positions plus all recorded lambda parameters and open literals. Gated on
+/// pending candidates: a module whose receivers all resolved or were judged
+/// at generalization does zero work here.
+fn judgeResidualAmbiguityCandidates(self: *Self) Allocator.Error!void {
+    var any_pending = false;
+    for (self.ambiguity_candidates.items) |candidate| {
+        if (!candidate.judged) {
+            any_pending = true;
+            break;
+        }
+    }
+    if (!any_pending) return;
+
+    self.beginAmbiguityPinnableSets();
+    for (0..self.cir.all_defs.span.len) |def_offset| {
+        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
+        try self.addAmbiguityPinnableRoot(ModuleEnv.varFrom(def_idx));
+    }
+    try self.finishAmbiguityPinnableSets(
+        self.open_literal_vars.items,
+        self.checked_lambda_params.items,
+    );
+
+    for (self.ambiguity_candidates.items) |*candidate| {
+        if (candidate.judged) continue;
+        candidate.judged = true;
+        const resolved = self.types.resolveVar(candidate.var_);
+        const constraints_range = switch (resolved.desc.content) {
+            .flex => |flex| flex.constraints,
+            .rigid => |rigid| rigid.constraints,
+            else => continue,
+        };
+        if (constraints_range.len() == 0) continue;
+        try self.judgeAmbiguityCandidate(candidate.*, resolved.var_, resolved.desc.rank, constraints_range);
+    }
 }
 
 fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationConstraintId {
@@ -6395,32 +6807,6 @@ fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationCon
     }
 
     return null;
-}
-
-fn recordConstraintExprForFnVar(
-    self: *Self,
-    fn_var: Var,
-    expr_idx: CIR.Expr.Idx,
-) std.mem.Allocator.Error!void {
-    try self.constraint_expr_by_fn_var.put(fn_var, expr_idx);
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        try self.constraint_expr_by_fn_var.put(resolved, expr_idx);
-    }
-}
-
-fn recordExpectRegionForFnVar(
-    self: *Self,
-    fn_var: Var,
-    region: Region,
-) std.mem.Allocator.Error!void {
-    try self.expect_region_by_constraint_fn_var.put(fn_var, region);
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        try self.expect_region_by_constraint_fn_var.put(resolved, region);
-    }
 }
 
 fn recordInterpolationConstraintIdForFnVar(
@@ -6468,16 +6854,6 @@ fn linkConstraintMetadata(
     left: Var,
     right: Var,
 ) std.mem.Allocator.Error!void {
-    if (self.constraintExprForFnVar(left) orelse self.constraintExprForFnVar(right)) |expr_idx| {
-        try self.recordConstraintExprForFnVar(left, expr_idx);
-        try self.recordConstraintExprForFnVar(right, expr_idx);
-    }
-
-    if (self.expectRegionForFnVar(left) orelse self.expectRegionForFnVar(right)) |region| {
-        try self.recordExpectRegionForFnVar(left, region);
-        try self.recordExpectRegionForFnVar(right, region);
-    }
-
     if (self.interpolationConstraintIdForFnVar(left) orelse self.interpolationConstraintIdForFnVar(right)) |id| {
         try self.recordInterpolationConstraintIdForFnVar(left, id);
         try self.recordInterpolationConstraintIdForFnVar(right, id);
@@ -6485,9 +6861,7 @@ fn linkConstraintMetadata(
 }
 
 fn hasConstraintMetadata(self: *Self) bool {
-    return self.constraint_expr_by_fn_var.count() > 0 or
-        self.expect_region_by_constraint_fn_var.count() > 0 or
-        self.interpolation_constraint_ids_by_fn_var.count() > 0;
+    return self.interpolation_constraint_ids_by_fn_var.count() > 0;
 }
 
 fn instantiatedMetadataVar(self: *Self, var_: Var) Var {
@@ -6502,42 +6876,18 @@ fn copyConstraintMetadata(
 ) std.mem.Allocator.Error!void {
     std.debug.assert(self.hasConstraintMetadata());
 
-    var maybe_expr_idx = self.constraint_expr_by_fn_var.get(old_var);
-    var maybe_region = self.expect_region_by_constraint_fn_var.get(old_var);
     var maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(old_var);
 
-    if (maybe_expr_idx == null or maybe_region == null or maybe_interpolation_id == null) {
+    if (maybe_interpolation_id == null) {
         const resolved_old = self.types.resolveVar(old_var).var_;
         if (resolved_old != old_var) {
-            if (maybe_expr_idx == null) {
-                maybe_expr_idx = self.constraint_expr_by_fn_var.get(resolved_old);
-            }
-            if (maybe_region == null) {
-                maybe_region = self.expect_region_by_constraint_fn_var.get(resolved_old);
-            }
-            if (maybe_interpolation_id == null) {
-                maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(resolved_old);
-            }
+            maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(resolved_old);
         }
     }
 
-    if (maybe_expr_idx == null and maybe_region == null and maybe_interpolation_id == null) return;
+    if (maybe_interpolation_id == null) return;
 
     const resolved_fresh = self.types.resolveVar(fresh_var).var_;
-    if (maybe_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(fresh_var, expr_idx);
-        if (resolved_fresh != fresh_var) {
-            try self.constraint_expr_by_fn_var.put(resolved_fresh, expr_idx);
-        }
-    }
-
-    if (maybe_region) |region| {
-        try self.expect_region_by_constraint_fn_var.put(fresh_var, region);
-        if (resolved_fresh != fresh_var) {
-            try self.expect_region_by_constraint_fn_var.put(resolved_fresh, region);
-        }
-    }
-
     if (maybe_interpolation_id) |old_id| {
         const old_metadata = self.interpolation_constraint_metadata.items[@intFromEnum(old_id)];
         // Remap each interpolated-part var through the instantiation var-map, exactly as
@@ -6564,10 +6914,10 @@ fn copyConstraintMetadata(
 
 fn findStaticDispatchUseForConstraint(
     self: *Self,
-    method_name: Ident.Idx,
-    constraint_fn_var: Var,
+    constraint: StaticDispatchConstraint,
 ) Allocator.Error!?StaticDispatchUse {
-    const expr_idx = self.constraintExprForFnVar(constraint_fn_var) orelse return null;
+    const method_name = constraint.fn_name;
+    const expr_idx = constraintIntroExpr(constraint) orelse return null;
     if (self.cir.store.getExpr(expr_idx) == .e_runtime_error) return null;
 
     switch (self.cir.store.getExpr(expr_idx)) {
@@ -6586,278 +6936,182 @@ fn findStaticDispatchUseForConstraint(
     };
 }
 
-/// Detect ambiguous static dispatch on a per-INSTANTIATION basis. Every time a
-/// generalized scheme carrying a non-literal static-dispatch constraint
-/// is instantiated, `instantiateVarHelp` recorded the freshly created receiver
-/// var here. After all solving, a recorded receiver that is still flex/rigid,
-/// carries a real non-literal/non-`is_eq` dispatch constraint, and does not
-/// resolve into the `pinnable` set can never be pinned by any caller — its
-/// dispatch is genuinely ambiguous and would reach the lowering `dispatchTarget`
-/// invariant. We report it (`MISSING METHOD`) and mark the offending call
-/// expression a runtime error so lowering never reaches that invariant.
+/// Apply the ambiguity verdicts collected by the local judgments: emit each
+/// `MISSING METHOD` problem and mark the offending expressions runtime errors
+/// so lowering never reaches an ownerless dispatch. Applying is batched here,
+/// at the settled end-of-check state, for two reasons: problem order stays
+/// stable (all ambiguity reports follow the other end-of-check reports, as
+/// they always have), and poisoning an expression mid-check would perturb the
+/// checking of everything downstream of it.
 ///
-/// This is the per-instantiation companion to `reportAmbiguousStaticDispatch`:
-/// the latter catches direct/def-site dispatches (the receiver appears directly
-/// in a checked expression's type), while this catches dispatches hidden inside a
-/// polymorphic helper that only become ambiguous at an unpinned call site.
-///
-/// An uncalled helper is never instantiated, so nothing is recorded for it and it
-/// stays clean. A helper instantiated at a concrete type has its recorded receiver
-/// resolved (no longer flex/rigid) by the time this runs, so it stays clean too.
-fn reportAmbiguousStaticDispatchPerInstantiation(
-    self: *Self,
-    reported: *std.AutoHashMap(Var, void),
-    pinnable: *std.AutoHashMap(Var, void),
-    external_pinnable: *std.AutoHashMap(Var, void),
-) std.mem.Allocator.Error!void {
-    if (self.instantiation_dispatchers.items.len == 0) return;
-
-    for (self.instantiation_dispatchers.items) |dispatcher| {
-        const resolved = self.types.resolveVar(dispatcher.dispatcher_var);
-        const constraints_range = switch (resolved.desc.content) {
-            .flex => |flex| flex.constraints,
-            .rigid => |rigid| rigid.constraints,
-            else => continue,
-        };
-        if (constraints_range.len() == 0) continue;
-        if (reported.contains(resolved.var_)) continue;
-
-        // A GENERALIZED dispatcher whose constraints are ALL `where`-clause
-        // contracts is a valid polymorphic obligation, not a dead end: it is a
-        // type parameter of an exposed generic function (e.g. `a` in
-        // `wrap : a -> a where [a.go : a -> a]`), and any caller that pins the
-        // receiver to a concrete type is responsible for — and separately
-        // checked for — satisfying the contract when the receiver grounds to a
-        // non-generalized concrete var. Reporting it here wrongly rejects a
-        // helper that is merely dispatched through nested generalized let-defs
-        // (the recorded receiver is a stale scheme var promoted by an enclosing
-        // generalization; its real call-site uses are recorded separately).
-        //
-        // We still report a generalized dispatcher that ALSO carries a
-        // concrete-use dispatch (a non-`where`-clause origin such as `plus` from
-        // `n + 1`): that use forces the receiver toward a grounding the contract
-        // cannot satisfy (issue 9657 — `plus` forces a numeric type that lacks
-        // `decode`). And a NON-generalized dispatcher is a concrete per-call hole
-        // whose instantiation never supplied the owner (issue 9644), so it is not
-        // skipped here either.
-        if (resolved.desc.rank == .generalized) {
-            var all_where_clause = true;
-            var any_body_required_where_clause = false;
-            for (self.types.sliceStaticDispatchConstraints(constraints_range)) |c| {
-                if (c.origin != .where_clause) {
-                    all_where_clause = false;
-                    break;
-                }
-                if (c.origin.where_clause.body_required) {
-                    any_body_required_where_clause = true;
-                }
-            }
-            if (all_where_clause and !(dispatcher.discarded_binding_rhs and any_body_required_where_clause)) continue;
+/// Verdicts share one dedup set keyed by resolved dispatcher var, so a
+/// receiver judged through several candidates — or reachable through several
+/// aliased vars — is reported once. Instantiation verdicts apply first
+/// because they produce the more informative two-region diagnostic; creation
+/// verdicts then cover the direct cases (`poly().to_i128()`,
+/// `poly() == poly()`) where the dispatch is created at the use site rather
+/// than copied by an instantiation.
+fn applyAmbiguityVerdicts(self: *Self) std.mem.Allocator.Error!void {
+    if (builtin.mode == .Debug) {
+        // The residual judgment just ran: an unjudged candidate here would
+        // mean a dispatch-constrained receiver escaped both the
+        // generalization events and the end-of-check pass — a worklist bug,
+        // and exactly the kind of hole that lets an ambiguous dispatch reach
+        // monotype lowering.
+        for (self.ambiguity_candidates.items) |candidate| {
+            std.debug.assert(candidate.judged);
         }
+    }
 
-        // Pick the constraint to report. Instantiated where-clause contracts get
-        // priority because they are explicit obligations copied from a signature:
-        // once the signature has been instantiated, the current call must either
-        // pin the owner or leave it externally pinnable. Literal-only constraints
-        // are skipped as before because numeric/string defaulting owns them.
-        //
-        //  - literal conversion (`from_numeral`, `from_quote`, or
-        //    `from_interpolation`): checker defaulting owns it (at finalize and at
-        //    generalization boundaries); a generalized literal resolves per
-        //    instantiation. A receiver carrying any literal-origin constraint is
-        //    skipped entirely, matching the def-site sweep — essential for numeric
-        //    helpers like `|x| x + y` whose receiver carries `desugared_binop` (`+`)
-        //    plus `from_numeral`.
-        //  - `is_eq`: structural equality. Lowering compares records/tuples/tag
-        //    unions/lists structurally with no owner needed, so a flex `is_eq`
-        //    receiver placeholder (left at check time by valid code such as
-        //    `[1] == [1]` or `Try.Ok(1) == Try.Ok(1)`, whose real value is concrete)
-        //    is not a dead end. A genuinely ambiguous equality on a bare flex value
-        //    (`poly() == poly()`) is still caught by the def-site sweep, which keys
-        //    on an expression whose OWN type is the bare-flex receiver.
-        //
-        // `to_hash` is deliberately NOT skipped here. A structural hash on a
-        // concrete key (e.g. `Dict.insert({a: 1}, ...)`) resolves its receiver to
-        // a concrete structure, so the receiver never reaches this flex/rigid
-        // sweep at all (it is filtered above). What does reach here is a `to_hash`
-        // contract on a genuinely undetermined key — e.g. the result of
-        // `Dict.join_map(src, |_, _| Dict.empty())`, whose key never grounds
-        // (issue 9644). That is a real dead end and must be reported via the
-        // body-forced path below, exactly like any other unsatisfiable contract.
-        //
-        // What remains — and is reported — is a real method dispatch
-        // (`method_call`/`desugared_unaryop`, a non-equality `desugared_binop`,
-        // or an instantiated `where_clause` contract) that requires a nominal
-        // owner the instantiation never supplied. Def-site where clauses remain
-        // valid polymorphic contracts; a per-instantiation where-clause receiver
-        // has already been copied into a concrete use of that contract, so if it
-        // is not pinnable here, no later caller can supply the missing owner.
-        const constraints = self.types.sliceStaticDispatchConstraints(constraints_range);
-        var first_where_constraint: ?StaticDispatchConstraint = null;
-        var first_nonliteral_constraint: ?StaticDispatchConstraint = null;
-        var has_literal_constraint = false;
-        for (constraints) |c| {
-            if (self.types.resolveVar(c.fn_var).desc.content == .err) continue;
-            if (isLiteralStaticDispatchOrigin(c.origin)) {
-                has_literal_constraint = true;
-            } else if (c.fn_name.eql(self.cir.idents.is_eq)) {
-                continue;
-            } else if (c.origin == .where_clause) {
-                if (first_where_constraint == null) first_where_constraint = c;
-            } else if (first_nonliteral_constraint == null) {
-                first_nonliteral_constraint = c;
-            }
+    if (self.ambiguity_verdicts.items.len == 0) return;
+
+    self.reported_dispatch_vars.clearRetainingCapacity();
+    for (self.ambiguity_verdicts.items) |verdict| {
+        if (verdict.source != .instantiation) continue;
+        try self.applyInstantiationAmbiguityVerdict(verdict);
+    }
+    try self.applyCreationAmbiguityVerdicts();
+}
+
+/// Apply one `.instantiation` ambiguity verdict. The judgment already
+/// established the receiver is unpinnable (see `judgeAmbiguityCandidate`);
+/// everything else is re-derived here at the settled state, because the final
+/// constraint fixpoint and the poison passes ran between judgment and apply —
+/// a receiver they grounded or erred is silently acquitted.
+fn applyInstantiationAmbiguityVerdict(self: *Self, verdict: AmbiguityVerdict) std.mem.Allocator.Error!void {
+    const resolved = self.types.resolveVar(verdict.var_);
+    const constraints_range = switch (resolved.desc.content) {
+        .flex => |flex| flex.constraints,
+        .rigid => |rigid| rigid.constraints,
+        else => return,
+    };
+    if (constraints_range.len() == 0) return;
+    if (self.reported_dispatch_vars.contains(resolved.var_)) return;
+
+    // Re-run the origin-policy selection (see `selectAmbiguityConstraint` for
+    // the decision table) so the reported constraint reflects the settled
+    // state.
+    const constraints = self.types.sliceStaticDispatchConstraints(constraints_range);
+    const selection = (try self.selectAmbiguityConstraint(
+        resolved.desc.rank,
+        constraints,
+        .instantiation,
+        verdict.discarded_binding_rhs,
+    )) orelse return;
+    const constraint = selection.constraint;
+    const is_instantiated_where_clause = selection.is_instantiated_where_clause;
+    const body_forced = selection.body_forced;
+    const where_dispatch_use = selection.where_dispatch_use;
+
+    // Locate the call site that left this receiver undetermined. Instantiated
+    // where-clause contracts carry exact dispatch-expression metadata, so
+    // they can report directly at that call. Ordinary hidden dispatches need
+    // the structural scan: the receiver var is internal to the instantiated
+    // callee type, so no expression's own type IS the receiver. Instead it
+    // flows into one of a call's ARGUMENTS, whose type structurally CONTAINS
+    // it in a DATA position (a tag payload, record field, tuple element, or
+    // nominal argument), never inside a function type. That data-position
+    // requirement distinguishes a genuine hole from a polymorphic function
+    // passed as a value: in `get(none({}))` the receiver is the tag payload
+    // of the `FfiOption` argument and is genuinely undetermined; in
+    // `Str.inspect(f)` where `f = |x| x + 1`, the receiver is `f`'s parameter,
+    // an uncalled function value whose parameter a future call would pin. A
+    // higher-order constraint that IS applied, like the `e_higher_order`
+    // corpus case, is caught through its creation verdict instead.
+    var primary: ?Region = null;
+    var secondary: ?Region = null;
+    var runtime_error_inserted = false;
+    if (is_instantiated_where_clause and where_dispatch_use != null) {
+        const dispatch_use = where_dispatch_use.?;
+        primary = dispatch_use.region;
+        runtime_error_inserted = true;
+
+        if (self.cir.store.getExpr(dispatch_use.expr_idx) != .e_runtime_error) {
+            const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
+                .region = dispatch_use.region,
+            } });
+            try self.replaceExprWithRuntimeError(dispatch_use.expr_idx, diagnostic_idx);
         }
-        const constraint = first_where_constraint orelse blk: {
-            if (has_literal_constraint) continue;
-            break :blk first_nonliteral_constraint orelse continue;
-        };
-        if (has_literal_constraint) continue;
-        const is_instantiated_where_clause = constraint.origin == .where_clause;
-        // A body-forced where-clause (the originating scheme's body provably
-        // dispatches this method) is reportable even with no in-module dispatch
-        // use: an unpinnable instantiated receiver can never gain the owner the
-        // contract requires, so its dispatch is a genuine dead end. A phantom
-        // where-clause (the body never dispatches it) still needs an in-module
-        // dispatch use to be a dead end; without one it is not reported.
-        const body_forced = is_instantiated_where_clause and constraint.origin.where_clause.body_required;
-        const where_dispatch_use = if (is_instantiated_where_clause)
-            try self.findStaticDispatchUseForConstraint(constraint.fn_name, constraint.fn_var)
-        else
-            null;
-        if (is_instantiated_where_clause and where_dispatch_use == null and !body_forced) continue;
-
-        // If the receiver resolves INTO the pinnable set, some caller — at this
-        // call's level or an enclosing one — can pin it, so it is not a dead end.
-        // The receiver of a hidden helper dispatch that the call DID pin unifies
-        // with a lambda parameter (e.g. `outer`'s `x` in `outer = |x| inner(x)`,
-        // pinned at `outer(10)`); the receiver of a genuine hole (`get(none({}))`)
-        // is a fresh instantiated var that unifies with nothing concrete, so it is
-        // absent from the pinnable set and reported.
-        //
-        // A where-clause with an IN-MODULE dispatch use is stricter
-        // (`external_pinnable`): the method is dispatched on this receiver here, so
-        // this call must satisfy the copied contract now — lambda parameters inside
-        // the already-instantiated call do not count, only external arguments can
-        // still pin it. This catches a receiver pinned to a type that lacks the
-        // method (issue 9657). A where-clause with NO in-module use (the body-forced
-        // hole, issue 9644) uses the broader `pinnable` set: its dispatch lives in
-        // another body, so a still-generalizable helper whose receiver is an (even
-        // nested) lambda parameter an enclosing caller can pin is not a dead end —
-        // only a receiver in neither set (a genuine hole) is reported.
-        const active_pinnable = if (is_instantiated_where_clause and where_dispatch_use != null) external_pinnable else pinnable;
-        if (active_pinnable.contains(resolved.var_)) continue;
-
-        // Locate the call site that left this receiver undetermined. Instantiated
-        // where-clause contracts carry exact dispatch-expression metadata, so
-        // they can report directly at that call. Ordinary hidden dispatches need
-        // the structural scan: the receiver var is internal to the instantiated
-        // callee type, so no expression's own type IS the receiver. Instead it
-        // flows into one of a call's ARGUMENTS, whose type structurally CONTAINS
-        // it in a DATA position (a tag payload, record field, tuple element, or
-        // nominal argument), never inside a function type. That data-position
-        // requirement distinguishes a genuine hole from a polymorphic function
-        // passed as a value: in `get(none({}))` the receiver is the tag payload
-        // of the `FfiOption` argument and is genuinely undetermined; in
-        // `Str.inspect(f)` where `f = |x| x + 1`, the receiver is `f`'s parameter,
-        // an uncalled function value whose parameter a future call would pin. A
-        // higher-order constraint that IS applied, like the `e_higher_order`
-        // corpus case, is caught by the def-site sweep instead.
-        var primary: ?Region = null;
-        var secondary: ?Region = null;
-        var runtime_error_inserted = false;
-        if (is_instantiated_where_clause and where_dispatch_use != null) {
-            const dispatch_use = where_dispatch_use.?;
-            primary = dispatch_use.region;
+    } else if (body_forced) {
+        // A body-forced where-clause with no in-module dispatch use (the
+        // unpinned receiver lives only in the instantiating call's result
+        // type, e.g. the `Dict(x, y)` returned by `Dict.join_map(...)`). The
+        // candidate recorded the exact expression whose instantiation created
+        // the obligation, so report there and mark it a runtime error — codegen
+        // then emits a crash instead of reaching the ownerless dispatch.
+        if (verdict.instantiation_expr) |inst_expr| {
+            primary = self.cir.store.getExprRegion(inst_expr);
             runtime_error_inserted = true;
-
-            if (self.cir.store.getExpr(dispatch_use.expr_idx) != .e_runtime_error) {
+            if (self.cir.store.getExpr(inst_expr) != .e_runtime_error) {
                 const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
-                    .region = dispatch_use.region,
+                    .region = primary.?,
                 } });
-                try self.replaceExprWithRuntimeError(dispatch_use.expr_idx, diagnostic_idx);
-            }
-        } else if (body_forced) {
-            // A body-forced where-clause with no in-module dispatch use (the
-            // unpinned receiver lives only in the instantiating call's result
-            // type, e.g. the `Dict(x, y)` returned by `Dict.join_map(...)`). The
-            // dispatcher recorded the exact expression whose instantiation created
-            // the obligation, so report there and mark it a runtime error — codegen
-            // then emits a crash instead of reaching the ownerless dispatch.
-            if (dispatcher.instantiation_expr) |inst_expr| {
-                primary = self.cir.store.getExprRegion(inst_expr);
-                runtime_error_inserted = true;
-                if (self.cir.store.getExpr(inst_expr) != .e_runtime_error) {
-                    const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
-                        .region = primary.?,
-                    } });
-                    try self.replaceExprWithRuntimeError(inst_expr, diagnostic_idx);
-                }
-            } else {
-                // A dispatcher created outside `checkExpr` has no recorded source
-                // expression to mark. This report must remain artifact-blocking for
-                // run paths because there is no explicit runtime-error node for
-                // post-check lowering to consume.
-                primary = self.getRegionAt(dispatcher.dispatcher_var);
+                try self.replaceExprWithRuntimeError(inst_expr, diagnostic_idx);
             }
         } else {
-            var raw_node_idx: u32 = 0;
-            while (raw_node_idx < self.cir.store.nodes.len()) : (raw_node_idx += 1) {
-                const node_idx: CIR.Node.Idx = @enumFromInt(raw_node_idx);
-                if (!isExprNodeTag(self.cir.store.nodes.get(node_idx).tag)) continue;
-
-                const expr_idx: CIR.Expr.Idx = @enumFromInt(raw_node_idx);
-                if (self.cir.store.getExpr(expr_idx) == .e_runtime_error) continue;
-                const call = switch (self.cir.store.getExpr(expr_idx)) {
-                    .e_call => |c| c,
-                    else => continue,
-                };
-
-                var arg_region: ?Region = null;
-                for (self.cir.store.sliceExpr(call.args)) |arg_idx| {
-                    self.var_set.clearRetainingCapacity();
-                    try self.collectDataReachableVars(ModuleEnv.varFrom(arg_idx), &self.var_set);
-                    if (self.var_set.contains(resolved.var_)) {
-                        arg_region = self.cir.store.getExprRegion(arg_idx);
-                        break;
-                    }
-                }
-                if (arg_region == null) continue;
-
-                if (primary == null) {
-                    primary = self.cir.store.getExprRegion(expr_idx);
-                    secondary = arg_region;
-                }
-
-                const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
-                    .region = self.cir.store.getExprRegion(expr_idx),
-                } });
-                try self.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
-                runtime_error_inserted = true;
-            }
+            // A dispatcher created outside `checkExpr` has no recorded source
+            // expression to mark. This report must remain artifact-blocking for
+            // run paths because there is no explicit runtime-error node for
+            // post-check lowering to consume.
+            primary = self.getRegionAt(verdict.var_);
         }
+    } else {
+        var raw_node_idx: u32 = 0;
+        while (raw_node_idx < self.cir.store.nodes.len()) : (raw_node_idx += 1) {
+            const node_idx: CIR.Node.Idx = @enumFromInt(raw_node_idx);
+            if (!isExprNodeTag(self.cir.store.nodes.get(node_idx).tag)) continue;
 
-        // No expression passes the receiver in the relevant position: an ordinary
-        // hidden dispatch whose receiver is a polymorphic function value's own
-        // parameter, which a future call can still pin — not a dead end.
-        if (primary == null) continue;
+            const expr_idx: CIR.Expr.Idx = @enumFromInt(raw_node_idx);
+            if (self.cir.store.getExpr(expr_idx) == .e_runtime_error) continue;
+            const call = switch (self.cir.store.getExpr(expr_idx)) {
+                .e_call => |c| c,
+                else => continue,
+            };
 
-        try reported.put(resolved.var_, {});
+            var arg_region: ?Region = null;
+            for (self.cir.store.sliceExpr(call.args)) |arg_idx| {
+                self.var_set.clearRetainingCapacity();
+                try self.collectDataReachableVars(ModuleEnv.varFrom(arg_idx), &self.var_set);
+                if (self.var_set.contains(resolved.var_)) {
+                    arg_region = self.cir.store.getExprRegion(arg_idx);
+                    break;
+                }
+            }
+            if (arg_region == null) continue;
 
-        const primary_region = primary.?;
-        const snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, resolved.var_);
-        const is_binop = constraint.origin == .desugared_binop;
+            if (primary == null) {
+                primary = self.cir.store.getExprRegion(expr_idx);
+                secondary = arg_region;
+            }
 
-        _ = try self.problems.appendProblem(self.gpa, .{ .static_dispatch = .{ .unresolved_dispatcher = .{
-            .region = primary_region,
-            .secondary_region = secondary,
-            .dispatcher_snapshot = snapshot,
-            .method_name = constraint.fn_name,
-            .is_binop = is_binop,
-            .binop_negated = constraint.origin.binopNegated(),
-            .runtime_error_inserted = runtime_error_inserted,
-        } } });
+            const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
+                .region = self.cir.store.getExprRegion(expr_idx),
+            } });
+            try self.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
+            runtime_error_inserted = true;
+        }
     }
+
+    // No expression passes the receiver in the relevant position: an ordinary
+    // hidden dispatch whose receiver is a polymorphic function value's own
+    // parameter, which a future call can still pin — not a dead end.
+    if (primary == null) return;
+
+    try self.reported_dispatch_vars.put(resolved.var_, {});
+
+    const primary_region = primary.?;
+    const snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, resolved.var_);
+    const is_binop = constraint.origin == .desugared_binop;
+
+    _ = try self.problems.appendProblem(self.gpa, .{ .static_dispatch = .{ .unresolved_dispatcher = .{
+        .region = primary_region,
+        .secondary_region = secondary,
+        .dispatcher_snapshot = snapshot,
+        .method_name = constraint.fn_name,
+        .is_binop = is_binop,
+        .binop_negated = constraint.origin.binopNegated(),
+        .runtime_error_inserted = runtime_error_inserted,
+    } } });
 }
 
 /// Validate the static-dispatch contracts copied out of generalized schemes
@@ -6866,7 +7120,7 @@ fn reportAmbiguousStaticDispatchPerInstantiation(
 /// concrete type, but instantiating a polymorphic where-clause starts with a
 /// fresh constrained flex that may only resolve after later call-site evidence.
 /// Re-checking the recorded range here makes that concrete owner validation
-/// explicit and leaves unresolved cases to the ambiguity sweep below.
+/// explicit and leaves unresolved cases to the ambiguity verdicts.
 fn checkInstantiatedStaticDispatchConstraints(
     self: *Self,
     env: *Env,
@@ -6909,35 +7163,37 @@ fn checkInstantiatedStaticDispatchConstraints(
     }
 }
 
-/// Detect ambiguous static dispatch: a static-dispatch-constrained type variable
-/// that is reachable through no function ARGUMENT position and is no lambda
-/// parameter, so no instantiation can ever pin it down. Such a variable reaches
-/// monomorphization as an unresolved flex/rigid dispatcher, which the lowering
-/// `dispatchTarget` invariant forbids. We catch it here, emit a `MISSING METHOD`
-/// diagnostic, and mark the offending expression a runtime error so lowering
-/// never reaches that invariant.
-///
-/// This runs at the very end of checking, once numeric defaulting, generalization,
-/// recursive-cycle resolution, constraint solving, and the poison passes have all
-/// settled — the same settled-state invariant `reportPolymorphicTopLevelValues`
-/// relies on.
-fn reportAmbiguousStaticDispatch(
-    self: *Self,
-    reported: *std.AutoHashMap(Var, void),
-    pinnable: *std.AutoHashMap(Var, void),
-) std.mem.Allocator.Error!void {
-    // `pinnable` (built by `collectPinnableVars`) holds every resolved var id that
-    // some instantiation can pin: every var reachable through an ARGUMENT position
-    // of a top-level def's generalized type, and every var reachable from a lambda
-    // parameter pattern (local/nested lambdas included).
-    //
-    // Sweep every expression. Flag any whose own type var is a flex/rigid var with
-    // a non-literal static-dispatch constraint and whose resolved id is not
-    // pinnable. Dedup by resolved var id (using the set shared with the
-    // per-instantiation sweep) so a value flowing through multiple expressions — or
-    // already reported per-instantiation — is reported once, preferring the first
-    // (innermost node-order) occurrence, which lands the underline on the dispatch
-    // use.
+/// Apply the `.creation` ambiguity verdicts: for each unpinnable receiver
+/// whose constraint was created directly at a dispatch expression, report at
+/// the first (innermost, node-order) expression whose own type is the
+/// receiver — that lands the underline on the dispatch use — and mark it a
+/// runtime error so lowering never reaches an ownerless dispatch. The node
+/// walk only runs when creation verdicts exist, i.e. on the error path; a
+/// clean module never scans.
+fn applyCreationAmbiguityVerdicts(self: *Self) std.mem.Allocator.Error!void {
+    // Gather the verdict vars, re-resolved at the settled state and
+    // re-validated through the origin-policy selection — the final constraint
+    // fixpoint and poison passes ran between judgment and apply, and a
+    // receiver they grounded or erred is silently acquitted.
+    self.ambiguity_verdict_vars.clearRetainingCapacity();
+    for (self.ambiguity_verdicts.items) |verdict| {
+        if (verdict.source != .creation) continue;
+        const resolved = self.types.resolveVar(verdict.var_);
+        const constraints_range = switch (resolved.desc.content) {
+            .flex => |flex| flex.constraints,
+            .rigid => |rigid| rigid.constraints,
+            else => continue,
+        };
+        if (constraints_range.len() == 0) continue;
+        if (self.reported_dispatch_vars.contains(resolved.var_)) continue;
+        try self.ambiguity_verdict_vars.put(resolved.var_, {});
+    }
+    if (self.ambiguity_verdict_vars.count() == 0) return;
+
+    // Walk expressions in node order; flag any whose own type var is a
+    // verdict receiver. Dedup by resolved var id (using the set shared with
+    // the instantiation verdicts) so a value flowing through multiple
+    // expressions — or already reported per-instantiation — is reported once.
     var raw_node_idx: u32 = 0;
     while (raw_node_idx < self.cir.store.nodes.len()) : (raw_node_idx += 1) {
         const node_idx: CIR.Node.Idx = @enumFromInt(raw_node_idx);
@@ -6947,48 +7203,26 @@ fn reportAmbiguousStaticDispatch(
         if (self.cir.store.getExpr(expr_idx) == .e_runtime_error) continue;
 
         const resolved = self.types.resolveVar(ModuleEnv.varFrom(expr_idx));
+        if (!self.ambiguity_verdict_vars.contains(resolved.var_)) continue;
         const constraints_range = switch (resolved.desc.content) {
             .flex => |flex| flex.constraints,
             .rigid => |rigid| rigid.constraints,
             else => continue,
         };
-        if (constraints_range.len() == 0) continue;
-        if (pinnable.contains(resolved.var_)) continue;
-        if (reported.contains(resolved.var_)) continue;
+        if (self.reported_dispatch_vars.contains(resolved.var_)) continue;
 
-        // Decide whether to flag based on the constraint origins.
-        //
-        // - Literal conversion (`from_numeral`, `from_quote`, or
-        //   `from_interpolation`): the var is an open literal. Defaulting resolves
-        //   it (first satisfier of its constraints; `Dec` when otherwise
-        //   unconstrained) and reports any unsatisfiable conversion separately, so
-        //   it is never flagged here — even when it also carries other constraints
-        //   (e.g. a numeric literal operand of `+` also has a `desugared_binop`).
-        // - `where_clause`: the dispatch is part of an explicit polymorphic
-        //   signature (`f : a -> a where [a.method : ...]`). That is a declared
-        //   contract pinned when callers instantiate the signature, so it is
-        //   legitimate and never flagged.
-        //
-        // Only the remaining un-annotated dispatch origins (`method_call`,
-        // `desugared_binop`, `desugared_unaryop`) can produce an unpinnable flex
-        // dispatcher at monomorphization. Flag using the first such constraint.
+        // Re-select the constraint to report at the settled state (see
+        // `selectAmbiguityConstraint` for the decision table).
         const constraints = self.types.sliceStaticDispatchConstraints(constraints_range);
-        var has_excluded_origin = false;
-        var first_constraint: ?StaticDispatchConstraint = null;
-        for (constraints) |c| {
-            switch (c.origin) {
-                .from_literal, .where_clause => {
-                    has_excluded_origin = true;
-                },
-                .method_call, .desugared_binop, .desugared_unaryop => {
-                    if (first_constraint == null) first_constraint = c;
-                },
-            }
-        }
-        if (has_excluded_origin) continue;
-        const constraint = first_constraint orelse continue;
+        const selection = (try self.selectAmbiguityConstraint(
+            resolved.desc.rank,
+            constraints,
+            .creation,
+            false,
+        )) orelse continue;
+        const constraint = selection.constraint;
 
-        try reported.put(resolved.var_, {});
+        try self.reported_dispatch_vars.put(resolved.var_, {});
 
         const region = self.cir.store.getExprRegion(expr_idx);
         const snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, resolved.var_);
@@ -7006,7 +7240,7 @@ fn reportAmbiguousStaticDispatch(
         } } });
 
         // Mark the expression a runtime error so lowering skips it and never
-        // reaches the `dispatchTarget` invariant.
+        // reaches an ownerless dispatch during monotype lowering.
         const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
             .region = region,
         } });
@@ -7126,7 +7360,7 @@ fn collectReachableVars(self: *Self, var_: Var, out: *std.AutoHashMap(Var, void)
 /// only into data positions (tag payloads, record fields, tuple elements, nominal
 /// args). A var reachable this way is part of the actual data flowing through
 /// `var_`, not a parameter or result of a function value carried by `var_`. The
-/// per-instantiation ambiguity sweep uses this to distinguish a genuinely
+/// instantiation-verdict apply uses this to distinguish a genuinely
 /// undetermined dispatch receiver passed as data (report) from a parameter of an
 /// uncalled polymorphic function value (do not report) — e.g. in `Str.inspect(f)`
 /// where `f = |x| x + 1`, the receiver is `f`'s parameter and the `+`-preserving
@@ -7252,7 +7486,7 @@ fn checkExpectBody(
     self.current_expect_region = expect_region;
     defer self.current_expect_region = saved_expect_region;
 
-    return try self.checkExprWithHoistSelectionSuppressed(body, env, expected.suppressComptimeConditionWarnings());
+    return try self.checkExpr(body, env, expected.suppressComptimeConditionWarnings().suppressHoistSelection());
 }
 
 fn varIsFunctionType(self: *Self, var_: Var) bool {
@@ -7308,6 +7542,25 @@ fn varIsEffectfulFunction(self: *Self, var_: Var) bool {
             .err, .flex, .rigid => return false,
         }
     }
+}
+
+fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool {
+    return switch (self.cir.store.getExpr(expr_idx)) {
+        .e_lambda => self.effectful_lambda_bodies.contains(expr_idx),
+        .e_closure => |closure| self.effectful_lambda_bodies.contains(closure.lambda_idx),
+        .e_hosted_lambda => true,
+        else => false,
+    };
+}
+
+fn checkEffectfulFunctionName(self: *Self, pattern_idx: CIR.Pattern.Idx, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
+    const ident = self.getPatternIdent(pattern_idx) orelse return;
+    if (ident.attributes.effectful) return;
+    if (!self.exprHasEffectfulFunctionBody(expr_idx)) return;
+
+    _ = try self.problems.appendProblem(self.gpa, .{ .effectful_function_name = .{
+        .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(pattern_idx)),
+    } });
 }
 
 fn varHasUnresolvedContent(
@@ -8177,6 +8430,20 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     self.current_processing_def = def_idx;
     defer self.current_processing_def = saved_processing_def;
 
+    // Scope the ambiguity-judgment cursors to this def: a generalization event
+    // inside it judges only candidates recorded while checking it, against a
+    // pinnable frontier built from its own lambda params and open literals.
+    // Saved/restored (not reset) because dependency defs check re-entrantly.
+    const saved_ambiguity_candidates_def_start = self.ambiguity_candidates_def_start;
+    self.ambiguity_candidates_def_start = self.ambiguity_candidates.items.len;
+    defer self.ambiguity_candidates_def_start = saved_ambiguity_candidates_def_start;
+    const saved_checked_lambda_params_def_start = self.checked_lambda_params_def_start;
+    self.checked_lambda_params_def_start = self.checked_lambda_params.items.len;
+    defer self.checked_lambda_params_def_start = saved_checked_lambda_params_def_start;
+    const saved_open_literal_vars_def_start = self.open_literal_vars_def_start;
+    self.open_literal_vars_def_start = self.open_literal_vars.items.len;
+    defer self.open_literal_vars_def_start = saved_open_literal_vars_def_start;
+
     // Make as processing
     const def_name = self.getPatternIdent(def.pattern);
     try self.top_level_ptrns.put(def.pattern, .{
@@ -8230,14 +8497,14 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     // hoisted roots inside them would duplicate compile-time work. Top-level
     // functions are not evaluated as data constants, so their bodies may still
     // contain top-level-equivalent local values.
-    const suppress_nested_hoists = !isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr));
-    if (suppress_nested_hoists) self.hoist_suppressed_depth += 1;
-    defer {
-        if (suppress_nested_hoists) self.hoist_suppressed_depth -= 1;
-    }
+    const def_is_function = isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr));
+    const def_expectation = if (def_is_function)
+        expectation.withHoistPosition(.eligible)
+    else
+        expectation.forComptimeRoot();
     self.checking_binding_rhs = true;
     self.checking_binding_rhs_pattern = def.pattern;
-    const def_does_fx = try self.checkExpr(def.expr, env, expectation);
+    const def_does_fx = try self.checkExpr(def.expr, env, def_expectation);
     if (def.annotation != null) {
         if (platform_required) |required| {
             if (self.defer_generalize) {
@@ -8274,6 +8541,9 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         try self.erroneous_value_patterns.put(self.gpa, def.pattern, {});
     }
     try self.closeAbsentConstructedPayloadVars(def.expr, expr_var);
+    if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr))) {
+        try self.checkEffectfulFunctionName(def.pattern, def.expr);
+    }
 
     if (self.defer_generalize) {
         // defer_generalize is only set when a cycle root has been identified.
@@ -9599,6 +9869,7 @@ const Expected = struct {
     branch_result: ?Var = null,
     return_result: ?Var = null,
     comptime_condition_warnings: enum { emit, suppress } = .emit,
+    hoist_position: HoistPosition = .suppressed,
 
     const ExpectedType = struct {
         var_: Var,
@@ -9620,6 +9891,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9630,6 +9902,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9640,6 +9913,33 @@ const Expected = struct {
             .branch_result = branch_result,
             .return_result = self.return_result orelse branch_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
+        };
+    }
+
+    fn withHoistPosition(self: Expected, hoist_position: HoistPosition) Expected {
+        return .{
+            .annotation = self.annotation,
+            .expected_type = self.expected_type,
+            .branch_result = self.branch_result,
+            .return_result = self.return_result,
+            .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = hoist_position,
+        };
+    }
+
+    fn suppressHoistSelection(self: Expected) Expected {
+        return self.withHoistPosition(.suppressed);
+    }
+
+    fn forComptimeRoot(self: Expected) Expected {
+        return .{
+            .annotation = self.annotation,
+            .expected_type = self.expected_type,
+            .branch_result = self.branch_result,
+            .return_result = self.return_result,
+            .comptime_condition_warnings = .suppress,
+            .hoist_position = .comptime_root,
         };
     }
 
@@ -9648,6 +9948,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = .suppressed,
         };
     }
 
@@ -9655,6 +9956,7 @@ const Expected = struct {
         return .{
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9664,6 +9966,7 @@ const Expected = struct {
             .branch_result = expected_return,
             .return_result = expected_return,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9674,6 +9977,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = .suppress,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -10558,7 +10862,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
     defer trace.end();
 
     // Attribute any dispatcher instantiated while checking this expression to it,
-    // so the ambiguity sweep can pinpoint the source of an unsatisfiable
+    // so an ambiguity verdict can pinpoint the source of an unsatisfiable
     // body-forced where-clause. Restored on exit to track the innermost expr.
     const prev_instantiation_source = self.instantiation_source_expr;
     self.instantiation_source_expr = expr_idx;
@@ -10684,7 +10988,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
     const child_expected = expected.forStatement();
     self.checking_binding_rhs_pattern = binding_rhs_pattern;
     errdefer self.checking_binding_rhs_pattern = null;
-    var hoist_frame = try self.beginHoistFrame(expr_idx, is_binding_rhs);
+    var hoist_frame = try self.beginHoistFrame(expr_idx, is_binding_rhs, expected.hoist_position);
     self.checking_binding_rhs_pattern = null;
     defer hoist_frame.deinit();
 
@@ -11350,7 +11654,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             const compile_time_known_binding = known: {
                 if (self.patternIsTopLevel(lookup.pattern_idx)) break :known true;
-                if (self.hoist_selection_suppressed_depth != 0) {
+                if (expected.hoist_position == .suppressed) {
                     if (self.hoist_known_values.get(lookup.pattern_idx)) |known_value| {
                         switch (known_value) {
                             .pattern_extraction => {
@@ -11426,7 +11730,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Check the final expression
             const final_expr_does_fx = if (stmt_result.blocks_later_hoists)
-                try self.checkExprWithHoistSelectionSuppressed(block.final_expr, env, expected)
+                try self.checkExpr(block.final_expr, env, expected.suppressHoistSelection())
             else
                 try self.checkExpr(block.final_expr, env, expected);
             does_fx = final_expr_does_fx or does_fx;
@@ -11576,13 +11880,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 if (body_is_delayed_dependency) self.delayed_dependency_depth -= 1;
             }
 
+            const lambda_body_expected = Expected.none().withHoistPosition(expected.hoist_position);
             const body_does_fx = if (mb_anno_func) |expected_func| blk: {
-                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, Expected.none().withBranchResult(expected_func.ret));
+                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, lambda_body_expected.withBranchResult(expected_func.ret));
                 try self.closeAbsentConstructedPayloadVars(lambda.body, body_var);
                 _ = try self.unifyInContext(expected_func.ret, body_var, env, anno_context);
                 break :blk lambda_body_does_fx;
             } else blk: {
-                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, Expected.none());
+                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, lambda_body_expected);
                 try self.closeAbsentConstructedPayloadVars(lambda.body, body_var);
                 break :blk lambda_body_does_fx;
             };
@@ -11600,6 +11905,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Create the function type
             if (body_does_fx) {
+                try self.effectful_lambda_bodies.put(expr_idx, {});
                 try self.unifyWith(expr_var, try self.types.mkFuncEffectful(arg_vars, body_var), env);
             } else {
                 try self.unifyWith(expr_var, try self.types.mkFuncUnbound(arg_vars, body_var), env);
@@ -12424,6 +12730,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             self.cycle_root_def = null;
             self.defer_generalize = false;
+
+            // Judge ambiguity only now that the deferred unifications and
+            // cross-function constraints have settled the cycle's scheme: a
+            // constraint on the function's own type variable that unifies
+            // with the definition's scheme is not ambiguous (issue 9632).
+            try self.judgeAmbiguityCandidatesAtGeneralization(expr_var);
         } else if (is_intermediate and at_def_top_level) {
             // Intermediate's top-level lambda: skip generalization.
             // Vars are preserved and will be merged by the cycle root.
@@ -12433,6 +12745,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             // are promoted to generalized.
             try self.defaultLiteralsAtGeneralizationBoundary(expr_var, env);
             try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
+            // The scheme's vars froze at generalized rank: judge this def's
+            // dispatch-constrained receivers now, while the judgment is a
+            // local question about one scheme (see
+            // `judgeAmbiguityCandidatesAtGeneralization`).
+            try self.judgeAmbiguityCandidatesAtGeneralization(expr_var);
         }
     }
 
@@ -13292,7 +13609,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
     var diverges = false;
     var blocks_later_hoists = false;
     var warn_unreachable = false;
-    const statement_expected = expected.forStatement();
+    const base_statement_expected = expected.forStatement();
     for (0..statements.span.len) |stmt_offset| {
         const stmt_idx = self.cir.store.statementAt(statements, stmt_offset);
         const stmt = self.cir.store.getStatement(stmt_idx);
@@ -13307,11 +13624,10 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
 
         try self.setVarRank(stmt_var, env);
 
-        const suppress_statement_hoists = blocks_later_hoists;
-        if (suppress_statement_hoists) self.hoist_selection_suppressed_depth += 1;
-        defer {
-            if (suppress_statement_hoists) self.hoist_selection_suppressed_depth -= 1;
-        }
+        const statement_expected = if (blocks_later_hoists)
+            base_statement_expected.suppressHoistSelection()
+        else
+            base_statement_expected;
 
         var statement_blocks_later_hoists = false;
         switch (stmt) {
@@ -13359,11 +13675,14 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const decl_expr_does_fx = try self.checkExpr(decl_stmt.expr, env, expectation);
                 does_fx = decl_expr_does_fx or does_fx;
                 statement_blocks_later_hoists = self.checkedExprBlocksLaterHoists(decl_stmt.expr, decl_expr_does_fx);
-                try self.recordHoistBindingCandidate(decl_stmt.pattern, decl_stmt.expr);
+                try self.recordHoistBindingCandidate(decl_stmt.pattern, decl_stmt.expr, expectation.hoist_position);
                 if (decl_stmt.anno == null and self.erroneous_value_exprs.contains(decl_stmt.expr)) {
                     try self.erroneous_value_patterns.put(self.gpa, decl_stmt.pattern, {});
                 }
                 try self.closeAbsentConstructedPayloadVars(decl_stmt.expr, decl_expr_var);
+                if (decl_is_fn) {
+                    try self.checkEffectfulFunctionName(decl_stmt.pattern, decl_stmt.expr);
+                }
 
                 // A record-destructure binding gets a dedicated context so the
                 // report can suggest `field: _` or `..` when the pattern is too
@@ -13376,7 +13695,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
 
                 if (decl_pattern_result.isOk()) {
                     try self.checkDestructureExhaustiveness(decl_stmt.pattern, decl_stmt.expr, decl_expr_var, env, stmt_region);
-                    try self.recordHoistPatternProvenance(decl_stmt.pattern, decl_stmt.expr);
+                    try self.recordHoistPatternProvenance(decl_stmt.pattern, decl_stmt.expr, expectation.hoist_position);
                 }
 
                 if (decl_is_fn) {
@@ -13518,7 +13837,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 //     print!($count.toStr())  <<<<
                 //     $count = $count + 1
                 // }
-                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected) or does_fx;
+                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected.suppressHoistSelection()) or does_fx;
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, cond_region);
                 _ = try self.unify(stmt_var, empty_rec, env);
             },
@@ -13532,7 +13851,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const bool_var = try self.freshBool(env, cond_region);
                 _ = try self.unify(bool_var, cond_var, env);
 
-                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected) or does_fx;
+                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected.suppressHoistSelection()) or does_fx;
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, cond_region);
                 _ = try self.unify(stmt_var, empty_rec, env);
             },
@@ -13546,7 +13865,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const bool_var = try self.freshBool(env, cond_region);
                 _ = try self.unify(bool_var, cond_var, env);
 
-                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected) or does_fx;
+                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected.suppressHoistSelection()) or does_fx;
                 try self.unifyWith(stmt_var, .{ .flex = Flex.init() }, env);
                 diverges = true;
             },
@@ -13644,6 +13963,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 try self.unifyWith(stmt_var, .err, env);
             },
             .s_break => {
+                statement_blocks_later_hoists = true;
                 diverges = true;
             },
         }
@@ -13764,7 +14084,7 @@ fn checkIfElseExpr(
     }
 
     // Then we check the 1st branch's body
-    does_fx = try self.checkExprWithHoistSelectionSuppressed(first_branch.body, env, expected.forBranchBody()) or does_fx;
+    does_fx = try self.checkExpr(first_branch.body, env, expected.forBranchBody()) or does_fx;
 
     if (expected_branch_ret) |expected_ret| {
         const branch_ctx = problem.Context{ .if_branch = .{
@@ -13788,7 +14108,7 @@ fn checkIfElseExpr(
         const branch = self.cir.store.getIfBranch(branch_idx);
 
         // Check the branches condition
-        does_fx = try self.checkExpr(branch.cond, env, child_expected) or does_fx;
+        does_fx = try self.checkExpr(branch.cond, env, child_expected.suppressHoistSelection()) or does_fx;
         const cond_var: Var = ModuleEnv.varFrom(branch.cond);
         const branch_bool_var = try self.freshBool(env, expr_region);
         const cond_result = try self.unifyInContext(branch_bool_var, cond_var, env, .if_condition);
@@ -13797,7 +14117,7 @@ fn checkIfElseExpr(
         }
 
         // Check the branch body
-        does_fx = try self.checkExprWithHoistSelectionSuppressed(branch.body, env, expected.forBranchBody()) or does_fx;
+        does_fx = try self.checkExpr(branch.body, env, expected.forBranchBody()) or does_fx;
 
         // Check against expected return type BEFORE pairwise unification
         if (expected_branch_ret) |expected_ret| {
@@ -13824,7 +14144,7 @@ fn checkIfElseExpr(
                 for (branches[cur_index + 1 ..]) |remaining_branch_idx| {
                     const remaining_branch = self.cir.store.getIfBranch(remaining_branch_idx);
 
-                    does_fx = try self.checkExpr(remaining_branch.cond, env, child_expected) or does_fx;
+                    does_fx = try self.checkExpr(remaining_branch.cond, env, child_expected.suppressHoistSelection()) or does_fx;
                     const remaining_cond_var: Var = ModuleEnv.varFrom(remaining_branch.cond);
 
                     const fresh_bool = try self.freshBool(env, expr_region);
@@ -13833,7 +14153,7 @@ fn checkIfElseExpr(
                         try self.warnIfComptimeConditionalExpr(remaining_branch.cond, .if_condition, expected);
                     }
 
-                    does_fx = try self.checkExprWithHoistSelectionSuppressed(remaining_branch.body, env, expected.forBranchBody()) or does_fx;
+                    does_fx = try self.checkExpr(remaining_branch.body, env, expected.forBranchBody()) or does_fx;
                     try self.unifyWith(ModuleEnv.varFrom(remaining_branch.body), .err, env);
                 }
 
@@ -13846,7 +14166,7 @@ fn checkIfElseExpr(
     }
 
     // Check the final else
-    does_fx = try self.checkExprWithHoistSelectionSuppressed(if_.final_else, env, expected.forBranchBody()) or does_fx;
+    does_fx = try self.checkExpr(if_.final_else, env, expected.forBranchBody()) or does_fx;
 
     // Check final else against expected return type before pairwise unification
     if (expected_branch_ret) |expected_ret| {
@@ -13988,13 +14308,13 @@ fn checkMatchExpr(
         }
 
         if (!had_type_error) {
-            try self.recordHoistSingleBranchMatchPatternProvenance(match, first_branch, first_branch_ptrn_idxs);
+            try self.recordHoistSingleBranchMatchPatternProvenance(match, first_branch, first_branch_ptrn_idxs, child_expected.hoist_position);
         }
         try self.recordHoistMatchBranchContextualBindings(first_branch_ptrn_idxs, match_hoist_owner);
 
         // Check guard if present
         if (first_branch.guard) |guard_idx| {
-            does_fx = try self.checkExprWithHoistSelectionSuppressed(guard_idx, env, child_expected) or does_fx;
+            does_fx = try self.checkExpr(guard_idx, env, child_expected.suppressHoistSelection()) or does_fx;
             const guard_var = ModuleEnv.varFrom(guard_idx);
             const guard_bool_var = try self.freshBool(env, expr_region);
             const guard_result = try self.unifyInContext(guard_bool_var, guard_var, env, .if_condition);
@@ -14004,7 +14324,7 @@ fn checkMatchExpr(
         }
 
         // Check the first branch's value, then use that at the branch_var
-        does_fx = try self.checkExprWithHoistSelectionSuppressed(first_branch.value, env, expected.forBranchBody()) or does_fx;
+        does_fx = try self.checkExpr(first_branch.value, env, expected.forBranchBody()) or does_fx;
         val_var = ModuleEnv.varFrom(first_branch.value);
 
         // Check first branch body against expected return type
@@ -14052,7 +14372,7 @@ fn checkMatchExpr(
 
         // Check guard if present
         if (branch.guard) |guard_idx| {
-            does_fx = try self.checkExprWithHoistSelectionSuppressed(guard_idx, env, child_expected) or does_fx;
+            does_fx = try self.checkExpr(guard_idx, env, child_expected.suppressHoistSelection()) or does_fx;
             const guard_var = ModuleEnv.varFrom(guard_idx);
             const branch_guard_bool_var = try self.freshBool(env, expr_region);
             const guard_result = try self.unifyInContext(branch_guard_bool_var, guard_var, env, .if_condition);
@@ -14062,7 +14382,7 @@ fn checkMatchExpr(
         }
 
         // Then, check the body
-        does_fx = try self.checkExprWithHoistSelectionSuppressed(branch.value, env, expected.forBranchBody()) or does_fx;
+        does_fx = try self.checkExpr(branch.value, env, expected.forBranchBody()) or does_fx;
 
         // Check branch body against expected return type BEFORE pairwise unification.
         // Pairwise unification poisons ALL connected vars via union-find on failure,
@@ -14111,7 +14431,7 @@ fn checkMatchExpr(
                     try self.recordHoistMatchBranchContextualBindings(other_branch_ptrn_idxs, match_hoist_owner);
 
                     // Then check the other branch's exprs
-                    does_fx = try self.checkExprWithHoistSelectionSuppressed(other_branch.value, env, expected.forBranchBody()) or does_fx;
+                    does_fx = try self.checkExpr(other_branch.value, env, expected.forBranchBody()) or does_fx;
                     try self.unifyWith(ModuleEnv.varFrom(other_branch.value), .err, env);
                 }
 
@@ -14706,10 +15026,10 @@ fn mkBinopConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .{ .desugared_binop = .{ .negated = negated } },
+        .provenance = constraintProvenance(binop_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (binop_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
         try self.publishBinopDispatchExpr(expr_idx, method_name, region, constraint_fn_var);
     }
 
@@ -14721,6 +15041,7 @@ fn mkBinopConstraint(
     );
 
     _ = try self.unify(constrained_var, lhs_var, env);
+    try self.recordAmbiguityCandidate(lhs_var, .creation, null, false);
 }
 
 fn publishBinopDispatchExpr(
@@ -14788,10 +15109,10 @@ fn mkUnaryOp(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .desugared_unaryop,
+        .provenance = constraintProvenance(unary_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
     if (unary_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
         try self.publishUnaryDispatchExpr(expr_idx, method_name, region, constraint_fn_var);
     }
 
@@ -14803,6 +15124,7 @@ fn mkUnaryOp(
     );
 
     _ = try self.unify(constrained_var, arg_var, env);
+    try self.recordAmbiguityCandidate(arg_var, .creation, null, false);
 }
 
 fn publishUnaryDispatchExpr(
@@ -14872,7 +15194,7 @@ fn checkIteratorForLoop(
 
     try self.cir.recordForLoopDispatchPlan(loop_node, ModuleEnv.nodeIdxFrom(pattern), ModuleEnv.nodeIdxFrom(iterable), iter_fn_var, next_fn_var);
 
-    does_fx = try self.checkExpr(body, env, child_expected) or does_fx;
+    does_fx = try self.checkExpr(body, env, child_expected.suppressHoistSelection()) or does_fx;
     return does_fx;
 }
 
@@ -14895,6 +15217,31 @@ fn mkMethodCallConstraint(
         region,
         method_expr_idx,
     );
+}
+
+/// Build provenance for a static dispatch constraint from its introducing
+/// expression (if any). This is the data the ambiguity judgment and the
+/// constraint-error reports consume; it replaced the old var-keyed side
+/// tables. Provenance is metadata: it never participates in type identity.
+fn constraintProvenance(intro_expr: ?CIR.Expr.Idx) StaticDispatchConstraint.Provenance {
+    return .{
+        .intro_expr = if (intro_expr) |e|
+            StaticDispatchConstraint.Provenance.OptExprIdx.from(@intFromEnum(e))
+        else
+            .none,
+    };
+}
+
+/// Like `constraintProvenance`, but also captures the current expect-body region.
+/// Only method-dispatch constraints carry it — the region feeds the
+/// "effectful dispatch in expect" diagnostic, matching what the old
+/// expect_region side table recorded (never for binop/unary origins).
+fn methodDispatchProvenance(self: *const Self, intro_expr: ?CIR.Expr.Idx) StaticDispatchConstraint.Provenance {
+    var provenance = constraintProvenance(intro_expr);
+    if (self.current_expect_region) |r| {
+        provenance.expect_region = StaticDispatchConstraint.Provenance.OptRegion.some(r);
+    }
+    return provenance;
 }
 
 fn mkSyntheticReceiverDispatchConstraint(
@@ -14945,14 +15292,9 @@ fn mkReceiverDispatchConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .method_call,
+        .provenance = self.methodDispatchProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    if (method_expr_idx) |expr_idx| {
-        try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
-    }
-    if (self.current_expect_region) |expect_region| {
-        try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
-    }
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -14961,6 +15303,7 @@ fn mkReceiverDispatchConstraint(
     );
 
     _ = try self.unify(constrained_var, receiver_var, env);
+    try self.recordAmbiguityCandidate(receiver_var, .creation, null, false);
     return constraint_fn_var;
 }
 
@@ -14985,12 +15328,9 @@ fn mkTypeMethodCallConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .method_call,
+        .provenance = self.methodDispatchProvenance(method_expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    try self.constraint_expr_by_fn_var.put(constraint_fn_var, method_expr_idx);
-    if (self.current_expect_region) |expect_region| {
-        try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
-    }
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -14999,6 +15339,7 @@ fn mkTypeMethodCallConstraint(
     );
 
     _ = try self.unify(constrained_var, dispatcher_var, env);
+    try self.recordAmbiguityCandidate(dispatcher_var, .creation, null, false);
     return constraint_fn_var;
 }
 
@@ -15024,13 +15365,10 @@ fn mkInterpolationConstraint(
         .fn_name = method_name,
         .fn_var = constraint_fn_var,
         .origin = .{ .from_literal = .interpolation },
+        .provenance = self.methodDispatchProvenance(expr_idx),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    try self.constraint_expr_by_fn_var.put(constraint_fn_var, expr_idx);
     try self.recordInterpolationConstraintMetadata(constraint_fn_var, expr_idx, item_var);
-    if (self.current_expect_region) |expect_region| {
-        try self.expect_region_by_constraint_fn_var.put(constraint_fn_var, expect_region);
-    }
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -15049,7 +15387,7 @@ fn rewriteDerivedIsEqMethodCallAsStructuralEq(
     self: *Self,
     constraint: StaticDispatchConstraint,
 ) bool {
-    const expr_idx = self.constraint_expr_by_fn_var.get(constraint.fn_var) orelse return true;
+    const expr_idx = constraintIntroExpr(constraint) orelse return true;
 
     switch (self.cir.store.getExpr(expr_idx)) {
         .e_method_call => |method_call| {
@@ -15089,7 +15427,7 @@ fn rewriteDerivedMethodCallAsStructuralHash(
     self: *Self,
     constraint: StaticDispatchConstraint,
 ) bool {
-    const expr_idx = self.constraint_expr_by_fn_var.get(constraint.fn_var) orelse return true;
+    const expr_idx = constraintIntroExpr(constraint) orelse return true;
 
     switch (self.cir.store.getExpr(expr_idx)) {
         .e_method_call => |method_call| {
@@ -15116,7 +15454,7 @@ fn rewriteDerivedMethodCallAsStructuralHash(
 
 fn rewriteEqBinopAsMethodEq(self: *Self, constraint: StaticDispatchConstraint) void {
     if (constraint.origin != .desugared_binop) return;
-    const expr_idx = self.constraint_expr_by_fn_var.get(constraint.fn_var) orelse return;
+    const expr_idx = constraintIntroExpr(constraint) orelse return;
     switch (self.cir.store.getExpr(expr_idx)) {
         .e_binop => |binop| {
             if (binop.op != .eq and binop.op != .ne) return;
@@ -15129,6 +15467,10 @@ fn rewriteEqBinopAsMethodEq(self: *Self, constraint: StaticDispatchConstraint) v
             );
         },
         .e_method_eq => |eq| {
+            // A discharge of an instantiated copy carries the copy's fn var;
+            // the node must keep the scheme-pristine fn var stamped at plan
+            // creation, so only the node's own constraint may restamp it.
+            if (eq.constraint_fn_var != constraint.fn_var) return;
             self.cir.store.replaceExprWithMethodEq(
                 expr_idx,
                 eq.lhs,
@@ -17212,6 +17554,14 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             for (rc_start..rc_start + rc_len) |i| {
                                 if (backing[i].origin == .where_clause and backing[i].fn_name.eql(constraint.fn_name)) {
                                     backing[i].origin.where_clause.body_required = true;
+                                    // Stamp the where-clause constraint's provenance with the
+                                    // body dispatch that forced it, so instantiated copies point
+                                    // at a concrete dispatch use (what the old side table's
+                                    // cross-unification linking supplied). Only adopt a real
+                                    // introducing expression; never clobber an existing one.
+                                    if (backing[i].provenance.intro_expr == .none) {
+                                        backing[i].provenance.intro_expr = constraint.provenance.intro_expr;
+                                    }
                                 }
                             }
                         }
@@ -17544,7 +17894,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     // key is set records the instantiation as `dispatch_target`
                     // evidence for the constraint being discharged.
                     self.evidence_target_site = .{
-                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .node_idx = if (constraintIntroExpr(constraint)) |expr| @intFromEnum(expr) else 0,
                         .constraint_fn_var = constraint.fn_var,
                     };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
@@ -17832,7 +18182,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     // chosen method target's scheme instantiation is recorded as
                     // `dispatch_target` evidence for this constraint.
                     self.evidence_target_site = .{
-                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .node_idx = if (constraintIntroExpr(constraint)) |expr| @intFromEnum(expr) else 0,
                         .constraint_fn_var = constraint.fn_var,
                     };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
@@ -18085,11 +18435,13 @@ fn reportEffectfulDispatchInExpect(
     constraint: StaticDispatchConstraint,
 ) std.mem.Allocator.Error!void {
     if (!self.varIsEffectfulFunction(constraint.fn_var)) return;
-    if (self.expect_region_by_constraint_fn_var.fetchRemove(constraint.fn_var)) |entry| {
-        _ = try self.problems.appendProblem(self.gpa, .{ .effectful_expect = .{
-            .region = entry.value,
-        } });
-    }
+    const expect_region = constraint.provenance.expect_region.get() orelse return;
+    // Report each constraint once even though constraint checking revisits it
+    // across passes — the dedup set replaces the old side table's fetchRemove.
+    if ((try self.reported_effectful_expect.getOrPut(constraint.fn_var)).found_existing) return;
+    _ = try self.problems.appendProblem(self.gpa, .{ .effectful_expect = .{
+        .region = expect_region,
+    } });
 }
 
 fn interpolationExprForConstraint(self: *Self, constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {

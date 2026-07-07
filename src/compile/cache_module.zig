@@ -176,7 +176,7 @@ pub const CacheModule = struct {
 
     /// Restore ModuleEnv from the cached data
     /// IMPORTANT: This expects source to remain valid for the lifetime of the restored ModuleEnv.
-    pub fn restore(self: *const CacheModule, allocator: Allocator, module_name: []const u8, source: []const u8) (Allocator.Error || error{BufferTooSmall})!*ModuleEnv {
+    pub fn restore(self: *const CacheModule, allocator: Allocator, module_name: []const u8, source: []const u8) (Allocator.Error || error{ BufferTooSmall, CorruptSerializedModuleEnv })!*ModuleEnv {
         // The entire data section contains the serialized ModuleEnv
         const serialized_data = self.data;
 
@@ -188,6 +188,7 @@ pub const CacheModule = struct {
 
         // Get pointer to the serialized ModuleEnv
         const deserialized_ptr = @as(*ModuleEnv.Serialized, @ptrCast(@alignCast(@constCast(serialized_data.ptr))));
+        deserialized_ptr.validate(serialized_data.len) catch return error.CorruptSerializedModuleEnv;
 
         // Calculate the base address of the serialized data
         const base_addr = @intFromPtr(serialized_data.ptr);
@@ -289,8 +290,8 @@ test "MODULE_ENV_VERSION_HASH golden value" {
     // an *intentional* layout change, bump `Constants.CACHE_VERSION` and replace the
     // golden bytes below with the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x36, 0x8F, 0x63, 0xA6, 0x4E, 0x6E, 0x39, 0x1C, 0x8B, 0x58, 0x8D, 0x35, 0x56, 0xFA, 0xB7, 0x2C,
-        0xFF, 0xD4, 0xAF, 0xB1, 0xAE, 0x4B, 0x67, 0xD2, 0x9B, 0xF1, 0xCF, 0x90, 0x6F, 0xCE, 0x3E, 0x23,
+        0xED, 0xD5, 0x5F, 0xD5, 0x57, 0x39, 0xC4, 0xC5, 0xD1, 0xB2, 0x29, 0x6E, 0x27, 0x01, 0xD0, 0x10,
+        0x12, 0xB8, 0xC4, 0x54, 0xB6, 0xEF, 0xEB, 0xBE, 0xC2, 0x8E, 0xE1, 0x0A, 0x9E, 0xB3, 0x21, 0x0F,
     };
     try std.testing.expectEqualSlices(u8, &golden, &MODULE_ENV_VERSION_HASH);
 }
