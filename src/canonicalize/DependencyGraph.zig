@@ -211,7 +211,14 @@ const DemandAnalyzer = struct {
                 var computed = DemandSummary{};
                 defer computed.deinit(self.allocator);
 
-                try self.collectLambdaExecution(lambda_idx, &computed, &local_callables);
+                // Walk the lambda's execution with the lambda marked active,
+                // exactly as an inline execution frame would.
+                const lambda_expr = self.cir.store.getExpr(lambda_idx);
+                if (lambda_expr == .e_lambda and !self.active_lambdas.contains(lambda_idx)) {
+                    try self.active_lambdas.put(self.allocator, lambda_idx, {});
+                    defer _ = self.active_lambdas.remove(lambda_idx);
+                    try self.walkDemand(lambda_expr.e_lambda.body, &computed, &local_callables);
+                }
 
                 const gop = try self.summaries.getOrPut(self.allocator, lambda_idx);
                 if (!gop.found_existing) {
@@ -229,7 +236,7 @@ const DemandAnalyzer = struct {
         defer local_callables.deinit(self.allocator);
 
         const def = self.cir.store.getDef(def_idx);
-        try self.collectExprConstruction(def.expr, out, &local_callables);
+        try self.walkDemand(def.expr, out, &local_callables);
     }
 
     fn addGraphDep(self: *DemandAnalyzer, out: *DemandSummary, def_idx: CIR.Def.Idx) std.mem.Allocator.Error!void {
@@ -238,6 +245,9 @@ const DemandAnalyzer = struct {
         }
     }
 
+    /// Resolve the lambda a def or expression evaluates to, following local
+    /// callable bindings and def-to-def alias chains (`f = g`) iteratively.
+    /// A cyclic alias chain (`a = b` / `b = a`) terminates as "no lambda".
     fn lambdaFromDef(self: *const DemandAnalyzer, def_idx: CIR.Def.Idx) ?CIR.Expr.Idx {
         const def = self.cir.store.getDef(def_idx);
         return self.lambdaFromExprWithLocals(def.expr, null);
@@ -248,18 +258,25 @@ const DemandAnalyzer = struct {
         expr_idx: CIR.Expr.Idx,
         local_callables: ?*const LocalCallables,
     ) ?CIR.Expr.Idx {
-        return switch (self.cir.store.getExpr(expr_idx)) {
-            .e_lambda => expr_idx,
-            .e_closure => |closure| closure.lambda_idx,
-            .e_lookup_local => |lookup| blk: {
-                if (local_callables) |locals| {
-                    if (locals.get(lookup.pattern_idx)) |lambda_idx| break :blk lambda_idx;
-                }
-                const def_idx = self.pattern_to_def.get(lookup.pattern_idx) orelse break :blk null;
-                break :blk self.lambdaFromDef(def_idx);
-            },
-            else => null,
-        };
+        var current = expr_idx;
+        // A def-alias chain is at most one hop per distinct def; anything
+        // longer than the number of defs is a cycle.
+        var hops_remaining: usize = self.summary_defs.len + 1;
+        while (hops_remaining > 0) : (hops_remaining -= 1) {
+            switch (self.cir.store.getExpr(current)) {
+                .e_lambda => return current,
+                .e_closure => |closure| return closure.lambda_idx,
+                .e_lookup_local => |lookup| {
+                    if (local_callables) |locals| {
+                        if (locals.get(lookup.pattern_idx)) |lambda_idx| return lambda_idx;
+                    }
+                    const def_idx = self.pattern_to_def.get(lookup.pattern_idx) orelse return null;
+                    current = self.cir.store.getDef(def_idx).expr;
+                },
+                else => return null,
+            }
+        }
+        return null;
     }
 
     fn rememberLocalCallable(
@@ -273,134 +290,385 @@ const DemandAnalyzer = struct {
         }
     }
 
-    fn collectLambdaExecution(
+    /// One unit of work for the demand walk. The walk is an explicit worklist
+    /// plus a stack of lambda-execution frames (zero-recursion policy): every
+    /// item executes against the innermost open frame's summary, or the
+    /// walk's root output when no frame is open.
+    const WalkItem = union(enum) {
+        /// Pre-order construction visit of one expression node.
+        visit: CIR.Expr.Idx,
+        /// Process one block statement; statements are pushed in reverse so
+        /// they execute in source order (local callables register in order).
+        visit_stmt: CIR.Statement.Idx,
+        /// Register a local binding as callable AFTER its RHS subtree has
+        /// been walked, matching the recursive walk's ordering (a binding is
+        /// never callable inside its own RHS walk).
+        remember_local: struct { pattern: CIR.Pattern.Idx, expr: CIR.Expr.Idx },
+        /// Resolve a call's target after its operands were visited: apply
+        /// the called lambda's demand summary, or record an unresolved
+        /// called pattern.
+        apply_call_target: struct { func: CIR.Expr.Idx, args: CIR.Expr.Span },
+        /// The summary-application half of a called-pattern argument (the
+        /// argument's construction visit is pushed separately).
+        apply_called_value: CIR.Expr.Idx,
+        /// Close an inline lambda-execution frame: fold its computed summary
+        /// into the parent (graph deps directly; called patterns matched
+        /// against the call's arguments) and deactivate the lambda.
+        finish_lambda: struct { lambda: CIR.Expr.Idx, args: CIR.Expr.Span },
+    };
+
+    const Walk = struct {
+        work: std.ArrayList(WalkItem) = .empty,
+        frames: std.ArrayList(DemandSummary) = .empty,
+
+        fn deinit(walk: *Walk, allocator: std.mem.Allocator) void {
+            walk.work.deinit(allocator);
+            for (walk.frames.items) |*frame| frame.deinit(allocator);
+            walk.frames.deinit(allocator);
+        }
+
+        fn push(walk: *Walk, allocator: std.mem.Allocator, item: WalkItem) std.mem.Allocator.Error!void {
+            try walk.work.append(allocator, item);
+        }
+    };
+
+    /// Run the demand walk from `root_expr`, accumulating into `out`.
+    fn walkDemand(
         self: *DemandAnalyzer,
-        lambda_idx: CIR.Expr.Idx,
+        root_expr: CIR.Expr.Idx,
         out: *DemandSummary,
         local_callables: *LocalCallables,
     ) std.mem.Allocator.Error!void {
-        if (self.active_lambdas.contains(lambda_idx)) return;
-        try self.active_lambdas.put(self.allocator, lambda_idx, {});
-        defer _ = self.active_lambdas.remove(lambda_idx);
+        var walk = Walk{};
+        defer walk.deinit(self.allocator);
+        try walk.push(self.allocator, .{ .visit = root_expr });
 
-        const expr = self.cir.store.getExpr(lambda_idx);
-        if (expr != .e_lambda) return;
-        try self.collectExprConstruction(expr.e_lambda.body, out, local_callables);
-    }
-
-    fn collectExprSpan(
-        self: *DemandAnalyzer,
-        span: CIR.Expr.Span,
-        out: *DemandSummary,
-        local_callables: *LocalCallables,
-    ) std.mem.Allocator.Error!void {
-        for (self.cir.store.sliceExpr(span)) |expr_idx| {
-            try self.collectExprConstruction(expr_idx, out, local_callables);
+        while (walk.work.pop()) |item| {
+            const current: *DemandSummary = if (walk.frames.items.len > 0)
+                &walk.frames.items[walk.frames.items.len - 1]
+            else
+                out;
+            switch (item) {
+                .visit => |expr_idx| try self.visitExpr(&walk, current, expr_idx),
+                .visit_stmt => |stmt_idx| try self.visitStmt(&walk, stmt_idx),
+                .remember_local => |bind| try self.rememberLocalCallable(bind.pattern, bind.expr, local_callables),
+                .apply_call_target => |call| try self.applyCallTarget(&walk, current, call.func, call.args, local_callables),
+                .apply_called_value => |expr_idx| try self.applyCalledValue(&walk, current, expr_idx, local_callables),
+                .finish_lambda => |fin| {
+                    var computed = walk.frames.pop().?;
+                    defer computed.deinit(self.allocator);
+                    _ = self.active_lambdas.remove(fin.lambda);
+                    const parent: *DemandSummary = if (walk.frames.items.len > 0)
+                        &walk.frames.items[walk.frames.items.len - 1]
+                    else
+                        out;
+                    try self.foldLambdaSummary(&walk, parent, &computed, fin.lambda, fin.args);
+                },
+            }
         }
     }
 
-    fn collectCall(
+    /// Apply a called lambda's demand summary at a call site. A cached
+    /// summary folds immediately; an uncached lambda's body is walked inline
+    /// in its own frame (guarded by `active_lambdas` against recursion), and
+    /// folded when the frame closes.
+    fn beginApplyLambdaSummary(
         self: *DemandAnalyzer,
-        call_func: CIR.Expr.Idx,
+        walk: *Walk,
+        current: *DemandSummary,
+        lambda_idx: CIR.Expr.Idx,
         call_args: CIR.Expr.Span,
-        out: *DemandSummary,
-        local_callables: *LocalCallables,
     ) std.mem.Allocator.Error!void {
-        try self.collectExprConstruction(call_func, out, local_callables);
-        try self.collectExprSpan(call_args, out, local_callables);
-        try self.applyCallTarget(call_func, call_args, out, local_callables);
+        if (self.summaries.getPtr(lambda_idx)) |summary| {
+            try self.foldLambdaSummary(walk, current, summary, lambda_idx, call_args);
+            return;
+        }
+        if (self.active_lambdas.contains(lambda_idx)) return;
+        const expr = self.cir.store.getExpr(lambda_idx);
+        if (expr != .e_lambda) return;
+
+        try self.active_lambdas.put(self.allocator, lambda_idx, {});
+        try walk.frames.append(self.allocator, DemandSummary{});
+        // The finish item pops first-in-last-out: the body's whole walk runs
+        // inside the frame, then the frame folds into its parent.
+        try walk.push(self.allocator, .{ .finish_lambda = .{ .lambda = lambda_idx, .args = call_args } });
+        try walk.push(self.allocator, .{ .visit = expr.e_lambda.body });
+    }
+
+    /// Fold one lambda's demand summary into `into` for a call with
+    /// `call_args`: graph deps transfer directly; a called pattern that
+    /// matches a passed argument walks that argument as a called value,
+    /// otherwise it propagates unresolved.
+    fn foldLambdaSummary(
+        self: *DemandAnalyzer,
+        walk: *Walk,
+        into: *DemandSummary,
+        summary: *const DemandSummary,
+        lambda_idx: CIR.Expr.Idx,
+        call_args: CIR.Expr.Span,
+    ) std.mem.Allocator.Error!void {
+        var dep_iter = summary.deps.keyIterator();
+        while (dep_iter.next()) |def_idx| {
+            try self.addGraphDep(into, def_idx.*);
+        }
+
+        var called_iter = summary.called_patterns.keyIterator();
+        while (called_iter.next()) |pattern_idx| {
+            if (self.callArgForPattern(lambda_idx, call_args, pattern_idx.*)) |arg_expr| {
+                try walk.push(self.allocator, .{ .apply_called_value = arg_expr });
+                try walk.push(self.allocator, .{ .visit = arg_expr });
+            } else {
+                _ = try into.addCalledPattern(self.allocator, pattern_idx.*);
+            }
+        }
     }
 
     fn applyCallTarget(
         self: *DemandAnalyzer,
+        walk: *Walk,
+        current: *DemandSummary,
         call_func: CIR.Expr.Idx,
         call_args: CIR.Expr.Span,
-        out: *DemandSummary,
         local_callables: *LocalCallables,
     ) std.mem.Allocator.Error!void {
         switch (self.cir.store.getExpr(call_func)) {
             .e_lookup_local => |lookup| {
                 if (local_callables.get(lookup.pattern_idx)) |lambda_idx| {
-                    try self.applyLambdaSummary(lambda_idx, call_args, out, local_callables);
+                    try self.beginApplyLambdaSummary(walk, current, lambda_idx, call_args);
                     return;
                 }
                 if (self.pattern_to_def.get(lookup.pattern_idx)) |def_idx| {
                     if (self.lambdaFromDef(def_idx)) |lambda_idx| {
-                        try self.applyLambdaSummary(lambda_idx, call_args, out, local_callables);
+                        try self.beginApplyLambdaSummary(walk, current, lambda_idx, call_args);
                     }
                     return;
                 }
-                _ = try out.addCalledPattern(self.allocator, lookup.pattern_idx);
+                _ = try current.addCalledPattern(self.allocator, lookup.pattern_idx);
             },
-            .e_lambda => try self.applyLambdaSummary(call_func, call_args, out, local_callables),
-            .e_closure => |closure| try self.applyLambdaSummary(closure.lambda_idx, call_args, out, local_callables),
+            .e_lambda => try self.beginApplyLambdaSummary(walk, current, call_func, call_args),
+            .e_closure => |closure| try self.beginApplyLambdaSummary(walk, current, closure.lambda_idx, call_args),
             else => {},
         }
     }
 
-    fn applyLambdaSummary(
+    fn applyCalledValue(
         self: *DemandAnalyzer,
-        lambda_idx: CIR.Expr.Idx,
-        call_args: CIR.Expr.Span,
-        out: *DemandSummary,
-        local_callables: *LocalCallables,
-    ) std.mem.Allocator.Error!void {
-        var computed = DemandSummary{};
-        defer computed.deinit(self.allocator);
-
-        if (self.summaries.getPtr(lambda_idx)) |summary| {
-            _ = try computed.mergeFrom(self.allocator, summary);
-        } else {
-            try self.collectLambdaExecution(lambda_idx, &computed, local_callables);
-        }
-
-        var dep_iter = computed.deps.keyIterator();
-        while (dep_iter.next()) |def_idx| {
-            try self.addGraphDep(out, def_idx.*);
-        }
-
-        var called_iter = computed.called_patterns.keyIterator();
-        while (called_iter.next()) |pattern_idx| {
-            if (self.callArgForPattern(lambda_idx, call_args, pattern_idx.*)) |arg_expr| {
-                try self.collectCalledValue(arg_expr, out, local_callables);
-            } else {
-                _ = try out.addCalledPattern(self.allocator, pattern_idx.*);
-            }
-        }
-    }
-
-    fn collectCalledValue(
-        self: *DemandAnalyzer,
+        walk: *Walk,
+        current: *DemandSummary,
         expr_idx: CIR.Expr.Idx,
-        out: *DemandSummary,
         local_callables: *LocalCallables,
     ) std.mem.Allocator.Error!void {
-        try self.collectExprConstruction(expr_idx, out, local_callables);
+        const empty_args = CIR.Expr.Span{ .span = base.DataSpan.empty() };
         switch (self.cir.store.getExpr(expr_idx)) {
             .e_lookup_local => |lookup| {
                 if (local_callables.get(lookup.pattern_idx)) |lambda_idx| {
-                    const empty_args = CIR.Expr.Span{ .span = base.DataSpan.empty() };
-                    try self.applyLambdaSummary(lambda_idx, empty_args, out, local_callables);
+                    try self.beginApplyLambdaSummary(walk, current, lambda_idx, empty_args);
                     return;
                 }
                 if (self.pattern_to_def.get(lookup.pattern_idx)) |def_idx| {
                     if (self.lambdaFromDef(def_idx)) |lambda_idx| {
-                        const empty_args = CIR.Expr.Span{ .span = base.DataSpan.empty() };
-                        try self.applyLambdaSummary(lambda_idx, empty_args, out, local_callables);
+                        try self.beginApplyLambdaSummary(walk, current, lambda_idx, empty_args);
                     }
                     return;
                 }
-                _ = try out.addCalledPattern(self.allocator, lookup.pattern_idx);
+                _ = try current.addCalledPattern(self.allocator, lookup.pattern_idx);
             },
-            .e_lambda => {
-                const empty_args = CIR.Expr.Span{ .span = base.DataSpan.empty() };
-                try self.applyLambdaSummary(expr_idx, empty_args, out, local_callables);
-            },
-            .e_closure => |closure| {
-                const empty_args = CIR.Expr.Span{ .span = base.DataSpan.empty() };
-                try self.applyLambdaSummary(closure.lambda_idx, empty_args, out, local_callables);
-            },
+            .e_lambda => try self.beginApplyLambdaSummary(walk, current, expr_idx, empty_args),
+            .e_closure => |closure| try self.beginApplyLambdaSummary(walk, current, closure.lambda_idx, empty_args),
             else => {},
+        }
+    }
+
+    /// Push every child of a span in reverse, so pops visit in source order.
+    fn pushExprSpanReversed(self: *DemandAnalyzer, walk: *Walk, span: CIR.Expr.Span) std.mem.Allocator.Error!void {
+        const exprs = self.cir.store.sliceExpr(span);
+        var i = exprs.len;
+        while (i > 0) {
+            i -= 1;
+            try walk.push(self.allocator, .{ .visit = exprs[i] });
+        }
+    }
+
+    fn visitStmt(self: *DemandAnalyzer, walk: *Walk, stmt_idx: CIR.Statement.Idx) std.mem.Allocator.Error!void {
+        switch (self.cir.store.getStatement(stmt_idx)) {
+            .s_decl => |decl| {
+                // Register the callable only after its RHS subtree walked.
+                try walk.push(self.allocator, .{ .remember_local = .{ .pattern = decl.pattern, .expr = decl.expr } });
+                try walk.push(self.allocator, .{ .visit = decl.expr });
+            },
+            .s_var => |var_stmt| {
+                try walk.push(self.allocator, .{ .remember_local = .{ .pattern = var_stmt.pattern_idx, .expr = var_stmt.expr } });
+                try walk.push(self.allocator, .{ .visit = var_stmt.expr });
+            },
+            .s_var_uninitialized => {},
+            .s_reassign => |reassign| try walk.push(self.allocator, .{ .visit = reassign.expr }),
+            .s_dbg => |dbg| try walk.push(self.allocator, .{ .visit = dbg.expr }),
+            .s_expr => |expr_stmt| try walk.push(self.allocator, .{ .visit = expr_stmt.expr }),
+            .s_expect => |expect| try walk.push(self.allocator, .{ .visit = expect.body }),
+            .s_for => |for_stmt| {
+                try walk.push(self.allocator, .{ .visit = for_stmt.body });
+                try walk.push(self.allocator, .{ .visit = for_stmt.expr });
+            },
+            .s_while => |while_stmt| {
+                try walk.push(self.allocator, .{ .visit = while_stmt.body });
+                try walk.push(self.allocator, .{ .visit = while_stmt.cond });
+            },
+            .s_infinite_loop => |loop_stmt| {
+                try walk.push(self.allocator, .{ .visit = loop_stmt.body });
+                try walk.push(self.allocator, .{ .visit = loop_stmt.cond });
+            },
+            .s_breakable_loop => |loop_stmt| {
+                try walk.push(self.allocator, .{ .visit = loop_stmt.body });
+                try walk.push(self.allocator, .{ .visit = loop_stmt.cond });
+            },
+            .s_return => |ret| try walk.push(self.allocator, .{ .visit = ret.expr }),
+            .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_type_var_alias, .s_crash, .s_runtime_error, .s_break => {},
+        }
+    }
+
+    fn visitExpr(
+        self: *DemandAnalyzer,
+        walk: *Walk,
+        current: *DemandSummary,
+        expr_idx: CIR.Expr.Idx,
+    ) std.mem.Allocator.Error!void {
+        switch (self.cir.store.getExpr(expr_idx)) {
+            .e_lookup_local => |lookup| {
+                if (self.pattern_to_def.get(lookup.pattern_idx)) |def_idx| {
+                    try self.addGraphDep(current, def_idx);
+                }
+            },
+            .e_call => |call| {
+                // Operands first, then the target's summary applies —
+                // pushed in reverse so pops run func, args, apply.
+                try walk.push(self.allocator, .{ .apply_call_target = .{ .func = call.func, .args = call.args } });
+                try self.pushExprSpanReversed(walk, call.args);
+                try walk.push(self.allocator, .{ .visit = call.func });
+            },
+            .e_lambda => {},
+            .e_closure => |closure| {
+                for (self.cir.store.sliceCaptures(closure.captures)) |capture_idx| {
+                    const capture = self.cir.store.getCapture(capture_idx);
+                    if (self.pattern_to_def.get(capture.pattern_idx)) |def_idx| {
+                        try self.addGraphDep(current, def_idx);
+                    }
+                }
+            },
+            .e_if => |if_expr| {
+                const branches = self.cir.store.sliceIfBranches(if_expr.branches);
+                var i = branches.len;
+                while (i > 0) {
+                    i -= 1;
+                    const branch = self.cir.store.getIfBranch(branches[i]);
+                    try walk.push(self.allocator, .{ .visit = branch.cond });
+                    try walk.push(self.allocator, .{ .visit = branch.body });
+                }
+                try walk.push(self.allocator, .{ .visit = if_expr.final_else });
+            },
+            .e_match => |match_expr| {
+                try walk.push(self.allocator, .{ .visit = match_expr.cond });
+                const branches = self.cir.store.sliceMatchBranches(match_expr.branches);
+                var i = branches.len;
+                while (i > 0) {
+                    i -= 1;
+                    const branch = self.cir.store.getMatchBranch(branches[i]);
+                    try walk.push(self.allocator, .{ .visit = branch.value });
+                    if (branch.guard) |guard_idx| {
+                        try walk.push(self.allocator, .{ .visit = guard_idx });
+                    }
+                }
+            },
+            .e_list => |list| try self.pushExprSpanReversed(walk, list.elems),
+            .e_record => |record| {
+                const fields = self.cir.store.sliceRecordFields(record.fields);
+                var i = fields.len;
+                while (i > 0) {
+                    i -= 1;
+                    const field = self.cir.store.getRecordField(fields[i]);
+                    try walk.push(self.allocator, .{ .visit = field.value });
+                }
+                if (record.ext) |ext_idx| try walk.push(self.allocator, .{ .visit = ext_idx });
+            },
+            .e_field_access => |access| try walk.push(self.allocator, .{ .visit = access.receiver }),
+            .e_method_call => |call| {
+                try self.pushExprSpanReversed(walk, call.args);
+                try walk.push(self.allocator, .{ .visit = call.receiver });
+            },
+            .e_dispatch_call => |call| {
+                try self.pushExprSpanReversed(walk, call.args);
+                try walk.push(self.allocator, .{ .visit = call.receiver });
+            },
+            .e_interpolation => |interpolation| {
+                try walk.push(self.allocator, .{ .visit = interpolation.first });
+                try self.pushExprSpanReversed(walk, interpolation.parts);
+            },
+            .e_structural_eq => |eq| {
+                try walk.push(self.allocator, .{ .visit = eq.lhs });
+                try walk.push(self.allocator, .{ .visit = eq.rhs });
+            },
+            .e_structural_hash => |h| {
+                try walk.push(self.allocator, .{ .visit = h.value });
+                try walk.push(self.allocator, .{ .visit = h.hasher });
+            },
+            .e_method_eq => |eq| {
+                try walk.push(self.allocator, .{ .visit = eq.lhs });
+                try walk.push(self.allocator, .{ .visit = eq.rhs });
+            },
+            .e_type_method_call => |call| try self.pushExprSpanReversed(walk, call.args),
+            .e_type_dispatch_call => |call| try self.pushExprSpanReversed(walk, call.args),
+            .e_tuple_access => |tuple_access| try walk.push(self.allocator, .{ .visit = tuple_access.tuple }),
+            .e_tuple => |tuple| try self.pushExprSpanReversed(walk, tuple.elems),
+            .e_binop => |binop| {
+                try walk.push(self.allocator, .{ .visit = binop.lhs });
+                try walk.push(self.allocator, .{ .visit = binop.rhs });
+            },
+            .e_unary_minus => |unop| try walk.push(self.allocator, .{ .visit = unop.expr }),
+            .e_unary_not => |unop| try walk.push(self.allocator, .{ .visit = unop.expr }),
+            .e_block => |block| {
+                try walk.push(self.allocator, .{ .visit = block.final_expr });
+                const stmts = self.cir.store.sliceStatements(block.stmts);
+                var i = stmts.len;
+                while (i > 0) {
+                    i -= 1;
+                    try walk.push(self.allocator, .{ .visit_stmt = stmts[i] });
+                }
+            },
+            .e_tag => |tag| try self.pushExprSpanReversed(walk, tag.args),
+            .e_nominal => |nominal| try walk.push(self.allocator, .{ .visit = nominal.backing_expr }),
+            .e_run_low_level => |run_ll| try self.pushExprSpanReversed(walk, run_ll.args),
+            .e_nominal_external => |nominal| try walk.push(self.allocator, .{ .visit = nominal.backing_expr }),
+            .e_dbg => |dbg| try walk.push(self.allocator, .{ .visit = dbg.expr }),
+            .e_expect_err => |expect_err| try walk.push(self.allocator, .{ .visit = expect_err.expr }),
+            .e_expect => |expect| try walk.push(self.allocator, .{ .visit = expect.body }),
+            .e_return => |ret| try walk.push(self.allocator, .{ .visit = ret.expr }),
+            .e_break => {},
+            .e_for => |for_expr| {
+                try walk.push(self.allocator, .{ .visit = for_expr.body });
+                try walk.push(self.allocator, .{ .visit = for_expr.expr });
+            },
+            .e_num,
+            .e_frac_f32,
+            .e_frac_f64,
+            .e_dec,
+            .e_dec_small,
+            .e_num_from_numeral,
+            .e_typed_int,
+            .e_typed_frac,
+            .e_typed_num_from_numeral,
+            .e_str,
+            .e_str_segment,
+            .e_bytes_literal,
+            .e_empty_list,
+            .e_empty_record,
+            .e_zero_argument_tag,
+            .e_ellipsis,
+            .e_anno_only,
+            .e_hosted_lambda,
+            .e_lookup_external,
+            .e_lookup_required,
+            .e_crash,
+            .e_runtime_error,
+            => {},
         }
     }
 
@@ -485,166 +753,6 @@ const DemandAnalyzer = struct {
         }
 
         return false;
-    }
-
-    fn collectExprConstruction(
-        self: *DemandAnalyzer,
-        expr_idx: CIR.Expr.Idx,
-        out: *DemandSummary,
-        local_callables: *LocalCallables,
-    ) std.mem.Allocator.Error!void {
-        switch (self.cir.store.getExpr(expr_idx)) {
-            .e_lookup_local => |lookup| {
-                if (self.pattern_to_def.get(lookup.pattern_idx)) |def_idx| {
-                    try self.addGraphDep(out, def_idx);
-                }
-            },
-            .e_call => |call| try self.collectCall(call.func, call.args, out, local_callables),
-            .e_lambda => {},
-            .e_closure => |closure| {
-                for (self.cir.store.sliceCaptures(closure.captures)) |capture_idx| {
-                    const capture = self.cir.store.getCapture(capture_idx);
-                    if (self.pattern_to_def.get(capture.pattern_idx)) |def_idx| {
-                        try self.addGraphDep(out, def_idx);
-                    }
-                }
-            },
-            .e_if => |if_expr| {
-                try self.collectExprConstruction(if_expr.final_else, out, local_callables);
-                for (self.cir.store.sliceIfBranches(if_expr.branches)) |branch_idx| {
-                    const branch = self.cir.store.getIfBranch(branch_idx);
-                    try self.collectExprConstruction(branch.body, out, local_callables);
-                    try self.collectExprConstruction(branch.cond, out, local_callables);
-                }
-            },
-            .e_match => |match_expr| {
-                for (self.cir.store.sliceMatchBranches(match_expr.branches)) |branch_idx| {
-                    const branch = self.cir.store.getMatchBranch(branch_idx);
-                    if (branch.guard) |guard_idx| {
-                        try self.collectExprConstruction(guard_idx, out, local_callables);
-                    }
-                    try self.collectExprConstruction(branch.value, out, local_callables);
-                }
-                try self.collectExprConstruction(match_expr.cond, out, local_callables);
-            },
-            .e_list => |list| try self.collectExprSpan(list.elems, out, local_callables),
-            .e_record => |record| {
-                if (record.ext) |ext_idx| {
-                    try self.collectExprConstruction(ext_idx, out, local_callables);
-                }
-                for (self.cir.store.sliceRecordFields(record.fields)) |field_idx| {
-                    const field = self.cir.store.getRecordField(field_idx);
-                    try self.collectExprConstruction(field.value, out, local_callables);
-                }
-            },
-            .e_field_access => |access| try self.collectExprConstruction(access.receiver, out, local_callables),
-            .e_method_call => |call| {
-                try self.collectExprConstruction(call.receiver, out, local_callables);
-                try self.collectExprSpan(call.args, out, local_callables);
-            },
-            .e_dispatch_call => |call| {
-                try self.collectExprConstruction(call.receiver, out, local_callables);
-                try self.collectExprSpan(call.args, out, local_callables);
-            },
-            .e_interpolation => |interpolation| {
-                try self.collectExprSpan(interpolation.parts, out, local_callables);
-                try self.collectExprConstruction(interpolation.first, out, local_callables);
-            },
-            .e_structural_eq => |eq| {
-                try self.collectExprConstruction(eq.rhs, out, local_callables);
-                try self.collectExprConstruction(eq.lhs, out, local_callables);
-            },
-            .e_structural_hash => |h| {
-                try self.collectExprConstruction(h.hasher, out, local_callables);
-                try self.collectExprConstruction(h.value, out, local_callables);
-            },
-            .e_method_eq => |eq| {
-                try self.collectExprConstruction(eq.rhs, out, local_callables);
-                try self.collectExprConstruction(eq.lhs, out, local_callables);
-            },
-            .e_type_method_call => |call| try self.collectExprSpan(call.args, out, local_callables),
-            .e_type_dispatch_call => |call| try self.collectExprSpan(call.args, out, local_callables),
-            .e_tuple_access => |tuple_access| try self.collectExprConstruction(tuple_access.tuple, out, local_callables),
-            .e_tuple => |tuple| try self.collectExprSpan(tuple.elems, out, local_callables),
-            .e_binop => |binop| {
-                try self.collectExprConstruction(binop.rhs, out, local_callables);
-                try self.collectExprConstruction(binop.lhs, out, local_callables);
-            },
-            .e_unary_minus => |unop| try self.collectExprConstruction(unop.expr, out, local_callables),
-            .e_unary_not => |unop| try self.collectExprConstruction(unop.expr, out, local_callables),
-            .e_block => |block| {
-                for (self.cir.store.sliceStatements(block.stmts)) |stmt_idx| {
-                    const stmt = self.cir.store.getStatement(stmt_idx);
-                    switch (stmt) {
-                        .s_decl => |decl| {
-                            try self.collectExprConstruction(decl.expr, out, local_callables);
-                            try self.rememberLocalCallable(decl.pattern, decl.expr, local_callables);
-                        },
-                        .s_var => |var_stmt| {
-                            try self.collectExprConstruction(var_stmt.expr, out, local_callables);
-                            try self.rememberLocalCallable(var_stmt.pattern_idx, var_stmt.expr, local_callables);
-                        },
-                        .s_var_uninitialized => {},
-                        .s_reassign => |reassign| try self.collectExprConstruction(reassign.expr, out, local_callables),
-                        .s_dbg => |dbg| try self.collectExprConstruction(dbg.expr, out, local_callables),
-                        .s_expr => |expr_stmt| try self.collectExprConstruction(expr_stmt.expr, out, local_callables),
-                        .s_expect => |expect| try self.collectExprConstruction(expect.body, out, local_callables),
-                        .s_for => |for_stmt| try self.collectExprConstruction(for_stmt.expr, out, local_callables),
-                        .s_while => |while_stmt| {
-                            try self.collectExprConstruction(while_stmt.body, out, local_callables);
-                            try self.collectExprConstruction(while_stmt.cond, out, local_callables);
-                        },
-                        .s_infinite_loop => |loop_stmt| {
-                            try self.collectExprConstruction(loop_stmt.body, out, local_callables);
-                            try self.collectExprConstruction(loop_stmt.cond, out, local_callables);
-                        },
-                        .s_breakable_loop => |loop_stmt| {
-                            try self.collectExprConstruction(loop_stmt.body, out, local_callables);
-                            try self.collectExprConstruction(loop_stmt.cond, out, local_callables);
-                        },
-                        .s_return => |ret| try self.collectExprConstruction(ret.expr, out, local_callables),
-                        .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_type_var_alias, .s_crash, .s_runtime_error, .s_break => {},
-                    }
-                }
-                try self.collectExprConstruction(block.final_expr, out, local_callables);
-            },
-            .e_tag => |tag| try self.collectExprSpan(tag.args, out, local_callables),
-            .e_nominal => |nominal| try self.collectExprConstruction(nominal.backing_expr, out, local_callables),
-            .e_run_low_level => |run_ll| try self.collectExprSpan(run_ll.args, out, local_callables),
-            .e_nominal_external => |nominal| try self.collectExprConstruction(nominal.backing_expr, out, local_callables),
-            .e_dbg => |dbg| try self.collectExprConstruction(dbg.expr, out, local_callables),
-            .e_expect_err => |expect_err| try self.collectExprConstruction(expect_err.expr, out, local_callables),
-            .e_expect => |expect| try self.collectExprConstruction(expect.body, out, local_callables),
-            .e_return => |ret| try self.collectExprConstruction(ret.expr, out, local_callables),
-            .e_break => {},
-            .e_for => |for_expr| {
-                try self.collectExprConstruction(for_expr.body, out, local_callables);
-                try self.collectExprConstruction(for_expr.expr, out, local_callables);
-            },
-            .e_num,
-            .e_frac_f32,
-            .e_frac_f64,
-            .e_dec,
-            .e_dec_small,
-            .e_num_from_numeral,
-            .e_typed_int,
-            .e_typed_frac,
-            .e_typed_num_from_numeral,
-            .e_str,
-            .e_str_segment,
-            .e_bytes_literal,
-            .e_empty_list,
-            .e_empty_record,
-            .e_zero_argument_tag,
-            .e_ellipsis,
-            .e_anno_only,
-            .e_hosted_lambda,
-            .e_lookup_external,
-            .e_lookup_required,
-            .e_crash,
-            .e_runtime_error,
-            => {},
-        }
     }
 };
 
@@ -805,7 +913,6 @@ fn collectNameReferences(
     pattern_to_def: *const std.AutoHashMapUnmanaged(CIR.Pattern.Idx, CIR.Def.Idx),
     root_expr: CIR.Expr.Idx,
     out: *std.AutoHashMapUnmanaged(CIR.Def.Idx, void),
-    out_has_type_var_alias: *bool,
     scratch_stack: *std.ArrayList(CIR.Expr.Idx),
     allocator: std.mem.Allocator,
 ) std.mem.Allocator.Error!void {
@@ -933,8 +1040,7 @@ fn collectNameReferences(
                             try scratch_stack.append(allocator, loop_stmt.body);
                         },
                         .s_return => |ret| try scratch_stack.append(allocator, ret.expr),
-                        .s_type_var_alias => out_has_type_var_alias.* = true,
-                        .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_crash, .s_runtime_error, .s_break => {},
+                        .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_type_var_alias, .s_crash, .s_runtime_error, .s_break => {},
                     }
                 }
                 try scratch_stack.append(allocator, block.final_expr);
@@ -1001,11 +1107,6 @@ pub fn computeCheckOrder(
     cir: *const ModuleEnv,
     all_defs: CIR.Def.Span,
     allocator: std.mem.Allocator,
-    /// Filled with defs whose body contains an `s_type_var_alias` statement
-    /// (`T : a`): their type-qualified dispatch nodes resolve through the
-    /// def's own annotation generation, so the checker must not pre-declare
-    /// their annotation as a standalone scheme.
-    defs_with_type_var_alias: *std.AutoHashMapUnmanaged(CIR.Def.Idx, void),
 ) std.mem.Allocator.Error!EvaluationOrder {
     const defs_slice = cir.store.sliceDefs(all_defs);
 
@@ -1031,11 +1132,7 @@ pub fn computeCheckOrder(
     for (defs_slice) |def_idx| {
         refs.clearRetainingCapacity();
         const def = cir.store.getDef(def_idx);
-        var has_type_var_alias = false;
-        try collectNameReferences(cir, &pattern_to_def, def.expr, &refs, &has_type_var_alias, &scratch_stack, allocator);
-        if (has_type_var_alias) {
-            try defs_with_type_var_alias.put(allocator, def_idx, {});
-        }
+        try collectNameReferences(cir, &pattern_to_def, def.expr, &refs, &scratch_stack, allocator);
         var ref_iter = refs.keyIterator();
         while (ref_iter.next()) |ref_def_idx| {
             try graph.addEdge(def_idx, ref_def_idx.*);

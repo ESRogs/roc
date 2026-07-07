@@ -6340,8 +6340,9 @@ test "check type - mutually recursive functions - partially annotated polymorphi
 }
 
 test "check type - mutually recursive functions - inner let-def lambda inside cycle participant is generalized" {
-    // Inner let-def lambda should generalize normally even while
-    // defer_generalize is active for the outer cycle.
+    // Inner let-def lambda should generalize normally even while the
+    // enclosing binding group's own generalization waits for the group
+    // boundary.
     const source =
         \\f = |n| {
         \\    id = |x| x
