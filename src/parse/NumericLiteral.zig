@@ -769,12 +769,22 @@ fn compactFrac(
 
 fn smallDecFromParts(before: []const u8, after: []const u8, after_count: u64, is_negative: bool) ?SmallDecValue {
     if (after_count > std.math.maxInt(u8)) return null;
+    const after_digit_count = usizeToU64(after.len) orelse return null;
+    if (after_digit_count > after_count) return null;
+    const after_leading_zero_count = after_count - after_digit_count;
+
     var magnitude: u32 = 0;
     var saw_digit = false;
     for (before) |byte| {
         if (byte < '0' or byte > '9') return null;
         saw_digit = true;
         magnitude = checkedMulAdd(u32, magnitude, 10, byte - '0') orelse return null;
+        if (magnitude > @as(u32, @intCast(std.math.maxInt(i16))) + @intFromBool(is_negative)) return null;
+    }
+    var leading_zero_index: u64 = 0;
+    while (leading_zero_index < after_leading_zero_count) : (leading_zero_index += 1) {
+        saw_digit = true;
+        magnitude = checkedMulAdd(u32, magnitude, 10, 0) orelse return null;
         if (magnitude > @as(u32, @intCast(std.math.maxInt(i16))) + @intFromBool(is_negative)) return null;
     }
     for (after) |byte| {
@@ -795,12 +805,21 @@ fn smallDecFromParts(before: []const u8, after: []const u8, after_count: u64, is
 
 fn decFromParts(before: []const u8, after: []const u8, after_count: u64, is_negative: bool) ?i128 {
     if (after_count > 18) return null;
+    const after_digit_count = usizeToU64(after.len) orelse return null;
+    if (after_digit_count > after_count) return null;
+    const after_leading_zero_count = after_count - after_digit_count;
+
     var magnitude: u128 = 0;
     var saw_digit = false;
     for (before) |byte| {
         if (byte < '0' or byte > '9') return null;
         saw_digit = true;
         magnitude = checkedMulAdd(u128, magnitude, 10, byte - '0') orelse return null;
+    }
+    var leading_zero_index: u64 = 0;
+    while (leading_zero_index < after_leading_zero_count) : (leading_zero_index += 1) {
+        saw_digit = true;
+        magnitude = checkedMulAdd(u128, magnitude, 10, 0) orelse return null;
     }
     for (after) |byte| {
         if (byte < '0' or byte > '9') return null;
@@ -1116,6 +1135,17 @@ test "compact fractional literals trim trailing zero scale consistently" {
     try std.testing.expectEqualSlices(u8, &.{3}, literal.before);
     try std.testing.expectEqualSlices(u8, &.{}, literal.after);
     try std.testing.expectEqual(@as(u64, 1), literal.after_decimal_digit_count);
+}
+
+test "compact fractional literals preserve counted leading zeros after decimal point" {
+    var literal = try parse(std.testing.allocator, "1.0000005", .frac);
+    defer literal.deinit(std.testing.allocator);
+
+    try std.testing.expect(literal.compact == .dec);
+    try std.testing.expectEqual(@as(i128, 1_000_000_500_000_000_000), literal.compact.dec);
+    try std.testing.expectEqualSlices(u8, &.{1}, literal.before);
+    try std.testing.expectEqualSlices(u8, &.{5}, literal.after);
+    try std.testing.expectEqual(@as(u64, 7), literal.after_decimal_digit_count);
 }
 
 test "parse fractional literal with minimum i64 exponent as compact numeral facts" {
