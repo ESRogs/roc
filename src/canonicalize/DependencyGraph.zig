@@ -805,6 +805,7 @@ fn collectNameReferences(
     pattern_to_def: *const std.AutoHashMapUnmanaged(CIR.Pattern.Idx, CIR.Def.Idx),
     root_expr: CIR.Expr.Idx,
     out: *std.AutoHashMapUnmanaged(CIR.Def.Idx, void),
+    out_has_type_var_alias: *bool,
     scratch_stack: *std.ArrayList(CIR.Expr.Idx),
     allocator: std.mem.Allocator,
 ) std.mem.Allocator.Error!void {
@@ -932,7 +933,8 @@ fn collectNameReferences(
                             try scratch_stack.append(allocator, loop_stmt.body);
                         },
                         .s_return => |ret| try scratch_stack.append(allocator, ret.expr),
-                        .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_type_var_alias, .s_crash, .s_runtime_error, .s_break => {},
+                        .s_type_var_alias => out_has_type_var_alias.* = true,
+                        .s_import, .s_alias_decl, .s_nominal_decl, .s_type_anno, .s_crash, .s_runtime_error, .s_break => {},
                     }
                 }
                 try scratch_stack.append(allocator, block.final_expr);
@@ -999,6 +1001,11 @@ pub fn computeCheckOrder(
     cir: *const ModuleEnv,
     all_defs: CIR.Def.Span,
     allocator: std.mem.Allocator,
+    /// Filled with defs whose body contains an `s_type_var_alias` statement
+    /// (`T : a`): their type-qualified dispatch nodes resolve through the
+    /// def's own annotation generation, so the checker must not pre-declare
+    /// their annotation as a standalone scheme.
+    defs_with_type_var_alias: *std.AutoHashMapUnmanaged(CIR.Def.Idx, void),
 ) std.mem.Allocator.Error!EvaluationOrder {
     const defs_slice = cir.store.sliceDefs(all_defs);
 
@@ -1024,7 +1031,11 @@ pub fn computeCheckOrder(
     for (defs_slice) |def_idx| {
         refs.clearRetainingCapacity();
         const def = cir.store.getDef(def_idx);
-        try collectNameReferences(cir, &pattern_to_def, def.expr, &refs, &scratch_stack, allocator);
+        var has_type_var_alias = false;
+        try collectNameReferences(cir, &pattern_to_def, def.expr, &refs, &has_type_var_alias, &scratch_stack, allocator);
+        if (has_type_var_alias) {
+            try defs_with_type_var_alias.put(allocator, def_idx, {});
+        }
         var ref_iter = refs.keyIterator();
         while (ref_iter.next()) |ref_def_idx| {
             try graph.addEdge(def_idx, ref_def_idx.*);

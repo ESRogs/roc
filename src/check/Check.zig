@@ -24,6 +24,7 @@ const MkSafeList = collections.SafeList;
 
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
+const DependencyGraph = can.DependencyGraph;
 const PatternRefutability = can.PatternRefutability;
 const Allocator = std.mem.Allocator;
 const Ident = base.Ident;
@@ -179,47 +180,76 @@ platform_requirements: ?PlatformRequirementInput,
 platform_required_defs: std.AutoHashMapUnmanaged(CIR.Def.Idx, PlatformRequiredDef),
 /// Local block-statement (`s_decl`) function patterns whose body is currently
 /// being type-checked. Used to detect self-recursion (and references to an
-/// enclosing in-flight def) of LOCAL function defs so their recursive references
-/// defer unification (fresh flex + a pending `local_recursive_refs` entry)
-/// instead of lowering the pattern var's rank, which would prevent
-/// generalization of the def's rigid type variables. Analogous to
-/// `top_level_ptrns` but for block-local defs.
+/// enclosing in-flight def) of LOCAL function defs: an unannotated in-flight
+/// reference unifies monomorphically with the pattern var — the same
+/// binding-group recursion rule as top-level defs — which is why a
+/// self-capturing local `s_decl` is checked inside its own rank frame (the
+/// pattern var lives in that frame, so the monomorphic links generalize with
+/// the def at the frame's exit). An annotated local def's scheme is
+/// pre-declared before its body, so its in-flight references instantiate the
+/// scheme instead. Analogous to `top_level_ptrns` but for block-local defs.
 ///
-/// Presence == "currently being checked" (defer); absence == normal
+/// Presence == "currently being checked"; absence == normal
 /// lookup/instantiate. A reference can only resolve to the current def or an
 /// enclosing in-flight one: forward references to a *later* sibling, and local
 /// mutual recursion, are rejected during canonicalization (local defs are
 /// sequentially scoped), so this is always a single self/enclosing chain.
 local_processing_ptrns: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, LocalDefProcessed) = .{},
-/// Recursive references recorded while checking a LOCAL block def's body (a
-/// self-reference, or a reference to an enclosing in-flight local def), pending
-/// validation once the def's lambda has generalized. Kept in a dedicated stack
-/// rather than the shared `constraints` list because sequential scoping
-/// guarantees local recursion is a single self/enclosing chain — never a mutual
-/// group — so these need no cycle machinery, no per-use instantiation, and no
-/// entanglement with other deferred constraint kinds.
-local_recursive_refs: std.ArrayListUnmanaged(LocalRecursiveRef) = .empty,
 /// The name of the enclosing function, if known.
 /// Used to provide better error messages when type checking lambda arguments.
 enclosing_func_name: ?Ident.Idx,
 /// Type writer for formatting types at snapshot time
 type_writer: types_mod.TypeWriter,
-/// --- Lazy cycle detection state ---
+/// --- Dependency-ordered driver state ---
 ///
-/// Only one cycle can be active at a time because defs are processed
-/// sequentially. `defer_generalize` is global: once set, it affects all
-/// defs processed while active, including non-cycle functions that happen
-/// to be checked during the cycle (e.g. a diamond branch that calls into
-/// the cycle). This is safe because those extra vars are still correctly
-/// typed; they just get generalized at the cycle root instead of
-/// independently.
-/// The def currently being type-checked (innermost in the call stack)
-current_processing_def: ?CIR.Def.Idx = null,
-/// When a dispatch cycle is detected, the .processing def that is the
-/// outermost participant (the "root" that will handle generalization)
-cycle_root_def: ?CIR.Def.Idx = null,
-/// True when generalization should be deferred (a dispatch cycle was detected)
-defer_generalize: bool = false,
+/// Type checking processes top-level defs as binding groups: the SCC
+/// condensation of canonicalization's name-reference graph, in deterministic
+/// topological order (see `DependencyGraph.computeCheckOrder`). A name
+/// reference between groups therefore always points at an already-checked
+/// def. Static-dispatch dependencies are type-directed and cannot be in the
+/// name graph; when one resolves to an unchecked, unannotated local def, the
+/// obligation is recorded in `pending_dispatch_targets` and resolved at the
+/// current group's generalization boundary by checking the target's group in
+/// its own frame — never by re-entering `checkDef` mid-body.
+///
+/// Checking order for the current module's top-level defs. Owned; freed in
+/// `deinit`. Transient: computed when file checking starts, never part of
+/// the checked module.
+check_order: ?DependencyGraph.EvaluationOrder = null,
+/// Which check-order group each top-level def belongs to.
+def_group: std.AutoHashMapUnmanaged(CIR.Def.Idx, u32) = .empty,
+/// Defs whose body contains an `s_type_var_alias` statement (`T : a`): their
+/// type-qualified dispatch nodes resolve through the def's own annotation
+/// generation, so the annotation is not separable from the body frame and is
+/// not pre-declared as a scheme.
+defs_with_type_var_alias: std.AutoHashMapUnmanaged(CIR.Def.Idx, void) = .empty,
+/// Per-group progress; a `.checking` group has a frame on `group_stack`.
+group_states: std.ArrayListUnmanaged(GroupState) = .empty,
+/// Groups currently being checked, outermost first. Nesting happens only at
+/// group generalization boundaries (Invariant E): a dispatch obligation whose
+/// target group is unchecked suspends the current group at its boundary,
+/// checks the target group in a deeper frame, and resumes. Group merge for
+/// dispatch cycles needs no dedicated structure: a suspended group's members
+/// are `.processed` but not yet generalized, so a back-reference links to
+/// their still-live vars monomorphically and rank adjustment keeps the shared
+/// structure at the suspended group's rank, where it generalizes when that
+/// group's boundary completes.
+group_stack: std.ArrayListUnmanaged(GroupFrame) = .empty,
+/// Dispatch obligations whose targets are unchecked, unannotated local defs,
+/// owned by the group that discovered them (stack-suffix discipline: entries
+/// at index >= the owning frame's `pending_targets_top` belong to that frame).
+pending_dispatch_targets: std.ArrayListUnmanaged(CIR.Def.Idx) = .empty,
+/// Top-level defs whose scheme was declared from their annotation before any
+/// body checking (annotated-scheme pre-pass). Their pattern/def vars are
+/// generalized schemes: references instantiate them and never require the
+/// body to have been checked; the body is later checked against a fresh
+/// rigid copy of the annotation, in graph order like everything else.
+predeclared_def_schemes: std.AutoHashMapUnmanaged(CIR.Def.Idx, void) = .empty,
+/// The one expression (a recursive group member's top-level RHS) whose
+/// generalization is suppressed because it lives in its group's shared rank
+/// frame and generalizes at the group boundary instead. Consume-once, like
+/// `checking_call_arg`; `e_closure` re-asserts it onto its inner lambda.
+suppress_generalize_expr: ?CIR.Expr.Idx = null,
 /// True when checking an immediately-consumed call operand expression. Used to
 /// suppress generalization of standalone lambdas that appear either as the
 /// direct callee or as a direct call argument, since they don't need
@@ -251,20 +281,6 @@ checking_binding_rhs_pattern: ?CIR.Pattern.Idx = null,
 discarded_binding_rhs_expr: ?CIR.Expr.Idx = null,
 /// Tracks whether static exhaustiveness diagnostics are compile-time candidates.
 exhaustiveness_context: ExhaustivenessContext.Context = .{},
-/// Deferred def-level unifications (def_var = ptrn_var = expr_var).
-/// These must happen AFTER generalization to avoid lowering expr_var's rank
-/// before generalization can process it, but BEFORE eql constraint resolution
-/// so that def/ptrn vars point to generalized expr vars when cross-function
-/// constraints resolve. This ordering requirement is why these can't be
-/// stored in the `constraints` list (which runs after both steps).
-deferred_def_unifications: std.ArrayListUnmanaged(DeferredDefUnification),
-/// Platform-required unifications deferred past cycle generalization, for the
-/// same rank reasons as `deferred_def_unifications`.
-deferred_platform_required_unifications: std.ArrayListUnmanaged(DeferredPlatformRequiredUnification),
-/// Envs from cycle participants whose vars need to be merged at the cycle root.
-/// Stored here instead of merging eagerly so that ranks remain correct
-/// (no `popRankRetainingVars` needed).
-deferred_cycle_envs: std.ArrayListUnmanaged(Env),
 /// Tracks all local lookup exprs so erroneous bindings can be poisoned explicitly
 /// after type checking has finished.
 value_lookup_tracking: std.ArrayListUnmanaged(ValueLookupEntry),
@@ -596,13 +612,27 @@ const LocalDefProcessed = struct {
     pattern_idx: CIR.Pattern.Idx,
 };
 
-/// A recursive reference made inside a LOCAL block def's body, pending
-/// validation once the def's lambda has generalized. `pat_var` is the def's
-/// (eventually generalized) pattern var; `expr_var` is the reference's flex var.
-const LocalRecursiveRef = struct {
-    pat_var: Var,
-    expr_var: Var,
-    def_name: ?Ident.Idx,
+/// Progress of one check-order group (see `check_order`).
+const GroupState = enum { pending, checking, checked };
+
+/// One group currently being checked (an entry on `group_stack`).
+const GroupFrame = struct {
+    group_index: u32,
+    /// The env rank on entry to the group.
+    base_rank: Rank,
+    /// The rank `checkDef` runs at for this group's members: `base_rank` for a
+    /// singleton, or the shared frame (`base_rank.next()`) for a recursive
+    /// group.
+    def_check_rank: Rank,
+    /// The group's generalization boundary: a singleton function def's RHS
+    /// frame or a recursive group's shared frame (`base_rank.next()`), or
+    /// `base_rank` itself for a value def (which never generalizes). Pending
+    /// dispatch obligations resolve here, and obligation vars are pinned at
+    /// this rank so no inner frame generalizes them first (Invariant D).
+    boundary_rank: Rank,
+    /// `pending_dispatch_targets` length on entry; entries at or above this
+    /// index are owned by this frame (Invariant B, stack-suffix discipline).
+    pending_targets_top: usize,
 };
 
 const HoistPosition = enum {
@@ -1096,20 +1126,6 @@ const HoistFrameGuard = struct {
     }
 };
 
-/// A deferred def-level unification (def_var = ptrn_var = expr_var).
-const DeferredDefUnification = struct {
-    def_var: Var,
-    ptrn_var: Var,
-    expr_var: Var,
-};
-
-const DeferredPlatformRequiredUnification = struct {
-    expected_var: Var,
-    expr_var: Var,
-    required_ident: Ident.Idx,
-    platform_region: Region,
-};
-
 const ValueLookupEntry = struct {
     expr_idx: CIR.Expr.Idx,
     pattern_idx: CIR.Pattern.Idx,
@@ -1141,22 +1157,6 @@ const Constraint = union(enum) {
         expected: Var,
         actual: Var,
         ctx: problem.Context,
-        /// True when this is a `recursive_def` cross-reference to a *different*,
-        /// annotated member of a recursive group (mutual recursion). Such a
-        /// reference is instantiated per use-site at validation time so each
-        /// member keeps its own rigid type parameters; a self-reference (or an
-        /// unannotated target) stays monomorphic. Drives resolution, not the
-        /// error message — kept here rather than in `ctx` (which is purely
-        /// diagnostic) so it doesn't have to ride inside the problem context.
-        is_cross_reference: bool = false,
-        /// For a `recursive_def` edge, the referenced def's body var — the one
-        /// that carries the referenced def's annotated function type. It exists
-        /// only to let `defaultLiteralsAtGeneralizationBoundary` read which of a
-        /// recursive call's parameters are concretely annotated (and therefore
-        /// pin a literal argument) at a point where `expected` (a self-reference's
-        /// pattern var) is not yet unified with the annotation. Null for non-
-        /// recursive edges.
-        recursive_annotated_fn_var: ?Var = null,
     },
 
     pub const SafeList = MkSafeList(@This());
@@ -1352,9 +1352,6 @@ fn initAssumePrepared(
         .enclosing_func_name = null,
         // Initialize with null import_mapping - caller should call fixupTypeWriter() after storing Check
         .type_writer = try types_mod.TypeWriter.initFromParts(gpa, types, cir.getIdentStore(), null),
-        .deferred_def_unifications = .empty,
-        .deferred_platform_required_unifications = .empty,
-        .deferred_cycle_envs = .empty,
         .value_lookup_tracking = .empty,
         .erroneous_value_exprs = .empty,
         .erroneous_value_patterns = .empty,
@@ -1429,11 +1426,13 @@ pub fn deinit(self: *Self) void {
     self.unify_scratch.deinit();
     self.occurs_scratch.deinit();
     self.seen_annos.deinit();
-    // Release any stored cycle envs before deiniting the pool
-    for (self.deferred_cycle_envs.items) |deferred_env| {
-        self.env_pool.release(deferred_env);
-    }
-    self.deferred_cycle_envs.deinit(self.gpa);
+    if (self.check_order) |*order| order.deinit();
+    self.def_group.deinit(self.gpa);
+    self.defs_with_type_var_alias.deinit(self.gpa);
+    self.group_states.deinit(self.gpa);
+    self.group_stack.deinit(self.gpa);
+    self.pending_dispatch_targets.deinit(self.gpa);
+    self.predeclared_def_schemes.deinit(self.gpa);
     self.value_lookup_tracking.deinit(self.gpa);
     self.erroneous_value_exprs.deinit(self.gpa);
     self.erroneous_value_patterns.deinit(self.gpa);
@@ -1486,10 +1485,7 @@ pub fn deinit(self: *Self) void {
     self.top_level_ptrns.deinit();
     self.platform_required_defs.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
-    self.local_recursive_refs.deinit(self.gpa);
     self.type_writer.deinit();
-    self.deferred_def_unifications.deinit(self.gpa);
-    self.deferred_platform_required_unifications.deinit(self.gpa);
     self.instantiation_dispatchers.deinit(self.gpa);
     self.ambiguity_candidates.deinit(self.gpa);
     self.ambiguity_verdicts.deinit(self.gpa);
@@ -5219,13 +5215,16 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
 
     try self.processAppPlatformRequirements(&env);
 
-    // Then, iterate over defs again, inferring types
-    for (0..self.cir.all_defs.span.len) |def_offset| {
-        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
-        try self.checkDef(def_idx, &env);
-
-        // Ensure that after processing a def, checkDef correctly restores the
-        // rank to outermost for the next level of processing
+    // Declare every annotated def's scheme before any body is checked, then
+    // check defs as binding groups in dependency order. A name reference
+    // between groups always points at an already-checked (or pre-declared)
+    // def; dispatch-discovered dependencies resolve at group boundaries.
+    try self.setupCheckOrder();
+    try self.predeclareAnnotatedDefSchemes(&env);
+    const group_count: u32 = @intCast(self.check_order.?.sccs.len);
+    var group_index: u32 = 0;
+    while (group_index < group_count) : (group_index += 1) {
+        try self.ensureGroupChecked(group_index, &env);
         std.debug.assert(env.rank() == .outermost);
     }
 
@@ -6736,6 +6735,12 @@ fn judgeAmbiguityCandidate(
 /// defs or the final constraint fixpoint, so it stays on the worklist for the
 /// end-of-check residual judgment.
 fn judgeAmbiguityCandidatesAtGeneralization(self: *Self, scheme_root: Var) Allocator.Error!void {
+    try self.judgeAmbiguityCandidatesAtGeneralizationMultiRoot(&.{scheme_root});
+}
+
+/// `judgeAmbiguityCandidatesAtGeneralization` for a whole binding group: the
+/// pinnable frontier includes every member's scheme root.
+fn judgeAmbiguityCandidatesAtGeneralizationMultiRoot(self: *Self, scheme_roots: []const Var) Allocator.Error!void {
     var sets_built = false;
     for (self.ambiguity_candidates.items[self.ambiguity_candidates_def_start..]) |*candidate| {
         if (candidate.judged) continue;
@@ -6760,7 +6765,9 @@ fn judgeAmbiguityCandidatesAtGeneralization(self: *Self, scheme_root: Var) Alloc
         candidate.judged = true;
         if (!sets_built) {
             self.beginAmbiguityPinnableSets();
-            try self.addAmbiguityPinnableRoot(scheme_root);
+            for (scheme_roots) |scheme_root| {
+                try self.addAmbiguityPinnableRoot(scheme_root);
+            }
             try self.finishAmbiguityPinnableSets(
                 self.open_literal_vars.items[self.open_literal_vars_def_start..],
                 self.checked_lambda_params.items[self.checked_lambda_params_def_start..],
@@ -8377,13 +8384,14 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     try env.var_pool.pushRank();
     std.debug.assert(env.rank() == .outermost);
 
-    // Type-check defs from local type declarations (their associated blocks)
-    for (0..self.cir.all_defs.span.len) |def_offset| {
-        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
-        try self.checkDef(def_idx, &env);
-
-        // Ensure that after processing a def, checkDef correctly restores the
-        // rank to outermost for the next level of processing
+    // Type-check defs from local type declarations (their associated blocks),
+    // as dependency-ordered binding groups just like file checking.
+    try self.setupCheckOrder();
+    try self.predeclareAnnotatedDefSchemes(&env);
+    const group_count: u32 = @intCast(self.check_order.?.sccs.len);
+    var group_index: u32 = 0;
+    while (group_index < group_count) : (group_index += 1) {
+        try self.ensureGroupChecked(group_index, &env);
         std.debug.assert(env.rank() == .outermost);
     }
 
@@ -8443,15 +8451,11 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         }
     }
 
-    // Track which def is currently being processed (for cycle detection)
-    const saved_processing_def = self.current_processing_def;
-    self.current_processing_def = def_idx;
-    defer self.current_processing_def = saved_processing_def;
-
     // Scope the ambiguity-judgment cursors to this def: a generalization event
     // inside it judges only candidates recorded while checking it, against a
     // pinnable frontier built from its own lambda params and open literals.
-    // Saved/restored (not reset) because dependency defs check re-entrantly.
+    // Saved/restored (not reset) because groups check defs back to back and a
+    // dispatch obligation can nest another group's defs at a boundary.
     const saved_ambiguity_candidates_def_start = self.ambiguity_candidates_def_start;
     self.ambiguity_candidates_def_start = self.ambiguity_candidates.items.len;
     defer self.ambiguity_candidates_def_start = saved_ambiguity_candidates_def_start;
@@ -8475,17 +8479,33 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     const ptrn_var = ModuleEnv.varFrom(def.pattern);
     const expr_var = ModuleEnv.varFrom(def.expr);
 
-    // Ensure that initially we are at top level
-    std.debug.assert(env.rank() == .outermost);
+    // Ensure we're at the rank the driver checks defs at: the outermost rank,
+    // or a recursive group's shared frame (whose members are checked inside
+    // it), or a nested group frame opened at a dispatch boundary.
+    std.debug.assert(env.rank() == self.currentDefCheckRank());
 
-    // Set the ptrn and expr rank
-    try self.setVarRank(def_var, env);
-    try self.setVarRank(ptrn_var, env);
+    // Whether this def's scheme was already declared by the annotated-scheme
+    // pre-pass. Its pattern/def vars carry the generalized scheme, so they
+    // must not be re-ranked (that would demote the scheme's root), and the
+    // body's checked type is validated against a rigid copy of the annotation
+    // instead of being unified into the pattern.
+    const predeclared = self.predeclared_def_schemes.contains(def_idx);
 
-    const def_pattern_ctx: PatternCtx = if (self.patternNeedsExhaustiveness(def.pattern)) .match_branch else .bound;
+    // Whether the driver already ranked this def's pattern in the current
+    // recursive group's shared frame (so in-group forward references can link
+    // to it monomorphically before this def's body is checked).
+    const group_prechecked = !predeclared and self.defInCurrentRecursiveGroup(def_idx);
 
-    // Check the pattern
-    try self.checkPattern(def.pattern, def_pattern_ctx, env);
+    if (!predeclared and !group_prechecked) {
+        // Set the ptrn and expr rank
+        try self.setVarRank(def_var, env);
+        try self.setVarRank(ptrn_var, env);
+
+        const def_pattern_ctx: PatternCtx = if (self.patternNeedsExhaustiveness(def.pattern)) .match_branch else .bound;
+
+        // Check the pattern
+        try self.checkPattern(def.pattern, def_pattern_ctx, env);
+    }
 
     // Extract function name from the pattern (for better error messages)
     const saved_func_name = self.enclosing_func_name;
@@ -8496,6 +8516,9 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     const platform_required = self.platform_required_defs.get(def_idx);
     const expectation = blk: {
         if (def.annotation) |annotation_idx| {
+            if (predeclared) {
+                break :blk Expected.fromPredeclaredAnnotation(annotation_idx);
+            }
             break :blk Expected.fromAnnotation(annotation_idx);
         } else if (platform_required) |required| {
             break :blk Expected.none().withExpectedType(.{
@@ -8525,25 +8548,12 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     const def_does_fx = try self.checkExpr(def.expr, env, def_expectation);
     if (def.annotation != null) {
         if (platform_required) |required| {
-            if (self.defer_generalize) {
-                // Same rank contract as the deferred def unifications below:
-                // the requirement var lives at the outermost rank, so unifying
-                // now would lower this cycle participant's expr var out of the
-                // rank the cycle root generalizes at.
-                try self.deferred_platform_required_unifications.append(self.gpa, .{
-                    .expected_var = required.expected_var,
-                    .expr_var = ModuleEnv.varFrom(def.expr),
-                    .required_ident = required.required_ident,
-                    .platform_region = required.platform_region,
-                });
-            } else {
-                _ = try self.unifyInContext(
-                    required.expected_var,
-                    ModuleEnv.varFrom(def.expr),
-                    env,
-                    .{ .platform_requirement = .{ .required_ident = required.required_ident, .platform_region = required.platform_region } },
-                );
-            }
+            _ = try self.unifyInContext(
+                required.expected_var,
+                ModuleEnv.varFrom(def.expr),
+                env,
+                .{ .platform_requirement = .{ .required_ident = required.required_ident, .platform_region = required.platform_region } },
+            );
         }
     }
     if (def_does_fx) {
@@ -8563,18 +8573,12 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         try self.checkEffectfulFunctionName(def.pattern, def.expr);
     }
 
-    if (self.defer_generalize) {
-        // defer_generalize is only set when a cycle root has been identified.
-        std.debug.assert(self.cycle_root_def != null);
-
-        // Defer unifications until after generalization.
-        // If we unify now, def_var(R1) with expr_var(R2) lowers expr_var
-        // to R1 in the type store, and generalize at R2 would skip it.
-        _ = try self.deferred_def_unifications.append(self.gpa, .{
-            .def_var = def_var,
-            .ptrn_var = ptrn_var,
-            .expr_var = expr_var,
-        });
+    if (predeclared) {
+        // The pattern and def vars already carry the annotation scheme, and
+        // the body was validated against a rigid copy of it inside checkExpr.
+        // Unifying the scheme with the body's independently generalized copy
+        // would collide the two copies' rigid type parameters, so the def's
+        // published type stays exactly the annotation.
     } else {
         // Unify the ptrn and the expr
         const ptrn_result = try self.unify(ptrn_var, expr_var, env);
@@ -8594,6 +8598,397 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         .def_name = def_name,
         .status = .processed,
     });
+}
+
+// dependency-ordered driver //
+
+/// Compute the module's dependency-ordered checking plan: the SCC condensation
+/// of the name-reference graph in deterministic topological order. Transient —
+/// owned by this Check instance and freed in deinit, never part of the checked
+/// module.
+fn setupCheckOrder(self: *Self) std.mem.Allocator.Error!void {
+    if (self.check_order != null) return;
+    self.check_order = try DependencyGraph.computeCheckOrder(self.cir, self.cir.all_defs, self.gpa, &self.defs_with_type_var_alias);
+    const sccs = self.check_order.?.sccs;
+    try self.group_states.appendNTimes(self.gpa, .pending, sccs.len);
+    for (sccs, 0..) |scc, group_index| {
+        for (scc.defs) |def_idx| {
+            try self.def_group.put(self.gpa, def_idx, @intCast(group_index));
+        }
+    }
+}
+
+/// Declare every annotated top-level def's scheme from its annotation, before
+/// any body is checked. A reference to an annotated def — by name or by
+/// dispatch — then instantiates the scheme and never requires the referenced
+/// body to have been checked; bodies are later checked *against* their
+/// declared scheme, in graph order like everything else.
+///
+/// Only simple `.assign`-pattern defs participate: a destructuring def's
+/// sub-pattern linking runs through `checkPattern` during `checkDef`, which a
+/// pre-declared pattern must skip.
+fn predeclareAnnotatedDefSchemes(self: *Self, env: *Env) std.mem.Allocator.Error!void {
+    std.debug.assert(env.rank() == .outermost);
+    for (0..self.cir.all_defs.span.len) |def_offset| {
+        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
+        const def = self.cir.store.getDef(def_idx);
+        const annotation_idx = def.annotation orelse continue;
+        if (!(try self.annotationIsPredeclarableScheme(def_idx, def.pattern, annotation_idx))) continue;
+        try self.predeclareDefScheme(def.pattern, ModuleEnv.varFrom(def_idx), annotation_idx, env);
+        try self.predeclared_def_schemes.put(self.gpa, def_idx, {});
+    }
+}
+
+/// Whether a def's annotation can be declared as a standalone scheme before
+/// its body is checked. Three exclusions, each keeping today's
+/// annotation-generated-with-the-body semantics for the def instead (the def
+/// is still checked in graph order; references simply wait for its group):
+/// - a non-`.assign` pattern needs `checkPattern` to link its sub-patterns;
+/// - a body containing `T : a` type-var aliases dispatches through the
+///   annotation's own generated nodes, so annotation and body share one
+///   generation;
+/// - an `_` hole is inferred from the body, so the annotation alone does not
+///   determine the scheme.
+fn annotationIsPredeclarableScheme(
+    self: *Self,
+    def_idx: CIR.Def.Idx,
+    pattern_idx: CIR.Pattern.Idx,
+    annotation_idx: CIR.Annotation.Idx,
+) std.mem.Allocator.Error!bool {
+    if (self.cir.store.getPattern(pattern_idx) != .assign) return false;
+    if (self.defs_with_type_var_alias.contains(def_idx)) return false;
+    return !(try self.annotationContainsUnderscore(annotation_idx));
+}
+
+/// Whether the annotation's type (or any of its where-clause method
+/// signatures) contains an `_` inference hole. Explicit worklist walk.
+fn annotationContainsUnderscore(self: *Self, annotation_idx: CIR.Annotation.Idx) std.mem.Allocator.Error!bool {
+    const annotation = self.cir.store.getAnnotation(annotation_idx);
+
+    var stack_allocator_state = std.heap.stackFallback(1024, self.gpa);
+    const stack_allocator = stack_allocator_state.get();
+    var pending: std.ArrayList(CIR.TypeAnno.Idx) = .empty;
+    defer pending.deinit(stack_allocator);
+
+    try pending.append(stack_allocator, annotation.anno);
+    if (annotation.where) |where_span| {
+        for (self.cir.store.sliceWhereClauses(where_span)) |where_idx| {
+            switch (self.cir.store.getWhereClause(where_idx)) {
+                .w_method => |method| {
+                    try pending.append(stack_allocator, method.var_);
+                    for (self.cir.store.sliceTypeAnnos(method.args)) |arg_idx| {
+                        try pending.append(stack_allocator, arg_idx);
+                    }
+                    try pending.append(stack_allocator, method.ret);
+                },
+                .w_alias, .w_malformed => {},
+            }
+        }
+    }
+
+    while (pending.pop()) |anno_idx| {
+        switch (self.cir.store.getTypeAnno(anno_idx)) {
+            .underscore => return true,
+            .rigid_var, .rigid_var_lookup, .lookup, .malformed => {},
+            .apply => |apply| {
+                for (self.cir.store.sliceTypeAnnos(apply.args)) |arg_idx| {
+                    try pending.append(stack_allocator, arg_idx);
+                }
+            },
+            .tag_union => |tag_union| {
+                for (self.cir.store.sliceTypeAnnos(tag_union.tags)) |tag_idx| {
+                    try pending.append(stack_allocator, tag_idx);
+                }
+                if (tag_union.ext) |ext_idx| try pending.append(stack_allocator, ext_idx);
+            },
+            .tag => |tag| {
+                for (self.cir.store.sliceTypeAnnos(tag.args)) |arg_idx| {
+                    try pending.append(stack_allocator, arg_idx);
+                }
+            },
+            .tuple => |tuple| {
+                for (self.cir.store.sliceTypeAnnos(tuple.elems)) |elem_idx| {
+                    try pending.append(stack_allocator, elem_idx);
+                }
+            },
+            .record => |record| {
+                for (self.cir.store.sliceAnnoRecordFields(record.fields)) |field_idx| {
+                    const field = self.cir.store.getAnnoRecordField(field_idx);
+                    try pending.append(stack_allocator, field.ty);
+                }
+                if (record.ext) |ext_idx| try pending.append(stack_allocator, ext_idx);
+            },
+            .@"fn" => |func| {
+                for (self.cir.store.sliceTypeAnnos(func.args)) |arg_idx| {
+                    try pending.append(stack_allocator, arg_idx);
+                }
+                try pending.append(stack_allocator, func.ret);
+            },
+            .parens => |parens| try pending.append(stack_allocator, parens.anno),
+        }
+    }
+    return false;
+}
+
+/// Generate `annotation_idx`'s type in its own rank frame, bind the given
+/// pattern (and optional def) var to it, and generalize the frame, publishing
+/// the scheme. The annotation's type is generated exactly once, here — the
+/// body pass checks against a fresh rigid copy of it (see
+/// `Expected.annotation_predeclared`).
+fn predeclareDefScheme(
+    self: *Self,
+    pattern_idx: CIR.Pattern.Idx,
+    mb_def_var: ?Var,
+    annotation_idx: CIR.Annotation.Idx,
+    env: *Env,
+) std.mem.Allocator.Error!void {
+    try env.var_pool.pushRank();
+    defer env.var_pool.popRank();
+
+    try self.generateAnnotationType(annotation_idx, env);
+    const anno_var = ModuleEnv.varFrom(annotation_idx);
+
+    const ptrn_var = ModuleEnv.varFrom(pattern_idx);
+    try self.setVarRank(ptrn_var, env);
+    _ = try self.unify(ptrn_var, anno_var, env);
+    if (mb_def_var) |def_var| {
+        try self.setVarRank(def_var, env);
+        _ = try self.unify(def_var, ptrn_var, env);
+    }
+
+    try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
+}
+
+/// The rank `checkDef` expects the env to sit at: the current group's
+/// def-check rank (a recursive group's members check inside its shared
+/// frame), or the outermost rank outside any group (REPL, expect bodies).
+fn currentDefCheckRank(self: *const Self) Rank {
+    if (self.group_stack.items.len == 0) return .outermost;
+    return self.group_stack.items[self.group_stack.items.len - 1].def_check_rank;
+}
+
+/// The rank of the current group's generalization boundary: the frame where a
+/// singleton def's RHS generalizes (or a recursive group's shared frame), and
+/// where pending dispatch obligations resolve. Obligation vars are pinned at
+/// this rank so no inner frame can generalize them first (Invariant D).
+fn currentGroupBoundaryRank(self: *const Self) Rank {
+    if (self.group_stack.items.len == 0) return Rank.outermost.next();
+    return self.group_stack.items[self.group_stack.items.len - 1].boundary_rank;
+}
+
+fn currentFramePendingTargetsTop(self: *const Self) usize {
+    if (self.group_stack.items.len == 0) return 0;
+    return self.group_stack.items[self.group_stack.items.len - 1].pending_targets_top;
+}
+
+/// Whether `def_idx` is a member of the group currently on top of the stack,
+/// and that group is recursive (so the driver pre-ranked its pattern in the
+/// group's shared frame).
+fn defInCurrentRecursiveGroup(self: *const Self, def_idx: CIR.Def.Idx) bool {
+    if (self.group_stack.items.len == 0) return false;
+    const frame = self.group_stack.items[self.group_stack.items.len - 1];
+    if (!self.check_order.?.sccs[frame.group_index].is_recursive) return false;
+    const group_index = self.def_group.get(def_idx) orelse return false;
+    return group_index == frame.group_index;
+}
+
+fn ensureGroupsCheckedUpTo(self: *Self, group_index: u32, env: *Env) std.mem.Allocator.Error!void {
+    // Groups are in topological order, so every group this one name-depends on
+    // has a smaller index. Checking the whole prefix keeps nested checking
+    // deterministic and guarantees the target group's name dependencies are in
+    // place before its bodies run.
+    var gi: u32 = 0;
+    while (gi <= group_index) : (gi += 1) {
+        try self.ensureGroupChecked(gi, env);
+    }
+}
+
+fn ensureGroupChecked(self: *Self, group_index: u32, env: *Env) std.mem.Allocator.Error!void {
+    switch (self.group_states.items[group_index]) {
+        .checked => return,
+        .checking => {
+            // A dispatch back-edge into a suspended group resolves against its
+            // still-live (.processed but not yet generalized) member vars; it
+            // never re-enters the group. Reaching here is a driver bug.
+            if (builtin.mode == .Debug) {
+                std.debug.panic("type checker invariant violated: re-entered group {d} while it is being checked", .{group_index});
+            }
+            unreachable;
+        },
+        .pending => try self.checkGroup(group_index, env),
+    }
+}
+
+/// Check one binding group. A non-recursive singleton runs the ordinary
+/// per-def path (its RHS frame is the group's boundary). A recursive group
+/// gets one shared rank frame: members' patterns are ranked in it first (so
+/// in-group references — forward or backward — link to them monomorphically),
+/// unannotated function members' top-level lambdas are kept in the frame
+/// instead of generalizing on their own, and the whole group generalizes at
+/// the frame's boundary (the ML binding-group rule).
+fn checkGroup(self: *Self, group_index: u32, env: *Env) std.mem.Allocator.Error!void {
+    const scc = self.check_order.?.sccs[group_index];
+    const base_rank = env.rank();
+
+    // Invariant E (boundary cleanliness): group checks start — and nest —
+    // only with no mid-body state pending.
+    std.debug.assert(self.suppress_generalize_expr == null);
+
+    // A singleton value def never generalizes, so its obligations resolve at
+    // the base rank (after checkDef); everything else's boundary is the RHS
+    // or shared group frame.
+    const group_is_value_def = !scc.is_recursive and
+        !isFunctionDef(&self.cir.store, self.cir.store.getExpr(self.cir.store.getDef(scc.defs[0]).expr));
+
+    self.group_states.items[group_index] = .checking;
+    try self.group_stack.append(self.gpa, .{
+        .group_index = group_index,
+        .base_rank = base_rank,
+        .def_check_rank = if (scc.is_recursive) base_rank.next() else base_rank,
+        .boundary_rank = if (group_is_value_def) base_rank else base_rank.next(),
+        .pending_targets_top = self.pending_dispatch_targets.items.len,
+    });
+
+    if (!scc.is_recursive) {
+        std.debug.assert(scc.defs.len == 1);
+        try self.checkDef(scc.defs[0], env);
+        std.debug.assert(env.rank() == base_rank);
+        // A function def resolved its dispatch obligations at its RHS
+        // generalization boundary (inside checkExpr); a value def has no such
+        // boundary, so any obligations its RHS recorded resolve here.
+        try self.resolveGroupPendingDispatchTargets(env);
+    } else {
+        try env.var_pool.pushRank();
+        const frame_rank = env.rank();
+
+        // Rank every member's def/pattern vars in the shared frame first, so
+        // an earlier member's body can reference a later member. Pre-declared
+        // (annotated) members already carry their generalized scheme.
+        for (scc.defs) |member_def_idx| {
+            if (self.predeclared_def_schemes.contains(member_def_idx)) continue;
+            const member_def = self.cir.store.getDef(member_def_idx);
+            try self.setVarRank(ModuleEnv.varFrom(member_def_idx), env);
+            try self.setVarRank(ModuleEnv.varFrom(member_def.pattern), env);
+            const member_pattern_ctx: PatternCtx = if (self.patternNeedsExhaustiveness(member_def.pattern)) .match_branch else .bound;
+            try self.checkPattern(member_def.pattern, member_pattern_ctx, env);
+        }
+
+        for (scc.defs) |member_def_idx| {
+            const member_def = self.cir.store.getDef(member_def_idx);
+            if (!self.predeclared_def_schemes.contains(member_def_idx) and
+                isFunctionDef(&self.cir.store, self.cir.store.getExpr(member_def.expr)))
+            {
+                // The member's top-level RHS lives in the group frame and
+                // generalizes at the group boundary, not on its own.
+                self.suppress_generalize_expr = member_def.expr;
+            }
+            try self.checkDef(member_def_idx, env);
+            std.debug.assert(self.suppress_generalize_expr == null);
+            std.debug.assert(env.rank() == frame_rank);
+        }
+
+        // The group's generalization boundary. (Owned copy, not scratch: the
+        // boundary can nest other groups' checks, which use the scratch
+        // lists themselves.)
+        const member_roots = try self.gpa.alloc(Var, scc.defs.len);
+        defer self.gpa.free(member_roots);
+        for (scc.defs, 0..) |member_def_idx, i| {
+            const member_def = self.cir.store.getDef(member_def_idx);
+            member_roots[i] = ModuleEnv.varFrom(member_def.expr);
+        }
+
+        try self.runGroupBoundary(member_roots, env);
+        try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
+        try self.judgeAmbiguityCandidatesAtGeneralizationMultiRoot(member_roots);
+        env.var_pool.popRank();
+    }
+
+    std.debug.assert(env.rank() == base_rank);
+    // Invariant B: every dispatch obligation this group discovered was
+    // resolved at its boundary.
+    std.debug.assert(self.pending_dispatch_targets.items.len ==
+        self.group_stack.items[self.group_stack.items.len - 1].pending_targets_top);
+    _ = self.group_stack.pop();
+    self.group_states.items[group_index] = .checked;
+}
+
+/// Run the group generalization boundary up to (not including) the generalize
+/// call: resolve pending dispatch obligations by checking their target groups
+/// in nested frames (Invariant D — nothing may generalize while an obligation
+/// into an unchecked group is outstanding), interleaved with boundary literal
+/// defaulting to a fixpoint, since a defaulting round can pin a receiver and
+/// surface a new obligation.
+fn runGroupBoundary(self: *Self, roots: []const Var, env: *Env) std.mem.Allocator.Error!void {
+    while (true) {
+        // Deferred dispatch receivers may have been pinned since the last
+        // in-body pass — in a recursive group, the members' def-level
+        // pattern=body unifications run after their bodies' dispatch passes,
+        // and they can pin a recursive call's result (e.g. #9885's
+        // `reverse(rest).append(first)`). Resolve those before generalizing.
+        try self.checkStaticDispatchConstraints(env, false);
+        try self.resolveGroupPendingDispatchTargets(env);
+        const pending_before = self.pending_dispatch_targets.items.len;
+        try self.defaultLiteralsAtGeneralizationBoundaryMultiRoot(roots, env);
+        if (self.pending_dispatch_targets.items.len == pending_before) break;
+    }
+    // Invariant D: every remaining deferred dispatch constraint targets a
+    // checked def, an annotated scheme, or a still-flex receiver.
+    std.debug.assert(self.pending_dispatch_targets.items.len == self.currentFramePendingTargetsTop());
+}
+
+/// Drain the current frame's pending dispatch targets: check each target's
+/// group (nested, in its own frame, together with the topological prefix it
+/// may name-depend on), then re-run dispatch constraint processing, which may
+/// pin further receivers and record further targets — loop to quiescence.
+fn resolveGroupPendingDispatchTargets(self: *Self, env: *Env) std.mem.Allocator.Error!void {
+    const top = self.currentFramePendingTargetsTop();
+    while (self.pending_dispatch_targets.items.len > top) {
+        while (self.pending_dispatch_targets.items.len > top) {
+            const target_def = self.pending_dispatch_targets.pop().?;
+            const target_group = self.def_group.get(target_def).?;
+            try self.ensureGroupsCheckedUpTo(target_group, env);
+        }
+        try self.checkStaticDispatchConstraints(env, false);
+    }
+}
+
+/// Record that a dispatch obligation resolved to `target_def_idx` — an
+/// unchecked, unannotated local def — for resolution at the current group's
+/// boundary.
+fn recordPendingDispatchTarget(self: *Self, target_def_idx: CIR.Def.Idx) std.mem.Allocator.Error!void {
+    try self.pending_dispatch_targets.append(self.gpa, target_def_idx);
+}
+
+/// Pin `obligation_var`'s class at the current group's boundary rank so no
+/// inner frame generalizes it before the obligation resolves (Invariant D,
+/// enforced by rank: rank adjustment at each inner generalization keeps
+/// everything the obligation touched below the generalizing rank — escaped,
+/// alive, and un-generalized until the boundary).
+fn pinVarAtGroupBoundaryRank(self: *Self, obligation_var: Var, env: *Env) std.mem.Allocator.Error!void {
+    const boundary_rank = self.currentGroupBoundaryRank();
+    const resolved = self.types.resolveVar(obligation_var);
+    if (resolved.desc.rank != .generalized and
+        @intFromEnum(resolved.desc.rank) > @intFromEnum(boundary_rank))
+    {
+        try self.types.setDescRank(resolved.desc_idx, boundary_rank);
+        try env.var_pool.addVarToRank(resolved.var_, boundary_rank);
+    }
+}
+
+/// Whether a function def's closure captures the given pattern — i.e. the body
+/// references the binding being defined (self-recursion, directly or through a
+/// nested closure). A capture-free lambda cannot reference its own binding.
+fn closureCapturesOwnPattern(self: *const Self, expr_idx: CIR.Expr.Idx, pattern_idx: CIR.Pattern.Idx) bool {
+    switch (self.cir.store.getExpr(expr_idx)) {
+        .e_closure => |closure| {
+            for (self.cir.store.sliceCaptures(closure.captures)) |capture_idx| {
+                const capture = self.cir.store.getCapture(capture_idx);
+                if (capture.pattern_idx == pattern_idx) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 // create types for type decls //
@@ -9883,6 +10278,13 @@ fn setBuiltinTypeContent(
 
 const Expected = struct {
     annotation: ?CIR.Annotation.Idx = null,
+    /// True when `annotation`'s scheme was already declared by the
+    /// annotated-scheme pre-pass (its type var is generalized). The body then
+    /// checks against a fresh rigid copy of the scheme instead of generating
+    /// the annotation's type in place: generating it again would emit its
+    /// diagnostics twice, and unifying the body with the published scheme
+    /// itself would mutate generalized vars.
+    annotation_predeclared: bool = false,
     expected_type: ?ExpectedType = null,
     branch_result: ?Var = null,
     return_result: ?Var = null,
@@ -9902,9 +10304,16 @@ const Expected = struct {
         return Expected.none().withAnnotation(annotation_idx);
     }
 
+    fn fromPredeclaredAnnotation(annotation_idx: CIR.Annotation.Idx) Expected {
+        var expected = Expected.fromAnnotation(annotation_idx);
+        expected.annotation_predeclared = true;
+        return expected;
+    }
+
     fn withAnnotation(self: Expected, annotation_idx: CIR.Annotation.Idx) Expected {
         return .{
             .annotation = annotation_idx,
+            .annotation_predeclared = self.annotation_predeclared,
             .expected_type = self.expected_type,
             .branch_result = self.branch_result,
             .return_result = self.return_result,
@@ -9916,6 +10325,7 @@ const Expected = struct {
     fn withExpectedType(self: Expected, expected_type: ExpectedType) Expected {
         return .{
             .annotation = self.annotation,
+            .annotation_predeclared = self.annotation_predeclared,
             .expected_type = expected_type,
             .branch_result = self.branch_result,
             .return_result = self.return_result,
@@ -9991,6 +10401,7 @@ const Expected = struct {
     fn suppressComptimeConditionWarnings(self: Expected) Expected {
         return .{
             .annotation = self.annotation,
+            .annotation_predeclared = self.annotation_predeclared,
             .expected_type = self.expected_type,
             .branch_result = self.branch_result,
             .return_result = self.return_result,
@@ -10919,29 +11330,21 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
     }
     defer self.discarded_binding_rhs_expr = prev_discarded_binding_rhs_expr;
 
+    // A recursive group member's top-level RHS lives in the group's shared
+    // rank frame and generalizes at the group boundary, not on its own.
+    // Consume-once; `e_closure` re-asserts it onto its inner lambda below.
+    const suppress_group_member_generalize = self.suppress_generalize_expr == expr_idx;
+    if (suppress_group_member_generalize) self.suppress_generalize_expr = null;
+
     // Decide whether this binding generalizes — see `shouldGeneralize` for the
     // three qualifying paths and why each is sound.
-    const should_generalize = self.shouldGeneralize(expr, expected.annotation, is_binding_rhs, is_call_arg);
+    const should_generalize = !suppress_group_member_generalize and
+        self.shouldGeneralize(expr, expected.annotation, is_binding_rhs, is_call_arg);
 
     // Push/pop ranks based on if we should generalize
     if (should_generalize) try env.var_pool.pushRank();
     defer if (should_generalize) {
-        // For an intermediate cycle participant's top-level lambda,
-        // don't pop: rank and vars are preserved for the caller to
-        // store and merge at the cycle root before generalization.
-        // Inner lambdas (rank > outermost+1) always pop normally.
-        const at_def_top_level = env.rank() == Rank.outermost.next();
-        const is_cycle_root = if (self.cycle_root_def) |root_def|
-            self.current_processing_def != null and root_def == self.current_processing_def.?
-        else
-            false;
-        const is_intermediate = self.cycle_root_def != null and !is_cycle_root;
-
-        if (is_intermediate and at_def_top_level) {
-            // Don't pop — vars will be merged by cycle root.
-        } else {
-            env.var_pool.popRank();
-        }
+        env.var_pool.popRank();
     };
 
     try self.setVarRank(expr_var_raw, env);
@@ -10960,9 +11363,23 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         }
 
         if (expected.annotation) |annotation_idx| {
-            // Generate the type for the annotation
-            try self.generateAnnotationType(annotation_idx, env);
-            const anno_var = ModuleEnv.varFrom(annotation_idx);
+            const anno_var = anno: {
+                if (expected.annotation_predeclared) {
+                    // The annotation's type was generated (once) and
+                    // generalized by the annotated-scheme pre-pass. Check the
+                    // body against a faithful rigid copy at this frame's rank
+                    // so body checking can't mutate the published scheme.
+                    break :anno try self.instantiateVarOrphan(
+                        ModuleEnv.varFrom(annotation_idx),
+                        env,
+                        env.rank(),
+                        .use_last_var,
+                    );
+                }
+                // Generate the type for the annotation
+                try self.generateAnnotationType(annotation_idx, env);
+                break :anno ModuleEnv.varFrom(annotation_idx);
+            };
 
             // Copy/paste the variable. This will be used if the expr errors to
             // preserve the type annotation for places that reference this def.
@@ -11502,138 +11919,64 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             const mb_processing_def = self.top_level_ptrns.get(lookup.pattern_idx);
             if (mb_processing_def) |processing_def| {
                 const referenced_def = self.cir.store.getDef(processing_def.def_idx);
+                // A pre-declared (annotated) def's pattern var carries its
+                // generalized scheme regardless of body-check status, so every
+                // reference to it falls through to the instantiate tail below —
+                // the uniform rule: annotated references never need the body.
+                const target_predeclared = self.predeclared_def_schemes.contains(processing_def.def_idx);
 
                 switch (processing_def.status) {
                     .not_processed => {
-                        var sub_env = try self.env_pool.acquire();
-                        errdefer self.env_pool.release(sub_env);
-
-                        // Push through to top_level
-                        try sub_env.var_pool.pushRank();
-                        std.debug.assert(sub_env.rank() == .outermost);
-
-                        try self.checkDef(processing_def.def_idx, &sub_env);
-
-                        if (self.defer_generalize) {
-                            std.debug.assert(self.cycle_root_def != null);
-
-                            // Cycle detected: store env for merge at cycle root.
-                            _ = try self.deferred_cycle_envs.append(self.gpa, sub_env);
-
-                            const def = self.cir.store.getDef(processing_def.def_idx);
-                            const def_expr_var = ModuleEnv.varFrom(def.expr);
-                            if (def.annotation != null) {
-                                // Forward reference to an ANNOTATED member of the
-                                // recursive group (mutual recursion). Decouple the
-                                // reference with a flex var and defer a
-                                // cross-reference constraint to the cycle root,
-                                // where the target is generalized and instantiated
-                                // per use-site. Unifying directly with the target's
-                                // (not-yet-generalized) type would force the two
-                                // members' rigid type parameters to coincide,
-                                // producing a spurious `T(k)` != `T(k)`.
-                                try self.unifyWith(expr_var, .{ .flex = Flex.init() }, env);
-                                _ = try self.constraints.append(self.gpa, Constraint{ .eql = .{
-                                    .expected = def_expr_var,
-                                    .actual = expr_var,
-                                    .ctx = .{ .recursive_def = .{ .def_name = processing_def.def_name } },
-                                    .is_cross_reference = true,
-                                    .recursive_annotated_fn_var = def_expr_var,
-                                } });
-                            } else {
-                                // Unannotated member: the group is inferred together
-                                // and shares type variables, so link monomorphically.
-                                // After checkDef, e_closure rank elevation has run,
-                                // so the closure var is at rank 2 — safe to unify
-                                // without pulling body vars below the generalization
-                                // rank.
-                                _ = try self.unify(expr_var, def_expr_var, env);
+                        if (!target_predeclared) {
+                            // The driver checks groups in topological order, so
+                            // an unchecked, un-pre-declared target can only be
+                            // a later member of the CURRENT recursive group —
+                            // its pattern var was ranked in the group's shared
+                            // frame before any member body ran.
+                            if (builtin.mode == .Debug) {
+                                if (!self.defInCurrentRecursiveGroup(processing_def.def_idx)) {
+                                    std.debug.panic("type checker invariant violated: name reference to unchecked def outside the current binding group", .{});
+                                }
                             }
-
+                            if (!isFunctionDef(&self.cir.store, self.cir.store.getExpr(referenced_def.expr)) and
+                                self.delayed_dependency_depth == 0)
+                            {
+                                // A value member of a recursive group referenced
+                                // outside any lambda body is a strict value
+                                // cycle.
+                                try self.poisonRecursiveNonFunctionProcessingDef(processing_def, expr_idx, env);
+                            } else {
+                                // The binding-group recursion rule: an in-group
+                                // reference to an unannotated member unifies
+                                // monomorphically with the member's in-flight
+                                // type, so facts discovered at the call site
+                                // flow into the inferred scheme.
+                                _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
+                            }
                             break :blk;
-                        } else {
-                            std.debug.assert(sub_env.rank() == .outermost);
-                            self.env_pool.release(sub_env);
                         }
                     },
                     .processing => {
-                        if (!isFunctionDef(&self.cir.store, self.cir.store.getExpr(referenced_def.expr))) {
-                            if (self.delayed_dependency_depth == 0) {
-                                try self.poisonRecursiveNonFunctionProcessingDef(processing_def, expr_idx, env);
-                            } else {
-                                _ = try self.unify(expr_var, ModuleEnv.varFrom(referenced_def.expr), env);
+                        if (!target_predeclared) {
+                            if (!isFunctionDef(&self.cir.store, self.cir.store.getExpr(referenced_def.expr))) {
+                                if (self.delayed_dependency_depth == 0) {
+                                    try self.poisonRecursiveNonFunctionProcessingDef(processing_def, expr_idx, env);
+                                } else {
+                                    _ = try self.unify(expr_var, ModuleEnv.varFrom(referenced_def.expr), env);
+                                }
+                                break :blk;
                             }
+
+                            // The def is mid-check, so it must not be generalized yet.
+                            std.debug.assert(self.types.resolveVar(pat_var).desc.rank != .generalized);
+
+                            // The binding-group recursion rule (see the
+                            // .not_processed arm): a self-reference, or a
+                            // reference to an in-flight unannotated member,
+                            // links monomorphically.
+                            _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
                             break :blk;
                         }
-
-                        // Recursive function reference. We assign the lookup a
-                        // flex var, then record an equality constraint for
-                        // later validation at the function-recursion boundary.
-
-                        // Assert that this def is NOT generalized nor outermost
-                        std.debug.assert(self.types.resolveVar(pat_var).desc.rank != .generalized);
-
-                        // Set the expr to be a flex
-                        try self.unifyWith(expr_var, .{ .flex = Flex.init() }, env);
-
-                        // A reference to a *different*, ANNOTATED def in the cycle
-                        // (mutual recursion) is instantiated per use-site at
-                        // validation time, so the members' rigid type parameters
-                        // don't clash. A self-reference, or a reference to an
-                        // unannotated member, stays monomorphic: unannotated
-                        // mutually-recursive functions are inferred as a group and
-                        // must share their (not-yet-generalized) type variables.
-                        const is_cross_reference = (referenced_def.annotation != null) and
-                            if (self.current_processing_def) |current_def|
-                                current_def != processing_def.def_idx
-                            else
-                                false;
-
-                        // For a cross-reference, target the callee's expr var
-                        // rather than its pattern var: at the cycle root the
-                        // root's pattern var is not yet linked to its generalized
-                        // type (that def-level unification happens after the body
-                        // is checked), but every participant's expr var has been
-                        // generalized by then — so instantiation can find it.
-                        const constraint_expected = if (is_cross_reference)
-                            ModuleEnv.varFrom(referenced_def.expr)
-                        else
-                            pat_var;
-
-                        // Write down this constraint for later validation. The
-                        // annotated body var is recorded only when the referenced
-                        // def is actually annotated: a literal argument is pinned to
-                        // an annotated parameter, never to one whose type was merely
-                        // inferred from the body.
-                        _ = try self.constraints.append(self.gpa, Constraint{ .eql = .{
-                            .expected = constraint_expected,
-                            .actual = expr_var,
-                            .ctx = .{ .recursive_def = .{ .def_name = processing_def.def_name } },
-                            .is_cross_reference = is_cross_reference,
-                            .recursive_annotated_fn_var = if (referenced_def.annotation != null)
-                                ModuleEnv.varFrom(referenced_def.expr)
-                            else
-                                null,
-                        } });
-
-                        // Detect mutual recursion through local lookups. If the
-                        // referenced def is different from the current one, we
-                        // have a function cycle: current → ... → this_def → ...
-                        // → current.
-                        if (self.current_processing_def) |current_def| {
-                            if (current_def != processing_def.def_idx) {
-                                if (self.cycle_root_def == null) {
-                                    // First cycle detection: no prior cycle should be in progress.
-                                    std.debug.assert(!self.defer_generalize);
-                                    std.debug.assert(self.deferred_cycle_envs.items.len == 0);
-                                    std.debug.assert(self.deferred_def_unifications.items.len == 0);
-                                    self.cycle_root_def = processing_def.def_idx;
-                                }
-                                self.defer_generalize = true;
-                            }
-                        }
-
-                        break :blk;
                     },
                     .processed => {},
                 }
@@ -11642,32 +11985,22 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             // Local block-def recursion. If this lookup targets a local `s_decl`
             // function whose body is currently being checked, it's a recursive
             // reference (to the def itself, or to an enclosing in-flight def).
-            // Defer unification — fresh flex now + a pending `local_recursive_refs`
-            // entry validated after the def generalizes — so we don't unify with
-            // the not-yet-generalized pattern var, which would lower its rank and
-            // prevent generalization of the def's rigid type parameters.
+            // An annotated local def's scheme is pre-declared before its body,
+            // so its pattern var is already generalized and the reference falls
+            // through to the instantiate tail. An unannotated one follows the
+            // binding-group recursion rule: unify monomorphically with the
+            // pattern var, which lives in the def's own rank frame (see the
+            // recursive `s_decl` frame in `checkStatement`) so the links
+            // generalize with the def.
             //
             // A reference to an already-finished sibling local def is NOT in this
             // map (removed after it generalizes), so it falls through to the tail
             // below and instantiates normally.
             if (self.local_processing_ptrns.get(lookup.pattern_idx)) |local_def| {
-                // The pattern is mid-check, so it must not be generalized yet.
-                std.debug.assert(self.types.resolveVar(pat_var).desc.rank != .generalized);
-
-                // Set the expr to be a flex
-                try self.unifyWith(expr_var, .{ .flex = Flex.init() }, env);
-
-                // Record for validation once the def's lambda has generalized.
-                // A dedicated stack, not the shared constraints list (sequential
-                // scoping makes this a single self/enclosing chain — see the
-                // `local_recursive_refs` field doc).
-                try self.local_recursive_refs.append(self.gpa, .{
-                    .pat_var = pat_var,
-                    .expr_var = expr_var,
-                    .def_name = local_def.def_name,
-                });
-
-                break :blk;
+                if (self.types.resolveVar(pat_var).desc.rank != .generalized) {
+                    _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = local_def.def_name } });
+                    break :blk;
+                }
             }
 
             const compile_time_known_binding = known: {
@@ -11954,26 +12287,13 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             self.checking_immediate_callee = is_immediate_callee;
             defer self.checking_call_arg = saved_checking_call_arg;
             defer self.checking_immediate_callee = saved_checking_immediate_callee;
+            // A group member's RHS suppression applies to the lambda the
+            // closure wraps, exactly like the call-arg status above.
+            if (suppress_group_member_generalize) {
+                self.suppress_generalize_expr = closure.lambda_idx;
+            }
             does_fx = try self.checkExpr(closure.lambda_idx, env, expected) or does_fx;
             const lambda_var = ModuleEnv.varFrom(closure.lambda_idx);
-
-            // For intermediate cycle participants, the inner lambda skipped
-            // generalization and kept its rank (2). The closure var was set
-            // at the outer rank (1) before the lambda pushed. Elevate the
-            // closure var to match so unification doesn't pull to min(1,2)=1,
-            // which would prevent generalization at the cycle root.
-            const lambda_rank = self.types.resolveVar(lambda_var).desc.rank;
-            if (lambda_rank != .generalized) {
-                const expr_resolved = self.types.resolveVar(expr_var);
-                if (@intFromEnum(lambda_rank) > @intFromEnum(expr_resolved.desc.rank)) {
-                    // Elevation only fires for intermediate cycle participants
-                    // whose lambda skipped generalization (kept rank 2). In the
-                    // non-cycle case, the lambda is generalized (rank 0) so we
-                    // never enter this branch.
-                    std.debug.assert(self.defer_generalize);
-                    try self.types.setDescRank(expr_resolved.desc_idx, lambda_rank);
-                }
-            }
 
             _ = try self.unify(expr_var, lambda_var, env);
         },
@@ -12690,81 +13010,25 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
     // If this type of expr should be generalized, generalize it!
     if (should_generalize) {
-        const at_def_top_level = env.rank() == Rank.outermost.next();
-        const is_cycle_root = if (self.cycle_root_def) |root_def|
-            self.current_processing_def != null and root_def == self.current_processing_def.?
-        else
-            false;
-        const is_intermediate = self.cycle_root_def != null and !is_cycle_root;
-
-        if (is_cycle_root and at_def_top_level) {
-            // Cycle root's top-level lambda: merge all stored cycle envs,
-            // generalize, then run deferred unifications.
-            for (self.deferred_cycle_envs.items) |*deferred_env| {
-                std.debug.assert(deferred_env.rank() == Rank.outermost.next());
-                try env.var_pool.mergeFrom(&deferred_env.var_pool);
-            }
-
-            // Boundary defaulting must see the merged cycle vars but run
-            // BEFORE ranks are promoted to generalized.
-            try self.defaultLiteralsAtGeneralizationBoundary(expr_var, env);
-
-            try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
-
-            // Execute deferred def-level unifications (now safe since
-            // expr_vars are generalized and won't be lowered by Rank.min)
-            for (self.deferred_def_unifications.items) |u| {
-                _ = try self.unify(u.ptrn_var, u.expr_var, env);
-                _ = try self.unify(u.def_var, u.ptrn_var, env);
-            }
-            self.deferred_def_unifications.clearRetainingCapacity();
-
-            for (self.deferred_platform_required_unifications.items) |u| {
-                _ = try self.unifyInContext(
-                    u.expected_var,
-                    u.expr_var,
-                    env,
-                    .{ .platform_requirement = .{ .required_ident = u.required_ident, .platform_region = u.platform_region } },
-                );
-            }
-            self.deferred_platform_required_unifications.clearRetainingCapacity();
-
-            // Resolve eql constraints accumulated during cycle body checks
-            // (from .processing handlers). This must happen now — before
-            // subsequent defs use the generalized types — so that cross-
-            // function constraints are propagated into the generalized vars
-            // before instantiation creates independent copies.
-            try self.checkConstraints(env);
-
-            // Release stored envs back to pool
-            for (self.deferred_cycle_envs.items) |deferred_env| {
-                self.env_pool.release(deferred_env);
-            }
-            self.deferred_cycle_envs.clearRetainingCapacity();
-
-            self.cycle_root_def = null;
-            self.defer_generalize = false;
-
-            // Judge ambiguity only now that the deferred unifications and
-            // cross-function constraints have settled the cycle's scheme: a
-            // constraint on the function's own type variable that unifies
-            // with the definition's scheme is not ambiguous (issue 9632).
-            try self.judgeAmbiguityCandidatesAtGeneralization(expr_var);
-        } else if (is_intermediate and at_def_top_level) {
-            // Intermediate's top-level lambda: skip generalization.
-            // Vars are preserved and will be merged by the cycle root.
+        if (env.rank() == self.currentGroupBoundaryRank()) {
+            // This frame is the enclosing group's generalization boundary (a
+            // singleton group's def RHS). Resolve dispatch obligations into
+            // unchecked groups before anything here generalizes (Invariant D),
+            // interleaved with boundary defaulting.
+            try self.runGroupBoundary(&.{expr_var}, env);
         } else {
-            // Normal generalization (no cycle, or inner lambda within a cycle participant).
-            // Boundary defaulting runs first: it must see ranks BEFORE they
-            // are promoted to generalized.
+            // Inner lambda: boundary defaulting runs first — it must see
+            // ranks BEFORE they are promoted to generalized. Pending dispatch
+            // obligations (pinned at the group's boundary rank) escape this
+            // frame and stay live for the group boundary.
             try self.defaultLiteralsAtGeneralizationBoundary(expr_var, env);
-            try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
-            // The scheme's vars froze at generalized rank: judge this def's
-            // dispatch-constrained receivers now, while the judgment is a
-            // local question about one scheme (see
-            // `judgeAmbiguityCandidatesAtGeneralization`).
-            try self.judgeAmbiguityCandidatesAtGeneralization(expr_var);
         }
+        try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
+        // The scheme's vars froze at generalized rank: judge this def's
+        // dispatch-constrained receivers now, while the judgment is a
+        // local question about one scheme (see
+        // `judgeAmbiguityCandidatesAtGeneralization`).
+        try self.judgeAmbiguityCandidatesAtGeneralization(expr_var);
     }
 
     try hoist_frame.finish(does_fx);
@@ -13649,10 +13913,40 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const decl_expr_var: Var = ModuleEnv.varFrom(decl_stmt.expr);
                 const decl_pattern_var: Var = ModuleEnv.varFrom(decl_stmt.pattern);
 
+                const decl_is_fn = isFunctionDef(&self.cir.store, self.cir.store.getExpr(decl_stmt.expr));
+
+                // An annotated local function's scheme is pre-declared from
+                // its annotation before the body is checked — the same rule
+                // as top-level defs — so in-flight (recursive) references
+                // instantiate the scheme. Conservatively limited to
+                // type-var-free annotations: an annotation that introduces
+                // type vars can be aliased (`T : a`) or constrained (`where`)
+                // by the body, which ties the body to the annotation's own
+                // generated nodes; such defs keep the shared-generation path.
+                const decl_predeclared = decl_is_fn and decl_stmt.anno != null and
+                    self.cir.store.getPattern(decl_stmt.pattern) == .assign and
+                    !self.cir.store.getAnnotation(decl_stmt.anno.?).mentions_type_var and
+                    !(try self.annotationContainsUnderscore(decl_stmt.anno.?));
+
+                // A self-recursive unannotated local function is a binding
+                // group of one: its pattern var must live in a rank frame
+                // that generalizes after its RHS, so the monomorphic
+                // recursive links (see the local recursion branch in
+                // `e_lookup_local`) generalize with the def instead of
+                // pinning it at the block's rank. Self-recursion always shows
+                // up as the closure capturing its own binding.
+                const decl_recursive_fn = decl_is_fn and !decl_predeclared and
+                    self.closureCapturesOwnPattern(decl_stmt.expr, decl_stmt.pattern);
+                if (decl_recursive_fn) try env.var_pool.pushRank();
+
                 const decl_pattern_ctx: PatternCtx = if (self.patternNeedsExhaustiveness(decl_stmt.pattern)) .match_branch else .bound;
 
-                // Check the pattern
-                try self.checkPattern(decl_stmt.pattern, decl_pattern_ctx, env);
+                if (decl_predeclared) {
+                    try self.predeclareDefScheme(decl_stmt.pattern, null, decl_stmt.anno.?, env);
+                } else {
+                    // Check the pattern
+                    try self.checkPattern(decl_stmt.pattern, decl_pattern_ctx, env);
+                }
 
                 // Extract function name from the pattern (for better error messages)
                 const saved_func_name = self.enclosing_func_name;
@@ -13662,21 +13956,20 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 // Check the annotation, if it exists
                 const expectation = blk: {
                     if (decl_stmt.anno) |annotation_idx| {
-                        break :blk statement_expected.withAnnotation(annotation_idx);
+                        var annotated = statement_expected.withAnnotation(annotation_idx);
+                        annotated.annotation_predeclared = decl_predeclared;
+                        break :blk annotated;
                     } else {
                         break :blk statement_expected;
                     }
                 };
 
                 // Register function defs as "currently processing" so recursive
-                // references in their own body defer unification (see the local
-                // recursion branch in `e_lookup_local`). Only function defs can
-                // legitimately be self-recursive; value defs (`x = x`) keep their
-                // existing diagnostics. Snapshot the pending-recursive-ref stack
-                // so we only validate the references recorded while checking THIS
-                // def's body.
-                const decl_is_fn = isFunctionDef(&self.cir.store, self.cir.store.getExpr(decl_stmt.expr));
-                const local_recursive_refs_top = self.local_recursive_refs.items.len;
+                // references in their own body follow the binding-group
+                // recursion rule (see the local recursion branch in
+                // `e_lookup_local`). Only function defs can legitimately be
+                // self-recursive; value defs (`x = x`) keep their existing
+                // diagnostics.
                 if (decl_is_fn) {
                     try self.local_processing_ptrns.put(self.gpa, decl_stmt.pattern, .{
                         .def_name = self.getPatternIdent(decl_stmt.pattern),
@@ -13698,25 +13991,41 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     try self.checkEffectfulFunctionName(decl_stmt.pattern, decl_stmt.expr);
                 }
 
-                // A record-destructure binding gets a dedicated context so the
-                // report can suggest `field: _` or `..` when the pattern is too
-                // narrow for the value (the pattern is the first/expected arg).
-                const decl_pattern_result = switch (self.cir.store.getPattern(decl_stmt.pattern)) {
-                    .record_destructure => try self.unifyInContext(decl_pattern_var, decl_expr_var, env, .record_destructure),
-                    else => try self.unify(decl_pattern_var, decl_expr_var, env),
-                };
-                _ = try self.unify(stmt_var, decl_pattern_var, env);
-
-                if (decl_pattern_result.isOk()) {
-                    try self.checkDestructureExhaustiveness(decl_stmt.pattern, decl_stmt.expr, decl_expr_var, env, stmt_region);
+                if (decl_predeclared) {
+                    // The pattern already carries the annotation scheme and
+                    // the body was validated against a rigid copy of it (see
+                    // `Expected.annotation_predeclared`); unifying the two
+                    // independently generalized copies would collide their
+                    // rigid type parameters.
                     try self.recordHoistPatternProvenance(decl_stmt.pattern, decl_stmt.expr, expectation.hoist_position);
+                } else {
+                    // A record-destructure binding gets a dedicated context so the
+                    // report can suggest `field: _` or `..` when the pattern is too
+                    // narrow for the value (the pattern is the first/expected arg).
+                    const decl_pattern_result = switch (self.cir.store.getPattern(decl_stmt.pattern)) {
+                        .record_destructure => try self.unifyInContext(decl_pattern_var, decl_expr_var, env, .record_destructure),
+                        else => try self.unify(decl_pattern_var, decl_expr_var, env),
+                    };
+
+                    if (decl_pattern_result.isOk()) {
+                        try self.checkDestructureExhaustiveness(decl_stmt.pattern, decl_stmt.expr, decl_expr_var, env, stmt_region);
+                        try self.recordHoistPatternProvenance(decl_stmt.pattern, decl_stmt.expr, expectation.hoist_position);
+                    }
                 }
 
+                if (decl_recursive_fn) {
+                    // This statement's binding-group boundary: the pattern and
+                    // the recursive links generalize together, then the frame
+                    // pops so the statement's own var unifies with the
+                    // finished scheme below.
+                    try self.defaultLiteralsAtGeneralizationBoundary(decl_pattern_var, env);
+                    try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
+                    env.var_pool.popRank();
+                }
+
+                _ = try self.unify(stmt_var, decl_pattern_var, env);
+
                 if (decl_is_fn) {
-                    // The def's lambda has generalized (inside checkExpr) and the
-                    // pattern var now carries the generalized function type, so it
-                    // is safe to validate the recursive references it recorded.
-                    try self.validateLocalRecursiveRefs(env, local_recursive_refs_top);
                     _ = self.local_processing_ptrns.remove(decl_stmt.pattern);
                 }
             },
@@ -15760,47 +16069,6 @@ fn poisonRecursiveNonFunctionProcessingDef(
     }
 }
 
-fn freshRecursiveMethodPlaceholder(
-    self: *Self,
-    processing_def: DefProcessed,
-    def: CIR.Def,
-    env: *Env,
-    region: Region,
-) Allocator.Error!Var {
-    const method_var = try self.fresh(env, region);
-
-    // Match e_lookup_local recursion semantics: a different annotated def in the
-    // same recursive group is instantiated per use-site at cycle validation time,
-    // while self references and unannotated group members stay monomorphic.
-    const is_cross_reference = (def.annotation != null) and
-        if (self.current_processing_def) |current_def|
-            current_def != processing_def.def_idx
-        else
-            false;
-
-    const constraint_expected = if (is_cross_reference)
-        ModuleEnv.varFrom(def.expr)
-    else
-        ModuleEnv.varFrom(def.pattern);
-
-    _ = try self.constraints.append(self.gpa, Constraint{
-        .eql = .{
-            .expected = constraint_expected,
-            .actual = method_var,
-            .ctx = .{ .recursive_def = .{ .def_name = processing_def.def_name } },
-            .is_cross_reference = is_cross_reference,
-            // A literal argument is pinned to an annotated parameter only; record the
-            // annotated body var solely when the referenced def carries an annotation.
-            .recursive_annotated_fn_var = if (def.annotation != null)
-                ModuleEnv.varFrom(def.expr)
-            else
-                null,
-        },
-    });
-
-    return method_var;
-}
-
 fn poisonErroneousValueUses(self: *Self) Allocator.Error!void {
     for (self.value_lookup_tracking.items) |entry| {
         const pattern_var = ModuleEnv.varFrom(entry.pattern_idx);
@@ -16605,6 +16873,14 @@ fn emitBoundaryWarningAfterCommit(
 }
 
 fn defaultLiteralsAtGeneralizationBoundary(self: *Self, def_root_var: Var, env: *Env) std.mem.Allocator.Error!void {
+    try self.defaultLiteralsAtGeneralizationBoundaryMultiRoot(&.{def_root_var}, env);
+}
+
+/// `defaultLiteralsAtGeneralizationBoundary` for a whole binding group: the
+/// reachable protection set is seeded from every member's root, so a literal
+/// reachable from any member's signature stays open across the shared
+/// boundary.
+fn defaultLiteralsAtGeneralizationBoundaryMultiRoot(self: *Self, def_root_vars: []const Var, env: *Env) std.mem.Allocator.Error!void {
     const rank = env.rank();
 
     // The candidate universe is the var pool entry this generalize call will
@@ -16640,70 +16916,16 @@ fn defaultLiteralsAtGeneralizationBoundary(self: *Self, def_root_var: Var, env: 
         }
     }
 
-    // The def root's reachable closure (recursing into `where`-constraint
-    // signatures). A cycle root generalizes its whole group at once, so also seed
-    // from every deferred cycle participant's def vars; at a non-cycle boundary
-    // that list is empty or an enclosing cycle's, and seeding from it is purely
-    // conservative (keeps more literals open, never defaults extra ones).
+    // The reachable closure of every def root at this boundary (recursing into
+    // `where`-constraint signatures). A recursive group generalizes as one
+    // unit, so all members' roots seed the same protection set. Recursive
+    // references need no special seeding: the binding-group recursion rule
+    // unifies them with the member's in-flight type immediately, so a literal
+    // constrained through a recursive call is already reachable from the
+    // member's root.
     self.boundary_reachable_vars.clearRetainingCapacity();
-    try self.collectReachableVars(def_root_var, &self.boundary_reachable_vars);
-    for (self.deferred_def_unifications.items) |deferred| {
-        try self.collectReachableVars(deferred.ptrn_var, &self.boundary_reachable_vars);
-        try self.collectReachableVars(deferred.expr_var, &self.boundary_reachable_vars);
-        try self.collectReachableVars(deferred.def_var, &self.boundary_reachable_vars);
-    }
-
-    // Recursive-reference edges (`ctx == .recursive_def`) link a recursive call's
-    // flex reference to the def's own (annotated) type and resolve only after this
-    // boundary, at the cycle root. The reference is an internal body var unreachable
-    // from the def's signature, so the fixpoint below never activates it. Seed the
-    // reachable closure of each recursive call's
-    // RETURN: a literal whose dispatch hangs off an unresolved recursive result
-    // (e.g. `fc(.., fc(..) + 1)` where `fc : I64, I64 -> I64` — `1`'s `plus`
-    // receiver is `fc(..)`'s return) stays protected until the recursion resolves
-    // and `plus` pins it to I64, instead of defaulting to Dec first.
-    //
-    // Also seed an ARGUMENT whose corresponding annotated parameter is concrete: a
-    // literal passed directly to a recursive call (e.g. `slice(rest, 0, end - 1)`
-    // where param 1 is annotated `U64`) must unify with that parameter's type when
-    // the deferred edge resolves, not default to Dec first. The annotated signature
-    // is read from `recursive_annotated_fn_var` (the referenced def's body var,
-    // carrying its annotated function like `List(a), U64, U64 -> List(a)`) — set
-    // only when the referenced def is actually annotated, since `eql.expected` (a
-    // self-reference's pattern var) is not yet unified with the annotation here.
-    // Resolving each parameter shows whether it pins the argument: a parameter that
-    // is still flex/rigid pins nothing, so its argument is left unseeded — and an
-    // unannotated recursive function records no fn var at all, so its arguments keep
-    // today's behavior. A genuinely mismatched argument (e.g. `fib("bad arg")`)
-    // carries a `Str`, not an open numeral, so seeding its var changes no defaulting
-    // and the real clash still surfaces. Purely conservative throughout: only ever
-    // keeps more literals open, defaults none.
-    for (self.boundary_eql_edges.items) |eql| {
-        switch (eql.ctx) {
-            .recursive_def => {
-                const ref_resolved = self.types.resolveVar(eql.actual);
-                const ref_func = ref_resolved.desc.content.unwrapFunc() orelse continue;
-                try self.collectReachableVars(ref_func.ret, &self.boundary_reachable_vars);
-
-                // The referenced def's annotated body var supplies the
-                // parameter types: `expected` (a self-reference's pattern
-                // var) is not yet unified with the annotation here, but the
-                // body var has carried it since the body was checked.
-                const annotated_fn_var = eql.recursive_annotated_fn_var orelse continue;
-                const annotated_func = self.types.resolveVar(annotated_fn_var).desc.content.unwrapFunc() orelse continue;
-                const call_args = self.types.sliceVars(ref_func.args);
-                const param_vars = self.types.sliceVars(annotated_func.args);
-                const arg_count = @min(call_args.len, param_vars.len);
-                for (call_args[0..arg_count], param_vars[0..arg_count]) |call_arg, param_var| {
-                    const param_content = self.types.resolveVar(param_var).desc.content;
-                    switch (param_content) {
-                        .flex, .rigid => {},
-                        .structure, .alias, .err => try self.collectReachableVars(call_arg, &self.boundary_reachable_vars),
-                    }
-                }
-            },
-            else => {},
-        }
+    for (def_root_vars) |def_root_var| {
+        try self.collectReachableVars(def_root_var, &self.boundary_reachable_vars);
     }
 
     // Pending `eql` constraints are recursive-group cross-reference edges; a
@@ -16744,6 +16966,7 @@ fn defaultLiteralsAtGeneralizationBoundary(self: *Self, def_root_var: Var, env: 
 fn anyDeferredDispatchReceiverResolved(self: *Self, env: *Env) Allocator.Error!bool {
     for (env.deferred_static_dispatch_constraints.items.items) |deferred| {
         if (self.types.resolveVar(deferred.var_).desc.content == .flex) continue;
+        if (deferred.waiting_on_target_def) continue;
         if (try self.deferredConstraintWaitsOnDerivedEncode(deferred, env)) continue;
         return true;
     }
@@ -17394,36 +17617,8 @@ fn processReturnConstraints(self: *Self, env: *Env, lambda_idx: CIR.Expr.Idx) st
     self.return_constraint_frames.shrinkRetainingCapacity(frame_idx);
 }
 
-/// Validate the recursive references recorded while checking a LOCAL block def's
-/// body (those at index >= `from`), now that the def's lambda has generalized
-/// and its pattern var carries the generalized type. Sequential scoping forbids
-/// local mutual recursion, so every such reference is a self/enclosing one and a
-/// plain unification suffices (no per-use instantiation). The validated refs are
-/// then popped.
-fn validateLocalRecursiveRefs(self: *Self, env: *Env, from: usize) std.mem.Allocator.Error!void {
-    // Capture the end up front: validation only unifies, it never records new
-    // local recursive refs, so the range is stable.
-    const end = self.local_recursive_refs.items.len;
-    var i = from;
-    while (i < end) : (i += 1) {
-        const ref = self.local_recursive_refs.items[i];
-        _ = try self.unifyInContext(ref.pat_var, ref.expr_var, env, .{ .recursive_def = .{ .def_name = ref.def_name } });
-    }
-    self.local_recursive_refs.shrinkRetainingCapacity(from);
-}
-
-/// Resolve one `eql` constraint. For a `recursive_def` cross-reference (mutual
-/// recursion) whose target has been generalized, instantiate the target so the
-/// reference gets fresh type parameters — otherwise the two members' rigid type
-/// variables would be forced to unify, producing a spurious `T(k)` != `T(k)`
-/// mismatch. Self-references (and any not-yet-generalized target) keep the
-/// monomorphic direct unification.
+/// Resolve one `eql` constraint.
 fn resolveEqlConstraint(self: *Self, eql: anytype, env: *Env) std.mem.Allocator.Error!void {
-    if (eql.is_cross_reference and self.types.resolveVar(eql.expected).desc.rank == .generalized) {
-        const instantiated = try self.instantiateVar(eql.expected, env, .use_last_var);
-        _ = try self.unifyInContext(instantiated, eql.actual, env, eql.ctx);
-        return;
-    }
     _ = try self.unifyInContext(eql.expected, eql.actual, env, eql.ctx);
 }
 
@@ -17863,41 +18058,33 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     var cycle_method_expr_var: ?Var = null;
 
                     if (method_is_this_module) {
-                        // Check if we've processed this def already.
+                        // Check if we've processed this def already. A
+                        // pre-declared (annotated) def's method type var
+                        // carries its generalized scheme regardless of status,
+                        // so it falls through to the instantiate path below.
                         const mb_processing_def = self.top_level_ptrns.get(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
+                            const target_predeclared = self.predeclared_def_schemes.contains(def_idx);
                             switch (processing_def.status) {
-                                .not_processed => {
-                                    var sub_env = try self.env_pool.acquire();
-                                    errdefer self.env_pool.release(sub_env);
-
-                                    try sub_env.var_pool.pushRank();
-                                    std.debug.assert(sub_env.rank() == .outermost);
-
-                                    try self.checkDef(processing_def.def_idx, &sub_env);
-
-                                    if (self.defer_generalize) {
-                                        std.debug.assert(self.cycle_root_def != null);
-
-                                        // Cycle detected: store env for merge at cycle root.
-                                        try self.deferred_cycle_envs.append(self.gpa, sub_env);
-                                        // Use the def's closure/expr var directly (same
-                                        // as e_lookup_local .not_processed). After checkDef,
-                                        // e_closure rank elevation has already run, so the
-                                        // closure var is at rank 2 — safe for unification.
-                                        if (def.annotation != null) {
-                                            cycle_method_expr_var = try self.freshRecursiveMethodPlaceholder(processing_def, def, env, region);
-                                        } else {
-                                            const def_expr_var = ModuleEnv.varFrom(def.expr);
-                                            cycle_method_expr_var = def_expr_var;
-                                        }
-                                    } else {
-                                        std.debug.assert(sub_env.rank() == .outermost);
-                                        self.env_pool.release(sub_env);
-                                    }
+                                .not_processed => if (!target_predeclared) {
+                                    // Unannotated, unchecked local target. A
+                                    // dispatch edge cannot be in the name
+                                    // graph, so this is discovered here — but
+                                    // never checked here: record the target
+                                    // for the enclosing group's boundary, pin
+                                    // the constraint's vars at the boundary
+                                    // rank (Invariant D), and leave the
+                                    // constraint deferred.
+                                    try self.recordPendingDispatchTarget(def_idx);
+                                    try self.pinVarAtGroupBoundaryRank(constraint.fn_var, env);
+                                    try self.pinVarAtGroupBoundaryRank(deferred_constraint.var_, env);
+                                    var waiting_constraint = deferred_constraint;
+                                    waiting_constraint.waiting_on_target_def = true;
+                                    try self.scratch_deferred_static_dispatch_constraints.append(waiting_constraint);
+                                    continue;
                                 },
-                                .processing => {
+                                .processing => if (!target_predeclared) {
                                     if (!isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr))) {
                                         if (self.delayed_dependency_depth == 0) {
                                             try self.poisonRecursiveNonFunctionProcessingDef(processing_def, null, env);
@@ -17907,26 +18094,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                                             cycle_method_expr_var = ModuleEnv.varFrom(def.expr);
                                         }
                                     } else {
-                                        // Create a fresh flex var at the current rank for
-                                        // the method type, and validate it against the
-                                        // binding at the recursion boundary. Using the
-                                        // binding var directly here would pull body vars
-                                        // to a lower rank and prevent generalization.
-                                        cycle_method_expr_var = try self.freshRecursiveMethodPlaceholder(processing_def, def, env, region);
-                                    }
-
-                                    // Check if this is mutual recursion through dispatch.
-                                    if (self.current_processing_def) |current_def| {
-                                        if (current_def != processing_def.def_idx) {
-                                            if (self.cycle_root_def == null) {
-                                                // First cycle detection: no prior cycle should be in progress.
-                                                std.debug.assert(!self.defer_generalize);
-                                                std.debug.assert(self.deferred_cycle_envs.items.len == 0);
-                                                std.debug.assert(self.deferred_def_unifications.items.len == 0);
-                                                self.cycle_root_def = processing_def.def_idx;
-                                            }
-                                            self.defer_generalize = true;
-                                        }
+                                        // In-flight unannotated target (self-
+                                        // dispatch, or an in-group member):
+                                        // the binding-group recursion rule —
+                                        // link monomorphically to the def's
+                                        // in-flight RHS var, which lives in
+                                        // the frame that generalizes it.
+                                        cycle_method_expr_var = ModuleEnv.varFrom(def.expr);
                                     }
                                 },
                                 .processed => {},
@@ -18165,35 +18339,26 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     const def = method_env.store.getDef(def_idx);
                     var cycle_method_expr_var: ?Var = null;
                     if (method_is_this_module) {
+                        // See the nominal branch above: pre-declared targets
+                        // fall through to the instantiate path; unannotated
+                        // unchecked targets are recorded for the group
+                        // boundary; in-flight unannotated targets link
+                        // monomorphically (the binding-group recursion rule).
                         const mb_processing_def = self.top_level_ptrns.get(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
+                            const target_predeclared = self.predeclared_def_schemes.contains(def_idx);
                             switch (processing_def.status) {
-                                .not_processed => {
-                                    var sub_env = try self.env_pool.acquire();
-                                    errdefer self.env_pool.release(sub_env);
-
-                                    try sub_env.var_pool.pushRank();
-                                    std.debug.assert(sub_env.rank() == .outermost);
-
-                                    try self.checkDef(processing_def.def_idx, &sub_env);
-
-                                    if (self.defer_generalize) {
-                                        std.debug.assert(self.cycle_root_def != null);
-
-                                        try self.deferred_cycle_envs.append(self.gpa, sub_env);
-                                        if (def.annotation != null) {
-                                            cycle_method_expr_var = try self.freshRecursiveMethodPlaceholder(processing_def, def, env, region);
-                                        } else {
-                                            const def_expr_var = ModuleEnv.varFrom(def.expr);
-                                            cycle_method_expr_var = def_expr_var;
-                                        }
-                                    } else {
-                                        std.debug.assert(sub_env.rank() == .outermost);
-                                        self.env_pool.release(sub_env);
-                                    }
+                                .not_processed => if (!target_predeclared) {
+                                    try self.recordPendingDispatchTarget(def_idx);
+                                    try self.pinVarAtGroupBoundaryRank(constraint.fn_var, env);
+                                    try self.pinVarAtGroupBoundaryRank(deferred_constraint.var_, env);
+                                    var waiting_constraint = deferred_constraint;
+                                    waiting_constraint.waiting_on_target_def = true;
+                                    try self.scratch_deferred_static_dispatch_constraints.append(waiting_constraint);
+                                    continue;
                                 },
-                                .processing => {
+                                .processing => if (!target_predeclared) {
                                     if (!isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr))) {
                                         if (self.delayed_dependency_depth == 0) {
                                             try self.poisonRecursiveNonFunctionProcessingDef(processing_def, null, env);
@@ -18203,19 +18368,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                                             cycle_method_expr_var = ModuleEnv.varFrom(def.expr);
                                         }
                                     } else {
-                                        cycle_method_expr_var = try self.freshRecursiveMethodPlaceholder(processing_def, def, env, region);
-                                    }
-
-                                    if (self.current_processing_def) |current_def| {
-                                        if (current_def != processing_def.def_idx) {
-                                            if (self.cycle_root_def == null) {
-                                                std.debug.assert(!self.defer_generalize);
-                                                std.debug.assert(self.deferred_cycle_envs.items.len == 0);
-                                                std.debug.assert(self.deferred_def_unifications.items.len == 0);
-                                                self.cycle_root_def = processing_def.def_idx;
-                                            }
-                                            self.defer_generalize = true;
-                                        }
+                                        cycle_method_expr_var = ModuleEnv.varFrom(def.expr);
                                     }
                                 },
                                 .processed => {},
