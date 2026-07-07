@@ -2534,6 +2534,17 @@ const Unifier = struct {
                     }
                 }
             }
+            // Provenance is metadata (excluded from constraint identity): merge it
+            // field-wise, keeping the winner's value and falling back to the other
+            // side's so an introducing site or expect region recorded on either
+            // constraint survives the merge — the old var-keyed side tables linked
+            // both unified vars to the same entry.
+            if (constraint.provenance.intro_expr == .none) {
+                constraint.provenance.intro_expr = two_constraints.a.provenance.intro_expr;
+            }
+            if (constraint.provenance.expect_region.get() == null) {
+                constraint.provenance.expect_region = two_constraints.a.provenance.expect_region;
+            }
             self.types_store.static_dispatch_constraints.items.appendAssumeCapacity(constraint);
         }
         for (self.scratch.only_in_a_static_dispatch_constraints.sliceRange(partitioned.only_in_a)) |only_a| {
