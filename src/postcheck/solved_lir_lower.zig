@@ -3671,7 +3671,8 @@ const Lowerer = struct {
         if (try self.foldListMapCanReuseMatch(target, result_ty, scrutinee, branches_span, next)) |folded| return folded;
         const scrutinee_ty = try self.lowerExprContextTy(scrutinee);
         const scrutinee_local = try self.addTemp(scrutinee_ty);
-        const branches = self.solved.lifted.branchSpan(branches_span);
+        const branches = try GuardedList.dupe(self.allocator, Lifted.Branch, self.solved.lifted.branchSpan(branches_span));
+        defer self.allocator.free(branches);
         const done = self.freshJoinPointId();
         const branch_chain = try self.lowerBranchTree(scrutinee_local, scrutinee_ty, branches, target, result_ty, done, comptime_site);
         const remainder = try self.lowerExprIntoAtType(scrutinee_local, scrutinee, scrutinee_ty, branch_chain);
@@ -4317,11 +4318,11 @@ const Lowerer = struct {
         }
 
         pub fn recordDestruct(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId, i: u16) Common.LowerError!SubPat {
-            const destruct = self.l.solved.lifted.recordDestructSpan(self.l.pat(pat_id).data.record)[i];
+            const destruct = GuardedList.at(self.l.solved.lifted.recordDestructSpan(self.l.pat(pat_id).data.record), i);
             const index = self.l.recordFieldIndex(ty, destruct.name);
             return .{
                 .index = index,
-                .ty = self.l.recordFields(ty)[@as(usize, @intCast(index))].ty,
+                .ty = GuardedList.at(self.l.recordFields(ty), @as(usize, @intCast(index))).ty,
                 .pat = destruct.pattern,
             };
         }
@@ -4334,7 +4335,7 @@ const Lowerer = struct {
             const items = self.l.solved.lifted.patSpan(self.l.pat(pat_id).data.tuple);
             const item_tys = self.l.tupleItemTypes(ty);
             if (items.len != item_tys.len) Common.invariant("tuple pattern arity differed from target tuple type");
-            return .{ .index = i, .ty = item_tys[i], .pat = items[i] };
+            return .{ .index = i, .ty = GuardedList.at(item_tys, i), .pat = GuardedList.at(items, i) };
         }
 
         pub fn nominalInner(self: MatchTreeCtx, pat_id: Lifted.PatId, ty: Type.TypeId) Common.LowerError!SubPat {
@@ -4355,7 +4356,7 @@ const Lowerer = struct {
             const payloads = self.l.solved.lifted.patSpan(tag.payloads);
             const payload_tys = self.l.tagPayloadTypesByIndex(ty, self.l.tagIndex(ty, tag.name));
             if (payloads.len != payload_tys.len) Common.invariant("tag pattern payload arity differed from target tag type");
-            return .{ .index = i, .ty = payload_tys[i], .pat = payloads[i] };
+            return .{ .index = i, .ty = GuardedList.at(payload_tys, i), .pat = GuardedList.at(payloads, i) };
         }
 
         pub fn tagVariantCount(self: MatchTreeCtx, ty: Type.TypeId) ?u32 {
@@ -4393,7 +4394,7 @@ const Lowerer = struct {
         }
 
         pub fn listElemPat(self: MatchTreeCtx, pat_id: Lifted.PatId, i: u32) Lifted.PatId {
-            return self.l.solved.lifted.patSpan(self.l.pat(pat_id).data.list.patterns)[i];
+            return GuardedList.at(self.l.solved.lifted.patSpan(self.l.pat(pat_id).data.list.patterns), i);
         }
 
         pub fn listElemTy(self: MatchTreeCtx, ty: Type.TypeId) Type.TypeId {
@@ -4411,7 +4412,7 @@ const Lowerer = struct {
                 .frac_f64_lit => |value| @as(u64, @bitCast(if (value == 0.0) @as(f64, 0.0) else value)),
                 .str_lit => |lit| try self.strShapeKey(self.l.stringLiteralText(lit), &.{}, .exact),
                 .str_pattern => |str| blk: {
-                    const steps = self.l.solved.lifted.strPatternStepSpan(str.steps);
+                    const steps = try GuardedList.dupe(self.arena, Lifted.StrPatternStep, self.l.solved.lifted.strPatternStepSpan(str.steps));
                     break :blk try self.strShapeKey(self.l.stringLiteralText(str.prefix), steps, str.end);
                 },
                 .list => |list| list.patterns.len,
@@ -4499,11 +4500,11 @@ const Lowerer = struct {
 
         pub fn strCapturePat(self: MatchTreeCtx, pat_id: Lifted.PatId, i: u16) ?Lifted.PatId {
             const str = self.l.pat(pat_id).data.str_pattern;
-            return self.l.solved.lifted.strPatternStepSpan(str.steps)[i].capture;
+            return GuardedList.at(self.l.solved.lifted.strPatternStepSpan(str.steps), i).capture;
         }
 
         pub fn stmtCount(self: MatchTreeCtx) usize {
-            return self.l.result.store.cf_stmts.items.len;
+            return self.l.result.store.cf_stmts.len();
         }
 
         pub fn freshJoinPointId(self: MatchTreeCtx) LIR.JoinPointId {
@@ -4676,8 +4677,8 @@ const Lowerer = struct {
             };
             const steps = self.l.solved.lifted.strPatternStepSpan(str.steps);
             const locals = try self.arena.alloc(?LIR.LocalId, steps.len);
-            for (steps, locals) |step, *out| {
-                out.* = if (step.capture) |capture| try self.l.addTemp(try self.l.lowerPatTy(capture)) else null;
+            for (locals, 0..) |*out, i| {
+                out.* = if (GuardedList.at(steps, i).capture) |capture| try self.l.addTemp(try self.l.lowerPatTy(capture)) else null;
             }
             return locals;
         }
@@ -4693,10 +4694,10 @@ const Lowerer = struct {
                 .str_pattern => |str| {
                     const input_steps = self.l.solved.lifted.strPatternStepSpan(str.steps);
                     const lir_steps = try self.arena.alloc(LIR.StrMatchStep, input_steps.len);
-                    for (input_steps, lir_steps, capture_locals) |input_step, *lir_step, capture| {
+                    for (lir_steps, capture_locals, 0..) |*lir_step, capture, i| {
                         lir_step.* = .{
                             .capture = if (capture) |local| .{ .view = local } else .discard,
-                            .delimiter = try self.l.lirStrLiteral(input_step.delimiter),
+                            .delimiter = try self.l.lirStrLiteral(GuardedList.at(input_steps, i).delimiter),
                         };
                     }
                     return .{

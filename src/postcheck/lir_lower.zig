@@ -2187,11 +2187,11 @@ const Lowerer = struct {
         }
 
         pub fn recordDestruct(self: MatchTreeCtx, pat_id: LambdaMono.PatId, ty: Type.TypeId, i: u16) Common.LowerError!SubPat {
-            const destruct = self.l.program.recordDestructSpan(self.l.pat(pat_id).data.record)[i];
+            const destruct = GuardedList.at(self.l.program.recordDestructSpan(self.l.pat(pat_id).data.record), i);
             const index = self.l.recordFieldIndex(ty, destruct.name);
             return .{
                 .index = index,
-                .ty = self.l.recordFields(ty)[@as(usize, @intCast(index))].ty,
+                .ty = GuardedList.at(self.l.recordFields(ty), @as(usize, @intCast(index))).ty,
                 .pat = destruct.pattern,
             };
         }
@@ -2201,8 +2201,8 @@ const Lowerer = struct {
         }
 
         pub fn tupleItem(self: MatchTreeCtx, pat_id: LambdaMono.PatId, _: Type.TypeId, i: u16) Common.LowerError!SubPat {
-            const items = self.l.program.patSpan(self.l.pat(pat_id).data.tuple);
-            return .{ .index = i, .ty = self.l.pat(items[i]).ty, .pat = items[i] };
+            const item = GuardedList.at(self.l.program.patSpan(self.l.pat(pat_id).data.tuple), i);
+            return .{ .index = i, .ty = self.l.pat(item).ty, .pat = item };
         }
 
         pub fn nominalInner(self: MatchTreeCtx, pat_id: LambdaMono.PatId, ty: Type.TypeId) Common.LowerError!SubPat {
@@ -2219,8 +2219,8 @@ const Lowerer = struct {
         }
 
         pub fn tagPayload(self: MatchTreeCtx, pat_id: LambdaMono.PatId, _: Type.TypeId, i: u16) Common.LowerError!SubPat {
-            const payloads = self.l.program.patSpan(self.l.pat(pat_id).data.tag.payloads);
-            return .{ .index = i, .ty = self.l.pat(payloads[i]).ty, .pat = payloads[i] };
+            const payload = GuardedList.at(self.l.program.patSpan(self.l.pat(pat_id).data.tag.payloads), i);
+            return .{ .index = i, .ty = self.l.pat(payload).ty, .pat = payload };
         }
 
         pub fn tagVariantCount(self: MatchTreeCtx, ty: Type.TypeId) ?u32 {
@@ -2263,7 +2263,7 @@ const Lowerer = struct {
         }
 
         pub fn listElemPat(self: MatchTreeCtx, pat_id: LambdaMono.PatId, i: u32) LambdaMono.PatId {
-            return self.l.program.patSpan(self.l.pat(pat_id).data.list.patterns)[i];
+            return GuardedList.at(self.l.program.patSpan(self.l.pat(pat_id).data.list.patterns), i);
         }
 
         pub fn listElemTy(self: MatchTreeCtx, ty: Type.TypeId) Type.TypeId {
@@ -2286,7 +2286,7 @@ const Lowerer = struct {
                 .frac_f64_lit => |value| @as(u64, @bitCast(if (value == 0.0) @as(f64, 0.0) else value)),
                 .str_lit => |lit| try self.strShapeKey(self.l.program.stringLiteralText(lit), &.{}, .exact),
                 .str_pattern => |str| blk: {
-                    const steps = self.l.program.strPatternStepSpan(str.steps);
+                    const steps = try GuardedList.dupe(self.arena, LambdaMono.StrPatternStep, self.l.program.strPatternStepSpan(str.steps));
                     break :blk try self.strShapeKey(self.l.program.stringLiteralText(str.prefix), steps, str.end);
                 },
                 .list => |list| list.patterns.len,
@@ -2363,11 +2363,11 @@ const Lowerer = struct {
 
         pub fn strCapturePat(self: MatchTreeCtx, pat_id: LambdaMono.PatId, i: u16) ?LambdaMono.PatId {
             const str = self.l.pat(pat_id).data.str_pattern;
-            return self.l.program.strPatternStepSpan(str.steps)[i].capture;
+            return GuardedList.at(self.l.program.strPatternStepSpan(str.steps), i).capture;
         }
 
         pub fn stmtCount(self: MatchTreeCtx) usize {
-            return self.l.result.store.cf_stmts.items.len;
+            return self.l.result.store.cf_stmts.len();
         }
 
         pub fn freshJoinPointId(self: MatchTreeCtx) LIR.JoinPointId {
@@ -2550,8 +2550,8 @@ const Lowerer = struct {
             };
             const steps = self.l.program.strPatternStepSpan(str.steps);
             const locals = try self.arena.alloc(?LIR.LocalId, steps.len);
-            for (steps, locals) |step, *out| {
-                out.* = if (step.capture) |capture| try self.l.addTemp(self.l.pat(capture).ty) else null;
+            for (locals, 0..) |*out, i| {
+                out.* = if (GuardedList.at(steps, i).capture) |capture| try self.l.addTemp(self.l.pat(capture).ty) else null;
             }
             return locals;
         }
@@ -2567,10 +2567,10 @@ const Lowerer = struct {
                 .str_pattern => |str| {
                     const input_steps = self.l.program.strPatternStepSpan(str.steps);
                     const lir_steps = try self.arena.alloc(LIR.StrMatchStep, input_steps.len);
-                    for (input_steps, lir_steps, capture_locals) |input_step, *lir_step, capture| {
+                    for (lir_steps, capture_locals, 0..) |*lir_step, capture, i| {
                         lir_step.* = .{
                             .capture = if (capture) |local| .{ .view = local } else .discard,
-                            .delimiter = try self.l.lirStrLiteral(input_step.delimiter),
+                            .delimiter = try self.l.lirStrLiteral(GuardedList.at(input_steps, i).delimiter),
                         };
                     }
                     return .{
