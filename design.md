@@ -3561,8 +3561,8 @@ mirror a C struct. When a nominal declaration contains an unnamed field, layout
 commit sends the fields to the store in declaration order and commits that
 order verbatim. The store inserts normal C-style implicit padding between
 fields as alignment requires, and rounds the total size up to the maximum field
-alignment. It does not repair or reorder the declaration. Padding is an
-explicit layout fact, so later stages consume committed offsets and sizes
+alignment. It does not repair or reorder the declaration. Padding is represented
+in committed layout fields, so later stages consume committed offsets and sizes
 instead of reconstructing them.
 
 Nominal record declarations may contain unnamed fields, written `_` or

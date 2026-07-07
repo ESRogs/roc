@@ -17,8 +17,11 @@ const GraphField = layout.GraphField;
 const GraphNodeId = layout.GraphNodeId;
 const GraphRef = layout.GraphRef;
 
+/// Lookup table from checked-module cache keys to the serialized checked artifacts
+/// needed to resolve imported nominal declarations.
 pub const ArtifactMap = std.AutoHashMap(CheckedArtifact.CheckedModuleArtifactKey, *const CheckedArtifact.CheckedModuleArtifact);
 
+/// Failures that can occur while converting checked-artifact types to layouts.
 pub const Error = std.mem.Allocator.Error || error{
     UnresolvedByValue,
 };
@@ -52,6 +55,8 @@ const NominalDeclarationLookup = struct {
     declaration: CheckedArtifact.CheckedNominalDeclaration,
 };
 
+/// Resolves checked-artifact type IDs to interned layout IDs using committed
+/// nominal declarations from the artifact set.
 pub const Resolver = struct {
     store: *Store,
     allocator: std.mem.Allocator,
@@ -99,7 +104,7 @@ pub const Resolver = struct {
         if (build_state.refs_by_type.get(key)) |cached| return cached;
         if (self.canonical_cache.get(key)) |cached| return .{ .canonical = cached };
 
-        return switch (self.checkedTypePayload(artifact, checked_type)) {
+        return switch (checkedTypePayload(artifact, checked_type)) {
             .pending => unreachable,
             .flex, .rigid => if (parent_context == .heap_indirect)
                 .{ .canonical = .opaque_ptr }
@@ -218,7 +223,7 @@ pub const Resolver = struct {
         var backing_fields = std.ArrayList(CheckedArtifact.CheckedRecordField).empty;
         defer backing_fields.deinit(self.allocator);
         try self.appendRecordRowFields(artifact, &backing_fields, nominal.backing);
-        self.sortRecordFieldsByName(artifact, backing_fields.items);
+        sortRecordFieldsByName(artifact, backing_fields.items);
 
         var graph_fields = std.ArrayList(GraphField).empty;
         defer graph_fields.deinit(self.allocator);
@@ -229,7 +234,7 @@ pub const Resolver = struct {
             switch (field) {
                 .named => |field_name_id| {
                     const field_name = lookup.artifact.canonical_names.recordFieldLabelText(field_name_id);
-                    const match = self.backingFieldByName(artifact, backing_fields.items, field_name) orelse unreachable;
+                    const match = backingFieldByName(artifact, backing_fields.items, field_name) orelse unreachable;
                     graph_fields.appendAssumeCapacity(.{
                         .index = match.index,
                         .child = try self.buildRefForType(artifact, match.field.ty, .ordinary, build_state),
@@ -265,7 +270,7 @@ pub const Resolver = struct {
         if (ext) |ext_id| try self.appendRecordRowFields(artifact, &fields, ext_id);
         if (fields.items.len == 0) return .{ .canonical = .zst };
 
-        self.sortRecordFieldsByName(artifact, fields.items);
+        sortRecordFieldsByName(artifact, fields.items);
 
         var graph_fields = std.ArrayList(GraphField).empty;
         defer graph_fields.deinit(self.allocator);
@@ -311,7 +316,7 @@ pub const Resolver = struct {
         try self.appendTagRowTags(artifact, &tags, ext);
         if (tags.items.len == 0) return .{ .canonical = .zst };
 
-        self.sortTagsByName(artifact, tags.items);
+        sortTagsByName(artifact, tags.items);
 
         var variants = std.ArrayList(GraphRef).empty;
         defer variants.deinit(self.allocator);
@@ -374,7 +379,7 @@ pub const Resolver = struct {
             if (seen.contains(current_id)) break;
             try seen.put(current_id, {});
 
-            switch (self.checkedTypePayload(artifact, current_id)) {
+            switch (checkedTypePayload(artifact, current_id)) {
                 .alias => |alias| current = alias.backing,
                 .empty_record => break,
                 .record => |record| {
@@ -408,7 +413,7 @@ pub const Resolver = struct {
             if (seen.contains(current_id)) break;
             try seen.put(current_id, {});
 
-            switch (self.checkedTypePayload(artifact, current_id)) {
+            switch (checkedTypePayload(artifact, current_id)) {
                 .alias => |alias| current = alias.backing,
                 .empty_tag_union => break,
                 .tag_union => |tag_union| {
@@ -470,34 +475,27 @@ pub const Resolver = struct {
     }
 
     fn checkedTypePayload(
-        self: *const Resolver,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
     ) CheckedArtifact.CheckedTypePayload {
-        _ = self;
         return artifact.checked_types.payload(checked_type);
     }
 
     fn sortRecordFieldsByName(
-        self: *const Resolver,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         fields: []CheckedArtifact.CheckedRecordField,
     ) void {
         std.mem.sort(CheckedArtifact.CheckedRecordField, fields, &artifact.canonical_names, recordFieldLessThan);
-        _ = self;
     }
 
     fn sortTagsByName(
-        self: *const Resolver,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         tags: []CheckedArtifact.CheckedTag,
     ) void {
         std.mem.sort(CheckedArtifact.CheckedTag, tags, &artifact.canonical_names, tagLessThan);
-        _ = self;
     }
 
     fn backingFieldByName(
-        self: *const Resolver,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         fields: []const CheckedArtifact.CheckedRecordField,
         name: []const u8,
@@ -508,7 +506,6 @@ pub const Resolver = struct {
                 return .{ .index = @intCast(index), .field = field };
             }
         }
-        _ = self;
         return null;
     }
 };

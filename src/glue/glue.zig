@@ -284,9 +284,8 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
 
         for (artifact.platform_required_declarations.declarations) |declaration| {
             const name = artifact.canonical_names.exportNameText(declaration.platform_name);
-            const scheme = artifact.checked_types.schemeForKey(declaration.declared_source_ty) orelse
-                glueInvariant("platform-required declaration has no checked type scheme", .{});
-            const type_id = try type_table.getOrInsert(artifact, scheme.root);
+            const checked_type = platformRequiredEntrypointCheckedType(artifact, declaration);
+            const type_id = try type_table.getOrInsert(artifact, checked_type);
             try entrypoint_type_ids.put(name, type_id);
         }
 
@@ -756,6 +755,27 @@ fn providedRootFfiSymbol(
         std.debug.panic("glue invariant violated: provided export root has no published FFI symbol", .{});
     }
     unreachable;
+}
+
+fn platformRequiredEntrypointCheckedType(
+    artifact: *const CheckedArtifact.CheckedModuleArtifact,
+    declaration: CheckedArtifact.PlatformRequiredDeclaration,
+) CheckedArtifact.CheckedTypeId {
+    if (artifact.platform_required_bindings.lookupByRequiredIndex(declaration.requires_idx)) |binding| {
+        if (binding.declaration != declaration.id) {
+            glueInvariant("platform-required binding disagreed with declaration id", .{});
+        }
+        const relation = artifact.platform_requirement_relations.lookupByRelationId(binding.checked_relation) orelse
+            glueInvariant("platform-required binding has no checked relation row", .{});
+        if (relation.declaration != declaration.id or relation.requires_idx != declaration.requires_idx) {
+            glueInvariant("platform-required relation disagreed with declaration", .{});
+        }
+        return relation.requested_source_ty_payload;
+    }
+
+    const scheme = artifact.checked_types.schemeForKey(declaration.declared_source_ty) orelse
+        glueInvariant("platform-required declaration has no checked type scheme", .{});
+    return scheme.root;
 }
 
 fn argLayoutsForProc(
@@ -1231,42 +1251,6 @@ const TypeTable = struct {
 
     const SizeAlign = struct { size: u64, alignment: u64 };
 
-    /// Get the size and alignment for a type table entry by index.
-    fn getSizeAlign(self: *const TypeTable, type_id: u64) SizeAlign {
-        if (type_id >= self.entries.items.len) glueInvariant("missing type table entry {d}", .{type_id});
-        return self.getSizeAlignForRepr(self.entries.items[@intCast(type_id)]);
-    }
-
-    /// Get the size and alignment for a CollectedTypeRepr from committed layout facts.
-    fn getSizeAlignForRepr(self: *const TypeTable, repr: CollectedTypeRepr) SizeAlign {
-        const facts = switch (repr) {
-            .bool_,
-            .dec,
-            .f32_,
-            .f64_,
-            .i8_,
-            .i16_,
-            .i32_,
-            .i64_,
-            .i128_,
-            .u8_,
-            .u16_,
-            .u32_,
-            .u64_,
-            .u128_,
-            .str_,
-            .unit,
-            => |facts| facts,
-            .box => |box| box.layout,
-            .list => |list| list.layout,
-            .function => |func| func.layout,
-            .record => |rec| rec.layout,
-            .tag_union => |tu| tu.layout,
-            .unknown => |unknown| unknown.layout,
-        };
-        return facts.native(self.target_usize);
-    }
-
     fn convertCheckedType(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
@@ -1405,14 +1389,6 @@ const TypeTable = struct {
         declaration: CheckedArtifact.CheckedNominalDeclaration,
         padding_field_types: []const CheckedArtifact.CheckedTypeId,
     };
-
-    fn artifactByKey(
-        self: *TypeTable,
-        key: CheckedArtifact.CheckedModuleArtifactKey,
-    ) *const CheckedArtifact.CheckedModuleArtifact {
-        return self.artifacts_by_key.get(key) orelse
-            glueInvariant("nominal representation referenced an artifact that glue did not load", .{});
-    }
 
     fn nominalDeclarationFor(
         self: *TypeTable,
@@ -1618,6 +1594,7 @@ const TypeTable = struct {
         var all_fields = std.ArrayList(CheckedArtifact.CheckedRecordField).empty;
         defer all_fields.deinit(self.gpa);
         try appendRecordRowFields(self.gpa, artifact, fields, ext, &all_fields);
+        sortRecordFieldsByName(artifact, all_fields.items);
         return self.convertRecordFields(artifact, checked_type, all_fields.items);
     }
 
@@ -2564,6 +2541,21 @@ fn appendRecordRowFields(
             else => glueInvariant("non-record checked row reached glue record conversion", .{}),
         }
     }
+}
+
+fn sortRecordFieldsByName(
+    artifact: *const CheckedArtifact.CheckedModuleArtifact,
+    fields: []CheckedArtifact.CheckedRecordField,
+) void {
+    std.mem.sort(CheckedArtifact.CheckedRecordField, fields, &artifact.canonical_names, checkedRecordFieldLessThan);
+}
+
+fn checkedRecordFieldLessThan(
+    names: *const CanonicalNameStore,
+    lhs: CheckedArtifact.CheckedRecordField,
+    rhs: CheckedArtifact.CheckedRecordField,
+) bool {
+    return names.recordFieldLabelTextLessThan(lhs.name, rhs.name);
 }
 
 fn appendTagRowTags(
