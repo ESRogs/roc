@@ -79,7 +79,9 @@ TypeTable := { entries : List(TypeInfo) }.{
 						Ok(payload_id) => SinglePayload(payload_id)
 						Err(_) => SingleNoPayload
 					}
-				Err(_) => SingleNoPayload
+				Err(_) => {
+					crash "glue invariant violated: single-tag union had no tag"
+				}
 			}
 		} else {
 			NotSingleVariant
@@ -173,7 +175,10 @@ ref_layout = {
 	details: AbiBuiltin,
 }
 
+sample_info : TypeRepr -> TypeInfo
 sample_info = |repr| { repr, layout: sample_layout, rc: RcNoop }
+
+ref_info : TypeRepr -> TypeInfo
 ref_info = |repr| { repr, layout: ref_layout, rc: RcRefcounted }
 
 sample_table : TypeTable
@@ -187,11 +192,18 @@ sample_table = TypeTable.from_list([
 	ref_info(RocTagUnion({ name: "Try", tags: [{ name: "Err", payload: [2] }, { name: "Ok", payload: [0] }] })),
 ])
 
+## Checks the sample `TypeTable.is_unit` behavior.
 expect sample_table.is_unit(0) == Bool.False
+## Checks the sample `TypeTable.is_refcounted` behavior.
 expect sample_table.is_refcounted(1)
+## Checks the sample `TypeTable.is_refcounted` behavior.
 expect sample_table.is_refcounted(2)
+## Checks the sample `TypeTable.is_refcounted` behavior.
 expect sample_table.is_refcounted(3)
+## Checks the sample `TypeTable.is_anonymous_record` behavior.
 expect sample_table.is_anonymous_record(4) == Bool.False
+## Checks the sample `TypeTable.duplicate_tag_union_names` behavior.
 expect sample_table.duplicate_tag_union_names() == ["Try"]
 
+## Checks `TypeTable.is_named_multi_tag_union` for this representative case.
 expect TypeTable.is_named_multi_tag_union(sample_table.get(5))

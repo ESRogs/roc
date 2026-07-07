@@ -87,6 +87,7 @@ TypeNamePlan := { table : TypeTable }.{
 		}
 	}
 
+	collect_preferred_for_type_id : { entries : List(PreferredName), seen_names : List(Str), seen_type_ids : List(U64) }, TypeTable, U64, Str, Str, List(U64) -> { entries : List(PreferredName), seen_names : List(Str), seen_type_ids : List(U64) }
 	collect_preferred_for_type_id = |state, type_table, type_id, alias_base, module_base, visited_type_ids| {
 		if List.contains(visited_type_ids, type_id) {
 			return state
@@ -144,6 +145,7 @@ TypeNamePlan := { table : TypeTable }.{
 		}
 	}
 
+	add_preferred_name : { entries : List(PreferredName), seen_names : List(Str), seen_type_ids : List(U64) }, U64, Str -> { entries : List(PreferredName), seen_names : List(Str), seen_type_ids : List(U64) }
 	add_preferred_name = |state, type_id, name| {
 		if name == "" or List.contains(state.seen_type_ids, type_id) or List.contains(state.seen_names, name) {
 			state
@@ -156,6 +158,7 @@ TypeNamePlan := { table : TypeTable }.{
 		}
 	}
 
+	collect_aliases_for_type_id : { entries : List(AliasPlan), seen_aliases : List(Str) }, TypeTable, U64, Str, Str, List(U64) -> { entries : List(AliasPlan), seen_aliases : List(Str) }
 	collect_aliases_for_type_id = |state, type_table, type_id, alias_base, module_base, visited_type_ids| {
 		if List.contains(visited_type_ids, type_id) {
 			return state
@@ -219,6 +222,7 @@ TypeNamePlan := { table : TypeTable }.{
 		}
 	}
 
+	add_alias : { entries : List(AliasPlan), seen_aliases : List(Str) }, Str, U64, AliasKind -> { entries : List(AliasPlan), seen_aliases : List(Str) }
 	add_alias = |state, alias, type_id, kind| {
 		if alias == "" or List.contains(state.seen_aliases, alias) {
 			state

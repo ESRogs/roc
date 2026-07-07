@@ -41,14 +41,18 @@ AbiLayout := {
 	record_fields = |layout|
 		match layout.details {
 			AbiRecord(record) => record.fields
-			_ => []
+			_ => {
+				crash "glue invariant violated: expected record ABI layout"
+			}
 		}
 
 	tag_layouts : AbiLayout -> List(AbiTagLayout)
 	tag_layouts = |layout|
 		match layout.details {
 			AbiTagUnion(tag_union) => tag_union.tags
-			_ => []
+			_ => {
+				crash "glue invariant violated: expected tag union ABI layout"
+			}
 		}
 
 	discriminant_offset : AbiLayout, AbiWidth -> U64
@@ -59,13 +63,17 @@ AbiLayout := {
 					Pointer32 => tag_union.discriminant_offset32
 					Pointer64 => tag_union.discriminant_offset64
 				}
-			_ => 0
+			_ => {
+				crash "glue invariant violated: expected tag union ABI layout"
+			}
 		}
 
 	discriminant_size : AbiLayout -> U64
 	discriminant_size = |layout|
 		match layout.details {
 			AbiTagUnion(tag_union) => tag_union.discriminant_size
-			_ => 0
+			_ => {
+				crash "glue invariant violated: expected tag union ABI layout"
+			}
 		}
 }

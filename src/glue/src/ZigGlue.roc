@@ -11,6 +11,7 @@ import pf.AbiTagLayout exposing [AbiTagLayout]
 import pf.AbiWidth exposing [AbiWidth]
 import pf.ArgShape exposing [ArgShape]
 import pf.GlueInput exposing [GlueInput]
+import pf.HostedFunctionInfo exposing [HostedFunctionInfo]
 import pf.TypeNamePlan exposing [TypeNamePlan]
 import pf.FunctionRepr exposing [FunctionRepr]
 import pf.RecordRepr exposing [RecordRepr]
@@ -58,6 +59,7 @@ default_tag_union_struct_name = |duplicate_names, type_id, tu| {
 }
 
 ## Return the emitted Zig type name for a multi-variant tag union.
+tag_union_struct_name : TypeNamePlan.PreferredNames, List(Str), U64, TagUnionRepr -> Str
 tag_union_struct_name = |preferred_names, duplicate_names, type_id, tu| {
 	preferred = preferred_names.lookup(type_id)
 	if preferred.found {
@@ -67,13 +69,16 @@ tag_union_struct_name = |preferred_names, duplicate_names, type_id, tu| {
 	}
 }
 
-hosted_module_name_to_struct_name = |name| {
+hosted_module_name_to_struct_name : Str -> Str
+hosted_module_name_to_struct_name = |name|
 	match List.first(Str.split_on(name, ".")) {
 		Ok(module_name) => name_to_struct_name(module_name)
-		Err(_) => name_to_struct_name(name)
+		Err(_) => {
+			crash "glue invariant violated: module name split produced no segments"
+		}
 	}
-}
 
+generated_type_names_zig : TypeTable, List(Str) -> List(Str)
 generated_type_names_zig = |type_table, duplicate_names| {
 	var $names = []
 	var $type_id = 0
@@ -97,6 +102,7 @@ generated_type_names_zig = |type_table, duplicate_names| {
 	$names
 }
 
+type_name_roots_zig : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable -> List(TypeNamePlan.Root)
 type_name_roots_zig = |hosted_functions, provides_list, type_table| {
 	var $roots = []
 
@@ -123,14 +129,15 @@ type_name_roots_zig = |hosted_functions, provides_list, type_table| {
 	$roots
 }
 
-preferred_type_names_zig = |hosted_functions, provides_list, type_table, duplicate_names| {
+preferred_type_names_zig : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable, List(Str) -> TypeNamePlan.PreferredNames
+preferred_type_names_zig = |hosted_functions, provides_list, type_table, duplicate_names|
 	TypeNamePlan.from_table(type_table).preferred_names(
 		generated_type_names_zig(type_table, duplicate_names),
 		type_name_roots_zig(hosted_functions, provides_list, type_table),
 	)
-}
 
 ## Map a type table entry to its Zig type string using structured TypeRepr
+type_id_to_zig : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64 -> Str
 type_id_to_zig = |type_table, duplicate_tag_names, preferred_names, type_id| {
 	type_repr_to_zig(type_table, duplicate_tag_names, preferred_names, type_id, type_table.get(type_id))
 }
@@ -138,6 +145,7 @@ type_id_to_zig = |type_table, duplicate_tag_names, preferred_names, type_id| {
 ## Render one `extern struct` field declaration for a record field. Unnamed
 ## nominal-record padding fields become fixed-size byte arrays (`[size]u8`);
 ## named fields use their resolved Zig type.
+zig_record_field_decl : TypeTable, List(Str), TypeNamePlan.PreferredNames, AbiFieldLayout, AbiWidth -> Str
 zig_record_field_decl = |type_table, duplicate_tag_names, preferred_names, field, width| {
 	field_name = name_to_zig_quoted_ident(field.name)
 	zig_type = if field.is_padding {
@@ -150,6 +158,7 @@ zig_record_field_decl = |type_table, duplicate_tag_names, preferred_names, field
 
 ## Fields arrive in committed layout order (valid at both pointer widths);
 ## only per-width padding byte counts differ between the two renderings.
+zig_record_fields_decl : TypeTable, List(Str), TypeNamePlan.PreferredNames, List(AbiFieldLayout), AbiWidth -> Str
 zig_record_fields_decl = |type_table, duplicate_tag_names, preferred_names, fields, width| {
 	var $field_strs = ""
 	for field in fields {
@@ -158,6 +167,7 @@ zig_record_fields_decl = |type_table, duplicate_tag_names, preferred_names, fiel
 	$field_strs
 }
 
+zig_record_layout_assertions : Str, AbiLayout -> Str
 zig_record_layout_assertions = |type_name, abi_layout| {
 	if abi_layout.size64 > 0 or abi_layout.size32 > 0 {
 		block =
@@ -177,6 +187,7 @@ zig_record_layout_assertions = |type_name, abi_layout| {
 	}
 }
 
+zig_payload_layout_assertions : Str, AbiTagLayout -> Str
 zig_payload_layout_assertions = |type_name, tag_layout| {
 	if tag_layout.payload_size64 > 0 or tag_layout.payload_size32 > 0 {
 		block =
@@ -196,6 +207,7 @@ zig_payload_layout_assertions = |type_name, tag_layout| {
 	}
 }
 
+zig_record_struct_decl : Str, Str, Str, Str, Str, Str, AbiLayout -> Str
 zig_record_struct_decl = |doc, struct_name, field_strs64, field_strs32, method_decls64, method_decls32, abi_layout| {
 	assertions = zig_record_layout_assertions(struct_name, abi_layout)
 	decl =
@@ -205,6 +217,7 @@ zig_record_struct_decl = |doc, struct_name, field_strs64, field_strs32, method_d
 	"${doc}${decl}\n\n${assertions}"
 }
 
+zig_payload_struct_decl : Str, Str, TypeTable, List(Str), TypeNamePlan.PreferredNames, List(AbiFieldLayout), AbiTagLayout -> Str
 zig_payload_struct_decl = |doc, struct_name, type_table, duplicate_tag_names, preferred_names, fields, tag_layout| {
 	field_strs64 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, fields, Pointer64)
 	field_strs32 = zig_record_fields_decl(type_table, duplicate_tag_names, preferred_names, fields, Pointer32)
@@ -217,6 +230,7 @@ zig_payload_struct_decl = |doc, struct_name, type_table, duplicate_tag_names, pr
 }
 
 ## Convert a TypeRepr to its Zig type string
+type_repr_to_zig : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, TypeRepr -> Str
 type_repr_to_zig = |type_table, duplicate_tag_names, preferred_names, type_id, type_repr| {
 	match type_repr {
 		RocBool => "bool"
@@ -291,7 +305,8 @@ abi_discriminant_size = |abi_layout| abi_layout.discriminant_size()
 
 ## Resolve a tag union to a Zig type. Single-variant unions are unwrapped to their payload.
 ## Multi-variant unions with a name return a generated struct name.
-resolve_tag_union_type = |type_table, duplicate_tag_names, preferred_names, type_id, tu| {
+resolve_tag_union_type : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, TagUnionRepr -> Str
+resolve_tag_union_type = |type_table, duplicate_tag_names, preferred_names, type_id, tu|
 	match TypeTable.single_variant_payload(tu) {
 		SinglePayload(payload_id) => type_id_to_zig(type_table, duplicate_tag_names, preferred_names, payload_id)
 		SingleNoPayload => "*anyopaque"
@@ -301,8 +316,7 @@ resolve_tag_union_type = |type_table, duplicate_tag_names, preferred_names, type
 			} else {
 				"*anyopaque"
 			}
-		}
-}
+	}
 
 ## Generate the RocList(T) generic type function (static Zig code)
 generate_roc_list_generic : Str
@@ -545,6 +559,7 @@ generate_roc_env =
 
 ## Generate extern structs for element types found in the type table.
 ## Scans for Record types and generates Zig extern structs for them.
+generate_element_type_structs : TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_element_type_structs = |type_table, duplicate_tag_names, preferred_names| {
 	var $structs = ""
 	var $seen_names = []
@@ -600,6 +615,7 @@ generate_element_type_structs = |type_table, duplicate_tag_names, preferred_name
 ## Generate extern structs for tag union types found in the type table.
 ## Multi-variant tag unions get a tag enum, payload extern union, and wrapping extern struct.
 ## Pure enums (all variants have no payload) get just an enum.
+generate_tag_union_structs : TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_tag_union_structs = |type_table, duplicate_tag_names, preferred_names| {
 	var $structs = ""
 	var $seen_names = []
@@ -644,6 +660,7 @@ generate_tag_union_structs = |type_table, duplicate_tag_names, preferred_names| 
 	$structs
 }
 
+abi_tag_at : List(AbiTagLayout), U64 -> AbiTagLayout
 abi_tag_at = |abi_tags, index| {
 	match List.get(abi_tags, index) {
 		Ok(tag) => tag
@@ -653,9 +670,11 @@ abi_tag_at = |abi_tags, index| {
 	}
 }
 
+abi_tag_has_payload : AbiTagLayout -> Bool
 abi_tag_has_payload = |tag| tag.payload_size32 > 0 or tag.payload_size64 > 0
 
 ## Generate Zig code for a single multi-variant tag union.
+generate_single_tag_union : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, TagUnionRepr, AbiLayout -> Str
 generate_single_tag_union = |type_table, duplicate_tag_names, preferred_names, type_id, tu, abi_layout| {
 	struct_name = tag_union_struct_name(preferred_names, duplicate_tag_names, type_id, tu)
 	disc_type = disc_type_for_size(abi_discriminant_size(abi_layout))
@@ -712,11 +731,13 @@ generate_single_tag_union = |type_table, duplicate_tag_names, preferred_names, t
 			if !(abi_tag_has_payload(tag_layout)) {
 				# No-payload variant: use [0]u8 (Zig extern unions can't have void)
 				$union_fields = Str.concat($union_fields, "        ${snake}: [0]u8,\n")
-			} else if List.len(union_tag.payload) == 1 {
-				zig_type = match List.first(union_tag.payload) {
-					Ok(pid) => type_id_to_zig(type_table, duplicate_tag_names, preferred_names, pid)
-					Err(_) => "*anyopaque"
-				}
+				} else if List.len(union_tag.payload) == 1 {
+					zig_type = match List.first(union_tag.payload) {
+						Ok(pid) => type_id_to_zig(type_table, duplicate_tag_names, preferred_names, pid)
+						Err(_) => {
+							crash "glue invariant violated: single-payload tag had no payload"
+						}
+					}
 				$union_fields = Str.concat($union_fields, "        ${snake}: ${zig_type},\n")
 				$accessors64 = Str.concat($accessors64, "    pub fn payload_${snake}(self: *const @This()) ${zig_type} {\n        return self.payload.${snake};\n    }\n")
 				$accessors32 = Str.concat($accessors32, "    pub fn payload_${snake}(self: *const @This()) ${zig_type} {\n        const ptr: *const ${zig_type} = @ptrCast(@alignCast(&self.payload));\n        return ptr.*;\n    }\n")
@@ -772,7 +793,8 @@ generate_single_tag_union = |type_table, duplicate_tag_names, preferred_names, t
 	}
 }
 
-disc_type_for_size = |size| {
+disc_type_for_size : U64 -> Str
+disc_type_for_size = |size|
 	if size <= 1 {
 		"u8"
 	} else if size == 2 {
@@ -782,12 +804,12 @@ disc_type_for_size = |size| {
 	} else {
 		"u64"
 	}
-}
 
 # =============================================================================
 # Generated Refcount Helpers
 # =============================================================================
 
+indent_lines : Str, Str -> Str
 indent_lines = |text, prefix| {
 	if text == "" {
 		return ""
@@ -804,13 +826,16 @@ indent_lines = |text, prefix| {
 	$result
 }
 
+box_payload_decref_name : U64 -> Str
 box_payload_decref_name = |inner_id| "decrefBoxPayloadType${U64.to_str(inner_id)}"
 
+decref_stmt_for_type_id : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, Str -> Str
 decref_stmt_for_type_id = |type_table, duplicate_tag_names, preferred_names, type_id, expr| {
 	type_repr = type_table.get(type_id)
 	decref_stmt_for_repr(type_table, duplicate_tag_names, preferred_names, type_id, type_repr, expr)
 }
 
+decref_stmt_for_repr : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, TypeRepr, Str -> Str
 decref_stmt_for_repr = |type_table, duplicate_tag_names, preferred_names, _type_id, type_repr, expr| {
 	match type_repr {
 		RocStr => "    ${expr}.decref(roc_host);\n"
@@ -863,11 +888,13 @@ decref_stmt_for_repr = |type_table, duplicate_tag_names, preferred_names, _type_
 	}
 }
 
+incref_stmt_for_type_id : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, Str -> Str
 incref_stmt_for_type_id = |type_table, duplicate_tag_names, preferred_names, type_id, expr| {
 	type_repr = type_table.get(type_id)
 	incref_stmt_for_repr(type_table, duplicate_tag_names, preferred_names, type_id, type_repr, expr)
 }
 
+incref_stmt_for_repr : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, TypeRepr, Str -> Str
 incref_stmt_for_repr = |type_table, duplicate_tag_names, preferred_names, _type_id, type_repr, expr| {
 	match type_repr {
 		RocStr => "    ${expr}.incref(amount);\n"
@@ -884,27 +911,22 @@ incref_stmt_for_repr = |type_table, duplicate_tag_names, preferred_names, _type_
 				"    ${expr}.incref(amount);\n"
 			}
 		}
-		RocTagUnion(tu) =>
-			if List.len(tu.tags) == 1 {
-				match List.first(tu.tags) {
-					Ok(tag) =>
-						match List.first(tag.payload) {
-							Ok(payload_id) => incref_stmt_for_type_id(type_table, duplicate_tag_names, preferred_names, payload_id, expr)
-							_ => ""
+			RocTagUnion(tu) =>
+				match TypeTable.single_variant_payload(tu) {
+					SinglePayload(payload_id) => incref_stmt_for_type_id(type_table, duplicate_tag_names, preferred_names, payload_id, expr)
+					SingleNoPayload => ""
+					NotSingleVariant =>
+						if tu.name != "" {
+							"    ${expr}.incref(amount);\n"
+						} else {
+							""
 						}
-					_ => ""
 				}
-			} else {
-				if tu.name != "" {
-					"    ${expr}.incref(amount);\n"
-				} else {
-					""
-				}
-			}
-		_ => ""
+			_ => ""
+		}
 	}
-}
 
+generate_record_refcount_methods : TypeTable, List(Str), TypeNamePlan.PreferredNames, List(AbiFieldLayout) -> Str
 generate_record_refcount_methods = |type_table, duplicate_tag_names, preferred_names, fields| {
 	var $decref_body = ""
 	var $incref_body = ""
@@ -933,6 +955,7 @@ generate_record_refcount_methods = |type_table, duplicate_tag_names, preferred_n
 	"    /// Recursively decrement Roc-owned fields.\n    pub fn decref(self: @This(), roc_host: *RocHost) void {\n        const value = self;\n${$decref_body}    }\n\n    /// Increment Roc-owned fields.\n    pub fn incref(self: @This(), amount: isize) void {\n        const value = self;\n${$incref_body}    }\n"
 }
 
+generate_tag_payload_refcount_branch : TypeTable, List(Str), TypeNamePlan.PreferredNames, TagVariant, Str -> Str
 generate_tag_payload_refcount_branch = |type_table, duplicate_tag_names, preferred_names, tag, mode| {
 	snake = to_lower_snake_case(tag.name)
 
@@ -946,11 +969,13 @@ generate_tag_payload_refcount_branch = |type_table, duplicate_tag_names, preferr
 				Ok(payload_id) =>
 					if mode == "decref" {
 						decref_stmt_for_type_id(type_table, duplicate_tag_names, preferred_names, payload_id, "value.payload_${snake}()")
-					} else {
-						incref_stmt_for_type_id(type_table, duplicate_tag_names, preferred_names, payload_id, "value.payload_${snake}()")
+						} else {
+							incref_stmt_for_type_id(type_table, duplicate_tag_names, preferred_names, payload_id, "value.payload_${snake}()")
+						}
+					Err(_) => {
+						crash "glue invariant violated: single-payload tag had no payload"
 					}
-				_ => ""
-			}
+				}
 
 		if body == "" {
 			"        .${tag.name} => {},\n"
@@ -975,6 +1000,7 @@ generate_tag_payload_refcount_branch = |type_table, duplicate_tag_names, preferr
 	}
 }
 
+decref_stmt_uses_roc_host_for_type_id : TypeTable, U64 -> Bool
 decref_stmt_uses_roc_host_for_type_id = |type_table, type_id| {
 	type_repr = type_table.get(type_id)
 	match type_repr {
@@ -992,30 +1018,25 @@ decref_stmt_uses_roc_host_for_type_id = |type_table, type_id| {
 	}
 }
 
+incref_stmt_uses_amount_for_type_id : TypeTable, U64 -> Bool
 incref_stmt_uses_amount_for_type_id = |type_table, type_id| {
 	type_repr = type_table.get(type_id)
 	match type_repr {
 		RocStr => Bool.True
 		RocList(_) => Bool.True
 		RocBox(_) => Bool.True
-		RocRecord(rec) => rec.name != ""
-		RocTagUnion(tu) =>
-			if List.len(tu.tags) == 1 {
-				match List.first(tu.tags) {
-					Ok(tag) =>
-						match List.first(tag.payload) {
-							Ok(payload_id) => incref_stmt_uses_amount_for_type_id(type_table, payload_id)
-							_ => Bool.False
-						}
-					_ => Bool.False
+			RocRecord(rec) => rec.name != ""
+			RocTagUnion(tu) =>
+				match TypeTable.single_variant_payload(tu) {
+					SinglePayload(payload_id) => incref_stmt_uses_amount_for_type_id(type_table, payload_id)
+					SingleNoPayload => Bool.False
+					NotSingleVariant => tu.name != ""
 				}
-			} else {
-				tu.name != ""
-			}
-		_ => Bool.False
+			_ => Bool.False
+		}
 	}
-}
 
+tag_payload_refcount_uses_param : TypeTable, TagVariant, Str -> Bool
 tag_payload_refcount_uses_param = |type_table, tag, mode| {
 	if List.is_empty(tag.payload) {
 		return Bool.False
@@ -1033,14 +1054,17 @@ tag_payload_refcount_uses_param = |type_table, tag, mode| {
 	)
 }
 
+tag_union_refcount_uses_param : TypeTable, TagUnionRepr, Str -> Bool
 tag_union_refcount_uses_param = |type_table, tu, mode| {
 	List.any(tu.tags, |tag| tag_payload_refcount_uses_param(type_table, tag, mode))
 }
 
+generate_tag_union_refcount_method_delegates : Str -> Str
 generate_tag_union_refcount_method_delegates = |struct_name| {
 	"    /// Recursively decrement Roc-owned payloads.\n    pub fn decref(self: @This(), roc_host: *RocHost) void {\n        decref${struct_name}(self, roc_host);\n    }\n\n    /// Increment Roc-owned payloads.\n    pub fn incref(self: @This(), amount: isize) void {\n        incref${struct_name}(self, amount);\n    }\n"
 }
 
+generate_tag_union_refcount_helpers : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64, TagUnionRepr -> Str
 generate_tag_union_refcount_helpers = |type_table, duplicate_tag_names, preferred_names, type_id, tu| {
 	struct_name = tag_union_struct_name(preferred_names, duplicate_tag_names, type_id, tu)
 	var $decref_branches = ""
@@ -1066,6 +1090,7 @@ generate_tag_union_refcount_helpers = |type_table, duplicate_tag_names, preferre
 	"fn decref${struct_name}(value: ${struct_name}, roc_host: *RocHost) void {\n${decref_unused}    switch (value.tag) {\n${$decref_branches}    }\n}\n\nfn incref${struct_name}(value: ${struct_name}, amount: isize) void {\n${incref_unused}    switch (value.tag) {\n${$incref_branches}    }\n}\n\n"
 }
 
+generate_box_payload_decref_helpers : TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_box_payload_decref_helpers = |type_table, duplicate_tag_names, preferred_names| {
 	var $helpers = ""
 	var $seen_inner_ids = []
@@ -1097,6 +1122,7 @@ generate_box_payload_decref_helpers = |type_table, duplicate_tag_names, preferre
 	$helpers
 }
 
+generate_refcount_helpers : TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_refcount_helpers = |type_table, duplicate_tag_names, preferred_names| {
 	var $helpers = ""
 	var $seen_names = []
@@ -1131,6 +1157,7 @@ generate_refcount_helpers = |type_table, duplicate_tag_names, preferred_names| {
 ## `Try` because different hosted functions can use different payload layouts.
 ## These aliases give platform authors stable API names for secondary names that
 ## share a concrete layout.
+add_type_alias_zig : { content : Str, seen : List(Str) }, Str, Str -> { content : Str, seen : List(Str) }
 add_type_alias_zig = |state, alias, target| {
 	if alias == target or List.contains(state.seen, alias) {
 		state
@@ -1142,8 +1169,10 @@ add_type_alias_zig = |state, alias, target| {
 	}
 }
 
+tag_union_has_payload_zig : TagUnionRepr -> Bool
 tag_union_has_payload_zig = |tu| TypeTable.tag_union_has_payload(tu)
 
+add_tag_union_aliases_zig : { content : Str, seen : List(Str) }, Str, Str, TagUnionRepr -> { content : Str, seen : List(Str) }
 add_tag_union_aliases_zig = |state, alias, target, tu| {
 	with_main_alias = add_type_alias_zig(state, alias, target)
 
@@ -1155,6 +1184,7 @@ add_tag_union_aliases_zig = |state, alias, target, tu| {
 	}
 }
 
+generate_platform_type_aliases_zig : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_platform_type_aliases_zig = |hosted_functions, provides_list, type_table, duplicate_tag_names, preferred_names| {
 	var $state = { content: "", seen: [] }
 	name_plan = TypeNamePlan.from_table(type_table)
@@ -1186,7 +1216,9 @@ generate_platform_type_aliases_zig = |hosted_functions, provides_list, type_tabl
 str_replace_all : Str, Str, Str -> Str
 str_replace_all = |s, from, to| RocName.replace_all(s, from, to)
 
+## Checks `str_replace_all` for this representative case.
 expect str_replace_all("a.b.c", ".", "_") == "a_b_c"
+## Checks `str_replace_all` for this representative case.
 expect str_replace_all("hello!", "!", "") == "hello"
 
 to_uppercase : U8 -> U8
@@ -1199,18 +1231,26 @@ to_lowercase = |ch| ch + 32
 to_lower_snake_case : Str -> Str
 to_lower_snake_case = |s| RocName.lower_snake_ascii(s)
 
+## Checks `to_lower_snake_case` for this representative case.
 expect to_lower_snake_case("FooBar") == "foo_bar"
+## Checks `to_lower_snake_case` for this representative case.
 expect to_lower_snake_case("fooBar") == "foo_bar"
+## Checks `to_lower_snake_case` for this representative case.
 expect to_lower_snake_case("foo") == "foo"
+## Checks `to_lower_snake_case` for this representative case.
 expect to_lower_snake_case("FOO") == "foo"
+## Checks `to_lower_snake_case` for this representative case.
 expect to_lower_snake_case("Stdout_line") == "stdout_line"
 
 ## Capitalize the first character of a string
 capitalize_first : Str -> Str
 capitalize_first = |s| RocName.capitalize_first(s)
 
+## Checks `capitalize_first` for this representative case.
 expect capitalize_first("hello") == "Hello"
+## Checks `capitalize_first` for this representative case.
 expect capitalize_first("Hello") == "Hello"
+## Checks `capitalize_first` for this representative case.
 expect capitalize_first("") == ""
 
 # =============================================================================
@@ -1221,41 +1261,57 @@ expect capitalize_first("") == ""
 name_to_struct_name : Str -> Str
 name_to_struct_name = |name| RocName.from_str(name).to_pascal()
 
+## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("Stdout.line!") == "StdoutLine"
+## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("line!") == "Line"
+## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("Foo.bar.baz!") == "FooBarBaz"
 
 ## Convert function name to snake_case (e.g., "Stdout.line!" -> "stdout_line")
 name_to_snake : Str -> Str
 name_to_snake = |name| RocName.from_str(name).to_lower_snake()
 
+## Checks `name_to_snake` for this representative case.
 expect name_to_snake("Stdout.line!") == "stdout_line"
+## Checks `name_to_snake` for this representative case.
 expect name_to_snake("line!") == "line"
+## Checks `name_to_snake` for this representative case.
 expect name_to_snake("Foo.barBaz!") == "foo_bar_baz"
+## Checks `name_to_snake` for this representative case.
 expect name_to_snake("PartDef.Idx.get!") == "part_def_idx_get"
 
 ## Convert function name to camelCase for Zig function names (e.g., "Stdout.line!" -> "hostedStdoutLine")
 name_to_camel : Str -> Str
 name_to_camel = |name| RocName.from_str(name).to_camel()
 
+## Checks `name_to_camel` for this representative case.
 expect name_to_camel("Stdout.line!") == "stdoutLine"
+## Checks `name_to_camel` for this representative case.
 expect name_to_camel("Echo.line!") == "echoLine"
+## Checks `name_to_camel` for this representative case.
 expect name_to_camel("PartDef.Idx.get!") == "partDefIdxGet"
 
 ## Quote a Roc record field as a Zig identifier without changing its name.
 name_to_zig_quoted_ident : Str -> Str
 name_to_zig_quoted_ident = |name| "@\"${name}\""
 
+## Checks `name_to_zig_quoted_ident` for this representative case.
 expect name_to_zig_quoted_ident("init!") == "@\"init!\""
+## Checks `name_to_zig_quoted_ident` for this representative case.
 expect name_to_zig_quoted_ident("render!") == "@\"render!\""
+## Checks `name_to_zig_quoted_ident` for this representative case.
 expect name_to_zig_quoted_ident("answer") == "@\"answer\""
 
 ## Lowercase the first character of a string
 lowercase_first : Str -> Str
 lowercase_first = |s| RocName.lowercase_first(s)
 
+## Checks `lowercase_first` for this representative case.
 expect lowercase_first("Hello") == "hello"
+## Checks `lowercase_first` for this representative case.
 expect lowercase_first("hello") == "hello"
+## Checks `lowercase_first` for this representative case.
 expect lowercase_first("") == ""
 
 # =============================================================================
@@ -1263,6 +1319,7 @@ expect lowercase_first("") == ""
 # =============================================================================
 
 ## Generate the complete Zig source file
+generate_zig_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry) -> Str
 generate_zig_file = |hosted_functions, type_table, provides_list| {
 	duplicate_tag_names = duplicate_tag_union_names(type_table)
 	preferred_names = preferred_type_names_zig(hosted_functions, provides_list, type_table, duplicate_tag_names)
@@ -1662,6 +1719,7 @@ generate_roc_str =
 ## Generate extern structs for record return types using compiler-emitted ABI field offsets.
 ## Only generates RetRecord structs when ret_type_id resolves to a record in the type table.
 ## Tag union return types (e.g., Try(Record, Str)) are not yet supported and are skipped.
+generate_all_record_structs : List(HostedFunctionInfo), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_all_record_structs = |hosted_functions, type_table, duplicate_tag_names, preferred_names| {
 	var $structs = ""
 	arg_shape = ArgShape.from_table(type_table)
@@ -1685,6 +1743,7 @@ generate_all_record_structs = |hosted_functions, type_table, duplicate_tag_names
 }
 
 ## Generate all argument extern structs
+generate_all_args_structs : List(HostedFunctionInfo), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_all_args_structs = |hosted_functions, type_table, duplicate_tag_names, preferred_names| {
 	var $structs = ""
 	for func in hosted_functions {
@@ -1695,6 +1754,7 @@ generate_all_args_structs = |hosted_functions, type_table, duplicate_tag_names, 
 
 ## Generate a single argument extern struct (empty string if no args).
 ## Uses type table for single-record args; positional for multi-arg or primitive args.
+generate_args_struct : HostedFunctionInfo, TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_args_struct = |func, type_table, duplicate_tag_names, preferred_names| {
 	struct_name = name_to_struct_name(func.name)
 	arg_shape = ArgShape.from_table(type_table)
@@ -1728,6 +1788,7 @@ generate_args_struct = |func, type_table, duplicate_tag_names, preferred_names| 
 }
 
 ## Build a natural C ABI parameter list from Roc function argument type IDs.
+direct_param_list : TypeTable, List(Str), TypeNamePlan.PreferredNames, List(U64) -> Str
 direct_param_list = |type_table, duplicate_tag_names, preferred_names, arg_type_ids| {
 	var $params = ""
 	var $idx = 0
@@ -1749,6 +1810,7 @@ direct_param_list = |type_table, duplicate_tag_names, preferred_names, arg_type_
 
 ## Build a hosted symbol parameter list, using the generated Args wrapper for
 ## anonymous single-record arguments so direct-symbol glue stays readable.
+direct_hosted_param_list : TypeTable, List(Str), TypeNamePlan.PreferredNames, HostedFunctionInfo -> Str
 direct_hosted_param_list = |type_table, duplicate_tag_names, preferred_names, func| {
 	arg_shape = ArgShape.from_table(type_table)
 	use_args_wrapper = arg_shape.single_arg_is_anonymous_record(func.arg_type_ids)
@@ -1790,6 +1852,7 @@ generate_runtime_symbol_externs =
 	\\
 
 ## Generate direct extern declarations for hosted symbols.
+generate_hosted_symbol_externs : List(HostedFunctionInfo), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_hosted_symbol_externs = |hosted_functions, type_table, duplicate_tag_names, preferred_names| {
 	if List.is_empty(hosted_functions) {
 		return ""
@@ -1975,6 +2038,7 @@ generate_make_roc_host =
 # Entrypoint Declarations
 # =============================================================================
 
+generate_provided_decl : ProvidesEntry, TypeTable, List(Str), TypeNamePlan.PreferredNames, TypeRepr -> Str
 generate_provided_decl = |entry, type_table, duplicate_tag_names, preferred_names, type_repr| {
 	match type_repr {
 		RocFunction(func) => {
@@ -1990,6 +2054,7 @@ generate_provided_decl = |entry, type_table, duplicate_tag_names, preferred_name
 }
 
 ## Generate extern declarations for entrypoints from the provides clause.
+generate_entrypoint_externs : List(ProvidesEntry), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_entrypoint_externs = |provides_list, type_table, duplicate_tag_names, preferred_names| {
 	if List.is_empty(provides_list) {
 		return ""

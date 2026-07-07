@@ -78,7 +78,9 @@ ArgShape := { table : TypeTable }.{
 							ArgNotRecord => PositionalArgs([type_id])
 						}
 					}
-				Err(_) => NoMeaningfulArgs
+				Err(_) => {
+					crash "glue invariant violated: single argument list was empty"
+				}
 			}
 		} else {
 			non_unit_ids = positional_non_unit_type_ids(arg_shape, arg_type_ids)
@@ -111,7 +113,9 @@ ArgShape := { table : TypeTable }.{
 		if List.len(arg_type_ids) == 1 {
 			match List.first(arg_type_ids) {
 				Ok(type_id) => arg_shape.table.is_anonymous_record(type_id)
-				Err(_) => Bool.False
+				Err(_) => {
+					crash "glue invariant violated: single argument list was empty"
+				}
 			}
 		} else {
 			Bool.False

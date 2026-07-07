@@ -9,6 +9,7 @@ import pf.AbiWidth exposing [AbiWidth]
 import pf.ArgShape exposing [ArgShape]
 import pf.GlueInput exposing [GlueInput]
 import pf.HostedFunctionInfo exposing [HostedFunctionInfo]
+import pf.RecordRepr exposing [RecordRepr]
 import pf.TagUnionRepr exposing [TagUnionRepr]
 import pf.ProvidesEntry exposing [ProvidesEntry]
 import pf.TypeTable exposing [TypeTable]
@@ -78,7 +79,8 @@ type_repr_to_c = |type_table, duplicate_record_names, duplicate_tag_names, type_
 	}
 }
 
-resolve_tag_union_type_c = |type_table, duplicate_record_names, duplicate_tag_names, type_id, tu| {
+resolve_tag_union_type_c : TypeTable, List(Str), List(Str), U64, TagUnionRepr -> Str
+resolve_tag_union_type_c = |type_table, duplicate_record_names, duplicate_tag_names, type_id, tu|
 	match TypeTable.single_variant_payload(tu) {
 		SinglePayload(payload_id) => type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, payload_id)
 		SingleNoPayload => "void"
@@ -88,8 +90,7 @@ resolve_tag_union_type_c = |type_table, duplicate_record_names, duplicate_tag_na
 			} else {
 				"void*"
 			}
-		}
-}
+	}
 
 c_record_field_decl : TypeTable, List(Str), List(Str), AbiFieldLayout, AbiWidth -> Str
 c_record_field_decl = |type_table, duplicate_record_names, duplicate_tag_names, field, width| {
@@ -105,6 +106,7 @@ c_record_field_decl = |type_table, duplicate_record_names, duplicate_tag_names, 
 
 ## Fields arrive in committed layout order (valid at both pointer widths);
 ## only per-width padding byte counts differ between the two renderings.
+c_record_fields_decl : TypeTable, List(Str), List(Str), List(AbiFieldLayout), AbiWidth -> Str
 c_record_fields_decl = |type_table, duplicate_record_names, duplicate_tag_names, fields, width| {
 	var $field_strs = ""
 	for field in fields {
@@ -137,6 +139,7 @@ duplicate_record_names = |type_table| {
 	$duplicates
 }
 
+record_struct_name : List(Str), U64, RecordRepr -> Str
 record_struct_name = |duplicate_names, type_id, rec| {
 	base = name_to_struct_name(rec.name)
 	if List.contains(duplicate_names, rec.name) {
@@ -178,20 +181,27 @@ capitalize_first = |s| RocName.capitalize_first(s)
 name_to_struct_name : Str -> Str
 name_to_struct_name = |name| RocName.from_str(name).to_pascal_clean()
 
+## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("Stdout.line!") == "StdoutLine"
+## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("Foo.bar.baz!") == "FooBarBaz"
+## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("__AnonStruct10") == "AnonStruct10"
 
 name_to_upper_ident : Str -> Str
 name_to_upper_ident = |name| RocName.from_str(name).to_screaming_snake_identifier()
 
+## Checks `name_to_upper_ident` for this representative case.
 expect name_to_upper_ident("Stdout.line!") == "STDOUT_LINE"
+## Checks `name_to_upper_ident` for this representative case.
 expect name_to_upper_ident("Foo.barBaz!") == "FOO_BAR_BAZ"
 
 name_to_c_func_name : Str -> Str
 name_to_c_func_name = |name| RocName.from_str(name).to_lower_snake_identifier()
 
+## Checks `name_to_c_func_name` for this representative case.
 expect name_to_c_func_name("Stdout.line!") == "stdout_line"
+## Checks `name_to_c_func_name` for this representative case.
 expect name_to_c_func_name("Foo.barBaz!") == "foo_bar_baz"
 
 name_to_c_field_ident : Str -> Str
@@ -240,8 +250,11 @@ name_to_c_field_ident = |name| {
 	}
 }
 
+## Checks `name_to_c_field_ident` for this representative case.
 expect name_to_c_field_ident("init!") == "init_bang"
+## Checks `name_to_c_field_ident` for this representative case.
 expect name_to_c_field_ident("type") == "type"
+## Checks `name_to_c_field_ident` for this representative case.
 expect name_to_c_field_ident("struct") == "struct_field"
 
 # =============================================================================
@@ -296,6 +309,7 @@ generate_defines = |hosted_functions| {
 	$defines
 }
 
+generate_type_decls : TypeTable, List(Str), List(Str) -> Str
 generate_type_decls = |type_table, duplicate_records, duplicate_tags| {
 	type_definitions = generate_opaque_type_decls(type_table, duplicate_records, duplicate_tags)
 
@@ -306,6 +320,7 @@ generate_type_decls = |type_table, duplicate_records, duplicate_tags| {
 	}
 }
 
+generate_opaque_type_decls : TypeTable, List(Str), List(Str) -> Str
 generate_opaque_type_decls = |type_table, duplicate_records, duplicate_tags| {
 	var $decls = ""
 	var $seen_names = []
@@ -337,6 +352,7 @@ generate_opaque_type_decls = |type_table, duplicate_records, duplicate_tags| {
 	$decls
 }
 
+generate_opaque_type_decl : Str, U64, U64, U64, U64 -> Str
 generate_opaque_type_decl = |type_name, size64, alignment64, size32, alignment32| {
 	byte_count64 = if size64 == 0 {
 		1
@@ -375,13 +391,13 @@ generate_opaque_type_decl = |type_name, size64, alignment64, size32, alignment32
 	"${decl}\n\n"
 }
 
-static_asserts = |type_name, size, alignment| {
+static_asserts : Str, U64, U64 -> Str
+static_asserts = |type_name, size, alignment|
 	if size > 0 {
 		"ROC_STATIC_ASSERT(sizeof(${type_name}) == ${U64.to_str(size)}, \"${type_name} size mismatch\");\nROC_STATIC_ASSERT(ROC_ALIGNOF(${type_name}) == ${U64.to_str(alignment)}, \"${type_name} alignment mismatch\");\n"
 	} else {
 		""
 	}
-}
 
 generate_all_args_structs : List(HostedFunctionInfo), TypeTable, List(Str), List(Str) -> Str
 generate_all_args_structs = |hosted_functions, type_table, duplicate_records, duplicate_tags| {
@@ -446,6 +462,7 @@ generate_args_struct = |func, type_table, duplicate_records, duplicate_tags| {
 	}
 }
 
+direct_param_list : TypeTable, List(Str), List(Str), List(U64) -> Str
 direct_param_list = |type_table, duplicate_records, duplicate_tags, arg_type_ids| {
 	var $params = ""
 	var $idx = 0
@@ -515,6 +532,7 @@ generate_hosted_symbol_decls = |hosted_functions, type_table, duplicate_records,
 	section("Hosted Symbols", $decls)
 }
 
+generate_provided_symbol_decls : List(ProvidesEntry), TypeTable, List(Str), List(Str) -> Str
 generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, duplicate_tags| {
 	if List.is_empty(provides_list) {
 		return ""

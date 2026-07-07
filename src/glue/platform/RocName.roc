@@ -143,7 +143,9 @@ RocName := { raw : Str }.{
 
 		first = match List.first(bytes) {
 			Ok(b) => b
-			Err(_) => 0
+			Err(_) => {
+				crash "glue invariant violated: non-empty UTF-8 byte list was empty"
+			}
 		}
 		first_is_lower = first >= 'a' and first <= 'z'
 		new_first = if first_is_lower to_uppercase(first) else first
@@ -161,7 +163,9 @@ RocName := { raw : Str }.{
 
 		first = match List.first(bytes) {
 			Ok(b) => b
-			Err(_) => 0
+			Err(_) => {
+				crash "glue invariant violated: non-empty UTF-8 byte list was empty"
+			}
 		}
 		first_is_upper = first >= 'A' and first <= 'Z'
 		new_first = if first_is_upper to_lowercase(first) else first
@@ -250,16 +254,29 @@ RocName := { raw : Str }.{
 	to_lowercase = |ch| ch + 32
 }
 
+## Checks `RocName.to_pascal` for this representative case.
 expect RocName.from_str("Stdout.line!").to_pascal() == "StdoutLine"
+## Checks `RocName.to_pascal` for this representative case.
 expect RocName.from_str("Foo.bar.baz!").to_pascal() == "FooBarBaz"
+## Checks `RocName.to_pascal_clean` for this representative case.
 expect RocName.from_str("Builder.print_value!").to_pascal_clean() == "BuilderPrintValue"
+## Checks `RocName.to_pascal_clean` for this representative case.
 expect RocName.from_str("__AnonStruct10").to_pascal_clean() == "AnonStruct10"
+## Checks `RocName.to_pascal_clean` for this representative case.
 expect RocName.from_str("__").to_pascal_clean() == "Anon"
+## Checks `RocName.to_lower_snake` for this representative case.
 expect RocName.from_str("PartDef.Idx.get!").to_lower_snake() == "part_def_idx_get"
+## Checks `RocName.to_screaming_snake` for this representative case.
 expect RocName.from_str("Foo.barBaz!").to_screaming_snake() == "FOO_BAR_BAZ"
+## Checks `RocName.to_camel` for this representative case.
 expect RocName.from_str("PartDef.Idx.get!").to_camel() == "partDefIdxGet"
+## Checks `RocName.to_field_name` for this representative case.
 expect RocName.from_str("Stdout.line!").to_field_name() == "Stdout_line"
+## Checks `RocName.to_lower_snake_identifier` for this representative case.
 expect RocName.from_str("Host.Tree item!").to_lower_snake_identifier() == "host_tree_item"
+## Checks `RocName.to_screaming_snake_identifier` for this representative case.
 expect RocName.from_str("Host.Tree-item!").to_screaming_snake_identifier() == "HOST_TREE_ITEM"
+## Checks `RocName.to_bang_snake_identifier` for this representative case.
 expect RocName.from_str("init!").to_bang_snake_identifier() == "init_bang"
+## Checks `RocName.strip_leading_underscores` for this representative case.
 expect RocName.strip_leading_underscores("__anon") == "anon"
