@@ -8823,13 +8823,23 @@ fn ensureGroupChecked(self: *Self, group_index: u32, env: *Env) std.mem.Allocato
     switch (self.group_states.items[group_index]) {
         .checked => return,
         .checking => {
-            // A dispatch back-edge into a suspended group resolves against its
-            // still-live (.processed but not yet generalized) member vars; it
-            // never re-enters the group. Reaching here is a driver bug.
+            // A suspended group — the current group, or an ancestor paused at
+            // its own boundary. Its members are already checked (`.processed`)
+            // with still-live, not-yet-generalized vars, so a dispatch
+            // back-edge resolves against them directly (the monomorphic merge)
+            // — the group is never re-entered. This also covers a pending
+            // target recorded mid-body for a later member of the SAME group:
+            // by boundary time the member loop has checked it.
             if (builtin.mode == .Debug) {
-                std.debug.panic("type checker invariant violated: re-entered group {d} while it is being checked", .{group_index});
+                var on_stack = false;
+                for (self.group_stack.items) |frame| {
+                    if (frame.group_index == group_index) {
+                        on_stack = true;
+                        break;
+                    }
+                }
+                std.debug.assert(on_stack);
             }
-            unreachable;
         },
         .pending => try self.checkGroup(group_index, env),
     }
@@ -8989,22 +8999,6 @@ fn pinVarAtGroupBoundaryRank(self: *Self, obligation_var: Var, env: *Env) std.me
     {
         try self.types.setDescRank(resolved.desc_idx, boundary_rank);
         try env.var_pool.addVarToRank(resolved.var_, boundary_rank);
-    }
-}
-
-/// Whether a function def's closure captures the given pattern — i.e. the body
-/// references the binding being defined (self-recursion, directly or through a
-/// nested closure). A capture-free lambda cannot reference its own binding.
-fn closureCapturesOwnPattern(self: *const Self, expr_idx: CIR.Expr.Idx, pattern_idx: CIR.Pattern.Idx) bool {
-    switch (self.cir.store.getExpr(expr_idx)) {
-        .e_closure => |closure| {
-            for (self.cir.store.sliceCaptures(closure.captures)) |capture_idx| {
-                const capture = self.cir.store.getCapture(capture_idx);
-                if (capture.pattern_idx == pattern_idx) return true;
-            }
-            return false;
-        },
-        else => return false,
     }
 }
 
@@ -11974,8 +11968,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                         // The binding-group recursion rule (see the
                         // .not_processed arm): a self-reference, or a
                         // reference to an in-flight unannotated member,
-                        // links monomorphically.
-                        _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
+                        // links monomorphically. The link targets the def's
+                        // RHS var — which lives in the frame that generalizes
+                        // the def — rather than its pattern var: a suspended
+                        // singleton's pattern sits at the outermost rank, and
+                        // a dispatch back-edge linking there would pull the
+                        // whole merged group out of generalization instead of
+                        // generalizing with the suspended group's boundary.
+                        _ = try self.unifyInContext(expr_var, ModuleEnv.varFrom(referenced_def.expr), env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
                         break :blk;
                     },
                     .processed => {},
@@ -13943,16 +13943,18 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     try self.predeclared_local_scheme_vars.put(self.gpa, decl_stmt.pattern, scheme_var);
                 }
 
-                // A self-recursive unannotated local function is a binding
-                // group of one: its pattern var must live in a rank frame
-                // that generalizes after its RHS, so the monomorphic
-                // recursive links (see the local recursion branch in
-                // `e_lookup_local`) generalize with the def instead of
-                // pinning it at the block's rank. Self-recursion always shows
-                // up as the closure capturing its own binding.
-                const decl_recursive_fn = decl_is_fn and !decl_predeclared and
-                    self.closureCapturesOwnPattern(decl_stmt.expr, decl_stmt.pattern);
-                if (decl_recursive_fn) try env.var_pool.pushRank();
+                // A local function def is a binding group of one: its pattern
+                // var lives in its own rank frame that generalizes after its
+                // RHS, so a self-recursive def's monomorphic links (see the
+                // local recursion branch in `e_lookup_local`) generalize with
+                // the def instead of pinning it at the block's rank. Applied
+                // to every function decl — a non-recursive one's frame is a
+                // cheap no-op (its pattern is already an alias of the RHS's
+                // generalized scheme by the time the frame closes), and
+                // self-recursion cannot be detected syntactically up front
+                // (a capture-free `f = |x| f(x)` has no self-capture).
+                const decl_fn_frame = decl_is_fn and !decl_predeclared;
+                if (decl_fn_frame) try env.var_pool.pushRank();
 
                 const decl_pattern_ctx: PatternCtx = if (self.patternNeedsExhaustiveness(decl_stmt.pattern)) .match_branch else .bound;
 
@@ -14013,9 +14015,9 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     try self.recordHoistPatternProvenance(decl_stmt.pattern, decl_stmt.expr, expectation.hoist_position);
                 }
 
-                if (decl_recursive_fn) {
+                if (decl_fn_frame) {
                     // This statement's binding-group boundary: the pattern and
-                    // the recursive links generalize together, then the frame
+                    // any recursive links generalize together, then the frame
                     // pops so the statement's own var unifies with the
                     // finished scheme below.
                     try self.defaultLiteralsAtGeneralizationBoundary(decl_pattern_var, env);
