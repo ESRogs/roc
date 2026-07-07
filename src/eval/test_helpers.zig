@@ -1575,7 +1575,7 @@ fn publishImportArtifacts(
             const available_artifacts = try importedViewsFromPublishImports(allocator, published_keys.items);
             defer allocator.free(available_artifacts);
 
-            var artifact = try check.CheckedArtifact.publishFromTypedModule(
+            const artifact = try check.CheckedArtifact.publishFromTypedModule(
                 allocator,
                 typed_cir_modules,
                 module_idx,
