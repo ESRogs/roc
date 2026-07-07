@@ -3101,14 +3101,6 @@ fn checkedTypeRootForScheme(
         glueInvariant("checked type scheme missing from artifact", .{})).root;
 }
 
-fn checkedRecordFieldLessThanByName(
-    names: *const CanonicalNameStore,
-    lhs: CheckedArtifact.CheckedRecordField,
-    rhs: CheckedArtifact.CheckedRecordField,
-) bool {
-    return names.recordFieldLabelTextLessThan(lhs.name, rhs.name);
-}
-
 fn appendRecordRowFields(
     gpa: std.mem.Allocator,
     artifact: *const CheckedArtifact.CheckedModuleArtifact,
