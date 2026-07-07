@@ -5263,29 +5263,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
         }
     }
 
-    // Check any accumulated constraints
-    try self.checkAllConstraints(&env);
-    try self.resolvePendingTupleAccesses(&env, false);
-    try self.checkAllConstraints(&env);
-
-    try self.resolveNumericLiteralsFromContext(&env);
-
-    if (!skip_numeric_defaults) {
-        try self.finalizeLiteralDefaults(&env);
-
-        // After finalizing numeric defaults, resolve any remaining deferred
-        // static dispatch constraints (e.g., Dec.plus, Dec.to_str).
-        if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
-            try self.checkStaticDispatchConstraints(&env, true);
-        }
-    }
-
-    try self.validateToInspectMethodTypes(&env);
-    try self.checkAllFromNumeralFlexConstraintCompatibility(&env, true);
-    try self.validateResolvedOpenNumeralLiterals(&env);
-    try self.checkInstantiatedStaticDispatchConstraints(&env, true);
-    try self.resolvePendingTupleAccesses(&env, true);
-    try self.checkAllConstraints(&env);
+    try self.finalizeTypes(&env, .{ .module = .{ .skip_numeric_defaults = skip_numeric_defaults } });
 
     // After solving all deferred constraints, check for infinite types
     for (0..self.cir.all_defs.span.len) |def_offset| {
@@ -8300,25 +8278,7 @@ pub fn checkExprRepl(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Erro
     // Check the expr
     _ = try self.checkExpr(expr_idx, &env, Expected.none());
 
-    // Check any accumulated constraints
-    try self.checkAllConstraints(&env);
-    try self.resolvePendingTupleAccesses(&env, false);
-    try self.checkAllConstraints(&env);
-    try self.resolveNumericLiteralsFromContext(&env);
-    try self.finalizeLiteralDefaults(&env);
-
-    // After finalizing numeric defaults, resolve any remaining deferred
-    // static dispatch constraints (e.g., Dec.not for !3).
-    if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
-        try self.checkStaticDispatchConstraints(&env, true);
-    }
-
-    // Check if the expression's type has incompatible constraints (e.g., !3)
-    const expr_var = ModuleEnv.varFrom(expr_idx);
-    try self.checkFlexVarConstraintCompatibility(expr_var, &env, true);
-    try self.validateResolvedOpenNumeralLiterals(&env);
-    try self.resolvePendingTupleAccesses(&env, true);
-    try self.checkAllConstraints(&env);
+    try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
     try self.reportPolymorphicConstrainedExpr(expr_idx);
 
     // Check for infinite types
@@ -8377,37 +8337,16 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     // Check the expr
     _ = try self.checkExpr(expr_idx, &env, Expected.none());
 
-    // Check any accumulated constraints
-    try self.checkAllConstraints(&env);
-    try self.resolvePendingTupleAccesses(&env, false);
-    try self.checkAllConstraints(&env);
-    try self.resolveNumericLiteralsFromContext(&env);
-    try self.finalizeLiteralDefaults(&env);
+    try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
 
-    // After finalizing literal defaults, resolve any remaining deferred static
-    // dispatch constraints: committing a default can generate deferred
-    // method_call constraints (e.g. Dec.to_str returns Str). Without this step,
-    // the return type of methods on numerics stays an unconstrained flex var,
-    // causing incorrect .zst layouts.
-    if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
-        try self.checkStaticDispatchConstraints(&env, true);
-        try self.checkAllConstraints(&env);
-    }
-
-    // After solving all deferred constraints, check for infinite types
+    // After solving all deferred constraints, check for infinite types —
+    // per-def AND for the result expression itself, matching checkExprRepl
+    // (its type may be infinite/anonymously recursive, which the per-def
+    // checks above don't cover).
     for (0..self.cir.all_defs.span.len) |def_offset| {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
     }
-
-    // Check the result expression itself, matching checkExprRepl: its type may
-    // have incompatible constraints (e.g. !3) or be infinite/anonymously
-    // recursive, neither of which is covered by the per-def checks above.
-    const expr_var = ModuleEnv.varFrom(expr_idx);
-    try self.checkFlexVarConstraintCompatibility(expr_var, &env, true);
-    try self.validateResolvedOpenNumeralLiterals(&env);
-    try self.resolvePendingTupleAccesses(&env, true);
-    try self.checkAllConstraints(&env);
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);
 
     try self.reportPolymorphicConstrainedExpr(expr_idx);
@@ -15855,6 +15794,72 @@ fn finalizeLiteralDefaults(self: *Self, env: *Env) std.mem.Allocator.Error!void 
     try self.runLiteralDefaultingRounds(env, .{ .finalize = .{
         .literal_count = self.open_literal_vars.items.len,
     } });
+}
+
+/// What `finalizeTypes` is finalizing: the whole module, or a single REPL
+/// expression (whose var gets the expression-scoped compatibility check the
+/// module-wide passes would skip).
+const FinalizeScope = union(enum) {
+    module: struct {
+        /// True when the caller intentionally leaves numeric defaults open
+        /// (e.g. type-introspection flows that re-check with context later).
+        skip_numeric_defaults: bool,
+    },
+    repl_expr: CIR.Expr.Idx,
+};
+
+/// THE type-finalization point: every checking entry point (module check and
+/// both REPL flavors) lands here exactly once, after its own constraint
+/// traversal. Literal defaults are decided here — by the defaulting oracle
+/// (src/types/literal_defaulting.zig) driving `runLiteralDefaultingRounds` —
+/// and every validation that needs final types (open-numeral range checks,
+/// default-type method compatibility, instantiated dispatch constraints)
+/// runs after the decision, so dispatch plans and evidence freeze only on
+/// finalized types.
+///
+/// The generalization-boundary defaulting (`defaultLiteralsAtGeneralizationBoundary`)
+/// is NOT a second decision point: it runs the same engine under the same
+/// oracle for the vars a def's generalize call is about to promote — a rank
+/// constraint (the leak warning and let-polymorphism filtering must see
+/// pre-promotion ranks), not a separate policy.
+fn finalizeTypes(self: *Self, env: *Env, scope: FinalizeScope) std.mem.Allocator.Error!void {
+    try self.checkAllConstraints(env);
+    try self.resolvePendingTupleAccesses(env, false);
+    try self.checkAllConstraints(env);
+
+    try self.resolveNumericLiteralsFromContext(env);
+    const run_defaults = switch (scope) {
+        .module => |module| !module.skip_numeric_defaults,
+        .repl_expr => true,
+    };
+    if (run_defaults) {
+        try self.finalizeLiteralDefaults(env);
+
+        // Committing a default can spawn deferred static-dispatch
+        // constraints (e.g. Dec.plus, Dec.to_str returning Str); resolve
+        // them so the validations below see settled types.
+        if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
+            try self.checkStaticDispatchConstraints(env, true);
+            try self.checkAllConstraints(env);
+        }
+    }
+
+    switch (scope) {
+        .module => {
+            try self.validateToInspectMethodTypes(env);
+            try self.checkAllFromNumeralFlexConstraintCompatibility(env, true);
+        },
+        // The REPL result expression is not module state; its type may have
+        // incompatible constraints (e.g. !3) the module-wide walk over open
+        // literal vars would not visit.
+        .repl_expr => |expr_idx| try self.checkFlexVarConstraintCompatibility(ModuleEnv.varFrom(expr_idx), env, true),
+    }
+    try self.validateResolvedOpenNumeralLiterals(env);
+    if (scope == .module) {
+        try self.checkInstantiatedStaticDispatchConstraints(env, true);
+    }
+    try self.resolvePendingTupleAccesses(env, true);
+    try self.checkAllConstraints(env);
 }
 
 /// The candidate universe `runLiteralDefaultingRounds` gathers from — the only
