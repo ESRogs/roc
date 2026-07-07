@@ -1395,7 +1395,6 @@ fn runSingleTest(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: u6
         .platform => runPlatformCase(io, allocator, spec, case_timeout_ms),
         .command => |command| runCommandCase(io, allocator, command, case_timeout_ms),
         .custom => |custom| runCustomCase(io, allocator, spec, custom, case_timeout_ms),
-        .glue_matrix => |matrix| runGlueMatrixCase(io, allocator, matrix, case_timeout_ms),
         .glue_runtime => |runtime| runGlueRuntimeCase(io, allocator, runtime, case_timeout_ms),
     };
 }
