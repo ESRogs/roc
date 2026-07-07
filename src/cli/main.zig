@@ -12691,6 +12691,17 @@ fn rocBump(ctx: *CliCtx, args: cli_args.BumpArgs) CliMainError!void {
         old_version = version;
     }
 
+    // Parse --expect up front so a malformed version fails before compiling.
+    var expect_version: ?base.url.Version = null;
+    if (args.expect) |raw| {
+        expect_version = base.url.parseVersionComponent(raw) orelse {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Invalid Expected Version",
+                .message = try std.fmt.allocPrint(ctx.arena, "`{s}` is not a valid version. Versions are MAJOR.MINOR.PATCH, e.g. 1.2.3.", .{raw}),
+            } });
+        };
+    }
+
     // Resolve the old package source to a local main.roc path.
     const old_path: []const u8 = blk: {
         if (std.mem.find(u8, args.old, "://") != null) {
@@ -12772,6 +12783,28 @@ fn rocBump(ctx: *CliCtx, args: cli_args.BumpArgs) CliMainError!void {
     stdout.print("\n{f} -> {f}\n", .{ old_version_value, next }) catch {};
     if (old_version_value.major == 0) {
         stdout.print("\n(Pre-1.0.0 versions are 0.X.Y: breaking changes bump X, everything else bumps Y.)\n", .{}) catch {};
+    }
+
+    // With --expect, fail unless the declared version bumps at least as far
+    // as the API diff requires. Bumping further than required is allowed.
+    if (expect_version) |expected| {
+        const declared = bump.diff.declaredMagnitude(old_version_value, expected) orelse {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Insufficient Version Bump",
+                .message = try std.fmt.allocPrint(ctx.arena, "The expected version {f} does not move forward from {f}.", .{ expected, old_version_value }),
+            } });
+        };
+        if (@intFromEnum(declared) < @intFromEnum(result.magnitude)) {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Insufficient Version Bump",
+                .message = try std.fmt.allocPrint(
+                    ctx.arena,
+                    "This is a {s} change, so the next version must be at least {f}, but --expect was {f}.",
+                    .{ result.magnitude.name(), next, expected },
+                ),
+            } });
+        }
+        stdout.print("\n{f} satisfies the required {s} bump.\n", .{ expected, result.magnitude.name() }) catch {};
     }
 }
 

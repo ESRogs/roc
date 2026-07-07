@@ -756,7 +756,7 @@ fn createInvalidUrlReport(allocator: Allocator, info: anytype) Allocator.Error!R
 }
 
 fn createBumpFailedReport(allocator: Allocator, info: anytype) Allocator.Error!Report {
-    var report = try Report.init(allocator, info.title, "roc bump could not compare the packages.", .runtime_error);
+    var report = try Report.init(allocator, info.title, "roc bump failed.", .runtime_error);
 
     try report.document.addText(info.message);
 

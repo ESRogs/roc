@@ -53,6 +53,30 @@ pub fn nextVersion(old: base.url.Version, magnitude: Magnitude) base.url.Version
     };
 }
 
+/// The magnitude a declared old -> declared version bump carries, or null
+/// when declared does not move forward from old. Combined with the diffed
+/// magnitude via `Magnitude.combine`-style ordering, a declared bump is
+/// sufficient when its magnitude is at least the required one — bumping
+/// further than required is always allowed.
+///
+/// Under 0.X.Y convention rules, bumping X (or crossing to 1.0.0 and beyond,
+/// which is always the author's call) carries major semantics and bumping Y
+/// carries minor semantics, so `.patch` is only produced from 1.0.0 on.
+pub fn declaredMagnitude(old: base.url.Version, declared: base.url.Version) ?Magnitude {
+    if (old.major == 0) {
+        if (declared.major > 0) return .major;
+        if (declared.minor > old.minor) return .major;
+        if (declared.minor == old.minor and declared.patch > old.patch) return .minor;
+        return null;
+    }
+    if (declared.major > old.major) return .major;
+    if (declared.major < old.major) return null;
+    if (declared.minor > old.minor) return .minor;
+    if (declared.minor < old.minor) return null;
+    if (declared.patch > old.patch) return .patch;
+    return null;
+}
+
 /// What kind of API difference a `Change` describes.
 pub const ChangeKind = enum {
     module_added,

@@ -221,6 +221,7 @@ pub const BumpArgs = struct {
     path: []const u8, // the new package's main .roc file
     old: []const u8, // the old package: URL, .tar.zst bundle, directory, or .roc file (REQUIRED)
     old_version: ?[]const u8 = null, // the old version (required unless `old` is a versioned URL)
+    expect: ?[]const u8 = null, // fail unless this version is a sufficient bump
     no_cache: bool = false, // disable cache
     verbose: bool = false, // enable verbose output
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
@@ -1050,6 +1051,7 @@ fn parseBump(args: []const []const u8) CliArgs {
     var path: ?[]const u8 = null;
     var old: ?[]const u8 = null;
     var old_version: ?[]const u8 = null;
+    var expect: ?[]const u8 = null;
     var no_cache = false;
     var verbose = false;
     var resolve_limits: ResolveLimitArgs = .{};
@@ -1071,6 +1073,12 @@ fn parseBump(args: []const []const u8) CliArgs {
             }
             i += 1;
             old_version = args[i];
+        } else if (mem.eql(u8, arg, "--expect")) {
+            if (i + 1 >= args.len) {
+                return CliArgs{ .problem = ArgProblem{ .missing_flag_value = .{ .flag = "--expect" } } };
+            }
+            i += 1;
+            expect = args[i];
         } else if (mem.startsWith(u8, arg, "--max-package-mb") or mem.startsWith(u8, arg, "--max-transitive-mb")) {
             switch (parseResolveLimitFlag(arg, &resolve_limits)) {
                 .problem => |problem| return CliArgs{ .problem = problem },
@@ -1098,6 +1106,7 @@ fn parseBump(args: []const []const u8) CliArgs {
         .path = path orelse "main.roc",
         .old = old_value,
         .old_version = old_version,
+        .expect = expect,
         .no_cache = no_cache,
         .verbose = verbose,
         .resolve_limits = resolve_limits,
@@ -1118,6 +1127,8 @@ const bump_help =
     \\                             .tar.zst bundle, a directory, or a main .roc file
     \\      --old-version <X.Y.Z>  The previous version number (required unless
     \\                             --old is a URL with a version path segment)
+    \\      --expect <X.Y.Z>       Fail unless this version bumps at least as far
+    \\                             as the API diff requires (for release CI)
     \\      --no-cache             Disable caching
     \\      --verbose              Enable verbose output
     \\  -h, --help                 Print help
@@ -2004,6 +2015,17 @@ test "roc bump" {
         try testing.expectEqualStrings("new_pkg/main.roc", result.bump.path);
         try testing.expectEqualStrings("old_pkg", result.bump.old);
         try testing.expectEqualStrings("1.2.3", result.bump.old_version.?);
+        try testing.expectEqual(null, result.bump.expect);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "bump", "--old", "old_pkg", "--old-version", "1.2.3", "--expect", "2.0.0" });
+        defer result.deinit(gpa);
+        try testing.expectEqualStrings("2.0.0", result.bump.expect.?);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "bump", "--old", "old_pkg", "--expect" });
+        defer result.deinit(gpa);
+        try testing.expectEqualStrings("--expect", result.problem.missing_flag_value.flag);
     }
     {
         const result = try parse(gpa, testing.io, &[_][]const u8{"bump"});

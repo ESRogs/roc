@@ -417,3 +417,48 @@ test "nextVersion uses 0.X.Y convention rules before 1.0.0" {
         diff_mod.nextVersion(v, .patch),
     );
 }
+
+test "declaredMagnitude classifies bumps from 1.0.0 on" {
+    const old = base.url.Version{ .major = 1, .minor = 2, .patch = 3 };
+    const cases = [_]struct { declared: base.url.Version, magnitude: ?Magnitude }{
+        .{ .declared = .{ .major = 2, .minor = 0, .patch = 0 }, .magnitude = .major },
+        // Skipping versions is fine; only the highest changed slot counts.
+        .{ .declared = .{ .major = 4, .minor = 1, .patch = 1 }, .magnitude = .major },
+        .{ .declared = .{ .major = 1, .minor = 3, .patch = 0 }, .magnitude = .minor },
+        .{ .declared = .{ .major = 1, .minor = 3, .patch = 5 }, .magnitude = .minor },
+        .{ .declared = .{ .major = 1, .minor = 2, .patch = 4 }, .magnitude = .patch },
+        .{ .declared = .{ .major = 1, .minor = 2, .patch = 10 }, .magnitude = .patch },
+        // Not moving forward is never a valid bump.
+        .{ .declared = .{ .major = 1, .minor = 2, .patch = 3 }, .magnitude = null },
+        .{ .declared = .{ .major = 1, .minor = 2, .patch = 2 }, .magnitude = null },
+        .{ .declared = .{ .major = 1, .minor = 1, .patch = 9 }, .magnitude = null },
+        .{ .declared = .{ .major = 0, .minor = 9, .patch = 0 }, .magnitude = null },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.magnitude, diff_mod.declaredMagnitude(old, case.declared));
+    }
+}
+
+test "declaredMagnitude classifies bumps with 0.X.Y convention rules" {
+    const old = base.url.Version{ .major = 0, .minor = 5, .patch = 2 };
+    const cases = [_]struct { declared: base.url.Version, magnitude: ?Magnitude }{
+        // Bumping the 0.X compatibility group carries major semantics, as
+        // does crossing to 1.0.0 (always the author's call).
+        .{ .declared = .{ .major = 0, .minor = 6, .patch = 0 }, .magnitude = .major },
+        .{ .declared = .{ .major = 0, .minor = 9, .patch = 1 }, .magnitude = .major },
+        .{ .declared = .{ .major = 1, .minor = 0, .patch = 0 }, .magnitude = .major },
+        .{ .declared = .{ .major = 2, .minor = 1, .patch = 0 }, .magnitude = .major },
+        // A 0.patch bump carries minor semantics (patches are lumped in).
+        .{ .declared = .{ .major = 0, .minor = 5, .patch = 3 }, .magnitude = .minor },
+        .{ .declared = .{ .major = 0, .minor = 5, .patch = 9 }, .magnitude = .minor },
+        // Not moving forward is never a valid bump.
+        .{ .declared = .{ .major = 0, .minor = 5, .patch = 2 }, .magnitude = null },
+        .{ .declared = .{ .major = 0, .minor = 5, .patch = 1 }, .magnitude = null },
+        .{ .declared = .{ .major = 0, .minor = 4, .patch = 9 }, .magnitude = null },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.magnitude, diff_mod.declaredMagnitude(old, case.declared));
+    }
+}
