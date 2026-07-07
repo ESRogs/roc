@@ -10,26 +10,19 @@ match person {
 }
 ~~~
 # EXPECTED
-EXPECTED PATTERN FIELD - error_dollar_prefix_pattern_field.md:2:7:2:12
+INVALID RECORD FIELD NAME - error_dollar_prefix_pattern_field.md:2:7:2:12
 # PROBLEMS
 
-┌────────────────────────┐
-│ EXPECTED PATTERN FIELD ├─ I was parsing a record pattern, and I expected ───┐
-└┬───────────────────────┘  a lowercase field name.                           │
+┌───────────────────────────┐
+│ INVALID RECORD FIELD NAME ├─ Record field names cannot start with a ────────┐
+└┬──────────────────────────┘  dollar sign.                                   │
  │                                                                            │
  │  { $name } => $name                                                        │
  │    ‾‾‾‾‾                                                                   │
  └────────────────────────────────── error_dollar_prefix_pattern_field.md:2:7 ┘
 
-    Record pattern fields start with lowercase names. You can bind the field
-    directly or write `name: pattern`.
-
-    For example:
-        { name, age: years }
-
-    I found `$name` here.
-    Dollar-prefixed names are mutable variables in Roc. Record fields are
-    labels, so they cannot start with `$`.
+    Names that start with `$` are reassignable variables declared with the
+    `var` keyword, so they cannot be used as record field names.
 
 # TOKENS
 ~~~zig
@@ -44,13 +37,14 @@ EndOfFile,
 	(e-ident (raw "person"))
 	(branches
 		(branch
-			(p-malformed (tag "expected_lower_ident_pat_field_name"))
+			(p-record
+				(field (name "$name") (rest false)))
 			(e-ident (raw "$name")))))
 ~~~
 # FORMATTED
 ~~~roc
 match person {
-	 => $name
+	{ $name } => $name
 }
 ~~~
 # CANONICALIZE
@@ -63,11 +57,16 @@ match person {
 			(branch
 				(patterns
 					(pattern (degenerate false)
-						(p-runtime-error (tag "pattern_not_canonicalized"))))
+						(p-record-destructure
+							(destructs
+								(record-destruct (label "$name") (ident "$name")
+									(required
+										(p-assign (ident "$name"))))))))
 				(value
-					(e-runtime-error (tag "ident_not_in_scope")))))))
+					(e-lookup-local
+						(p-assign (ident "$name"))))))))
 ~~~
 # TYPES
 ~~~clojure
-(expr (type "Error"))
+(expr (type "_a"))
 ~~~

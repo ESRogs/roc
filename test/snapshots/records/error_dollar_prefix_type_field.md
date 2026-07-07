@@ -8,26 +8,19 @@ type=statement
 Person : { $name : Str }
 ~~~
 # EXPECTED
-EXPECTED TYPE FIELD - error_dollar_prefix_type_field.md:1:12:1:17
+INVALID RECORD FIELD NAME - error_dollar_prefix_type_field.md:1:12:1:17
 # PROBLEMS
 
-┌─────────────────────┐
-│ EXPECTED TYPE FIELD ├─ I was parsing a record type, and I expected a ───────┐
-└┬────────────────────┘  field name.                                          │
+┌───────────────────────────┐
+│ INVALID RECORD FIELD NAME ├─ Record field names cannot start with a ────────┐
+└┬──────────────────────────┘  dollar sign.                                   │
  │                                                                            │
  │  Person : { $name : Str }                                                  │
  │             ‾‾‾‾‾                                                          │
  └──────────────────────────────────── error_dollar_prefix_type_field.md:1:12 ┘
 
-    Record type fields start with lowercase names, `_`, or named underscores,
-    followed by `:` and the field type.
-
-    For example:
-        { name : Str, age : U64 }
-
-    I found `$name` here.
-    Dollar-prefixed names are mutable variables in Roc. Record fields are
-    labels, so they cannot start with `$`.
+    Names that start with `$` are reassignable variables declared with the
+    `var` keyword, so they cannot be used as record field names.
 
 # TOKENS
 ~~~zig
@@ -39,18 +32,22 @@ EndOfFile,
 (s-type-decl
 	(header (name "Person")
 		(args))
-	(ty-malformed (tag "expected_type_field_name")))
+	(ty-record
+		(anno-record-field (name "$name")
+			(ty (name "Str")))))
 ~~~
 # FORMATTED
 ~~~roc
-Person : 
+NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
 (can-ir
 	(s-alias-decl
 		(ty-header (name "Person"))
-		(ty-malformed)))
+		(ty-record
+			(field (field "$name")
+				(ty-lookup (name "Str") (builtin))))))
 ~~~
 # TYPES
 ~~~clojure

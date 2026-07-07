@@ -534,6 +534,7 @@ pub fn parseDiagnosticToReport(self: *AST, env: *const CommonEnv, diagnostic: Di
         .crash_statement_in_expr_position => reportParseProblem(ctx, "Crash Statement In Expression", "I was parsing an expression, but `crash` starts a statement.", "If you need to crash in expression position, wrap the crash statement in a block expression.", .{ .example = "{\n    crash \"unreachable\"\n}" }),
         .return_outside_function => reportParseProblem(ctx, "Return Outside Function", "I was parsing a statement, and `return` appeared outside a function body.", "`return` exits from the current function. Move it inside a function body, or remove it if this code is already the final expression.", .{ .example = "foo = |x| {\n    if x < 0 { return Err(Negative) }\n    Ok(x)\n}" }),
         .expected_expr_record_field_name => reportParseProblem(ctx, "Expected Record Field", "I was parsing a record expression, and I expected a lowercase field name.", "Record fields start with lowercase names. After the name, either write `: value` or omit the value to use field punning.", .{ .example = "{ name: \"Ada\", age }" }),
+        .record_field_name_cannot_be_var => reportParseProblem(ctx, "Invalid Record Field Name", "Record field names cannot start with a dollar sign.", "Names that start with `$` are reassignable variables declared with the `var` keyword, so they cannot be used as record field names.", .{ .show_found = false }),
         .expected_ty_apply_close_round => reportParseProblem(ctx, "Expected Type Argument End", "I was parsing type arguments, and I expected `)`.", "Type applications put their arguments inside parentheses.", .{ .example = "Dict(Str, U64)" }),
         .expected_expr_apply_close_round => reportParseProblem(ctx, "Expected Call Argument End", "I was parsing function or method call arguments, and I expected `)`.", "Function call arguments go inside parentheses and are separated with commas.", .{ .example = "add(1, 2)" }),
         .where_expected_open_bracket => reportParseProblem(ctx, "Expected Where Clause List", "I was parsing a `where` clause, and I expected `[`.", "Where constraints are written in a square-bracketed list after `where`.", .{ .example = "where [a.hash : a -> U64]" }),
@@ -664,6 +665,8 @@ pub const Diagnostic = struct {
         crash_statement_in_expr_position,
         return_outside_function,
         expected_expr_record_field_name,
+        /// `$name` idents are reassignable variables and cannot name record fields
+        record_field_name_cannot_be_var,
         expected_ty_apply_close_round,
         expected_expr_apply_close_round,
         where_expected_open_bracket,

@@ -8,26 +8,19 @@ type=expr
 { $field : "value" }
 ~~~
 # EXPECTED
-EXPECTED RECORD FIELD - dollar_prefix_field_name.md:1:3:1:9
+INVALID RECORD FIELD NAME - dollar_prefix_field_name.md:1:3:1:9
 # PROBLEMS
 
-┌───────────────────────┐
-│ EXPECTED RECORD FIELD ├─ I was parsing a record expression, and I ──────────┐
-└┬──────────────────────┘  expected a lowercase field name.                   │
+┌───────────────────────────┐
+│ INVALID RECORD FIELD NAME ├─ Record field names cannot start with a ────────┐
+└┬──────────────────────────┘  dollar sign.                                   │
  │                                                                            │
  │  { $field : "value" }                                                      │
  │    ‾‾‾‾‾‾                                                                  │
  └─────────────────────────────────────────── dollar_prefix_field_name.md:1:3 ┘
 
-    Record fields start with lowercase names. After the name, either write `:
-    value` or omit the value to use field punning.
-
-    For example:
-        { name: "Ada", age }
-
-    I found `$field` here.
-    Dollar-prefixed names are mutable variables in Roc. Record fields are
-    labels, so they cannot start with `$`.
+    Names that start with `$` are reassignable variables declared with the
+    `var` keyword, so they cannot be used as record field names.
 
 # TOKENS
 ~~~zig
@@ -36,19 +29,24 @@ EndOfFile,
 ~~~
 # PARSE
 ~~~clojure
-(e-malformed (reason "expected_expr_record_field_name"))
+(e-record
+	(field (field "$field")
+		(e-string
+			(e-string-part (raw "value")))))
 ~~~
 # FORMATTED
 ~~~roc
-
+{ $field: "value" }
 ~~~
 # CANONICALIZE
 ~~~clojure
-(can-ir (empty true))
+(e-record
+	(fields
+		(field (name "$field")
+			(e-string
+				(e-literal (string "value"))))))
 ~~~
 # TYPES
 ~~~clojure
-(inferred-types
-	(defs)
-	(expressions))
+(expr (type "{ $field: Str }"))
 ~~~
