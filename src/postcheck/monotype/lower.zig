@@ -1167,7 +1167,7 @@ const Builder = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.lowerFnTemplateDef(view, fn_template, &.{});
+                const fn_id = try self.lowerFnTemplateDef(fn_template, &.{});
                 break :blk try self.program.addExpr(.{
                     .ty = self.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = fn_id } },
@@ -1190,7 +1190,7 @@ const Builder = struct {
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
-            .fn_value => |fn_id| try self.restoreConstFnExpr(view, view, fn_id, mono_fn_ty),
+            .fn_value => |fn_id| try self.restoreConstFnExpr(view, fn_id, mono_fn_ty),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
             else => Common.invariant("callable eval binding root did not output a callable value"),
         };
@@ -1250,19 +1250,18 @@ const Builder = struct {
         source_fn_ty: checked.CheckedTypeId,
     ) Allocator.Error!Ast.DefId {
         const fn_ty = try self.lowerType(source_ty_view, source_fn_ty);
-        return try self.lowerTemplateWithMono(template_ref, source_ty_view, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
+        return try self.lowerTemplateWithMono(template_ref, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
     }
 
     fn lowerTemplateWithMono(
         self: *Builder,
         template_ref: names.ProcTemplate,
-        source_ty_view: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
         evidence: []const SpecEvidence,
     ) Allocator.Error!Ast.DefId {
-        return try self.lowerTemplateWithMonoFor(template_ref, source_ty_view, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null);
+        return try self.lowerTemplateWithMonoFor(template_ref, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null);
     }
 
     /// Specializations of one template family are deduplicated by structural
@@ -1274,7 +1273,6 @@ const Builder = struct {
     fn lowerTemplateWithMonoFor(
         self: *Builder,
         template_ref: names.ProcTemplate,
-        source_ty_view: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
@@ -1473,9 +1471,6 @@ const Builder = struct {
         body_ctx.current_fn_key = root_fn_key;
         defer body_ctx.deinit();
         const public_constraint_fn_ty = try body_ctx.publicOpaqueFunctionUnificationType(lower_fn_ty);
-        if (moduleBytesEqual(source_ty_view.key.bytes, view.key.bytes)) {
-            try body_ctx.constrainKnownType(source_fn_ty, public_constraint_fn_ty);
-        }
         try body_ctx.constrainTypeToMono(template.checked_fn_root, public_constraint_fn_ty);
 
         // The requested function type becomes a view of this specialization's
@@ -2626,7 +2621,7 @@ const Builder = struct {
                 break :blk self.fnDefForProcedureBindingBody(app_view, binding.body, source_fn_ty, source_fn_key, mono_fn_ty);
             },
         };
-        return try self.lowerFnTemplateCallTarget(source_ty_view, fn_template, &.{});
+        return try self.lowerFnTemplateCallTarget(fn_template, &.{});
     }
 
     /// Lower (or defer) a procedure template body and return the Monotype
@@ -2634,7 +2629,7 @@ const Builder = struct {
     /// request reserves an id and defers the body; outside one (root and
     /// wrapper paths, whose types come from the builder-global cache without
     /// body evidence), the body lowers now.
-    fn lowerFnTemplateCallTarget(self: *Builder, source_ty_view: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
+    fn lowerFnTemplateCallTarget(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
         const template_ref = switch (fn_template.fn_def) {
             .local_template,
             .imported_template,
@@ -2664,10 +2659,10 @@ const Builder = struct {
                 graph,
             );
             if (reserved.needs_lowering) {
+                try self.pinDeferredTemplateRequestToCheckedRoot(graph, template_ref, request_template.mono_fn_ty);
                 try graph.deferred_templates.append(self.allocator, .{
                     .fn_id = reserved.localFnId(),
                     .template_ref = template_ref,
-                    .module = source_ty_view.key,
                     .source_fn_ty = request_template.source_fn_ty,
                     .source_fn_key = request_template.source_fn_key,
                     .fn_ty = request_template.mono_fn_ty,
@@ -2677,18 +2672,49 @@ const Builder = struct {
             }
             return reserved.target;
         }
-        const def = try self.lowerTemplateWithMono(template_ref, source_ty_view, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
+        const def = try self.lowerTemplateWithMono(template_ref, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
         return .{ .local = self.defFnId(def) };
     }
 
-    fn lowerFnTemplateDef(self: *Builder, source_ty_view: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
+    /// A deferred template request seals from the requester's graph node
+    /// behind its request type, and value flow alone cannot reach
+    /// type-level-only positions such as phantom nominal type arguments.
+    /// Instantiating the requested template's checked function root into the
+    /// requester's graph at request creation delivers those checked root nodes
+    /// before sealing, so a row that still takes its `row_default` at seal
+    /// time is genuinely unconstrained rather than starved. Each request pins
+    /// a fresh instantiation: the checked root is generalized, and two
+    /// requests of one template at different types must not share
+    /// instantiated nodes.
+    fn pinDeferredTemplateRequestToCheckedRoot(
+        self: *Builder,
+        requester: *InstGraph,
+        template_ref: names.ProcTemplate,
+        fn_ty: Type.TypeId,
+    ) Allocator.Error!void {
+        // A request type without a graph view is a sealed snapshot (generated
+        // opaque evidence); sealing cannot default anything inside it.
+        if (requester.monoViewNode(fn_ty) == null) return;
+        const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
+        const template = view.templates.get(template_ref.template);
+        var draft = BodyDraftStore.init(self.allocator);
+        defer draft.deinit();
+        var ctx = BodyContext.initTypeOnly(self.allocator, self, view, .{
+            .proc_base = undefined, // type-only context; type lowering does not read the owner template
+            .template = undefined, // type-only context; type lowering does not read the owner template
+        }, requester, &draft);
+        defer ctx.deinit();
+        try ctx.constrainTypeToMono(template.checked_fn_root, fn_ty);
+    }
+
+    fn lowerFnTemplateDef(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
         return localFnIdFromSlot(
-            try self.lowerFnTemplateCallTarget(source_ty_view, fn_template, evidence),
+            try self.lowerFnTemplateCallTarget(fn_template, evidence),
             "Monotype function value lowering requires a local function definition",
         );
     }
 
-    fn lowerRestoredConstFnTemplate(self: *Builder, type_view: ModuleView, fn_template: Ast.FnTemplate) Allocator.Error!Ast.FnId {
+    fn lowerRestoredConstFnTemplate(self: *Builder, fn_template: Ast.FnTemplate) Allocator.Error!Ast.FnId {
         switch (fn_template.fn_def) {
             .nested => {
                 const fn_view = self.moduleForConstFnDef(fn_template.fn_def);
@@ -2708,7 +2734,7 @@ const Builder = struct {
                 _ = try self.sealActiveBodyDraft(graph, &body_draft, draft, draft_end, null, null);
                 return fn_id;
             },
-            else => return try self.lowerFnTemplateDef(type_view, fn_template, &.{}),
+            else => return try self.lowerFnTemplateDef(fn_template, &.{}),
         }
     }
 
@@ -2737,10 +2763,10 @@ const Builder = struct {
             source_ctx.graph,
         );
         if (reserved.needs_lowering) {
+            try self.pinDeferredTemplateRequestToCheckedRoot(source_ctx.graph, template_ref, request_template.mono_fn_ty);
             try source_ctx.graph.deferred_templates.append(self.allocator, .{
                 .fn_id = reserved.localFnId(),
                 .template_ref = template_ref,
-                .module = source_ctx.view.key,
                 .source_fn_ty = request_template.source_fn_ty,
                 .source_fn_key = request_template.source_fn_key,
                 .fn_ty = request_template.mono_fn_ty,
@@ -2979,7 +3005,6 @@ const Builder = struct {
                 Common.invariant("deferred template queue length changed while draining");
             _ = try self.lowerTemplateWithMonoFor(
                 request.template_ref,
-                self.moduleForId(request.module),
                 request.source_fn_ty,
                 request.source_fn_key,
                 request.fn_ty,
@@ -3653,7 +3678,6 @@ const Builder = struct {
     fn restoreConstFnExpr(
         self: *Builder,
         store_view: ModuleView,
-        type_view: ModuleView,
         fn_id: checked.ConstFnId,
         ty: Type.TypeId,
     ) Allocator.Error!Ast.ExprId {
@@ -3668,7 +3692,7 @@ const Builder = struct {
         }
         if (fn_value.captures.len == 0) {
             const template = try self.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
-            const mono_fn_id = try self.lowerRestoredConstFnTemplate(type_view, template);
+            const mono_fn_id = try self.lowerRestoredConstFnTemplate(template);
             return try self.program.addExpr(.{
                 .ty = self.program.fnSource(mono_fn_id).mono_fn_ty,
                 .data = .{ .fn_def = .{ .fn_id = mono_fn_id } },
@@ -4053,7 +4077,7 @@ const Builder = struct {
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
-                const expr = try self.restoreConstFnExpr(store_view, type_view, fn_id, ty);
+                const expr = try self.restoreConstFnExpr(store_view, fn_id, ty);
                 try self.const_expr_cache.put(address, expr);
                 return expr;
             },
@@ -4319,10 +4343,10 @@ const Builder = struct {
         const callable_mono_ty = try graph.sealNode(callable_node);
         const callee_def = try self.lowerTemplateWithMono(
             template,
-            lookup.view,
             lookup.target.callable_ty,
             lookup.view.types.rootKey(lookup.target.callable_ty),
             callable_mono_ty,
+            &.{},
         );
 
         const args = [_]Ast.ExprId{value};
@@ -6337,9 +6361,24 @@ const BodyContext = struct {
         graph: *InstGraph,
         draft: *BodyDraftStore,
     ) Allocator.Error!BodyContext {
+        var ctx = initTypeOnly(allocator, builder, view, owner_template, graph, draft);
         const string_literals = try allocator.alloc(?DraftStringLiteralId, view.bodies.stringLiteralCount());
-        errdefer allocator.free(string_literals);
         @memset(string_literals, null);
+        ctx.string_literals = string_literals;
+        return ctx;
+    }
+
+    /// Context for instantiating checked types into `graph` without lowering
+    /// any expressions: the module's string-literal table is never touched,
+    /// so it is not materialized. Expression lowering must use `init`.
+    fn initTypeOnly(
+        allocator: Allocator,
+        builder: *Builder,
+        view: ModuleView,
+        owner_template: names.ProcTemplate,
+        graph: *InstGraph,
+        draft: *BodyDraftStore,
+    ) BodyContext {
         return .{
             .allocator = allocator,
             .builder = builder,
@@ -6357,7 +6396,7 @@ const BodyContext = struct {
             .graph = graph,
             .draft = draft,
             .node_map = std.AutoHashMap(CheckedTypeAddress, NodeId).init(allocator),
-            .string_literals = string_literals,
+            .string_literals = &[_]?DraftStringLiteralId{},
             .loop_contexts = .empty,
             .pattern_literal_guards = .empty,
             .equality_expansion_stack = std.AutoHashMap(Type.TypeId, void).init(allocator),
@@ -8786,7 +8825,7 @@ const BodyContext = struct {
                     if (binding.binding.def == imported.def and binding.binding.pattern == imported.pattern) {
                         const binding_source = schemeRoot(view, binding.source_scheme, "imported procedure binding source scheme was not output");
                         const fn_template = self.builder.fnDefForImportedBindingBody(view, binding.body, binding_source, view.types.rootKey(binding_source), mono_fn_ty);
-                        const fn_id = try self.builder.lowerFnTemplateDef(view, fn_template, evidence);
+                        const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
                         break :blk try self.addExpr(.{
                             .ty = mono_fn_ty,
                             .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
@@ -8829,7 +8868,7 @@ const BodyContext = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.builder.lowerFnTemplateDef(view, fn_template, evidence);
+                const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
                 break :blk try self.addExpr(.{
                     .ty = self.builder.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
