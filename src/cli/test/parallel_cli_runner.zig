@@ -1365,13 +1365,17 @@ fn skipReason(skip: Skip) ?[]const u8 {
     };
 }
 
+fn caseTimeoutMs(spec: CliCase, fallback_timeout_ms: u64) u64 {
+    return spec.timeout_ms orelse fallback_timeout_ms;
+}
+
 fn runSingleTest(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: u64) TestResult {
     if (skipReason(spec.skip)) |reason| {
         var timer = harness.Timer.start() catch return .{ .status = .skip, .phase = .setup, .message = reason };
         return .{ .status = .skip, .phase = .setup, .duration_ns = timer.read(), .message = reason };
     }
 
-    const case_timeout_ms = spec.timeout_ms orelse timeout_ms;
+    const case_timeout_ms = caseTimeoutMs(spec, timeout_ms);
     return switch (spec.body) {
         .platform => runPlatformCase(io, allocator, spec, case_timeout_ms),
         .command => |command| runCommandCase(io, allocator, command, case_timeout_ms),
@@ -6098,6 +6102,7 @@ const Pool = harness.ProcessPool(CliCase, TestResult, .{
     .timeout_result = .{ .status = .timeout },
     .stabilizeResult = &stabilizeResult,
     .getName = &getTestName,
+    .getTimeoutMs = &caseTimeoutMs,
     .use_process_groups = true,
     .timeout_report_grace_ms = timeout_result_grace_ms,
     .windows_persistent_workers = false,
