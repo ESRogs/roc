@@ -47,9 +47,9 @@ var counted_total_stmts: usize = 0;
 
 fn countShapes(store: *const lir.LirStore, _: *const layout.Store) harness.LowerToLirHarnessError!void {
     counted_multiway_switches = 0;
-    counted_total_stmts = store.cf_stmts.items.len;
-    for (store.cf_stmts.items) |stmt| {
-        switch (stmt) {
+    counted_total_stmts = store.cf_stmts.len();
+    for (0..store.cf_stmts.len()) |i| {
+        switch (store.cf_stmts.get(i)) {
             .switch_stmt => |sw| {
                 if (sw.branches.len >= 5) counted_multiway_switches += 1;
             },
@@ -66,7 +66,7 @@ fn checkRankProcShape(store: *const lir.LirStore, layouts: *const layout.Store) 
     const buf = try gpa.alloc(u8, 1 << 20);
     defer gpa.free(buf);
     var found_multiway_proc = false;
-    for (0..store.proc_specs.items.len) |index| {
+    for (0..store.proc_specs.len()) |index| {
         var writer = std.Io.Writer.fixed(buf);
         try lir.DebugPrint.writeProc(gpa, store, layouts, @enumFromInt(@as(u32, @intCast(index))), &writer);
         const text = writer.buffered();
