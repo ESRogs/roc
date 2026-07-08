@@ -509,7 +509,7 @@ fn helpText(self: *ReplSession) Allocator.Error![]u8 {
     );
 }
 
-fn printDefs(self: *ReplSession) anyerror![]u8 {
+fn printDefs(self: *ReplSession) ReplStepError![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(self.allocator);
 
@@ -546,7 +546,7 @@ fn printDefs(self: *ReplSession) anyerror![]u8 {
     return try out.toOwnedSlice(self.allocator);
 }
 
-fn printTypeOfVar(self: *ReplSession, name: []const u8) anyerror![]u8 {
+fn printTypeOfVar(self: *ReplSession, name: []const u8) ReplStepError![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(self.allocator);
 
@@ -567,7 +567,7 @@ fn printTypeOfVar(self: *ReplSession, name: []const u8) anyerror![]u8 {
     return out.toOwnedSlice(self.allocator);
 }
 
-fn initParsedResources(self: *ReplSession) anyerror!eval.test_helpers.ParsedResources {
+fn initParsedResources(self: *ReplSession) ReplStepError!eval.test_helpers.ParsedResources {
     const definitions = try self.definitionsSource();
     defer self.allocator.free(definitions);
 
@@ -580,6 +580,7 @@ fn initParsedResources(self: *ReplSession) anyerror!eval.test_helpers.ParsedReso
         source,
         &.{},
         self.prePublishedBuiltin(),
+        self.roc_ctx,
     );
 }
 
