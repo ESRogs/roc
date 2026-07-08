@@ -3606,6 +3606,20 @@ pub fn build(b: *std.Build) void {
         build_wasm_iter_for_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_app.step);
 
+        // Noiter twin: the same sums over plain list literals. The runner prints
+        // each cart's byte size, so the iter build minus this baseline is the
+        // minted-adapter premium tracked in CI (the fusion pass's target).
+        const build_wasm_iter_noiter_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_noiter_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_noiter_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_noiter_static_lib_app.wasm",
+        });
+        build_wasm_iter_noiter_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_noiter_app.step);
+
         const build_wasm_rc_cleanup_app = b.addRunArtifact(roc_exe);
         build_wasm_rc_cleanup_app.addArgs(&.{
             "build",
@@ -3726,9 +3740,27 @@ pub fn build(b: *std.Build) void {
                 "--expected",
                 "ok",
                 "--assert-alloc-balanced",
+                // Absolute-size ceiling: the un-fused minted cart is ~48 KB
+                // (premium ~18 KB over the noiter twin). This catches a gross
+                // size blowup; the premium itself is read from the two printed
+                // sizes and is the fusion pass's target, not a hard gate pre-fusion.
+                "--max-bytes",
+                "65536",
             });
             run_wasm_iter_for_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_test.step);
+
+            // Noiter twin — asserts correctness and prints its size so CI logs
+            // carry both numbers for premium tracking.
+            const run_wasm_iter_noiter_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_noiter_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_noiter_static_lib_app.wasm",
+                "--expected",
+                "ok",
+            });
+            run_wasm_iter_noiter_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_noiter_test.step);
 
             const run_wasm_rc_cleanup_test = b.addRunArtifact(wasm_test_exe);
             run_wasm_rc_cleanup_test.addArgs(&.{
