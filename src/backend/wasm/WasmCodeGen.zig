@@ -8322,7 +8322,7 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
         },
         .set_local => |assign| {
             try self.emitProcLocal(assign.value);
-            try self.emitLocalSet(try self.getOrAllocTypedLocal(assign.target, try self.procLocalValType(assign.target)));
+            try self.bindLocalFromWasmStack(assign.target);
             try work.append(wa, .{ .node = .{ .stmt_id = assign.next, .stop = stop } });
         },
         .debug => |debug_stmt| {
@@ -8855,6 +8855,10 @@ fn generateI128Literal(self: *Self, value: i128) Allocator.Error!void {
 }
 
 fn bindAssignedLocal(self: *Self, target: ProcLocalId) Allocator.Error!void {
+    try self.bindLocalFromWasmStack(target);
+}
+
+fn bindLocalFromWasmStack(self: *Self, target: ProcLocalId) Allocator.Error!void {
     const ls = self.getLayoutStore();
     const runtime_layout = self.runtimeRepresentationLayoutIdx(self.procLocalLayoutIdx(target));
     const repr = try WasmLayout.wasmReprWithStore(runtime_layout, ls);

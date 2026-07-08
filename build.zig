@@ -3592,9 +3592,9 @@ pub fn build(b: *std.Build) void {
         build_wasm_str_concat_join_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_str_concat_join_app.step);
 
-        // End-to-end cart gate for the minted-iterator `for`-loop drive on the
-        // `--opt=size` (LLVM) build path — the path the eval-backend gates do
-        // not exercise and where the Rocci boot regression hid.
+        // End-to-end cart gate for the minted-iterator `for`-loop drive. The
+        // size build covers the LLVM cart path, and the dev build covers wasm
+        // composite loop-state rebinding for recursive generated iterators.
         const build_wasm_iter_for_app = b.addRunArtifact(roc_exe);
         build_wasm_iter_for_app.addArgs(&.{
             "build",
@@ -3605,6 +3605,17 @@ pub fn build(b: *std.Build) void {
         });
         build_wasm_iter_for_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_app.step);
+
+        const build_wasm_iter_for_dev_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_for_dev_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_static_lib_app_dev.wasm",
+        });
+        build_wasm_iter_for_dev_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_dev_app.step);
 
         // Noiter twin: the same sums over plain list literals. The runner prints
         // each cart's byte size, so the iter build minus this baseline is the
@@ -3749,6 +3760,17 @@ pub fn build(b: *std.Build) void {
             });
             run_wasm_iter_for_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_test.step);
+
+            const run_wasm_iter_for_dev_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_for_dev_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_static_lib_app_dev.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+            });
+            run_wasm_iter_for_dev_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_dev_test.step);
 
             // Noiter twin — asserts correctness and prints its size so CI logs
             // carry both numbers for premium tracking.
