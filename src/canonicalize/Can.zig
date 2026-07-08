@@ -6851,14 +6851,14 @@ fn canonicalizeSingleQuote(
                 .kind = .int_unbound,
             },
         }, region);
-        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(expr_idx), digits[0..digit_len], &.{}, 0, false, false, false);
+        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(expr_idx), digits[0..digit_len], &.{}, 0, false, false, false, true);
         return expr_idx;
     } else if (comptime Idx == Pattern.Idx) {
         const pat_idx = try self.env.addPattern(Pattern{ .num_literal = .{
             .value = value_content,
             .kind = .int_unbound,
         } }, region);
-        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(pat_idx), digits[0..digit_len], &.{}, 0, false, false, false);
+        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(pat_idx), digits[0..digit_len], &.{}, 0, false, false, false, true);
         return pat_idx;
     } else {
         @compileError("Unsupported Idx type");
@@ -6915,6 +6915,7 @@ fn recordNumeralLiteralForExpr(
         literal.isNegative(),
         literal.kind == .frac,
         literal.flags.had_decimal_point,
+        literal.isMaterialized(),
     );
 }
 
@@ -6934,6 +6935,7 @@ fn recordNumeralLiteralForPattern(
         literal.isNegative(),
         literal.kind == .frac,
         literal.flags.had_decimal_point,
+        literal.isMaterialized(),
     );
 }
 

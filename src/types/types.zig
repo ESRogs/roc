@@ -723,13 +723,21 @@ pub const NumeralInfo = struct {
     /// Whether this literal had an explicit type suffix such as `12.U64`.
     explicit_suffix: bool = false,
 
+    /// Whether the literal's exact digits were recorded and can be
+    /// materialized as a `Num.Numeral` (a custom type's `from_numeral` needs
+    /// the digit lists at runtime). False only for literals whose digit
+    /// expansion exceeds the recordable bound (e.g. `3e6000000000`); such a
+    /// literal also carries an empty `fits` set, since its exact value is
+    /// unknowable.
+    can_materialize_numeral: bool,
+
     /// Source region for error reporting
     region: base.Region,
 
     /// Build the constraint-carried facts from a literal's exact digits and
     /// its precomputed fit set.
-    pub fn fromExact(exact: numeral_mod.Exact, fit_set: numeral_mod.FitSet, region: base.Region) NumeralInfo {
-        const combined = combinedMagnitude(exact);
+    pub fn fromExact(exact: numeral_mod.Exact, fit_set: numeral_mod.FitSet, can_materialize_numeral: bool, region: base.Region) NumeralInfo {
+        const combined = if (can_materialize_numeral) combinedMagnitude(exact) else null;
         return .{
             .magnitude = @bitCast(combined orelse 0),
             .has_magnitude = combined != null,
@@ -737,6 +745,7 @@ pub const NumeralInfo = struct {
             .fits = fit_set,
             .is_negative = exact.is_negative,
             .is_fractional = exact.is_fractional,
+            .can_materialize_numeral = can_materialize_numeral,
             .explicit_suffix = false,
             .region = region,
         };
@@ -758,6 +767,7 @@ pub const NumeralInfo = struct {
         result.fits = a.fits.intersectWith(b.fits);
         result.is_negative = a.is_negative or b.is_negative;
         result.is_fractional = a.is_fractional or b.is_fractional;
+        result.can_materialize_numeral = a.can_materialize_numeral and b.can_materialize_numeral;
         return result;
     }
 
@@ -818,7 +828,7 @@ pub const NumeralInfo = struct {
         var no_heap: [0]u8 = .{};
         var fba = std.heap.FixedBufferAllocator.init(&no_heap);
         const fit_set = numeral_mod.computeFitSet(fba.allocator(), exact) catch unreachable;
-        return fromExact(exact, fit_set, region);
+        return fromExact(exact, fit_set, true, region);
     }
 };
 

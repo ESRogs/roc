@@ -941,8 +941,8 @@ pub fn main(init: std.process.Init) Allocator.Error!void {
         if (use_debug_allocator) {
             // Under Valgrind, use libc's malloc instead: Valgrind can't see the
             // debug allocator's sub-allocations (it carves them out of mmap'd
-            // pages) but tracks every malloc/free. Debug builds carry the client
-            // requests, so this auto-switches with no flag.
+            // pages) but tracks every malloc/free. Builds with Valgrind support
+            // carry the client requests, so this can auto-switch under Valgrind.
             if (builtin.link_libc and std.valgrind.runningOnValgrind() != 0) {
                 break :gpa .{ std.heap.c_allocator, false };
             }
@@ -11311,7 +11311,7 @@ fn rocRepl(ctx: *CliCtx, repl_args: cli_args.ReplArgs) CliMainError!void {
     // it before printing the greeting so the greeting and the first prompt appear
     // together and the REPL is immediately interactive — otherwise the greeting
     // shows with no prompt until this finishes.
-    var session = try ReplSession.init(ctx.gpa, ctx.io.std_io, backend_kind);
+    var session = try ReplSession.init(ctx.gpa, ctx.coreCtx(), backend_kind);
     defer session.deinit();
 
     if (mode == .interactive) {
@@ -13101,7 +13101,7 @@ fn rocDocs(ctx: *CliCtx, args: cli_args.DocsArgs) CliMainError!void {
     var result_with_env = checkFileWithBuildEnvPreserved(
         ctx,
         args.path,
-        null,
+        args.main,
         args.time,
         cache_config,
         null, // max_threads: use default (single-threaded for now)

@@ -889,44 +889,12 @@ const Builder = struct {
         };
     }
 
-    fn declaredModuleForAlias(self: *Builder, view: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
-        return self.moduleDigestForOrigin(view, alias.origin_module);
+    fn declaredModuleForAlias(_: *Builder, _: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
+        return moduleDigestFromId(alias.owner_module);
     }
 
-    fn declaredModuleForNominal(self: *Builder, view: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
-        return switch (nominal.representation) {
-            .imported_declaration => |imported| moduleDigestFromId(checked.importedNominalDeclarationModuleId(imported)),
-            .imported_box_payload_capability => |imported| moduleDigestFromId(checked.importedBoxPayloadCapabilityModuleId(imported)),
-            .builtin,
-            .local_declaration,
-            .local_box_payload_capability,
-            .opaque_without_backing,
-            => self.moduleDigestForOrigin(view, nominal.origin_module),
-        };
-    }
-
-    /// Resolve a named type's declaring module by 32-byte content identity —
-    /// an exact comparison against each candidate view's module identity
-    /// hash. Byte-identical module content reached through several checked
-    /// modules is interchangeable as a declaring module; the first match wins.
-    fn moduleDigestForOrigin(self: *Builder, view: ModuleView, origin_module: names.ModuleIdentityId) names.CheckedModuleDigest {
-        const origin_hash = view.names.moduleIdentityBytes(origin_module);
-        if (moduleViewIdentityMatches(view, origin_hash)) return moduleDigestFromId(view.key);
-
-        const root = moduleView(self.root_view);
-        if (moduleViewIdentityMatches(root, origin_hash)) return moduleDigestFromId(root.key);
-
-        for (self.modules.imports) |imported| {
-            const imported_view = moduleView(imported);
-            if (moduleViewIdentityMatches(imported_view, origin_hash)) return moduleDigestFromId(imported_view.key);
-        }
-
-        for (self.modules.root.relation_modules) |relation| {
-            const relation_view = moduleView(relation);
-            if (moduleViewIdentityMatches(relation_view, origin_hash)) return moduleDigestFromId(relation_view.key);
-        }
-
-        Common.invariant("checked named type origin module was not available to Monotype lowering");
+    fn declaredModuleForNominal(_: *Builder, _: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
+        return moduleDigestFromId(nominal.owner_module);
     }
 
     fn lowerRoot(self: *Builder, request: checked.RootRequest) Allocator.Error!void {
@@ -1168,7 +1136,7 @@ const Builder = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.lowerFnTemplateDef(view, fn_template, &.{});
+                const fn_id = try self.lowerFnTemplateDef(fn_template, &.{});
                 break :blk try self.program.addExpr(.{
                     .ty = self.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = fn_id } },
@@ -1191,7 +1159,7 @@ const Builder = struct {
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
-            .fn_value => |fn_id| try self.restoreConstFnExpr(view, view, fn_id, mono_fn_ty),
+            .fn_value => |fn_id| try self.restoreConstFnExpr(view, fn_id, mono_fn_ty),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
             else => Common.invariant("callable eval binding root did not output a callable value"),
         };
@@ -1251,19 +1219,18 @@ const Builder = struct {
         source_fn_ty: checked.CheckedTypeId,
     ) Allocator.Error!Ast.DefId {
         const fn_ty = try self.lowerType(source_ty_view, source_fn_ty);
-        return try self.lowerTemplateWithMono(template_ref, source_ty_view, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
+        return try self.lowerTemplateWithMono(template_ref, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
     }
 
     fn lowerTemplateWithMono(
         self: *Builder,
         template_ref: names.ProcTemplate,
-        source_ty_view: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
         evidence: []const SpecEvidence,
     ) Allocator.Error!Ast.DefId {
-        return try self.lowerTemplateWithMonoFor(template_ref, source_ty_view, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null);
+        return try self.lowerTemplateWithMonoFor(template_ref, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null);
     }
 
     /// Specializations of one template family are deduplicated by structural
@@ -1275,7 +1242,6 @@ const Builder = struct {
     fn lowerTemplateWithMonoFor(
         self: *Builder,
         template_ref: names.ProcTemplate,
-        source_ty_view: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
@@ -1391,17 +1357,71 @@ const Builder = struct {
 
         switch (template.target) {
             .hosted => {
+                // The host is compiled against the declared hosted signature,
+                // so that exact type is the only one the extern boundary may
+                // use. A use site can still widen a (closed) tag-union row in
+                // the result through ordinary unification (e.g. `?` re-wraps
+                // the hosted error into the caller's wider error union); such
+                // requests get a generated Roc adapter that calls the
+                // declared-type boundary and re-tags the result, instead of a
+                // hosted spec whose layout would not match the host ABI.
+                const declared_source_fn_ty = template.checked_fn_root;
+                const declared_source_fn_key = view.types.rootKey(declared_source_fn_ty);
+                const declared_mono_fn_ty = try self.lowerType(view, declared_source_fn_ty);
+                const hosted_fn_template = self.fnDefForTemplate(
+                    view,
+                    template_ref,
+                    declared_source_fn_ty,
+                    declared_source_fn_key,
+                    lower_fn_ty,
+                );
                 const fn_data = self.functionShape(lower_fn_ty, "hosted procedure template root type was not a function");
                 const args = try self.typedLocalsForArgs(self.program.types.span(fn_data.args));
+                if (self.hostedUseNeedsTryAdapter(declared_mono_fn_ty, lower_fn_ty)) {
+                    const source_def = try self.lowerTemplateWithMonoFor(
+                        template_ref,
+                        declared_source_fn_ty,
+                        declared_source_fn_key,
+                        declared_mono_fn_ty,
+                        &.{},
+                        null,
+                        null,
+                        null,
+                        null,
+                    );
+                    const adapter_template = Ast.FnTemplate{
+                        .fn_def = .{ .checked_generated = template_ref },
+                        .source_fn_ty = source_fn_ty,
+                        .source_fn_key = source_fn_key,
+                        .mono_fn_ty = lower_fn_ty,
+                    };
+                    const body = try self.hostedTryAdapterBody(
+                        args,
+                        self.defFnId(source_def),
+                        declared_mono_fn_ty,
+                        lower_fn_ty,
+                    );
+                    self.program.setDef(reservation.def, .{
+                        .symbol = reservation.symbol,
+                        .fn_def = adapter_template,
+                        .fn_id = reservation.fn_id,
+                        .args = args,
+                        .body = .{ .roc = body },
+                        .ret = fn_data.ret,
+                    });
+                    self.program.setFnSource(reservation.fn_id, adapter_template);
+                    try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
+                    return reservation.def;
+                }
                 self.program.setDef(reservation.def, .{
                     .symbol = reservation.symbol,
-                    .fn_def = fn_template,
+                    .fn_def = hosted_fn_template,
                     .fn_id = reservation.fn_id,
                     .args = args,
                     .body = .hosted,
                     .ret = fn_data.ret,
                 });
-                self.program.setFnSource(reservation.fn_id, fn_template);
+                self.program.setFnSource(reservation.fn_id, hosted_fn_template);
                 try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
                 return reservation.def;
             },
@@ -1474,9 +1494,6 @@ const Builder = struct {
         body_ctx.current_fn_key = root_fn_key;
         defer body_ctx.deinit();
         const public_constraint_fn_ty = try body_ctx.publicOpaqueFunctionUnificationType(lower_fn_ty);
-        if (moduleBytesEqual(source_ty_view.key.bytes, view.key.bytes)) {
-            try body_ctx.constrainKnownType(source_fn_ty, public_constraint_fn_ty);
-        }
         try body_ctx.constrainTypeToMono(template.checked_fn_root, public_constraint_fn_ty);
 
         // The requested function type becomes a view of this specialization's
@@ -2470,7 +2487,7 @@ const Builder = struct {
                 break :blk .{ .view = sv, .declaration = decl, .padding_field_tys = capability.paddingFieldTys(sv.interface_capabilities) };
             },
             .builtin => blk: {
-                const source_view = self.moduleForDigest(self.moduleDigestForOrigin(view, nominal.origin_module));
+                const source_view = self.moduleForId(nominal.owner_module);
                 const source_decl = nominal.source_decl orelse break :blk null;
                 for (source_view.types.nominal_declarations) |decl| {
                     if (decl.source_statement != source_decl) continue;
@@ -2621,7 +2638,7 @@ const Builder = struct {
                 break :blk self.fnDefForProcedureBindingBody(app_view, binding.body, source_fn_ty, source_fn_key, mono_fn_ty);
             },
         };
-        return try self.lowerFnTemplateCallTarget(source_ty_view, fn_template, &.{});
+        return try self.lowerFnTemplateCallTarget(fn_template, &.{});
     }
 
     /// Lower (or defer) a procedure template body and return the Monotype
@@ -2629,7 +2646,7 @@ const Builder = struct {
     /// request reserves an id and defers the body; outside one (root and
     /// wrapper paths, whose types come from the builder-global cache without
     /// body evidence), the body lowers now.
-    fn lowerFnTemplateCallTarget(self: *Builder, source_ty_view: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
+    fn lowerFnTemplateCallTarget(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
         const template_ref = switch (fn_template.fn_def) {
             .local_template,
             .imported_template,
@@ -2659,10 +2676,10 @@ const Builder = struct {
                 graph,
             );
             if (reserved.needs_lowering) {
+                try self.pinDeferredTemplateRequestToCheckedRoot(graph, template_ref, request_template.mono_fn_ty);
                 try graph.deferred_templates.append(self.allocator, .{
                     .fn_id = reserved.localFnId(),
                     .template_ref = template_ref,
-                    .module = source_ty_view.key,
                     .source_fn_ty = request_template.source_fn_ty,
                     .source_fn_key = request_template.source_fn_key,
                     .fn_ty = request_template.mono_fn_ty,
@@ -2672,18 +2689,49 @@ const Builder = struct {
             }
             return reserved.target;
         }
-        const def = try self.lowerTemplateWithMono(template_ref, source_ty_view, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
+        const def = try self.lowerTemplateWithMono(template_ref, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
         return .{ .local = self.defFnId(def) };
     }
 
-    fn lowerFnTemplateDef(self: *Builder, source_ty_view: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
+    /// A deferred template request seals from the requester's graph node
+    /// behind its request type, and value flow alone cannot reach
+    /// type-level-only positions such as phantom nominal type arguments.
+    /// Instantiating the requested template's checked function root into the
+    /// requester's graph at request creation delivers those checked root nodes
+    /// before sealing, so a row that still takes its `row_default` at seal
+    /// time is genuinely unconstrained rather than starved. Each request pins
+    /// a fresh instantiation: the checked root is generalized, and two
+    /// requests of one template at different types must not share
+    /// instantiated nodes.
+    fn pinDeferredTemplateRequestToCheckedRoot(
+        self: *Builder,
+        requester: *InstGraph,
+        template_ref: names.ProcTemplate,
+        fn_ty: Type.TypeId,
+    ) Allocator.Error!void {
+        // A request type without a graph view is a sealed snapshot (generated
+        // opaque evidence); sealing cannot default anything inside it.
+        if (requester.monoViewNode(fn_ty) == null) return;
+        const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
+        const template = view.templates.get(template_ref.template);
+        var draft = BodyDraftStore.init(self.allocator);
+        defer draft.deinit();
+        var ctx = BodyContext.initTypeOnly(self.allocator, self, view, .{
+            .proc_base = undefined, // type-only context; type lowering does not read the owner template
+            .template = undefined, // type-only context; type lowering does not read the owner template
+        }, requester, &draft);
+        defer ctx.deinit();
+        try ctx.constrainTypeToMono(template.checked_fn_root, fn_ty);
+    }
+
+    fn lowerFnTemplateDef(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
         return localFnIdFromSlot(
-            try self.lowerFnTemplateCallTarget(source_ty_view, fn_template, evidence),
+            try self.lowerFnTemplateCallTarget(fn_template, evidence),
             "Monotype function value lowering requires a local function definition",
         );
     }
 
-    fn lowerRestoredConstFnTemplate(self: *Builder, type_view: ModuleView, fn_template: Ast.FnTemplate) Allocator.Error!Ast.FnId {
+    fn lowerRestoredConstFnTemplate(self: *Builder, fn_template: Ast.FnTemplate) Allocator.Error!Ast.FnId {
         switch (fn_template.fn_def) {
             .nested => {
                 const fn_view = self.moduleForConstFnDef(fn_template.fn_def);
@@ -2703,7 +2751,7 @@ const Builder = struct {
                 _ = try self.sealActiveBodyDraft(graph, &body_draft, draft, draft_end, null, null);
                 return fn_id;
             },
-            else => return try self.lowerFnTemplateDef(type_view, fn_template, &.{}),
+            else => return try self.lowerFnTemplateDef(fn_template, &.{}),
         }
     }
 
@@ -2732,10 +2780,10 @@ const Builder = struct {
             source_ctx.graph,
         );
         if (reserved.needs_lowering) {
+            try self.pinDeferredTemplateRequestToCheckedRoot(source_ctx.graph, template_ref, request_template.mono_fn_ty);
             try source_ctx.graph.deferred_templates.append(self.allocator, .{
                 .fn_id = reserved.localFnId(),
                 .template_ref = template_ref,
-                .module = source_ctx.view.key,
                 .source_fn_ty = request_template.source_fn_ty,
                 .source_fn_key = request_template.source_fn_key,
                 .fn_ty = request_template.mono_fn_ty,
@@ -2974,7 +3022,6 @@ const Builder = struct {
                 Common.invariant("deferred template queue length changed while draining");
             _ = try self.lowerTemplateWithMonoFor(
                 request.template_ref,
-                self.moduleForId(request.module),
                 request.source_fn_ty,
                 request.source_fn_key,
                 request.fn_ty,
@@ -3648,7 +3695,6 @@ const Builder = struct {
     fn restoreConstFnExpr(
         self: *Builder,
         store_view: ModuleView,
-        type_view: ModuleView,
         fn_id: checked.ConstFnId,
         ty: Type.TypeId,
     ) Allocator.Error!Ast.ExprId {
@@ -3663,7 +3709,7 @@ const Builder = struct {
         }
         if (fn_value.captures.len == 0) {
             const template = try self.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
-            const mono_fn_id = try self.lowerRestoredConstFnTemplate(type_view, template);
+            const mono_fn_id = try self.lowerRestoredConstFnTemplate(template);
             return try self.program.addExpr(.{
                 .ty = self.program.fnSource(mono_fn_id).mono_fn_ty,
                 .data = .{ .fn_def = .{ .fn_id = mono_fn_id } },
@@ -4048,7 +4094,7 @@ const Builder = struct {
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
-                const expr = try self.restoreConstFnExpr(store_view, type_view, fn_id, ty);
+                const expr = try self.restoreConstFnExpr(store_view, fn_id, ty);
                 try self.const_expr_cache.put(address, expr);
                 return expr;
             },
@@ -4314,10 +4360,10 @@ const Builder = struct {
         const callable_mono_ty = try graph.sealNode(callable_node);
         const callee_def = try self.lowerTemplateWithMono(
             template,
-            lookup.view,
             lookup.target.callable_ty,
             lookup.view.types.rootKey(lookup.target.callable_ty),
             callable_mono_ty,
+            &.{},
         );
 
         const args = [_]Ast.ExprId{value};
@@ -4594,6 +4640,294 @@ const Builder = struct {
                 .final_else = else_expr,
             } },
         });
+    }
+
+    const BuilderTryInfo = struct {
+        ok_ty: Type.TypeId,
+        err_ty: Type.TypeId,
+        ok_tag: Type.Tag,
+        err_tag: Type.Tag,
+    };
+
+    /// Whether a hosted specialization request differs from the declared host
+    /// ABI only by a widened `Try` error row. Such requests get a generated
+    /// Roc adapter that calls the declared-type boundary and re-tags the
+    /// error into the wider row.
+    fn hostedUseNeedsTryAdapter(self: *Builder, declared_fn_ty: Type.TypeId, requested_fn_ty: Type.TypeId) bool {
+        if (self.sameMonoType(declared_fn_ty, requested_fn_ty)) return false;
+
+        const declared = self.functionShape(declared_fn_ty, "hosted declared type was not a function");
+        const requested = self.functionShape(requested_fn_ty, "hosted requested type was not a function");
+        if (self.sameMonoType(declared.ret, requested.ret)) return false;
+
+        const declared_try = self.tryInfoOrNull(declared.ret) orelse return false;
+        const requested_try = self.tryInfoOrNull(requested.ret) orelse return false;
+        if (!self.sameMonoType(declared_try.ok_ty, requested_try.ok_ty)) return false;
+        if (!self.errorRowIsIncludedIn(declared_try.err_ty, requested_try.err_ty)) return false;
+
+        const declared_args = self.program.types.span(declared.args);
+        const requested_args = self.program.types.span(requested.args);
+        if (declared_args.len != requested_args.len) {
+            Common.invariant("hosted function use changed arity from the declared ABI");
+        }
+        for (0..declared_args.len) |index| {
+            const declared_arg = GuardedList.at(declared_args, index);
+            const requested_arg = GuardedList.at(requested_args, index);
+            if (!self.sameMonoType(declared_arg, requested_arg)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn hostedTryAdapterBody(
+        self: *Builder,
+        args: Ast.Span(Ast.TypedLocal),
+        source_fn: Ast.FnId,
+        source_fn_ty: Type.TypeId,
+        target_fn_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        const source = self.functionShape(source_fn_ty, "hosted source adapter type was not a function");
+        const target = self.functionShape(target_fn_ty, "hosted target adapter type was not a function");
+        const source_args = self.program.types.span(source.args);
+        const target_args = self.program.types.span(target.args);
+        const adapter_args = self.program.typedLocalSpan(args);
+        if (source_args.len != target_args.len or source_args.len != GuardedList.borrowLen(adapter_args)) {
+            Common.invariant("hosted Try adapter arity differed from its function types");
+        }
+
+        const call_args = try self.allocator.alloc(Ast.ExprId, GuardedList.borrowLen(adapter_args));
+        defer self.allocator.free(call_args);
+        for (0..GuardedList.borrowLen(adapter_args)) |index| {
+            const arg = GuardedList.at(adapter_args, index);
+            const source_arg_ty = GuardedList.at(source_args, index);
+            const target_arg_ty = GuardedList.at(target_args, index);
+            if (!self.sameMonoType(arg.ty, source_arg_ty) or !self.sameMonoType(arg.ty, target_arg_ty)) {
+                Common.invariant("hosted Try adapter argument type differed from source or target function type");
+            }
+            call_args[index] = try self.localExpr(arg.local, arg.ty);
+        }
+
+        const source_call = try self.program.addExpr(.{
+            .ty = source.ret,
+            .data = .{ .call_proc = .{
+                .callee = Ast.localProcCallee(source_fn),
+                .args = try self.program.addExprSpan(call_args),
+            } },
+        });
+        return try self.tryReturnInjectionExpr(source_call, source.ret, target.ret);
+    }
+
+    fn tryReturnInjectionExpr(
+        self: *Builder,
+        source_expr: Ast.ExprId,
+        source_try_ty: Type.TypeId,
+        target_try_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        if (self.sameMonoType(source_try_ty, target_try_ty)) return source_expr;
+
+        const source_info = self.tryInfo(source_try_ty);
+        const target_info = self.tryInfo(target_try_ty);
+        if (!self.sameMonoType(source_info.ok_ty, target_info.ok_ty)) {
+            Common.invariant("Try adapter changed Ok type");
+        }
+        if (!self.errorRowIsIncludedIn(source_info.err_ty, target_info.err_ty)) {
+            Common.invariant("Try adapter error row was not included in target row");
+        }
+
+        const ok_local = try self.program.addLocal(self.symbols.fresh(), source_info.ok_ty);
+        const ok_payload_pat = try self.bindPat(ok_local, source_info.ok_ty);
+        const ok_pat = try self.program.addPat(.{ .ty = source_try_ty, .data = .{ .tag = .{
+            .name = source_info.ok_tag.name,
+            .payloads = try self.program.addPatSpan(&[_]Ast.PatId{ok_payload_pat}),
+        } } });
+        const ok_value = try self.localExpr(ok_local, source_info.ok_ty);
+        const ok_body = try self.tryOkExpr(target_try_ty, ok_value);
+
+        const err_local = try self.program.addLocal(self.symbols.fresh(), source_info.err_ty);
+        const err_payload_pat = try self.bindPat(err_local, source_info.err_ty);
+        const err_pat = try self.program.addPat(.{ .ty = source_try_ty, .data = .{ .tag = .{
+            .name = source_info.err_tag.name,
+            .payloads = try self.program.addPatSpan(&[_]Ast.PatId{err_payload_pat}),
+        } } });
+        const err_value = try self.localExpr(err_local, source_info.err_ty);
+        const injected_err = try self.errorRowInjectionExpr(err_value, source_info.err_ty, target_info.err_ty);
+        const err_body = try self.tryErrExpr(target_try_ty, injected_err);
+
+        const branches = [_]Ast.Branch{
+            .{ .pat = ok_pat, .body = ok_body },
+            .{ .pat = err_pat, .body = err_body },
+        };
+        return try self.program.addExpr(.{ .ty = target_try_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.program.addBranchSpan(&branches),
+        } } });
+    }
+
+    fn errorRowInjectionExpr(
+        self: *Builder,
+        source_expr: Ast.ExprId,
+        source_err_ty: Type.TypeId,
+        target_err_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        if (self.sameMonoType(source_err_ty, target_err_ty)) return source_expr;
+
+        const source_tags = self.tagUnionTags(source_err_ty);
+        if (source_tags.len == 0) {
+            Common.invariant("cannot inject an empty error row into a different error row");
+        }
+
+        const branches = try self.allocator.alloc(Ast.Branch, source_tags.len);
+        defer self.allocator.free(branches);
+        for (0..source_tags.len) |index| {
+            const source_tag = GuardedList.at(source_tags, index);
+            const source_payload_tys = self.program.types.span(source_tag.payloads);
+            const target_tag = self.tagByName(target_err_ty, source_tag.name);
+            const target_payload_tys = self.program.types.span(target_tag.payloads);
+            if (source_payload_tys.len != target_payload_tys.len) {
+                Common.invariant("Try adapter error tag payload arity differed in target row");
+            }
+
+            const payload_pats = try self.allocator.alloc(Ast.PatId, source_payload_tys.len);
+            defer self.allocator.free(payload_pats);
+            const payload_exprs = try self.allocator.alloc(Ast.ExprId, source_payload_tys.len);
+            defer self.allocator.free(payload_exprs);
+            for (0..source_payload_tys.len) |payload_index| {
+                const source_payload_ty = GuardedList.at(source_payload_tys, payload_index);
+                const target_payload_ty = GuardedList.at(target_payload_tys, payload_index);
+                if (!self.sameMonoType(source_payload_ty, target_payload_ty)) {
+                    Common.invariant("Try adapter error tag payload type differed in target row");
+                }
+                const local = try self.program.addLocal(self.symbols.fresh(), source_payload_ty);
+                payload_pats[payload_index] = try self.bindPat(local, source_payload_ty);
+                payload_exprs[payload_index] = try self.localExpr(local, source_payload_ty);
+            }
+
+            const pat = try self.program.addPat(.{ .ty = source_err_ty, .data = .{ .tag = .{
+                .name = source_tag.name,
+                .payloads = try self.program.addPatSpan(payload_pats),
+            } } });
+            const body = try self.tagValueExpr(target_err_ty, target_tag, payload_exprs);
+            branches[index] = .{ .pat = pat, .body = body };
+        }
+
+        return try self.program.addExpr(.{ .ty = target_err_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.program.addBranchSpan(branches),
+        } } });
+    }
+
+    fn tryOkExpr(self: *Builder, try_ty: Type.TypeId, value_expr: Ast.ExprId) Allocator.Error!Ast.ExprId {
+        const info = self.tryInfo(try_ty);
+        return try self.tagValueExpr(try_ty, info.ok_tag, &[_]Ast.ExprId{value_expr});
+    }
+
+    fn tryErrExpr(self: *Builder, try_ty: Type.TypeId, err_expr: Ast.ExprId) Allocator.Error!Ast.ExprId {
+        const info = self.tryInfo(try_ty);
+        return try self.tagValueExpr(try_ty, info.err_tag, &[_]Ast.ExprId{err_expr});
+    }
+
+    fn tagValueExpr(
+        self: *Builder,
+        ty: Type.TypeId,
+        tag: Type.Tag,
+        payloads: []const Ast.ExprId,
+    ) Allocator.Error!Ast.ExprId {
+        const backing_ty = self.nominalExprBackingType(ty) orelse ty;
+        const tag_expr = try self.program.addExpr(.{
+            .ty = backing_ty,
+            .data = .{ .tag = .{
+                .name = tag.name,
+                .payloads = try self.program.addExprSpan(payloads),
+            } },
+        });
+        if (self.nominalExprBackingType(ty) != null) {
+            return try self.program.addExpr(.{ .ty = ty, .data = .{ .nominal = tag_expr } });
+        }
+        return tag_expr;
+    }
+
+    fn tryInfo(self: *Builder, try_ty: Type.TypeId) BuilderTryInfo {
+        return self.tryInfoOrNull(try_ty) orelse Common.invariant("expected a named Try type");
+    }
+
+    fn tryInfoOrNull(self: *Builder, try_ty: Type.TypeId) ?BuilderTryInfo {
+        const backing_ty = self.namedBackingType(try_ty) orelse return null;
+        const ok_tag = self.tagByTextOrNull(backing_ty, "Ok") orelse return null;
+        const err_tag = self.tagByTextOrNull(backing_ty, "Err") orelse return null;
+        const ok_payloads = self.program.types.span(ok_tag.payloads);
+        const err_payloads = self.program.types.span(err_tag.payloads);
+        if (ok_payloads.len != 1 or err_payloads.len != 1) return null;
+        return .{
+            .ok_ty = GuardedList.at(ok_payloads, 0),
+            .err_ty = GuardedList.at(err_payloads, 0),
+            .ok_tag = ok_tag,
+            .err_tag = err_tag,
+        };
+    }
+
+    fn errorRowIsIncludedIn(self: *Builder, source_err_ty: Type.TypeId, target_err_ty: Type.TypeId) bool {
+        if (self.sameMonoType(source_err_ty, target_err_ty)) return true;
+        const source_tags = self.tagUnionTags(source_err_ty);
+        for (0..source_tags.len) |index| {
+            const source_tag = GuardedList.at(source_tags, index);
+            const target_tag = self.tagByNameOrNull(target_err_ty, source_tag.name) orelse return false;
+            const source_payloads = self.program.types.span(source_tag.payloads);
+            const target_payloads = self.program.types.span(target_tag.payloads);
+            if (source_payloads.len != target_payloads.len) return false;
+            for (0..source_payloads.len) |payload_index| {
+                const source_payload = GuardedList.at(source_payloads, payload_index);
+                const target_payload = GuardedList.at(target_payloads, payload_index);
+                if (!self.sameMonoType(source_payload, target_payload)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn tagByName(self: *Builder, ty: Type.TypeId, name: names.TagNameId) Type.Tag {
+        return self.tagByNameOrNull(ty, name) orelse Common.invariant("tag operation referenced tag absent from Monotype type");
+    }
+
+    fn tagByNameOrNull(self: *Builder, ty: Type.TypeId, name: names.TagNameId) ?Type.Tag {
+        const tags = self.tagUnionTags(ty);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(tags, index);
+            if (tag.name == name) return tag;
+        }
+        return null;
+    }
+
+    fn tagByTextOrNull(self: *Builder, ty: Type.TypeId, text: []const u8) ?Type.Tag {
+        const tags = self.tagUnionTags(ty);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(tags, index);
+            if (std.mem.eql(u8, self.program.names.tagLabelText(tag.name), text)) return tag;
+        }
+        return null;
+    }
+
+    fn tagUnionTags(self: *Builder, ty: Type.TypeId) Type.StoreSpanBorrow(Type.Tag, "tags") {
+        return switch (self.shapeContent(ty)) {
+            .tag_union => |tags| self.program.types.tagSpan(tags),
+            else => Common.invariant("tag operation expected tag-union type"),
+        };
+    }
+
+    fn nominalExprBackingType(self: *Builder, ty: Type.TypeId) ?Type.TypeId {
+        return switch (self.program.types.get(ty)) {
+            .named => |named| if (named.kind != .alias) blk: {
+                const backing = named.backing orelse break :blk null;
+                break :blk backing.ty;
+            } else null,
+            else => null,
+        };
+    }
+
+    fn sameMonoType(self: *Builder, a: Type.TypeId, b: Type.TypeId) bool {
+        if (a == b) return true;
+        const a_digest = self.program.types.typeDigest(&self.program.names, a);
+        const b_digest = self.program.types.typeDigest(&self.program.names, b);
+        return std.mem.eql(u8, a_digest.bytes[0..], b_digest.bytes[0..]);
     }
 };
 
@@ -6340,9 +6674,24 @@ const BodyContext = struct {
         graph: *InstGraph,
         draft: *BodyDraftStore,
     ) Allocator.Error!BodyContext {
+        var ctx = initTypeOnly(allocator, builder, view, owner_template, graph, draft);
         const string_literals = try allocator.alloc(?DraftStringLiteralId, view.bodies.stringLiteralCount());
-        errdefer allocator.free(string_literals);
         @memset(string_literals, null);
+        ctx.string_literals = string_literals;
+        return ctx;
+    }
+
+    /// Context for instantiating checked types into `graph` without lowering
+    /// any expressions: the module's string-literal table is never touched,
+    /// so it is not materialized. Expression lowering must use `init`.
+    fn initTypeOnly(
+        allocator: Allocator,
+        builder: *Builder,
+        view: ModuleView,
+        owner_template: names.ProcTemplate,
+        graph: *InstGraph,
+        draft: *BodyDraftStore,
+    ) BodyContext {
         return .{
             .allocator = allocator,
             .builder = builder,
@@ -6360,7 +6709,7 @@ const BodyContext = struct {
             .graph = graph,
             .draft = draft,
             .node_map = std.AutoHashMap(CheckedTypeAddress, NodeId).init(allocator),
-            .string_literals = string_literals,
+            .string_literals = &[_]?DraftStringLiteralId{},
             .loop_contexts = .empty,
             .pattern_literal_guards = .empty,
             .equality_expansion_stack = std.AutoHashMap(Type.TypeId, void).init(allocator),
@@ -8778,7 +9127,7 @@ const BodyContext = struct {
                     if (binding.binding.def == imported.def and binding.binding.pattern == imported.pattern) {
                         const binding_source = schemeRoot(view, binding.source_scheme, "imported procedure binding source scheme was not output");
                         const fn_template = self.builder.fnDefForImportedBindingBody(view, binding.body, binding_source, view.types.rootKey(binding_source), mono_fn_ty);
-                        const fn_id = try self.builder.lowerFnTemplateDef(view, fn_template, evidence);
+                        const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
                         break :blk try self.addExpr(.{
                             .ty = mono_fn_ty,
                             .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
@@ -8821,7 +9170,7 @@ const BodyContext = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.builder.lowerFnTemplateDef(view, fn_template, evidence);
+                const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
                 break :blk try self.addExpr(.{
                     .ty = self.builder.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
@@ -16551,6 +16900,9 @@ const BodyContext = struct {
         literal: can.ModuleEnv.NumeralLiteral,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        if (!literal.isMaterialized()) {
+            Common.invariant("checked from_numeral argument literal was not materialized");
+        }
         const field_span = switch (self.builder.shapeContent(ty)) {
             .record => |span| span,
             else => Common.invariant("Numeral Literal payload was not a record"),
