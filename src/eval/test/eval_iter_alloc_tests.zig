@@ -77,6 +77,39 @@ pub const tests = [_]TestCase{
         .source = "if Iter.fold(Iter.append(Iter.exclusive_range(0.U64, 5), 5), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
+
+    // --- `for`-loop driver over a minted chain. A `for` sinks the consuming
+    // loop into the chain and rebases the step's inline captures; the append
+    // step re-feeds its own inner-iterator capture slot with the destructured
+    // successor `rest`, so a driver that drops that operand freezes the inner
+    // iterator at its head and the loop never terminates. `fold` does not
+    // exercise this path, so these `for` cases are the gate for it. ---
+    .{
+        .name = "iter alloc: range append for-loop is zero-alloc",
+        .source =
+        \\{
+        \\    var sum = 0.U64
+        \\    for x in Iter.append(Iter.exclusive_range(0.U64, 5), 5) {
+        \\        sum = sum + x
+        \\    }
+        \\    if sum == 15 { "ok" } else { "bad" }
+        \\}
+        ,
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: range map for-loop is zero-alloc",
+        .source =
+        \\{
+        \\    var sum = 0.U64
+        \\    for x in Iter.map(Iter.exclusive_range(0.U64, 5), |n| n + 1) {
+        \\        sum = sum + x
+        \\    }
+        \\    if sum == 15 { "ok" } else { "bad" }
+        \\}
+        ,
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
     .{
         .name = "iter alloc: captured range map folds are zero-alloc",
         .source =

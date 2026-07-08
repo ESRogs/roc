@@ -901,17 +901,27 @@ fn deinitCaptureTable(allocator: Allocator, captures: []std.ArrayList(Ast.TypedL
 
 /// Find the existing operand value that supplies capture `id`.
 ///
-/// For a plain local read whose value-local carries a CaptureId, that CaptureId
-/// is authoritative — not the operand's stored id: spec_constr substitution can
-/// replace an operand's value with a local of a different capture while leaving
-/// the stored id stale, so the value's current identity wins.
+/// An operand carries two identities: the value's own CaptureId (when its value
+/// is a plain local that carries one) and the operand's declared `id` (set when
+/// the operand was built to fill a specific target slot). They agree for a
+/// pass-through capture, but diverge in two ways this join must both handle:
 ///
-/// When the value-local carries no CaptureId (e.g. a spec_constr-minted arg or
-/// temp local produced by argument splitting/inlining), no value identity is
-/// available, so the operand's stored id — set when the operand was built for a
-/// specific slot — is the only identity and is honored when present. Genuinely
-/// explicit (non-local) values likewise fall back to their stored id. A
-/// value-id match always takes precedence over the stored id.
+///   - A value-local whose CaptureId equals `id` is the exact supply for the
+///     slot and wins outright. This also overrides a stale declared id: when
+///     spec_constr substitutes an operand's value with a local of a different
+///     capture but leaves the declared id unchanged, the value's current
+///     identity is authoritative.
+///
+///   - Otherwise the operand's declared id names the slot it fills, even when
+///     its value-local carries a different CaptureId. spec_constr routes a
+///     value-local into a slot its own binding does not name — e.g. a
+///     destructured successor `rest` passed as the next iterator's inner-state
+///     capture — and only the declared id records which slot that is. A
+///     value-local with no CaptureId, and a genuinely explicit (non-local)
+///     value, are likewise keyed solely by the declared id.
+///
+/// An exact value-CaptureId match always takes precedence over a declared-id
+/// match; a declared-id match is used only when no exact match exists.
 fn operandValueForSlotId(program: *const Ast.Program, existing: anytype, id: checked.CaptureId) ?Ast.ExprId {
     var fallback_by_id: ?Ast.ExprId = null;
     for (0..existing.len) |index| {
@@ -920,6 +930,7 @@ fn operandValueForSlotId(program: *const Ast.Program, existing: anytype, id: che
             .local => |local| {
                 if (program.getLocal(local).capture_id) |value_id| {
                     if (value_id == id) return operand.value;
+                    if (operand.id == id and fallback_by_id == null) fallback_by_id = operand.value;
                 } else if (operand.id == id and fallback_by_id == null) {
                     fallback_by_id = operand.value;
                 }
