@@ -38,7 +38,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "to_str")
+				(method (module-of "a") (name "to_str") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -93,7 +93,7 @@ _ = function(value)
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))

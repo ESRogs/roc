@@ -40,7 +40,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "U64")))
 			(where
-				(method (module-of "a") (name "to_u64")
+				(method (module-of "a") (name "to_u64") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "U64")))))
@@ -97,7 +97,7 @@ _ = function(value)
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "U64") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_u64")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_u64") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "U64") (builtin))))))

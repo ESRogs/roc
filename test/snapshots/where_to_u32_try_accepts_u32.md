@@ -40,7 +40,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "U32")))
 			(where
-				(method (module-of "a") (name "to_u32_try")
+				(method (module-of "a") (name "to_u32_try") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty-apply
@@ -108,7 +108,7 @@ _ = function(value)
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "U32") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_u32_try")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_u32_try") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-apply (name "Try") (builtin)
