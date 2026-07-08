@@ -10,6 +10,41 @@ delivered by LLVM for optimized builds, exactly as it is for Rust. It is the
 durable agreement; implementation slices must conform to it or change it
 explicitly first.
 
+## As-built status (2026-07)
+
+Per-chain minting is **implemented and live**, not prospective. The three pieces
+this contract once listed as "must be built" all exist: the construction-site →
+backing channel and the surface↔internal bridge are the `generatedIterator*`
+family in `postcheck/monotype/lower.zig` (a minted nominal reuses the public
+`Iter` definition for unification/error boundaries while `def.generated` — a
+digest of `(kind, item, component types)` — separates its identity; see
+`generatedIteratorType`, `generatedIteratorContent`), and the widening cap is the
+depth backstop `max_minted_iterator_chain_depth = 16` (`generatedIteratorType`,
+with the bounded structural walk `mintedIteratorChainDepth`). The adapter
+zero-allocation rows in `eval_iter_alloc_tests.zig` — `range map fold`,
+`keep_if`, `drop_if`, `take_first`, `drop_first`, `concat`, `append`, and the
+`for`-loop-driver rows — are **green** across interpreter/dev/wasm. The Rocci
+Bird `.iter()` `--opt=size` build boots and plays identically to the direct-list
+build; its size premium is not yet ≈0 (fusion, the optional pass below, has not
+been built), so premium-tracking remains open.
+
+The runtime shape is a `{ len_if_known, step }` minted nominal where `step` is
+the adapter's inline closure (kept inline, not erased to a boxed callable);
+`Iter.next(it)` lowers to `it.step()` (`lowerGeneratedIteratorNextData`); and a
+`for` over a minted chain lowers to an explicit `.loop_` whose body matches
+`step()`'s `One`/`Skip`/`Done` and threads the successor `rest` as the loop's
+iterator state (`lowerIteratorFor`). The step closure carries the adapter's
+per-instance state as its captures; after spec_constr inlines a step, the lifted
+capture operands are re-derived by `recomputeCaptures` → `operandValueForSlotId`,
+which must key an operand to a slot by its declared CaptureId when the operand's
+value-local carries a different one (the successor `rest` re-fed into an
+inner-iterator slot) — see that function's contract. Known open edges are tracked
+outside this doc: `for`-consumed carts hang on the non-optimizing `--opt=dev`
+backend (a backend drive/RC issue, not the representation), and
+`iter.concat(Iter.single(x))` / nested concat need the bounded-union-at-merges
+representation (below) for two differently-typed minted iterators combined by
+value.
+
 ## Goals and Non-Goals
 
 Goal: **every bounded iterator compiles to zero heap allocations, in every
@@ -227,33 +262,33 @@ source-verified — the runtime allocation count is the only acceptance evidence
    read "green" while iterators still allocated (`range map fold` = 18 with the
    differential passing). Only the runtime allocation count is acceptance.
 
-## The three new pieces minting requires
+## The three pieces minting required (all built)
 
-The representation is verified feasible (make-or-break resolved: consumers *do*
-specialize per concrete nominal — `type.zig:942`, `Builtin.roc:2864` — and the
-box breaks at `store.zig:1061` for distinct nominals). Three pieces do not exist
-today and must be built:
+The representation was verified feasible (consumers *do* specialize per concrete
+nominal — `type.zig:942`, `Builtin.roc` `collect` where-bound — and the box breaks
+at `store.zig:1061` for distinct nominals) and all three enabling pieces now
+exist:
 
-- **The construction-site → backing channel** (at `callResultMonoType`,
-  `monotype/lower.zig:14316`) — the single most load-bearing piece; minting is
-  inert without it. Today a nominal's backing is a pure function of `(declaration,
-  args)` (`lowerNominalBackingType`, `:2126`), so `make()` returning `Iter(U64)`
-  carries the declaration's backing, not the concrete chain. The channel
-  substitutes the minted nominal as the call's result monotype.
-- **The surface↔internal bridge** — a one-directional coercion so an internal
-  nominal (`MapIter`) satisfies a surface `Iter(b)` position, since the two are
-  distinct non-unifying identities (`type.zig:942`) and the surface `map : … ->
-  Iter(b)` is frozen (`Builtin.roc:2800`). Invariant 1 holds; the coercion is
+- **The construction-site → backing channel** — a minted nominal is substituted
+  as a builtin iterator call's result monotype in the `generatedIterator*` family
+  (`monotype/lower.zig`): `generatedIteratorType` mints/deduplicates a per-chain
+  nominal keyed on `generatedIteratorDigest(kind, item, components)`, and
+  `generatedIteratorContent`/`generatedIteratorBackingType` build its `{len, step}`
+  backing with the recursive `rest` rewritten from the public `Iter` to the minted
+  self-type. Without this a nominal's backing would be a pure function of
+  `(declaration, args)` and `make()` returning `Iter(U64)` would carry the
+  declaration's backing, not the concrete chain.
+- **The surface↔internal bridge** — the minted nominal reuses the public `Iter`
+  definition (so it satisfies a surface `Iter(b)` position for unification and
+  error boundaries) while `def.generated` separates its layout identity from the
+  public recursive `Iter` and from sibling chains. Invariant 1 holds; the split is
   entirely internal.
-- **The widening cap** (above).
+- **The widening cap** (above) — the `max_minted_iterator_chain_depth = 16`
+  backstop.
 
-De-risk the channel first, as an empirical spike: hard-code the channel for
-`Iter.map` on a `RangeIter` receiver and confirm the `range map fold` row
-(`eval_iter_alloc_tests.zig:44`, currently RED) flips to 0 allocations. That one
-row going green is the whole approach made physical. If it cannot be greened by
-the channel alone, the contingency is Option A (relax Invariant 1 toward Rust's
-surface type-family) or Option B (accept the box for escaping adapter chains) —
-an owner decision.
+The de-risking spike is long past: the `range map fold` row and every other
+adapter row in `eval_iter_alloc_tests.zig` are green at 0 allocations, and the
+Rocci `.iter()` build boots and plays.
 
 ## Acceptance
 
@@ -283,10 +318,13 @@ in the core.
 
 ## Baseline
 
-Per-chain minting is the target representation. Base `range fold` is zero-alloc
-today (Slice 1, commit `4c391bee43`, kept the base step inline); the two adapter
-rows are the live RED gate. The demand-driven sparse-private-callable machinery
-was dropped when origin/main's postcheck rewrite was merged; main's spec_constr
-survives as the substrate for the *optional* fusion pass. Rocci's `.iter()` build
-may not compile until minting lands; making it build (and play) at zero allocation
-is the correctness gate owned by the new representation.
+Per-chain minting is the delivered representation. Base `range fold` is zero-alloc
+(Slice 1, commit `4c391bee43`, kept the base step inline) and the adapter rows are
+green — the RED gate was closed as minting landed. The demand-driven
+sparse-private-callable machinery was dropped when origin/main's postcheck rewrite
+was merged; main's spec_constr survives as the substrate for the *optional* fusion
+pass, and its inline-then-recompute-captures path is where the `for`-driver capture
+join (`operandValueForSlotId`) must route each step's successor `rest`. Rocci's
+`.iter()` build compiles, boots, and plays at zero adapter allocation; the
+remaining size premium over the direct-list build is the fusion pass's target, not
+the representation's.
