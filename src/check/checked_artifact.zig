@@ -459,6 +459,7 @@ pub const CompileTimeFinalizer = struct {
         MmapFailed,
         MprotectFailed,
         UnsupportedPlatform,
+        UnwindRegistrationFailed,
         VirtualAllocFailed,
         VirtualProtectFailed,
     };

@@ -301,9 +301,6 @@ fn allocateBytes(allocator: Allocator, len: usize, alignment: usize) ?[*]u8 {
 fn hostBytesAllocator(allocator: Allocator) Allocator {
     return switch (@import("builtin").target.os.tag) {
         .freestanding => std.heap.wasm_allocator,
-        // Windows stack-capturing allocators need registered unwind metadata
-        // for every JIT frame. The dev-backend JIT does not publish that yet.
-        .windows => std.heap.smp_allocator,
         else => allocator,
     };
 }
