@@ -482,16 +482,20 @@ test "hoisted list constants lower to internal static data" {
     );
     defer static_data_exports.deinitProvidedDataExports(gpa, exports);
 
-    const expected_symbol = try lir.Program.staticDataSymbolName(gpa, @enumFromInt(0));
-    defer gpa.free(expected_symbol);
-    for (exports) |static_export| {
-        if (!std.mem.eql(u8, static_export.symbol_name, expected_symbol)) continue;
+    for (lowered.lir_result.static_data_values.items, 0..) |_, index| {
+        const static_data_id: lir.LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(index)));
+        const expected_symbol = try lir.Program.staticDataSymbolName(gpa, static_data_id);
+        defer gpa.free(expected_symbol);
 
-        try std.testing.expect(static_export.bytes.len != 0);
-        try std.testing.expect(static_export.alignment != 0);
-        try std.testing.expect(static_export.is_global);
-        try std.testing.expect(!static_export.is_exported);
-        return;
+        for (exports) |static_export| {
+            if (!std.mem.eql(u8, static_export.symbol_name, expected_symbol)) continue;
+
+            try std.testing.expect(static_export.bytes.len != 0);
+            try std.testing.expect(static_export.alignment != 0);
+            try std.testing.expect(static_export.is_global);
+            try std.testing.expect(!static_export.is_exported);
+            return;
+        }
     }
     return error.StaticDataSymbolNotFound;
 }
