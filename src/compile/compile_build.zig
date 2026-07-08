@@ -29,7 +29,7 @@ const Mode = compile_package.Mode;
 const Allocator = std.mem.Allocator;
 
 /// The set of errors that can occur during a build (including `roc check`).
-pub const BuildError = Allocator.Error || std.Thread.SpawnError || error{ ExpectedPlatformString, ExpectedString, FileNotFound, AccessDenied, StreamTooLong, IoError, InvalidNullByteInPath, PathOutsideWorkspace, UnsupportedHeader, Internal, DownloadFailed, FileError, InvalidUrl, NoCacheDir, NoPackageSource, UnsupportedBuiltinAnnotationOnly, BuiltinLowLevelAnnotationMustBeFunction, LowLevelOperationsNotFound, InvalidDependency };
+pub const BuildError = Allocator.Error || std.Thread.SpawnError || error{ ExpectedPlatformString, ExpectedString, FileNotFound, AccessDenied, StreamTooLong, IoError, InvalidNullByteInPath, PathOutsideWorkspace, UnsupportedHeader, Internal, DownloadFailed, FileError, InvalidUrl, NoCacheDir, NoPackageSource, UnsupportedBuiltinAnnotationOnly, BuiltinLowLevelAnnotationMustBeFunction, LowLevelOperationsNotFound, InvalidDependency, MissingFilesDirectory, MissingTargetFile };
 /// Errors that can occur while initializing build inputs.
 pub const InitError = Allocator.Error || BuiltinModules.InitError;
 /// Errors that can occur while compiling discovered modules.
@@ -651,6 +651,7 @@ pub const BuildEnv = struct {
                 header_info.targets_config = null; // Prevent double-free in deinit
                 if (header_info.kind == .platform) {
                     self.moveHeaderExposesToPackage(pkg, &header_info);
+                    try self.validateDiscoveredPlatformTargetFiles(pkg.root_file, pkg.root_dir, pkg.targets_config);
                 }
             }
         }
@@ -1944,6 +1945,7 @@ pub const BuildEnv = struct {
                 if (plat_pkg.exposes.items.len == 0) {
                     self.moveHeaderExposesToPackage(plat_pkg, &child_info);
                 }
+                try self.validateDiscoveredPlatformTargetFiles(plat_pkg.root_file, plat_pkg.root_dir, plat_pkg.targets_config);
             }
         }
 
@@ -2012,6 +2014,90 @@ pub const BuildEnv = struct {
         // Route through OrderedSink with a stable fully-qualified identity so it participates in ordering.
         // We use "workspace:root" as the fq module identity.
         try self.sink.emitReport("workspace", "root", rep);
+    }
+
+    fn makeWorkspaceReportsDrainable(self: *BuildEnv) Allocator.Error!void {
+        try self.sink.buildOrder(&[_][]const u8{"workspace"}, &[_][]const u8{"root"}, &[_]u32{0});
+        self.sink.tryEmit();
+    }
+
+    fn validateDiscoveredPlatformTargetFiles(
+        self: *BuildEnv,
+        platform_source_path: []const u8,
+        platform_dir: []const u8,
+        maybe_targets_config: ?targets_config_mod.TargetsConfig,
+    ) BuildError!void {
+        const targets_config = maybe_targets_config orelse return;
+        const validation = try targets_config.validateDeclaredTargetFilesExist(self.gpa, self.filesystem.std_io, platform_dir);
+        defer validation.deinit(self.gpa);
+
+        if (!validation.hasErrors()) return;
+
+        for (validation.issues) |issue| {
+            switch (issue) {
+                .missing_inputs_directory => |info| try self.emitMissingTargetInputsDirectoryReport(platform_source_path, info),
+                .missing_target_file => |info| try self.emitMissingTargetFileReport(platform_source_path, info),
+            }
+        }
+
+        try self.makeWorkspaceReportsDrainable();
+        if (validation.hasMissingInputsDirectory()) {
+            return error.MissingFilesDirectory;
+        }
+        return error.MissingTargetFile;
+    }
+
+    fn emitMissingTargetInputsDirectoryReport(
+        self: *BuildEnv,
+        platform_source_path: []const u8,
+        info: anytype,
+    ) Allocator.Error!void {
+        const headline = try std.fmt.allocPrint(
+            self.gpa,
+            "The platform targets configuration uses inputs directory `{s}`, but that directory does not exist.",
+            .{info.inputs_dir},
+        );
+        defer self.gpa.free(headline);
+
+        var report = try Report.init(self.gpa, "Missing Files Directory", headline, .runtime_error);
+        try report.document.addText("Platform: ");
+        try report.document.addAnnotated(platform_source_path, .path);
+        try report.document.addLineBreak();
+        try report.document.addText("Expected directory: ");
+        try report.document.addAnnotated(info.expected_path, .path);
+        try report.document.addLineBreak();
+        try report.document.addLineBreak();
+        try report.document.addText("Create this directory or update the platform `targets` section. Builds cannot proceed until declared target inputs exist.");
+
+        try self.sink.emitReport("workspace", "root", report);
+    }
+
+    fn emitMissingTargetFileReport(
+        self: *BuildEnv,
+        platform_source_path: []const u8,
+        info: anytype,
+    ) Allocator.Error!void {
+        const headline = try std.fmt.allocPrint(
+            self.gpa,
+            "The platform targets configuration declares `{s}` for {s}, but that file does not exist.",
+            .{ info.file_path, @tagName(info.target) },
+        );
+        defer self.gpa.free(headline);
+
+        var report = try Report.init(self.gpa, "Missing Target File", headline, .runtime_error);
+        try report.document.addText("Platform: ");
+        try report.document.addAnnotated(platform_source_path, .path);
+        try report.document.addLineBreak();
+        try report.document.addText("Target output: ");
+        try report.document.addAnnotated(@tagName(info.output), .emphasized);
+        try report.document.addLineBreak();
+        try report.document.addText("Expected file: ");
+        try report.document.addAnnotated(info.expected_full_path, .path);
+        try report.document.addLineBreak();
+        try report.document.addLineBreak();
+        try report.document.addText("Every file listed in the platform `targets` section is checked, regardless of `--target`. Add the file or remove it from the target config before building.");
+
+        try self.sink.emitReport("workspace", "root", report);
     }
 
     fn resolvePlatformTargetConfigConstants(self: *BuildEnv) Allocator.Error!void {
