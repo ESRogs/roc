@@ -10325,17 +10325,18 @@ const CheckedBodyPayloadCopier = struct {
         has_suffix: bool,
     ) Allocator.Error!?CheckedExprData {
         return switch (builtin_nominal) {
-            .u8 => exactUnsignedIntLiteral(u8, module_env, literal, .u8),
-            .u16 => exactUnsignedIntLiteral(u16, module_env, literal, .u16),
-            .u32 => exactUnsignedIntLiteral(u32, module_env, literal, .u32),
-            .u64 => exactUnsignedIntLiteral(u64, module_env, literal, .u64),
-            .u128 => exactUnsignedIntLiteral(u128, module_env, literal, .u128),
-            .i8 => exactSignedIntLiteral(i8, module_env, literal, .i8),
-            .i16 => exactSignedIntLiteral(i16, module_env, literal, .i16),
-            .i32 => exactSignedIntLiteral(i32, module_env, literal, .i32),
-            .i64 => exactSignedIntLiteral(i64, module_env, literal, .i64),
-            .i128 => exactSignedIntLiteral(i128, module_env, literal, .i128),
+            .u8 => if (literal.isMaterialized()) exactUnsignedIntLiteral(u8, module_env, literal, .u8) else null,
+            .u16 => if (literal.isMaterialized()) exactUnsignedIntLiteral(u16, module_env, literal, .u16) else null,
+            .u32 => if (literal.isMaterialized()) exactUnsignedIntLiteral(u32, module_env, literal, .u32) else null,
+            .u64 => if (literal.isMaterialized()) exactUnsignedIntLiteral(u64, module_env, literal, .u64) else null,
+            .u128 => if (literal.isMaterialized()) exactUnsignedIntLiteral(u128, module_env, literal, .u128) else null,
+            .i8 => if (literal.isMaterialized()) exactSignedIntLiteral(i8, module_env, literal, .i8) else null,
+            .i16 => if (literal.isMaterialized()) exactSignedIntLiteral(i16, module_env, literal, .i16) else null,
+            .i32 => if (literal.isMaterialized()) exactSignedIntLiteral(i32, module_env, literal, .i32) else null,
+            .i64 => if (literal.isMaterialized()) exactSignedIntLiteral(i64, module_env, literal, .i64) else null,
+            .i128 => if (literal.isMaterialized()) exactSignedIntLiteral(i128, module_env, literal, .i128) else null,
             .f32 => blk: {
+                if (!literal.isMaterialized()) break :blk null;
                 const text = try numeralLiteralDecimalText(allocator, module_env, literal);
                 defer allocator.free(text);
                 break :blk if (std.fmt.parseFloat(f32, text)) |value|
@@ -10344,6 +10345,7 @@ const CheckedBodyPayloadCopier = struct {
                     null;
             },
             .f64 => blk: {
+                if (!literal.isMaterialized()) break :blk null;
                 const text = try numeralLiteralDecimalText(allocator, module_env, literal);
                 defer allocator.free(text);
                 break :blk if (std.fmt.parseFloat(f64, text)) |value|
@@ -10351,12 +10353,17 @@ const CheckedBodyPayloadCopier = struct {
                 else |_|
                     null;
             },
-            .dec => if (exactDecLiteral(module_env, literal)) |value|
-                .{ .dec = .{ .value = value, .has_suffix = has_suffix } }
-            else if (!has_suffix)
-                .{ .dec = .{ .value = if (literal.isNegative()) builtins.dec.RocDec.min else builtins.dec.RocDec.max, .has_suffix = has_suffix } }
-            else
-                null,
+            .dec => blk: {
+                if (literal.isMaterialized()) {
+                    if (exactDecLiteral(module_env, literal)) |value| {
+                        break :blk .{ .dec = .{ .value = value, .has_suffix = has_suffix } };
+                    }
+                }
+                break :blk if (!has_suffix)
+                    .{ .dec = .{ .value = if (literal.isNegative()) builtins.dec.RocDec.min else builtins.dec.RocDec.max, .has_suffix = has_suffix } }
+                else
+                    null;
+            },
             .bool,
             .str,
             .list,
@@ -10420,7 +10427,7 @@ const CheckedBodyPayloadCopier = struct {
         const after = base256BytesToU128(module_env.numeralDigitsAfter(literal)) orelse return null;
 
         const before_scaled = checkedMulU128(before, @intCast(builtins.dec.RocDec.one_point_zero_i128)) orelse return null;
-        const after_scale = pow10U128(decimal_places - after_count);
+        const after_scale = pow10U128(@intCast(decimal_places - after_count));
         const after_scaled = checkedMulU128(after, after_scale) orelse return null;
         const magnitude = checkedAddU128(before_scaled, after_scaled) orelse return null;
 
@@ -11323,6 +11330,9 @@ pub fn numeralLiteralDecimalText(
     module_env: *const ModuleEnv,
     literal: ModuleEnv.NumeralLiteral,
 ) Allocator.Error![]const u8 {
+    if (!literal.isMaterialized()) {
+        checkedArtifactInvariant("checked numeral literal decimal text requested for unmaterialized numeral", .{});
+    }
     const before = try base256DecimalText(allocator, module_env.numeralDigitsBefore(literal), 1);
     defer allocator.free(before);
 
@@ -30697,8 +30707,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xD3, 0xF0, 0xAA, 0x52, 0x73, 0xD5, 0x9E, 0xB4, 0xA8, 0xC2, 0x04, 0xBE, 0x69, 0x16, 0xF9, 0x49,
-        0xE5, 0x98, 0x09, 0xFF, 0xE0, 0xEB, 0x37, 0x30, 0x3E, 0xC3, 0xDB, 0xEF, 0x94, 0x24, 0x15, 0xC7,
+        0xEA, 0x31, 0x84, 0x44, 0x89, 0x4C, 0xA7, 0x26, 0xD1, 0xA7, 0xF7, 0x89, 0xEA, 0xC7, 0xA6, 0x96,
+        0x1F, 0x02, 0x44, 0xBC, 0x80, 0x6C, 0xD7, 0x32, 0xB5, 0x41, 0xB8, 0x05, 0x2A, 0x55, 0x1E, 0xA3,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
