@@ -77,6 +77,19 @@ pub const tests = [_]TestCase{
         .source = "if Iter.fold(Iter.append(Iter.exclusive_range(0.U64, 5), 5), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
+    .{
+        // concat over a `single` combines two differently-typed minted iterators
+        // by value; `single`'s successor and concat's exhausted first must each
+        // keep one monomorphic type, else the chain is un-representable flat.
+        .name = "iter alloc: range concat single fold is zero-alloc",
+        .source = "if Iter.fold(Iter.concat(Iter.exclusive_range(0.U64, 3), Iter.single(9)), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
+    .{
+        .name = "iter alloc: range single fold is zero-alloc",
+        .source = "if Iter.fold(Iter.single(7.U64), 0.U64, |a, b| a + b) == 7 { \"ok\" } else { \"bad\" }",
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
+    },
 
     // --- `for`-loop driver over a minted chain. A `for` sinks the consuming
     // loop into the chain and rebases the step's inline captures; the append

@@ -2740,10 +2740,27 @@ Builtin :: [].{
 		## expect Iter.fold(Iter.single(42.I64), [], |acc, item| acc.append(item)) == [42]
 		## ```
 		single : item -> Iter(item)
-		single = |item| iter_from_step(
-			Known(1),
-			|| One({ item, rest: range_done() }),
-		)
+		single = |item| {
+			# The post-item empty state is a `pending = Bool.False` value of this
+			# same iterator rather than the distinct `range_done` type, so the
+			# `rest` a consumer holds by value keeps one monomorphic type.
+			make = |pending|
+				iter_from_step(
+					if pending {
+						Known(1)
+					} else {
+						Known(0)
+					},
+					||
+						if pending {
+							One({ item, rest: make(Bool.False) })
+						} else {
+							Done
+						},
+				)
+
+			make(Bool.True)
+		}
 
 		## Returns an iterator that yields the given item first, followed by
 		## everything the given iterator yields.
@@ -2784,12 +2801,17 @@ Builtin :: [].{
 						Unknown => Unknown
 					},
 					||
+						# Once `remaining_first` is exhausted it is kept (not swapped
+						# for `range_done()`) so `make`'s inner-iterator argument keeps
+						# a single monomorphic type for the whole chain. An exhausted
+						# iterator reports length 0 and its `next` stays `Done`, so this
+						# is length- and result-equivalent.
 						match Iter.next(remaining_first) {
 							Done =>
 								match Iter.next(remaining_second) {
 									Done => Done
-									Skip({ rest }) => Skip({ rest: make(range_done(), rest) })
-									One({ item, rest }) => One({ item, rest: make(range_done(), rest) })
+									Skip({ rest }) => Skip({ rest: make(remaining_first, rest) })
+									One({ item, rest }) => One({ item, rest: make(remaining_first, rest) })
 								}
 							Skip({ rest }) => Skip({ rest: make(rest, remaining_second) })
 							One({ item, rest }) => One({ item, rest: make(rest, remaining_second) })
