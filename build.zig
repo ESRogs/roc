@@ -3592,6 +3592,20 @@ pub fn build(b: *std.Build) void {
         build_wasm_str_concat_join_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_str_concat_join_app.step);
 
+        // End-to-end cart gate for the minted-iterator `for`-loop drive on the
+        // `--opt=size` (LLVM) build path — the path the eval-backend gates do
+        // not exercise and where the Rocci boot regression hid.
+        const build_wasm_iter_for_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_for_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_static_lib_app.wasm",
+        });
+        build_wasm_iter_for_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_app.step);
+
         const build_wasm_rc_cleanup_app = b.addRunArtifact(roc_exe);
         build_wasm_rc_cleanup_app.addArgs(&.{
             "build",
@@ -3699,6 +3713,22 @@ pub fn build(b: *std.Build) void {
             });
             run_wasm_str_concat_join_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_str_concat_join_test.step);
+
+            // Boot-and-play the minted-iterator `for`-loop cart; "ok" means every
+            // inlined `for` over append/map/concat/chained minted chains ran to
+            // completion with correct sums (i.e. the drive advanced its inner
+            // iterators and terminated). `--assert-alloc-balanced` also catches a
+            // per-step allocate/free leak in the drive.
+            const run_wasm_iter_for_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_for_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+            });
+            run_wasm_iter_for_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_test.step);
 
             const run_wasm_rc_cleanup_test = b.addRunArtifact(wasm_test_exe);
             run_wasm_rc_cleanup_test.addArgs(&.{
