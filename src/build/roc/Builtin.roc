@@ -2801,11 +2801,11 @@ Builtin :: [].{
 						Unknown => Unknown
 					},
 					||
-						# Once `remaining_first` is exhausted it is kept (not swapped
-						# for `range_done()`) so `make`'s inner-iterator argument keeps
-						# a single monomorphic type for the whole chain. An exhausted
-						# iterator reports length 0 and its `next` stays `Done`, so this
-						# is length- and result-equivalent.
+					# Once `remaining_first` is exhausted it is kept (not swapped
+					# for `range_done()`) so `make`'s inner-iterator argument keeps
+					# a single monomorphic type for the whole chain. An exhausted
+					# iterator reports length 0 and its `next` stays `Done`, so this
+					# is length- and result-equivalent.
 						match Iter.next(remaining_first) {
 							Done =>
 								match Iter.next(remaining_second) {
