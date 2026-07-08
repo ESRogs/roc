@@ -3835,6 +3835,14 @@ pub const CheckedTypeStore = struct {
             }
         }
 
+        // Self-containment (issue #9983 / Option A): the published declaration
+        // table so far holds only THIS module's own declarations. Standalone
+        // consumers (glue) read an artifact without loading the declaring
+        // module's artifact, so embed a copy of every imported nominal
+        // declaration reachable from the published types, keyed by stable
+        // content identity.
+        try embedReachableImportedNominalDecls(allocator, &store, names, import_views);
+
         const source_type_roots = try sourceTypeRootsFromIndex(allocator, &active);
         errdefer allocator.free(source_type_roots);
 
@@ -5557,6 +5565,112 @@ fn checkedNominalRecordFieldSliceEql(a: []const CheckedNominalRecordField, b: []
         }
     }
     return true;
+}
+
+const OwnerNominalDecl = struct {
+    view: ImportedModuleView,
+    decl: CheckedNominalDeclaration,
+};
+
+/// Find the imported artifact view + declaration for a nominal by stable
+/// content identity (origin module hash) and declared type-name text. This is
+/// the same identity-directed resolution `importedNominalDeclarationRefForSourceNominal`
+/// uses; returns null when no owner view carries the declaration (a local
+/// declaration, or an owner not present at publication).
+fn ownerViewAndDeclForNominal(
+    imports: CheckedImportViews,
+    origin_hash: *const [32]u8,
+    type_text: []const u8,
+) ?OwnerNominalDecl {
+    for (imports.direct) |import| {
+        if (!importedViewIdentityMatches(import.view, origin_hash)) continue;
+        for (import.view.checked_types.nominal_declarations) |decl| {
+            if (Ident.textEql(import.view.canonical_names.typeNameText(decl.nominal.type_name), type_text)) {
+                return .{ .view = import.view, .decl = decl };
+            }
+        }
+    }
+    for (imports.available) |view| {
+        if (!importedViewIdentityMatches(view, origin_hash)) continue;
+        for (view.checked_types.nominal_declarations) |decl| {
+            if (Ident.textEql(view.canonical_names.typeNameText(decl.nominal.type_name), type_text)) {
+                return .{ .view = view, .decl = decl };
+            }
+        }
+    }
+    return null;
+}
+
+/// Project one imported nominal declaration (its declaration-root nominal
+/// payload, backing template, formals, declared record fields, and padding)
+/// from its owner view into `store`, and register it in the local declaration
+/// table. `appendCheckedNominalDeclarationFromPayload` deduplicates by content
+/// key and asserts equal-key-equal-content, so a redundant call is a no-op.
+fn embedOneImportedNominalDecl(
+    allocator: Allocator,
+    store: *CheckedTypeStore,
+    names: *canonical.CanonicalNameStore,
+    owner_view: ImportedModuleView,
+    owner_decl: CheckedNominalDeclaration,
+) Allocator.Error!void {
+    var projector = CheckedTypeStoreImportProjector.init(allocator, store, names, owner_view);
+    defer projector.deinit();
+
+    const local_root = try projector.project(owner_decl.declaration_root);
+
+    const owner_fields = owner_decl.declaredRecordFields(&owner_view.checked_types);
+    const local_fields = if (owner_fields.len == 0) &[_]CheckedNominalRecordField{} else blk: {
+        const out = try allocator.alloc(CheckedNominalRecordField, owner_fields.len);
+        errdefer allocator.free(out);
+        for (owner_fields, out) |owner_field, *local_field| {
+            local_field.* = switch (owner_field) {
+                .named => |label| .{ .named = try projector.remapRecordField(label) },
+                .padding => |ty| .{ .padding = try projector.project(ty) },
+            };
+        }
+        break :blk out;
+    };
+    defer if (local_fields.len != 0) allocator.free(local_fields);
+
+    try appendCheckedNominalDeclarationFromPayload(allocator, store, local_root, local_fields);
+}
+
+/// Ensure the artifact's declaration table holds a copy of every IMPORTED
+/// nominal declaration reachable from the published checked types (see the
+/// call site in `fromModule` for why). Fixpoint over `store.payloads`:
+/// projecting a backing can surface further imported nominals (e.g. an opaque
+/// whose backing uses `List`); those are appended and scanned in turn, so a
+/// single forward scan that re-reads the length reaches the transitive closure.
+fn embedReachableImportedNominalDecls(
+    allocator: Allocator,
+    store: *CheckedTypeStore,
+    names: *canonical.CanonicalNameStore,
+    imports: CheckedImportViews,
+) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < store.payloads.items.len) : (i += 1) {
+        // Read only scalar identity fields: the payload's slice fields alias
+        // pools that projection below can reallocate.
+        const origin_module, const type_name, const source_decl = switch (store.payloads.items[i]) {
+            .nominal => |nominal| .{ nominal.origin_module, nominal.name, nominal.source_decl },
+            else => continue,
+        };
+
+        const key = canonical.NominalTypeKey{
+            .module = origin_module,
+            .type_name = type_name,
+            .source_decl = source_decl,
+        };
+        // Already declared locally (this module's own declaration) or already
+        // embedded on an earlier iteration.
+        if (store.nominalDeclaration(key) != null) continue;
+
+        const origin_hash = names.moduleIdentityBytes(origin_module);
+        const type_text = names.typeNameText(type_name);
+        const owner = ownerViewAndDeclForNominal(imports, origin_hash, type_text) orelse continue;
+
+        try embedOneImportedNominalDecl(allocator, store, names, owner.view, owner.decl);
+    }
 }
 
 fn substitutedCheckedTypeKey(

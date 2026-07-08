@@ -10,6 +10,7 @@ const layout = @import("layout");
 
 const CheckedArtifact = check.CheckedArtifact;
 const CanonicalNameStore = check.CanonicalNames.CanonicalNameStore;
+const NominalTypeKey = check.CanonicalNames.NominalTypeKey;
 const Idx = layout.Idx;
 const Store = layout.Store;
 const Graph = layout.Graph;
@@ -39,16 +40,71 @@ const TypeKey = struct {
 const BuildState = struct {
     graph: Graph = .{},
     refs_by_type: std.AutoHashMap(TypeKey, GraphRef),
+    /// Formal->arg layout bindings for the declaration opening in flight
+    /// (issue #9983): a nominal application carries no backing, so its layout
+    /// is the declaration's backing TEMPLATE with the application's arg layouts
+    /// bound to the declaration's formals. Non-empty only mid-opening; while
+    /// non-empty, ordinary caching is disabled (the graph is binding-specific).
+    /// LAZY formal->arg bindings: a formal maps to the ARGUMENT CHECKED TYPE
+    /// (not a pre-resolved layout ref), which `buildRefForType` resolves in the
+    /// CONTEXT where the formal is used. An argument may be a rigid (a
+    /// polymorphic use) reachable only through heap-indirect positions in the
+    /// backing (e.g. a boxed opaque); resolving it eagerly in `.ordinary`
+    /// context would wrongly fail, but resolving it lazily at the box payload's
+    /// `.heap_indirect` position yields `opaque_ptr`. Non-empty only
+    /// mid-opening; while non-empty, ordinary caching is disabled.
+    template_bindings: std.AutoHashMap(TypeKey, BoundArg),
+    /// Openings on the stack, so a recursive template reference to the same
+    /// declaration at the same resolved args closes on the in-progress
+    /// placeholder instead of recursing forever.
+    active_opens: std.ArrayList(ActiveOpen) = .empty,
+
+    const BoundArg = struct {
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+    };
+
+    const ActiveOpen = struct {
+        artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
+        source_statement: u32,
+        arg_keys: []const TypeKey,
+        placeholder: GraphRef,
+    };
 
     fn init(allocator: std.mem.Allocator) BuildState {
-        return .{ .refs_by_type = std.AutoHashMap(TypeKey, GraphRef).init(allocator) };
+        return .{
+            .refs_by_type = std.AutoHashMap(TypeKey, GraphRef).init(allocator),
+            .template_bindings = std.AutoHashMap(TypeKey, BoundArg).init(allocator),
+        };
     }
 
     fn deinit(self: *BuildState, allocator: std.mem.Allocator) void {
         self.graph.deinit(allocator);
         self.refs_by_type.deinit();
+        self.template_bindings.deinit();
+        for (self.active_opens.items) |open| allocator.free(open.arg_keys);
+        self.active_opens.deinit(allocator);
+    }
+
+    /// Chase the formal-binding chain to a checked type's concrete identity.
+    fn resolvedKey(self: *const BuildState, artifact_key: CheckedArtifact.CheckedModuleArtifactKey, checked_type: CheckedArtifact.CheckedTypeId) TypeKey {
+        var cur = TypeKey{ .artifact_key = artifact_key, .checked_type = checked_type };
+        while (self.template_bindings.count() != 0) {
+            const bound = self.template_bindings.get(cur) orelse break;
+            cur = .{ .artifact_key = bound.artifact.key, .checked_type = bound.checked_type };
+        }
+        return cur;
     }
 };
+
+fn typeKeysEqual(a: []const TypeKey, b: []const TypeKey) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.meta.eql(x.artifact_key, y.artifact_key)) return false;
+        if (x.checked_type != y.checked_type) return false;
+    }
+    return true;
+}
 
 const NominalDeclarationLookup = struct {
     artifact: *const CheckedArtifact.CheckedModuleArtifact,
@@ -93,6 +149,44 @@ pub const Resolver = struct {
         return layout_idx;
     }
 
+    /// A single declaration-formal -> application-argument layout binding for
+    /// `resolveWithFormalBindings`. The formal is a checked type in the artifact
+    /// that owns the declaration; the argument is a checked type in the artifact
+    /// that supplied it (they can differ across a module boundary).
+    pub const FormalArgBinding = struct {
+        formal_artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        formal: CheckedArtifact.CheckedTypeId,
+        arg_artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        arg: CheckedArtifact.CheckedTypeId,
+    };
+
+    /// Resolve a checked type whose formals should be replaced by the given
+    /// argument layouts. Used by the glue type-table builder to obtain layout
+    /// facts for a nominal declaration's backing subtypes (which reference the
+    /// declaration's formals) at a concrete application. The result is
+    /// binding-specific, so it is never entered into `canonical_cache`.
+    pub fn resolveWithFormalBindings(
+        self: *Resolver,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+        bindings: []const FormalArgBinding,
+    ) Error!Idx {
+        if (bindings.len == 0) return self.resolve(artifact, checked_type);
+
+        var build_state = BuildState.init(self.allocator);
+        defer build_state.deinit(self.allocator);
+
+        // Bind each formal to its argument CHECKED TYPE; `buildRefForType`
+        // resolves it lazily in the context where the formal is used.
+        for (bindings) |b| {
+            const formal_key = TypeKey{ .artifact_key = b.formal_artifact.key, .checked_type = b.formal };
+            try build_state.template_bindings.put(formal_key, .{ .artifact = b.arg_artifact, .checked_type = b.arg });
+        }
+
+        const root = try self.buildRefForType(artifact, checked_type, .ordinary, &build_state);
+        return try self.store.internGraph(&build_state.graph, root);
+    }
+
     fn buildRefForType(
         self: *Resolver,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
@@ -101,8 +195,18 @@ pub const Resolver = struct {
         build_state: *BuildState,
     ) Error!GraphRef {
         const key = TypeKey{ .artifact_key = artifact.key, .checked_type = checked_type };
-        if (build_state.refs_by_type.get(key)) |cached| return cached;
-        if (self.canonical_cache.get(key)) |cached| return .{ .canonical = cached };
+        const caching_enabled = build_state.template_bindings.count() == 0;
+        if (!caching_enabled) {
+            // Resolve a bound formal to its argument IN THE CURRENT CONTEXT
+            // (chaining through nested bindings), so a rigid argument reachable
+            // only through heap-indirect positions still resolves.
+            if (build_state.template_bindings.get(key)) |bound| {
+                return try self.buildRefForType(bound.artifact, bound.checked_type, parent_context, build_state);
+            }
+        } else {
+            if (build_state.refs_by_type.get(key)) |cached| return cached;
+            if (self.canonical_cache.get(key)) |cached| return .{ .canonical = cached };
+        }
 
         return switch (checkedTypePayload(artifact, checked_type)) {
             .pending => unreachable,
@@ -136,24 +240,143 @@ pub const Resolver = struct {
             return if (parent_context == .heap_indirect) .{ .canonical = .opaque_ptr } else error.UnresolvedByValue;
         }
 
+        // Self-contained artifacts embed every imported/builtin declaration
+        // they use, so resolve the declaration locally. Builtins with a
+        // dedicated layout ref were handled above; anything still without a
+        // declaration falls back to the payload backing.
+        const lookup = self.nominalDeclarationFor(artifact, nominal) orelse
+            return try self.buildNominalBackingFallback(artifact, checked_type, nominal, parent_context, build_state);
+        const decl = lookup.declaration;
+
+        // Resolve the application's args to their concrete identities (chasing
+        // any outer bindings) for the recursion key. The arg LAYOUTS are NOT
+        // built here: formals bind to the arg checked types and resolve lazily
+        // in-context during backing walking (a rigid arg used only through a
+        // heap-indirect position must not fail an eager `.ordinary` resolve).
+        const args = nominal.args;
+        const arg_keys = try self.allocator.alloc(TypeKey, args.len);
+        var arg_keys_owned = true;
+        defer if (arg_keys_owned) self.allocator.free(arg_keys);
+        for (args, arg_keys) |arg_id, *arg_key| {
+            arg_key.* = build_state.resolvedKey(artifact.key, arg_id);
+        }
+
+        // A recursive template reference denotes an in-progress opening of the
+        // same declaration at the same resolved args: close on its placeholder.
+        for (build_state.active_opens.items) |open| {
+            if (std.meta.eql(open.artifact_key, lookup.artifact.key) and
+                open.source_statement == decl.source_statement and
+                typeKeysEqual(open.arg_keys, arg_keys))
+            {
+                return open.placeholder;
+            }
+        }
+
+        const caching_enabled = build_state.template_bindings.count() == 0;
         const key = TypeKey{ .artifact_key = artifact.key, .checked_type = checked_type };
-        if (build_state.refs_by_type.get(key)) |cached| return cached;
-        if (self.canonical_cache.get(key)) |cached| return .{ .canonical = cached };
+        if (caching_enabled) {
+            if (build_state.refs_by_type.get(key)) |cached| return cached;
+            if (self.canonical_cache.get(key)) |cached| return .{ .canonical = cached };
+        }
 
         const placeholder = try build_state.graph.reserveNode(self.allocator);
         const placeholder_ref = GraphRef{ .local = placeholder };
-        try build_state.refs_by_type.put(key, placeholder_ref);
+        if (caching_enabled) try build_state.refs_by_type.put(key, placeholder_ref);
 
-        if (try self.buildDeclaredNominalRecordRef(artifact, nominal, placeholder, build_state)) {
+        try build_state.active_opens.append(self.allocator, .{
+            .artifact_key = lookup.artifact.key,
+            .source_statement = decl.source_statement,
+            .arg_keys = arg_keys,
+            .placeholder = placeholder_ref,
+        });
+        arg_keys_owned = false; // now owned by the active open
+        defer {
+            const popped = build_state.active_opens.pop().?;
+            self.allocator.free(popped.arg_keys);
+        }
+
+        // Bind the declaration's formals (in the resolving artifact) to the arg
+        // CHECKED TYPES (in the using artifact), resolved lazily in-context.
+        const formals = decl.formalArgs(&lookup.artifact.checked_types);
+        std.debug.assert(formals.len == args.len);
+        const saved_bindings = try self.allocator.alloc(?BuildState.BoundArg, formals.len);
+        defer self.allocator.free(saved_bindings);
+        const bound_formals = try self.allocator.alloc(bool, formals.len);
+        defer self.allocator.free(bound_formals);
+        for (formals, args, saved_bindings, bound_formals) |formal_id, arg_id, *saved, *bound| {
+            const formal_key = TypeKey{ .artifact_key = lookup.artifact.key, .checked_type = formal_id };
+            // A polymorphic application binds a formal to ITSELF (arg == formal,
+            // a bare rigid). Skip it: leaving the formal unbound lets it resolve
+            // as a rigid in-context (opaque_ptr through a heap-indirect position,
+            // error by-value), and avoids a self-referential binding cycle.
+            const resolved = build_state.resolvedKey(artifact.key, arg_id);
+            if (std.meta.eql(resolved.artifact_key, formal_key.artifact_key) and resolved.checked_type == formal_key.checked_type) {
+                bound.* = false;
+                continue;
+            }
+            bound.* = true;
+            saved.* = build_state.template_bindings.get(formal_key);
+            try build_state.template_bindings.put(formal_key, .{ .artifact = artifact, .checked_type = arg_id });
+        }
+        defer {
+            for (formals, saved_bindings, bound_formals) |formal_id, saved, bound| {
+                if (!bound) continue;
+                const formal_key = TypeKey{ .artifact_key = lookup.artifact.key, .checked_type = formal_id };
+                if (saved) |prev| {
+                    build_state.template_bindings.put(formal_key, prev) catch unreachable;
+                } else {
+                    _ = build_state.template_bindings.remove(formal_key);
+                }
+            }
+        }
+
+        // Declared record with padding preserves declared field order.
+        if (try self.buildDeclaredNominalRecordRef(lookup, placeholder, build_state)) {
             return placeholder_ref;
         }
 
-        const backing_ref = try self.buildRefForType(artifact, nominal.backing, parent_context, build_state);
+        const backing_ref = try self.buildRefForType(lookup.artifact, decl.backing, parent_context, build_state);
         switch (backing_ref) {
             .canonical => {
                 // `internGraph` validates every reserved node, even when the caller returns a canonical ref.
                 build_state.graph.setNode(placeholder, .{ .nominal = backing_ref });
-                try build_state.refs_by_type.put(key, backing_ref);
+                if (caching_enabled) try build_state.refs_by_type.put(key, backing_ref);
+                return backing_ref;
+            },
+            .local => |backing_node| {
+                if (backing_node == placeholder) unreachable;
+                build_state.graph.setNode(placeholder, build_state.graph.getNode(backing_node));
+                return placeholder_ref;
+            },
+        }
+    }
+
+    /// Fallback for nominals without any resolvable declaration (builtin dict/
+    /// set/crypto types): resolve the payload backing directly.
+    fn buildNominalBackingFallback(
+        self: *Resolver,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+        nominal: CheckedArtifact.CheckedNominalType,
+        parent_context: ParentContext,
+        build_state: *BuildState,
+    ) Error!GraphRef {
+        const caching_enabled = build_state.template_bindings.count() == 0;
+        const key = TypeKey{ .artifact_key = artifact.key, .checked_type = checked_type };
+        if (caching_enabled) {
+            if (build_state.refs_by_type.get(key)) |cached| return cached;
+            if (self.canonical_cache.get(key)) |cached| return .{ .canonical = cached };
+        }
+
+        const placeholder = try build_state.graph.reserveNode(self.allocator);
+        const placeholder_ref = GraphRef{ .local = placeholder };
+        if (caching_enabled) try build_state.refs_by_type.put(key, placeholder_ref);
+
+        const backing_ref = try self.buildRefForType(artifact, nominal.backing, parent_context, build_state);
+        switch (backing_ref) {
+            .canonical => {
+                build_state.graph.setNode(placeholder, .{ .nominal = backing_ref });
+                if (caching_enabled) try build_state.refs_by_type.put(key, backing_ref);
                 return backing_ref;
             },
             .local => |backing_node| {
@@ -213,19 +436,20 @@ pub const Resolver = struct {
 
     fn buildDeclaredNominalRecordRef(
         self: *Resolver,
-        artifact: *const CheckedArtifact.CheckedModuleArtifact,
-        nominal: CheckedArtifact.CheckedNominalType,
+        lookup: NominalDeclarationLookup,
         placeholder: GraphNodeId,
         build_state: *BuildState,
     ) Error!bool {
-        const lookup = self.nominalDeclarationFor(artifact, nominal) orelse return false;
         const declared_fields = lookup.declaration.declaredRecordFields(&lookup.artifact.checked_types);
         if (!hasPaddingField(declared_fields)) return false;
 
+        // The DECLARATION's backing record (in the resolving artifact): field
+        // types are the declaration's formals, resolved to the caller's arg
+        // layouts through the bindings the caller established.
         var backing_fields = std.ArrayList(CheckedArtifact.CheckedRecordField).empty;
         defer backing_fields.deinit(self.allocator);
-        try self.appendRecordRowFields(artifact, &backing_fields, nominal.backing);
-        sortRecordFieldsByName(artifact, backing_fields.items);
+        try self.appendRecordRowFields(lookup.artifact, &backing_fields, lookup.declaration.backing);
+        sortRecordFieldsByName(lookup.artifact, backing_fields.items);
 
         var graph_fields = std.ArrayList(GraphField).empty;
         defer graph_fields.deinit(self.allocator);
@@ -236,10 +460,10 @@ pub const Resolver = struct {
             switch (field) {
                 .named => |field_name_id| {
                     const field_name = lookup.artifact.canonical_names.recordFieldLabelText(field_name_id);
-                    const match = backingFieldByName(artifact, backing_fields.items, field_name) orelse unreachable;
+                    const match = backingFieldByName(lookup.artifact, backing_fields.items, field_name) orelse unreachable;
                     graph_fields.appendAssumeCapacity(.{
                         .index = match.index,
-                        .child = try self.buildRefForType(artifact, match.field.ty, .ordinary, build_state),
+                        .child = try self.buildRefForType(lookup.artifact, match.field.ty, .ordinary, build_state),
                     });
                 },
                 .padding => |padding_ty| {
@@ -436,6 +660,18 @@ pub const Resolver = struct {
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         nominal: CheckedArtifact.CheckedNominalType,
     ) ?NominalDeclarationLookup {
+        // Self-contained artifacts embed a copy of every imported/builtin
+        // nominal declaration they use, keyed by content identity. Resolve
+        // from the LOCAL table first so no owner artifact must be loaded; the
+        // representation-directed arms below remain as a fallback.
+        const local_key = NominalTypeKey{
+            .module = nominal.origin_module,
+            .type_name = nominal.name,
+            .source_decl = nominal.source_decl,
+        };
+        if (artifact.checked_types.nominalDeclaration(local_key)) |declaration| {
+            return .{ .artifact = artifact, .declaration = declaration };
+        }
         return switch (nominal.representation) {
             .local_declaration => |declaration_id| .{
                 .artifact = artifact,
