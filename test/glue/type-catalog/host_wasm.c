@@ -122,13 +122,13 @@ void roc_crashed(const uint8_t *bytes, size_t len) {
     record_failure("roc_crashed");
 }
 
-EmptyOrPairOrPayloadOrRecursiveType0 roc_catalog_roundtrip(EmptyOrPairOrPayloadOrRecursiveType0 arg0) {
+EmptyOrPairOrPayloadOrRecursive roc_catalog_roundtrip(EmptyOrPairOrPayloadOrRecursive arg0) {
     return arg0;
 }
 
 void roc_catalog_single_no_payload(void) {}
 
-CatalogPayloadType3 roc_catalog_single_payload_roundtrip(CatalogPayloadType3 arg0) {
+CatalogPayload roc_catalog_single_payload_roundtrip(CatalogPayload arg0) {
     return arg0;
 }
 
