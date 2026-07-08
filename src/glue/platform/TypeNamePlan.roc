@@ -169,7 +169,7 @@ TypeNamePlan := { table : TypeTable }.{
 		type_repr = type_table.get(type_id)
 		match type_repr {
 			RocRecord(rec) =>
-				if rec.name != "" and rec.anonymous {
+				if rec.name != "" {
 					add_alias(state, alias_base, type_id, PlainAlias)
 				} else {
 					state
@@ -194,7 +194,7 @@ TypeNamePlan := { table : TypeTable }.{
 								} else if tu.name == "IOErr" {
 									add_alias(state, "${module_base}IOErr", type_id, TagUnionAlias)
 								} else {
-									state
+									add_alias(state, alias_base, type_id, TagUnionAlias)
 								}
 
 							var $next = with_union_alias

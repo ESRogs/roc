@@ -140,6 +140,10 @@ ROC_STATIC_ASSERT(ROC_ALIGNOF(Padded) == 4, "Padded alignment mismatch");
 #endif
 
 
+// Platform Type Aliases
+
+typedef HostTree HostTreeNode;
+
 // Hosted Function Infrastructure
 
 struct RocOps;

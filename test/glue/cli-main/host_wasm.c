@@ -386,7 +386,7 @@ void roc_cli_log(RocStr arg0) {
     roc_str_decref(arg0);
 }
 
-TryType2 roc_cli_many(
+CliHostManyResult roc_cli_many(
     uint8_t arg0,
     uint16_t arg1,
     uint32_t arg2,
@@ -418,7 +418,7 @@ TryType2 roc_cli_many(
     (void)arg13;
     roc_str_decref(arg14);
     record_failure("roc_cli_many was called");
-    return (TryType2){{0}};
+    return (CliHostManyResult){{0}};
 }
 
 CliHostNamedRecord roc_cli_shape(CircleOrEmptyOrRect arg0, AnonStruct22 arg1) {
@@ -460,7 +460,7 @@ static void finish_pass(void) {
 static void run_contract(void) {
     RocList args = make_args();
     if (failure_count == 0) {
-        TryType29 result = roc_main(args);
+        MainForHostResult result = roc_main(args);
         const uint8_t tag = result.bytes[4];
         if (tag != 1) {
             record_failure("roc_main returned Err");

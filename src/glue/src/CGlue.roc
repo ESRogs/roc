@@ -9,6 +9,8 @@ import pf.AbiWidth exposing [AbiWidth]
 import pf.ArgShape exposing [ArgShape]
 import pf.GlueInput exposing [GlueInput]
 import pf.HostedFunctionInfo exposing [HostedFunctionInfo]
+import pf.TypeNamePlan exposing [TypeNamePlan]
+import pf.RecordField exposing [RecordField]
 import pf.RecordRepr exposing [RecordRepr]
 import pf.TagUnionRepr exposing [TagUnionRepr]
 import pf.ProvidesEntry exposing [ProvidesEntry]
@@ -28,14 +30,14 @@ make_glue = |types_list| {
 # TypeRepr-based C Type Mapping
 # =============================================================================
 
-type_id_to_c : TypeTable, List(Str), List(Str), U64 -> Str
-type_id_to_c = |type_table, duplicate_record_names, duplicate_tag_names, type_id| {
+type_id_to_c : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, U64 -> Str
+type_id_to_c = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, type_id| {
 	type_repr = type_table.get(type_id)
-	type_repr_to_c(type_table, duplicate_record_names, duplicate_tag_names, type_id, type_repr)
+	type_repr_to_c(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, type_id, type_repr)
 }
 
-type_repr_to_c : TypeTable, List(Str), List(Str), U64, TypeRepr -> Str
-type_repr_to_c = |type_table, duplicate_record_names, duplicate_tag_names, type_id, type_repr| {
+type_repr_to_c : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, U64, TypeRepr -> Str
+type_repr_to_c = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, type_id, type_repr| {
 	match type_repr {
 		RocBool => "bool"
 		RocBox(inner_id) =>
@@ -43,7 +45,7 @@ type_repr_to_c = |type_table, duplicate_record_names, duplicate_tag_names, type_
 				RocFunction(_) => "RocErasedCallable"
 				RocUnknown(_) => "RocBox"
 				_ => {
-					inner_c = type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, inner_id)
+					inner_c = type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, inner_id)
 					if inner_c == "void*" or inner_c == "RocBox" {
 						"RocBox"
 					} else {
@@ -73,44 +75,44 @@ type_repr_to_c = |type_table, duplicate_record_names, duplicate_tag_names, type_
 			} else {
 				record_struct_name(duplicate_record_names, type_id, rec)
 			}
-		RocTagUnion(tu) => resolve_tag_union_type_c(type_table, duplicate_record_names, duplicate_tag_names, type_id, tu)
+		RocTagUnion(tu) => resolve_tag_union_type_c(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, type_id, tu)
 		RocFunction(_) => "void*"
 		RocUnknown(_) => "void*"
 	}
 }
 
-resolve_tag_union_type_c : TypeTable, List(Str), List(Str), U64, TagUnionRepr -> Str
-resolve_tag_union_type_c = |type_table, duplicate_record_names, duplicate_tag_names, type_id, tu|
+resolve_tag_union_type_c : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, U64, TagUnionRepr -> Str
+resolve_tag_union_type_c = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, type_id, tu|
 	match TypeTable.single_variant_payload(tu) {
-		SinglePayload(payload_id) => type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, payload_id)
+		SinglePayload(payload_id) => type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, payload_id)
 		SingleNoPayload => "void"
 		NotSingleVariant =>
 			if tu.name != "" {
-				tag_union_struct_name(duplicate_tag_names, type_id, tu)
+				tag_union_struct_name(preferred_names, duplicate_tag_names, type_id, tu)
 			} else {
 				"void*"
 			}
 	}
 
-c_record_field_decl : TypeTable, List(Str), List(Str), AbiFieldLayout, AbiWidth -> Str
-c_record_field_decl = |type_table, duplicate_record_names, duplicate_tag_names, field, width| {
+c_record_field_decl : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, AbiFieldLayout, AbiWidth -> Str
+c_record_field_decl = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field, width| {
 	field_name = name_to_c_field_ident(field.name)
 	if field.is_padding {
 		# Padding fields are nonzero at both widths (asserted by the compiler).
 		"    uint8_t ${field_name}[${U64.to_str(AbiFieldLayout.size(field, width))}];\n"
 	} else {
-		c_type = type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, field.type_id)
+		c_type = type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field.type_id)
 		"    ${c_type} ${field_name};\n"
 	}
 }
 
 ## Fields arrive in committed layout order (valid at both pointer widths);
 ## only per-width padding byte counts differ between the two renderings.
-c_record_fields_decl : TypeTable, List(Str), List(Str), List(AbiFieldLayout), AbiWidth -> Str
-c_record_fields_decl = |type_table, duplicate_record_names, duplicate_tag_names, fields, width| {
+c_record_fields_decl : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, List(AbiFieldLayout), AbiWidth -> Str
+c_record_fields_decl = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, fields, width| {
 	var $field_strs = ""
 	for field in fields {
-		$field_strs = Str.concat($field_strs, c_record_field_decl(type_table, duplicate_record_names, duplicate_tag_names, field, width))
+		$field_strs = Str.concat($field_strs, c_record_field_decl(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field, width))
 	}
 	$field_strs
 }
@@ -152,8 +154,8 @@ record_struct_name = |duplicate_names, type_id, rec| {
 duplicate_tag_union_names : TypeTable -> List(Str)
 duplicate_tag_union_names = |type_table| type_table.duplicate_tag_union_names()
 
-tag_union_struct_name : List(Str), U64, TagUnionRepr -> Str
-tag_union_struct_name = |duplicate_names, type_id, tu| {
+default_tag_union_struct_name : List(Str), U64, TagUnionRepr -> Str
+default_tag_union_struct_name = |duplicate_names, type_id, tu| {
 	base = name_to_struct_name(tu.name)
 	if List.contains(duplicate_names, tu.name) {
 		"${base}Type${U64.to_str(type_id)}"
@@ -161,6 +163,244 @@ tag_union_struct_name = |duplicate_names, type_id, tu| {
 		base
 	}
 }
+
+tag_union_struct_name : TypeNamePlan.PreferredNames, List(Str), U64, TagUnionRepr -> Str
+tag_union_struct_name = |preferred_names, duplicate_names, type_id, tu| {
+	preferred = preferred_names.lookup(type_id)
+	if preferred.found {
+		preferred.name
+	} else {
+		default_tag_union_struct_name(duplicate_names, type_id, tu)
+	}
+}
+
+hosted_module_name_to_struct_name : Str -> Str
+hosted_module_name_to_struct_name = |name|
+	match List.first(Str.split_on(name, ".")) {
+		Ok(module_name) => name_to_struct_name(module_name)
+		Err(_) => {
+			crash "glue invariant violated: module name split produced no segments"
+		}
+	}
+
+generated_type_names_c : TypeTable, List(Str), List(Str) -> List(Str)
+generated_type_names_c = |type_table, duplicate_records, duplicate_tags| {
+	var $names = []
+	var $type_id = 0
+
+	for type_info in type_table.entries() {
+		match type_info.repr {
+			RocRecord(rec) =>
+				if rec.name != "" {
+					$names = $names.append(record_struct_name(duplicate_records, $type_id, rec))
+				}
+			RocTagUnion(tu) =>
+				if List.len(tu.tags) >= 2 and tu.name != "" {
+					$names = $names.append(default_tag_union_struct_name(duplicate_tags, $type_id, tu))
+				}
+			_ => {}
+		}
+
+		$type_id = $type_id + 1
+	}
+
+	$names
+}
+
+type_name_root_alias_base_c : TypeTable, Str, U64 -> Str
+type_name_root_alias_base_c = |type_table, fallback, type_id|
+	match type_table.get(type_id) {
+		RocRecord(rec) =>
+			if rec.name != "" and !rec.anonymous {
+				name_to_struct_name(rec.name)
+			} else {
+				fallback
+			}
+		RocTagUnion(tu) =>
+			if tu.name != "" and tu.name != "Try" and tu.name != "IOErr" {
+				name_to_struct_name(tu.name)
+			} else {
+				fallback
+			}
+		_ => fallback
+	}
+
+record_alias_fields_c : TypeTable, RecordRepr -> List(RecordField)
+record_alias_fields_c = |type_table, rec| {
+	var $fields = rec.fields
+	var $found = Bool.False
+
+	if rec.name != "" and !rec.anonymous {
+		for type_info in type_table.entries() {
+			match type_info.repr {
+				RocRecord(candidate) =>
+					if !$found and candidate.name == rec.name {
+						$fields = candidate.fields
+						$found = Bool.True
+					}
+				_ => {}
+			}
+		}
+	}
+
+	$fields
+}
+
+type_name_roots_c : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable -> List(TypeNamePlan.Root)
+type_name_roots_c = |hosted_functions, provides_list, type_table| {
+	var $roots = []
+
+	for func in hosted_functions {
+		base = name_to_struct_name(func.name)
+		module_base = hosted_module_name_to_struct_name(func.name)
+
+		var $arg_idx = 0
+		for arg_type_id in func.arg_type_ids {
+			arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+			$roots = $roots.append(
+				{
+					alias_base: type_name_root_alias_base_c(type_table, arg_fallback, arg_type_id),
+					module_base,
+					type_id: arg_type_id,
+				},
+			)
+			$arg_idx = $arg_idx + 1
+		}
+
+		$roots = $roots.append(
+			{
+				alias_base: base,
+				module_base,
+				type_id: func.ret_type_id,
+			},
+		)
+	}
+
+	for entry in provides_list {
+		base = name_to_struct_name(entry.name)
+		module_base = hosted_module_name_to_struct_name(entry.name)
+
+		match type_table.get(entry.type_id) {
+			RocFunction(func) => {
+				var $arg_idx = 0
+				for arg_type_id in func.args {
+					arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+					$roots = $roots.append(
+						{
+							alias_base: type_name_root_alias_base_c(type_table, arg_fallback, arg_type_id),
+							module_base,
+							type_id: arg_type_id,
+						},
+					)
+					$arg_idx = $arg_idx + 1
+				}
+
+				$roots = $roots.append(
+					{
+						alias_base: base,
+						module_base,
+						type_id: func.ret,
+					},
+				)
+			}
+			_ => {
+				$roots = $roots.append(
+					{
+						alias_base: type_name_root_alias_base_c(type_table, base, entry.type_id),
+						module_base,
+						type_id: entry.type_id,
+					},
+				)
+			}
+		}
+	}
+
+	$roots
+}
+
+append_type_alias_roots_c : List(TypeNamePlan.Root), TypeTable, Str, Str, U64, List(U64) -> List(TypeNamePlan.Root)
+append_type_alias_roots_c = |roots, type_table, alias_base, module_base, type_id, visited_type_ids| {
+	if List.contains(visited_type_ids, type_id) {
+		return roots
+	}
+
+	next_visited = visited_type_ids.append(type_id)
+	root_alias_base = type_name_root_alias_base_c(type_table, alias_base, type_id)
+
+	var $roots = roots.append({ alias_base: root_alias_base, module_base, type_id })
+
+	match type_table.get(type_id) {
+		RocRecord(rec) => {
+			for field in record_alias_fields_c(type_table, rec) {
+				field_base = "${root_alias_base}${RocName.from_str(field.name).to_pascal_clean()}"
+				$roots = append_type_alias_roots_c($roots, type_table, field_base, module_base, field.type_id, next_visited)
+			}
+			$roots
+		}
+		RocList(elem_id) => append_type_alias_roots_c($roots, type_table, root_alias_base, module_base, elem_id, next_visited)
+		RocBox(inner_id) => append_type_alias_roots_c($roots, type_table, root_alias_base, module_base, inner_id, next_visited)
+		RocTagUnion(tu) => {
+			var $next = $roots
+			for tag in tu.tags {
+				child_base = "${root_alias_base}${RocName.capitalize_first(tag.name)}"
+				for payload_id in tag.payload {
+					$next = append_type_alias_roots_c($next, type_table, child_base, module_base, payload_id, next_visited)
+				}
+			}
+			$next
+		}
+		_ => $roots
+	}
+}
+
+type_alias_roots_c : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable -> List(TypeNamePlan.Root)
+type_alias_roots_c = |hosted_functions, provides_list, type_table| {
+	var $roots = []
+
+	for func in hosted_functions {
+		base = name_to_struct_name(func.name)
+		module_base = hosted_module_name_to_struct_name(func.name)
+
+		var $arg_idx = 0
+		for arg_type_id in func.arg_type_ids {
+			arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+			$roots = append_type_alias_roots_c($roots, type_table, arg_fallback, module_base, arg_type_id, [])
+			$arg_idx = $arg_idx + 1
+		}
+
+		$roots = append_type_alias_roots_c($roots, type_table, base, module_base, func.ret_type_id, [])
+	}
+
+	for entry in provides_list {
+		base = name_to_struct_name(entry.name)
+		module_base = hosted_module_name_to_struct_name(entry.name)
+
+		match type_table.get(entry.type_id) {
+			RocFunction(func) => {
+				var $arg_idx = 0
+				for arg_type_id in func.args {
+					arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+					$roots = append_type_alias_roots_c($roots, type_table, arg_fallback, module_base, arg_type_id, [])
+					$arg_idx = $arg_idx + 1
+				}
+
+				$roots = append_type_alias_roots_c($roots, type_table, base, module_base, func.ret, [])
+			}
+			_ => {
+				$roots = append_type_alias_roots_c($roots, type_table, base, module_base, entry.type_id, [])
+			}
+		}
+	}
+
+	$roots
+}
+
+preferred_type_names_c : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable, List(Str), List(Str) -> TypeNamePlan.PreferredNames
+preferred_type_names_c = |hosted_functions, provides_list, type_table, duplicate_records, duplicate_tags|
+	TypeNamePlan.from_table(type_table).preferred_names(
+		generated_type_names_c(type_table, duplicate_records, duplicate_tags),
+		type_name_roots_c(hosted_functions, provides_list, type_table),
+	)
 
 # =============================================================================
 # Name Conversion
@@ -265,20 +505,23 @@ generate_c_header : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry) -> 
 generate_c_header = |hosted_functions, type_table, provides_list| {
 	duplicate_records = duplicate_record_names(type_table)
 	duplicate_tags = duplicate_tag_union_names(type_table)
+	preferred_names = preferred_type_names_c(hosted_functions, provides_list, type_table, duplicate_records, duplicate_tags)
 
 	defines = generate_defines(hosted_functions)
 	count = List.len(hosted_functions)
-	type_decls = generate_type_decls(type_table, duplicate_records, duplicate_tags)
-	args_structs = generate_all_args_structs(hosted_functions, type_table, duplicate_records, duplicate_tags)
+	type_decls = generate_type_decls(type_table, duplicate_records, duplicate_tags, preferred_names)
+	type_aliases = generate_platform_type_aliases_c(hosted_functions, provides_list, type_table, duplicate_records, duplicate_tags, preferred_names)
+	args_structs = generate_all_args_structs(hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names)
 	hosted_fn_fields = generate_hosted_fn_fields(hosted_functions)
-	hosted_symbol_decls = generate_hosted_symbol_decls(hosted_functions, type_table, duplicate_records, duplicate_tags)
-	provided_symbol_decls = generate_provided_symbol_decls(provides_list, type_table, duplicate_records, duplicate_tags)
+	hosted_symbol_decls = generate_hosted_symbol_decls(hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names)
+	provided_symbol_decls = generate_provided_symbol_decls(provides_list, type_table, duplicate_records, duplicate_tags, preferred_names)
 
 	header_guard_top
 		.concat(includes_section)
 		.concat(extern_c_start)
 		.concat(core_types_section)
 		.concat(type_decls)
+		.concat(type_aliases)
 		.concat(hosted_fn_infrastructure)
 		.concat(function_count_section(count))
 		.concat(defines)
@@ -309,9 +552,9 @@ generate_defines = |hosted_functions| {
 	$defines
 }
 
-generate_type_decls : TypeTable, List(Str), List(Str) -> Str
-generate_type_decls = |type_table, duplicate_records, duplicate_tags| {
-	type_definitions = generate_opaque_type_decls(type_table, duplicate_records, duplicate_tags)
+generate_type_decls : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
+generate_type_decls = |type_table, duplicate_records, duplicate_tags, preferred_names| {
+	type_definitions = generate_opaque_type_decls(type_table, duplicate_records, duplicate_tags, preferred_names)
 
 	if type_definitions == "" {
 		""
@@ -320,8 +563,8 @@ generate_type_decls = |type_table, duplicate_records, duplicate_tags| {
 	}
 }
 
-generate_opaque_type_decls : TypeTable, List(Str), List(Str) -> Str
-generate_opaque_type_decls = |type_table, duplicate_records, duplicate_tags| {
+generate_opaque_type_decls : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
+generate_opaque_type_decls = |type_table, duplicate_records, duplicate_tags, preferred_names| {
 	var $decls = ""
 	var $seen_names = []
 	var $type_id = 0
@@ -338,7 +581,7 @@ generate_opaque_type_decls = |type_table, duplicate_records, duplicate_tags| {
 				}
 			RocTagUnion(tu) =>
 				if List.len(tu.tags) >= 2 and tu.name != "" {
-					type_name = tag_union_struct_name(duplicate_tags, $type_id, tu)
+					type_name = tag_union_struct_name(preferred_names, duplicate_tags, $type_id, tu)
 					if !(List.contains($seen_names, type_name)) {
 						$seen_names = $seen_names.append(type_name)
 						$decls = Str.concat($decls, generate_opaque_type_decl(type_name, type_info.layout.size64, type_info.layout.alignment64, type_info.layout.size32, type_info.layout.alignment32))
@@ -399,25 +642,54 @@ static_asserts = |type_name, size, alignment|
 		""
 	}
 
-generate_all_args_structs : List(HostedFunctionInfo), TypeTable, List(Str), List(Str) -> Str
-generate_all_args_structs = |hosted_functions, type_table, duplicate_records, duplicate_tags| {
+add_type_alias_c : { content : Str, seen : List(Str) }, Str, Str -> { content : Str, seen : List(Str) }
+add_type_alias_c = |state, alias, target| {
+	if alias == target or List.contains(state.seen, alias) {
+		state
+	} else {
+		{
+			content: Str.concat(state.content, "typedef ${target} ${alias};\n"),
+			seen: state.seen.append(alias),
+		}
+	}
+}
+
+generate_platform_type_aliases_c : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
+generate_platform_type_aliases_c = |hosted_functions, provides_list, type_table, duplicate_records, duplicate_tags, preferred_names| {
+	var $state = { content: "", seen: generated_type_names_c(type_table, duplicate_records, duplicate_tags) }
+	name_plan = TypeNamePlan.from_table(type_table)
+
+	for plan in name_plan.alias_plan(type_alias_roots_c(hosted_functions, provides_list, type_table)) {
+		target = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, plan.type_id)
+		$state = add_type_alias_c($state, plan.alias, target)
+	}
+
+	if $state.content == "" {
+		""
+	} else {
+		section("Platform Type Aliases", $state.content)
+	}
+}
+
+generate_all_args_structs : List(HostedFunctionInfo), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
+generate_all_args_structs = |hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names| {
 	var $args_structs = ""
 	for func in hosted_functions {
-		$args_structs = Str.concat($args_structs, generate_args_struct(func, type_table, duplicate_records, duplicate_tags))
+		$args_structs = Str.concat($args_structs, generate_args_struct(func, type_table, duplicate_records, duplicate_tags, preferred_names))
 	}
 	$args_structs
 }
 
-generate_args_struct : HostedFunctionInfo, TypeTable, List(Str), List(Str) -> Str
-generate_args_struct = |func, type_table, duplicate_records, duplicate_tags| {
+generate_args_struct : HostedFunctionInfo, TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
+generate_args_struct = |func, type_table, duplicate_records, duplicate_tags, preferred_names| {
 	struct_name = name_to_struct_name(func.name)
 	arg_shape = ArgShape.from_table(type_table)
 
 	match arg_shape.hosted_args(func) {
 		NoMeaningfulArgs => ""
 		SingleRecordArg(record) => {
-			fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, record.fields, Pointer64)
-			fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, record.fields, Pointer32)
+			fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer64)
+			fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer32)
 
 			doc = doc_comment(
 				[
@@ -444,7 +716,7 @@ generate_args_struct = |func, type_table, duplicate_records, duplicate_tags| {
 			var $positional_fields = ""
 			var $idx = 0
 			for arg_type_id in arg_type_ids {
-				c_type = type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
+				c_type = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, arg_type_id)
 				$positional_fields = Str.concat($positional_fields, "    ${c_type} arg${U64.to_str($idx)};\n")
 				$idx = $idx + 1
 			}
@@ -462,14 +734,14 @@ generate_args_struct = |func, type_table, duplicate_records, duplicate_tags| {
 	}
 }
 
-direct_param_list : TypeTable, List(Str), List(Str), List(U64) -> Str
-direct_param_list = |type_table, duplicate_records, duplicate_tags, arg_type_ids| {
+direct_param_list : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, List(U64) -> Str
+direct_param_list = |type_table, duplicate_records, duplicate_tags, preferred_names, arg_type_ids| {
 	var $params = ""
 	var $idx = 0
 	arg_shape = ArgShape.from_table(type_table)
 
 	for arg_type_id in arg_shape.positional_non_unit_type_ids(arg_type_ids) {
-		arg_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
+		arg_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, arg_type_id)
 		sep = if $params == "" {
 			""
 		} else {
@@ -486,8 +758,8 @@ direct_param_list = |type_table, duplicate_records, duplicate_tags, arg_type_ids
 	}
 }
 
-direct_hosted_param_list : TypeTable, List(Str), List(Str), HostedFunctionInfo -> Str
-direct_hosted_param_list = |type_table, duplicate_records, duplicate_tags, func| {
+direct_hosted_param_list : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, HostedFunctionInfo -> Str
+direct_hosted_param_list = |type_table, duplicate_records, duplicate_tags, preferred_names, func| {
 	arg_shape = ArgShape.from_table(type_table)
 	use_args_wrapper = arg_shape.single_arg_is_anonymous_record(func.arg_type_ids)
 
@@ -498,7 +770,7 @@ direct_hosted_param_list = |type_table, duplicate_records, duplicate_tags, func|
 		arg_c = if use_args_wrapper {
 			"${name_to_struct_name(func.name)}Args"
 		} else {
-			type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
+			type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, arg_type_id)
 		}
 		sep = if $params == "" {
 			""
@@ -516,24 +788,24 @@ direct_hosted_param_list = |type_table, duplicate_records, duplicate_tags, func|
 	}
 }
 
-generate_hosted_symbol_decls : List(HostedFunctionInfo), TypeTable, List(Str), List(Str) -> Str
-generate_hosted_symbol_decls = |hosted_functions, type_table, duplicate_records, duplicate_tags| {
+generate_hosted_symbol_decls : List(HostedFunctionInfo), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
+generate_hosted_symbol_decls = |hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names| {
 	if List.is_empty(hosted_functions) {
 		return ""
 	}
 
 	var $decls = ""
 	for func in hosted_functions {
-		params = direct_hosted_param_list(type_table, duplicate_records, duplicate_tags, func)
-		ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, func.ret_type_id)
+		params = direct_hosted_param_list(type_table, duplicate_records, duplicate_tags, preferred_names, func)
+		ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret_type_id)
 		$decls = Str.concat($decls, "/* ${func.name}: ${func.type_str} */\nextern ${ret_c} ${func.ffi_symbol}(${params});\n\n")
 	}
 
 	section("Hosted Symbols", $decls)
 }
 
-generate_provided_symbol_decls : List(ProvidesEntry), TypeTable, List(Str), List(Str) -> Str
-generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, duplicate_tags| {
+generate_provided_symbol_decls : List(ProvidesEntry), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
+generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, duplicate_tags, preferred_names| {
 	if List.is_empty(provides_list) {
 		return ""
 	}
@@ -543,12 +815,12 @@ generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, 
 		type_repr = type_table.get(entry.type_id)
 		match type_repr {
 			RocFunction(func) => {
-				params = direct_param_list(type_table, duplicate_records, duplicate_tags, func.args)
-				ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, func.ret)
+				params = direct_param_list(type_table, duplicate_records, duplicate_tags, preferred_names, func.args)
+				ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret)
 				$decls = Str.concat($decls, "/* Entrypoint: ${entry.name} */\nextern ${ret_c} ${entry.ffi_symbol}(${params});\n\n")
 			}
 			_ => {
-				value_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, entry.type_id)
+				value_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, entry.type_id)
 				$decls = Str.concat($decls, "/* Static provided value: ${entry.name} */\nextern const ${value_c} ${entry.ffi_symbol};\n\n")
 			}
 		}

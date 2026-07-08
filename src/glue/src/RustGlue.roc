@@ -314,7 +314,17 @@ generated_type_names_rust = |type_table, duplicate_names| {
 				}
 			RocTagUnion(tu) =>
 				if List.len(tu.tags) >= 2 and tu.name != "" {
-					$names = $names.append(default_tag_union_struct_name(duplicate_names, $type_id, tu))
+					struct_name = default_tag_union_struct_name(duplicate_names, $type_id, tu)
+					$names = $names.append(struct_name)
+					if TypeTable.tag_union_has_payload(tu) {
+						$names = $names.append("${struct_name}Tag")
+						$names = $names.append("${struct_name}Payload")
+						for tag in tu.tags {
+							if List.len(tag.payload) > 1 {
+								$names = $names.append("${struct_name}${capitalize_first(tag.name)}Payload")
+							}
+						}
+					}
 				}
 			_ => {}
 		}
@@ -325,28 +335,189 @@ generated_type_names_rust = |type_table, duplicate_names| {
 	$names
 }
 
+type_name_root_alias_base_rust : TypeTable, Str, U64 -> Str
+type_name_root_alias_base_rust = |type_table, fallback, type_id|
+	match type_table.get(type_id) {
+		RocRecord(rec) =>
+			if rec.name != "" and !rec.anonymous {
+				name_to_struct_name(rec.name)
+			} else {
+				fallback
+			}
+		RocTagUnion(tu) =>
+			if tu.name != "" and tu.name != "Try" and tu.name != "IOErr" {
+				name_to_struct_name(tu.name)
+			} else {
+				fallback
+			}
+		_ => fallback
+	}
+
+record_alias_fields_rust : TypeTable, RecordRepr -> List(RecordField)
+record_alias_fields_rust = |type_table, rec| {
+	var $fields = rec.fields
+	var $found = Bool.False
+
+	if rec.name != "" and !rec.anonymous {
+		for type_info in type_table.entries() {
+			match type_info.repr {
+				RocRecord(candidate) =>
+					if !$found and candidate.name == rec.name {
+						$fields = candidate.fields
+						$found = Bool.True
+					}
+				_ => {}
+			}
+		}
+	}
+
+	$fields
+}
+
 type_name_roots_rust : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable -> List(TypeNamePlan.Root)
 type_name_roots_rust = |hosted_functions, provides_list, type_table| {
 	var $roots = []
 
 	for func in hosted_functions {
+		base = name_to_struct_name(func.name)
+		module_base = hosted_module_name_to_struct_name(func.name)
+
+		var $arg_idx = 0
+		for arg_type_id in func.arg_type_ids {
+			arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+			$roots = $roots.append(
+				{
+					alias_base: type_name_root_alias_base_rust(type_table, arg_fallback, arg_type_id),
+					module_base,
+					type_id: arg_type_id,
+				},
+			)
+			$arg_idx = $arg_idx + 1
+		}
+
 		$roots = $roots.append(
 			{
-				alias_base: name_to_struct_name(func.name),
-				module_base: hosted_module_name_to_struct_name(func.name),
+				alias_base: base,
+				module_base,
 				type_id: func.ret_type_id,
 			},
 		)
 	}
 
 	for entry in provides_list {
-		$roots = $roots.append(
-			{
-				alias_base: name_to_struct_name(entry.name),
-				module_base: hosted_module_name_to_struct_name(entry.name),
-				type_id: TypeNamePlan.from_table(type_table).provided_entry_root_type_id(entry),
-			},
-		)
+		base = name_to_struct_name(entry.name)
+		module_base = hosted_module_name_to_struct_name(entry.name)
+
+		match type_table.get(entry.type_id) {
+			RocFunction(func) => {
+				var $arg_idx = 0
+				for arg_type_id in func.args {
+					arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+					$roots = $roots.append(
+						{
+							alias_base: type_name_root_alias_base_rust(type_table, arg_fallback, arg_type_id),
+							module_base,
+							type_id: arg_type_id,
+						},
+					)
+					$arg_idx = $arg_idx + 1
+				}
+
+				$roots = $roots.append(
+					{
+						alias_base: base,
+						module_base,
+						type_id: func.ret,
+					},
+				)
+			}
+			_ => {
+				$roots = $roots.append(
+					{
+						alias_base: type_name_root_alias_base_rust(type_table, base, entry.type_id),
+						module_base,
+						type_id: entry.type_id,
+					},
+				)
+			}
+		}
+	}
+
+	$roots
+}
+
+append_type_alias_roots_rust : List(TypeNamePlan.Root), TypeTable, Str, Str, U64, List(U64) -> List(TypeNamePlan.Root)
+append_type_alias_roots_rust = |roots, type_table, alias_base, module_base, type_id, visited_type_ids| {
+	if List.contains(visited_type_ids, type_id) {
+		return roots
+	}
+
+	next_visited = visited_type_ids.append(type_id)
+	root_alias_base = type_name_root_alias_base_rust(type_table, alias_base, type_id)
+
+	var $roots = roots.append({ alias_base: root_alias_base, module_base, type_id })
+
+	match type_table.get(type_id) {
+		RocRecord(rec) => {
+			for field in record_alias_fields_rust(type_table, rec) {
+				field_base = "${root_alias_base}${RocName.from_str(field.name).to_pascal_clean()}"
+				$roots = append_type_alias_roots_rust($roots, type_table, field_base, module_base, field.type_id, next_visited)
+			}
+			$roots
+		}
+		RocList(elem_id) => append_type_alias_roots_rust($roots, type_table, root_alias_base, module_base, elem_id, next_visited)
+		RocBox(inner_id) => append_type_alias_roots_rust($roots, type_table, root_alias_base, module_base, inner_id, next_visited)
+		RocTagUnion(tu) => {
+			var $next = $roots
+			for tag in tu.tags {
+				child_base = "${root_alias_base}${RocName.capitalize_first(tag.name)}"
+				for payload_id in tag.payload {
+					$next = append_type_alias_roots_rust($next, type_table, child_base, module_base, payload_id, next_visited)
+				}
+			}
+			$next
+		}
+		_ => $roots
+	}
+}
+
+type_alias_roots_rust : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable -> List(TypeNamePlan.Root)
+type_alias_roots_rust = |hosted_functions, provides_list, type_table| {
+	var $roots = []
+
+	for func in hosted_functions {
+		base = name_to_struct_name(func.name)
+		module_base = hosted_module_name_to_struct_name(func.name)
+
+		var $arg_idx = 0
+		for arg_type_id in func.arg_type_ids {
+			arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+			$roots = append_type_alias_roots_rust($roots, type_table, arg_fallback, module_base, arg_type_id, [])
+			$arg_idx = $arg_idx + 1
+		}
+
+		$roots = append_type_alias_roots_rust($roots, type_table, base, module_base, func.ret_type_id, [])
+	}
+
+	for entry in provides_list {
+		base = name_to_struct_name(entry.name)
+		module_base = hosted_module_name_to_struct_name(entry.name)
+
+		match type_table.get(entry.type_id) {
+			RocFunction(func) => {
+				var $arg_idx = 0
+				for arg_type_id in func.args {
+					arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
+					$roots = append_type_alias_roots_rust($roots, type_table, arg_fallback, module_base, arg_type_id, [])
+					$arg_idx = $arg_idx + 1
+				}
+
+				$roots = append_type_alias_roots_rust($roots, type_table, base, module_base, func.ret, [])
+			}
+			_ => {
+				$roots = append_type_alias_roots_rust($roots, type_table, base, module_base, entry.type_id, [])
+			}
+		}
 	}
 
 	$roots
@@ -392,10 +563,10 @@ add_tag_union_aliases_rust = |state, alias, target, tu| {
 
 generate_platform_type_aliases_rust : List(HostedFunctionInfo), List(ProvidesEntry), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
 generate_platform_type_aliases_rust = |hosted_functions, provides_list, type_table, duplicate_names, preferred_names| {
-	var $state = { content: "", seen: [] }
+	var $state = { content: "", seen: generated_type_names_rust(type_table, duplicate_names) }
 	name_plan = TypeNamePlan.from_table(type_table)
 
-	for plan in name_plan.alias_plan(type_name_roots_rust(hosted_functions, provides_list, type_table)) {
+	for plan in name_plan.alias_plan(type_alias_roots_rust(hosted_functions, provides_list, type_table)) {
 		target = type_id_to_rust(type_table, duplicate_names, preferred_names, plan.type_id)
 		$state = match plan.kind {
 			PlainAlias => add_type_alias_rust($state, plan.alias, target)
