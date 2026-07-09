@@ -2028,7 +2028,7 @@ pub const BuildEnv = struct {
         maybe_targets_config: ?targets_config_mod.TargetsConfig,
     ) BuildError!void {
         const targets_config = maybe_targets_config orelse return;
-        const validation = try targets_config.validateDeclaredTargetFilesExist(self.gpa, self.filesystem.std_io, platform_dir);
+        const validation = try targets_config.validateDeclaredTargetFilesExist(self.gpa, self.filesystem, platform_dir);
         defer validation.deinit(self.gpa);
 
         if (!validation.hasErrors()) return;

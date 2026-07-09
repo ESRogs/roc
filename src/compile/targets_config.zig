@@ -11,6 +11,7 @@ const std = @import("std");
 const base = @import("base");
 const builtins = @import("builtins");
 const check = @import("check");
+const CoreCtx = @import("ctx").CoreCtx;
 const parse = @import("parse");
 const roc_target = @import("roc_target");
 
@@ -206,7 +207,7 @@ pub const TargetsConfig = struct {
     pub fn validateDeclaredTargetFilesExist(
         self: TargetsConfig,
         allocator: Allocator,
-        std_io: std.Io,
+        filesystem: CoreCtx,
         platform_dir: []const u8,
     ) Allocator.Error!TargetFileValidation {
         var issues = std.ArrayList(TargetFileValidationIssue).empty;
@@ -224,7 +225,7 @@ pub const TargetsConfig = struct {
         var inputs_dir_path_owned = true;
         defer if (inputs_dir_path_owned) allocator.free(inputs_dir_path);
 
-        std.Io.Dir.cwd().access(std_io, inputs_dir_path, .{}) catch {
+        if (!filesystem.fileExists(inputs_dir_path)) {
             try issues.append(allocator, .{
                 .missing_inputs_directory = .{
                     .inputs_dir = inputs_dir,
@@ -233,7 +234,7 @@ pub const TargetsConfig = struct {
             });
             inputs_dir_path_owned = false;
             return .{ .issues = try issues.toOwnedSlice(allocator) };
-        };
+        }
 
         for (self.targets) |spec| {
             const target_name = @tagName(spec.target);
@@ -244,7 +245,7 @@ pub const TargetsConfig = struct {
                         var full_path_owned = true;
                         defer if (full_path_owned) allocator.free(full_path);
 
-                        std.Io.Dir.cwd().access(std_io, full_path, .{}) catch {
+                        if (!filesystem.fileExists(full_path)) {
                             try issues.append(allocator, .{
                                 .missing_target_file = .{
                                     .target = spec.target,
@@ -254,7 +255,7 @@ pub const TargetsConfig = struct {
                                 },
                             });
                             full_path_owned = false;
-                        };
+                        }
                     },
                     .app, .win_gui => {},
                 }
@@ -1009,6 +1010,7 @@ test "validateDeclaredTargetFilesExist checks all declared target files" {
 
     const platform_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(platform_dir);
+    const filesystem = CoreCtx.default(allocator, allocator, testing.io);
 
     const x64_items: []const LinkItem = &.{ .{ .file_path = "libhost.a" }, .app };
     const wasm_items: []const LinkItem = &.{ .{ .file_path = "host.wasm" }, .app };
@@ -1021,7 +1023,7 @@ test "validateDeclaredTargetFilesExist checks all declared target files" {
         .targets = specs,
     };
 
-    const validation = try config.validateDeclaredTargetFilesExist(allocator, testing.io, platform_dir);
+    const validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir);
     defer validation.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 1), validation.issues.len);
@@ -1044,6 +1046,7 @@ test "validateDeclaredTargetFilesExist uses default targets directory" {
 
     const platform_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(platform_dir);
+    const filesystem = CoreCtx.default(allocator, allocator, testing.io);
 
     const items: []const LinkItem = &.{ .{ .file_path = "libhost.a" }, .app };
     const specs: []const TargetLinkSpec = &.{
@@ -1054,7 +1057,7 @@ test "validateDeclaredTargetFilesExist uses default targets directory" {
         .targets = specs,
     };
 
-    const validation = try config.validateDeclaredTargetFilesExist(allocator, testing.io, platform_dir);
+    const validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir);
     defer validation.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 1), validation.issues.len);
