@@ -778,7 +778,6 @@ test "occurs: valid nominal return recursion does not hide invalid argument recu
     const root = try types_store.freshFromContent(.{ .structure = .{ .fn_pure = types.Func{
         .args = args,
         .ret = list_nominal,
-        .needs_instantiation = false,
     } } });
 
     const result = occurs(&types_store, &scratch, root);

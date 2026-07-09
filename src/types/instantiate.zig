@@ -432,7 +432,6 @@ pub const Instantiator = struct {
         return Func{
             .args = fresh_args_range,
             .ret = fresh_ret,
-            .needs_instantiation = true,
         };
     }
 

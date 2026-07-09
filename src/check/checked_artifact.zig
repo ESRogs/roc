@@ -1461,8 +1461,11 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
             // backing TEMPLATE: its formals stand for the args checked above.
             break :blk try checkedTypeIsConcreteCompileTimeRootInner(.decl_template, checked_types, nominal.backing, active);
         },
-        .function => |function| !function.needs_instantiation and
-            (try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, function.args, active)) and
+        // A function scheme is a concrete compile-time root exactly when its
+        // args and return contain no identity variables; the recursion returns
+        // false on flex (and non-decl rigid) vars, so no separate flag is
+        // needed. (`needs_instantiation` was a vestigial force-stamp.)
+        .function => |function| (try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, function.args, active)) and
             try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, function.ret, active),
         .tag_union => |tag_union| (try checkedTagsAreConcreteCompileTimeRoots(walk, checked_types, tag_union.tags, active)) and
             try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, tag_union.ext, active),
@@ -3349,8 +3352,9 @@ fn checkedTypeViewIsConcreteConstProducerSchemeInner(
             if (nominal.builtin != null) break :blk true;
             break :blk try checkedTypeViewIsConcreteConstProducerSchemeInner(checked_types, nominal.backing, active);
         },
-        .function => |function| !function.needs_instantiation and
-            (try checkedTypeViewSpanIsConcreteConstProducerScheme(checked_types, function.args, active)) and
+        // Concrete exactly when args and return carry no undefaulted identity
+        // variables; the recursion decides that, so no separate flag is needed.
+        .function => |function| (try checkedTypeViewSpanIsConcreteConstProducerScheme(checked_types, function.args, active)) and
             try checkedTypeViewIsConcreteConstProducerSchemeInner(checked_types, function.ret, active),
         .tag_union => |tag_union| (try checkedTypeViewTagsAreConcreteConstProducerScheme(checked_types, tag_union.tags, active)) and
             try checkedTypeViewIsConcreteConstProducerSchemeInner(checked_types, tag_union.ext, active),
@@ -6595,11 +6599,17 @@ fn copyCheckedFunctionType(
     kind: CheckedFunctionKind,
     func: types.Func,
 ) Allocator.Error!CheckedFunctionType {
+    const args = try copyCheckedTypeRange(allocator, module, names, imports, store, active, module.typeStoreConst().sliceVars(func.args));
+    const ret = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, func.ret);
+    // Recompute from the copied checked args/ret: a function needs
+    // instantiation exactly when it carries identity variables. (The source
+    // store-side flag is not consulted; it no longer exists.)
     return .{
         .kind = finalizedFunctionKind(kind),
-        .args = try copyCheckedTypeRange(allocator, module, names, imports, store, active, module.typeStoreConst().sliceVars(func.args)),
-        .ret = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, func.ret),
-        .needs_instantiation = func.needs_instantiation,
+        .args = args,
+        .ret = ret,
+        .needs_instantiation = try store.checkedTypeSliceContainsIdentityVariables(allocator, args) or
+            try store.checkedTypeContainsIdentityVariables(allocator, ret),
     };
 }
 

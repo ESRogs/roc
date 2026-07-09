@@ -44,7 +44,7 @@ test {
     // so the `Origin` union dominates the struct. Provenance adds a raw expr index
     // (4B) plus a where-clause expect region (8B), both `maxInt`-sentinel packed.
     try std.testing.expectEqual(64, @sizeOf(StaticDispatchConstraint));
-    try std.testing.expectEqual(16, @sizeOf(Func));
+    try std.testing.expectEqual(12, @sizeOf(Func));
 }
 
 test "source declaration checked constructors enforce packed statement capacity" {
@@ -647,7 +647,6 @@ pub const NominalDecl = struct {
 pub const Func = struct {
     args: Var.SafeList.Range,
     ret: Var,
-    needs_instantiation: bool,
 };
 
 // records //

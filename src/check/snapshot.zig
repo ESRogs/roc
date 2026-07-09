@@ -81,11 +81,10 @@ pub const SnapshotNominalType = struct {
     origin_module: base.ModuleIdentity.Idx,
 };
 
-/// A snapshotted function type with argument types, return type, and instantiation flag.
+/// A snapshotted function type with argument types and return type.
 pub const SnapshotFunc = struct {
     args: SnapshotContentIdxSafeList.Range,
     ret: SnapshotContentIdx,
-    needs_instantiation: bool,
 };
 
 /// A snapshotted record type with fields and extension variable.
@@ -549,7 +548,6 @@ pub const Store = struct {
         return SnapshotFunc{
             .args = args_range,
             .ret = deep_ret,
-            .needs_instantiation = func.needs_instantiation,
         };
     }
 

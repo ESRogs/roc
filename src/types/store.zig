@@ -36,6 +36,8 @@ const Content = types.Content;
 const Rank = types.Rank;
 const Flex = types.Flex;
 const Rigid = types.Rigid;
+const Func = types.Func;
+const Record = types.Record;
 const RecordField = types.RecordField;
 const TagUnion = types.TagUnion;
 const Tag = types.Tag;
@@ -738,25 +740,9 @@ pub const Store = struct {
     // Does not insert content into the types store.
     pub fn mkFuncUnbound(self: *Self, args: []const Var, ret: Var) std.mem.Allocator.Error!Content {
         const args_range = try self.appendVars(args);
-
-        // Check if any arguments need instantiation
-        var needs_inst = false;
-        for (args) |arg| {
-            if (try self.needsInstantiation(arg)) {
-                needs_inst = true;
-                break;
-            }
-        }
-
-        // Also check the return type
-        if (!needs_inst) {
-            needs_inst = try self.needsInstantiation(ret);
-        }
-
         return Content{ .structure = .{ .fn_unbound = .{
             .args = args_range,
             .ret = ret,
-            .needs_instantiation = needs_inst,
         } } };
     }
 
@@ -764,25 +750,9 @@ pub const Store = struct {
     // Does not insert content into the types store.
     pub fn mkFuncPure(self: *Self, args: []const Var, ret: Var) std.mem.Allocator.Error!Content {
         const args_range = try self.appendVars(args);
-
-        // Check if any arguments need instantiation
-        var needs_inst = false;
-        for (args) |arg| {
-            if (try self.needsInstantiation(arg)) {
-                needs_inst = true;
-                break;
-            }
-        }
-
-        // Also check the return type
-        if (!needs_inst) {
-            needs_inst = try self.needsInstantiation(ret);
-        }
-
         return Content{ .structure = .{ .fn_pure = .{
             .args = args_range,
             .ret = ret,
-            .needs_instantiation = needs_inst,
         } } };
     }
 
@@ -790,25 +760,9 @@ pub const Store = struct {
     // Does not insert content into the types store.
     pub fn mkFuncEffectful(self: *Self, args: []const Var, ret: Var) std.mem.Allocator.Error!Content {
         const args_range = try self.appendVars(args);
-
-        // Check if any arguments need instantiation
-        var needs_inst = false;
-        for (args) |arg| {
-            if (try self.needsInstantiation(arg)) {
-                needs_inst = true;
-                break;
-            }
-        }
-
-        // Also check the return type
-        if (!needs_inst) {
-            needs_inst = try self.needsInstantiation(ret);
-        }
-
         return Content{ .structure = .{ .fn_effectful = .{
             .args = args_range,
             .ret = ret,
-            .needs_instantiation = needs_inst,
         } } };
     }
 
@@ -942,9 +896,9 @@ pub const Store = struct {
                     const args = self.store.sliceNominalArgs(nominal);
                     try self.pushVars(args);
                 },
-                .fn_pure => |func| return func.needs_instantiation,
-                .fn_effectful => |func| return func.needs_instantiation,
-                .fn_unbound => |func| return func.needs_instantiation,
+                .fn_pure => |func| try self.pushFunc(func),
+                .fn_effectful => |func| try self.pushFunc(func),
+                .fn_unbound => |func| try self.pushFunc(func),
                 .record => |record| return try self.checkRecord(record),
                 .record_unbound => |fields| return try self.checkRecordFields(fields),
                 .empty_record => {},
@@ -952,6 +906,12 @@ pub const Store = struct {
                 .empty_tag_union => {},
             }
             return false;
+        }
+
+        fn pushFunc(self: *NeedsInstantiation, func: Func) Allocator.Error!void {
+            const args = self.store.sliceVars(func.args);
+            try self.pushVars(args);
+            try self.work.append(self.store.gpa, func.ret);
         }
 
         fn checkRecord(self: *NeedsInstantiation, record: Record) Allocator.Error!bool {
@@ -987,7 +947,6 @@ pub const Store = struct {
             }
         }
     };
-
     // sub list setters //
 
     /// Append a var to the backing list, returning the idx

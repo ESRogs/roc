@@ -235,7 +235,6 @@ fn copyFunc(ctx: *const CopyContext, func: Func) std.mem.Allocator.Error!Func {
     return Func{
         .args = dest_args_range,
         .ret = dest_ret,
-        .needs_instantiation = func.needs_instantiation,
     };
 }
 
