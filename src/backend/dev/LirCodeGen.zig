@@ -4316,9 +4316,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 // folded to a constant during Monotype lowering, so the op must
                 // never reach a backend. Reaching here is an invariant failure,
                 // not a missing feature.
-                .num_from_numeral => {
-                    std.debug.panic("num_from_numeral reached the dev backend; it must be folded to a constant during Monotype lowering", .{});
-                },
                 // Unimplemented ops
                 .num_log,
                 .num_round,

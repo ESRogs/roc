@@ -5,10 +5,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const base = @import("base");
-const builtins = @import("builtins");
 const tracy = @import("tracy");
 const collections = @import("collections");
 const types_mod = @import("types");
+const literal_defaulting = types_mod.literal_defaulting;
+const exact_numeral = types_mod.numeral;
 const can = @import("can");
 
 const copy_import = @import("copy_import.zig");
@@ -45,6 +46,14 @@ const SnapshotStore = snapshot_mod.Store;
 const ProblemStore = @import("problem.zig").Store;
 
 const Self = @This();
+
+const TypeDeclGenerationState = enum {
+    not_generated,
+    generating,
+    generated,
+};
+
+const no_def_group = std.math.maxInt(u32);
 
 const InterpolationConstraintId = enum(u32) { _ };
 
@@ -106,8 +115,8 @@ import_mapping: @import("types").import_mapping.ImportMapping,
 unify_scratch: unifier.Scratch,
 /// reusable scratch arrays used in occurs check
 occurs_scratch: occurs.Scratch,
-/// annos we've already seen when generation a type from an annotation
-seen_annos: std.AutoHashMap(CIR.TypeAnno.Idx, Var),
+/// Type annotation nodes already seen while generating one annotation type.
+seen_annos: std.DynamicBitSetUnmanaged,
 /// A pool of solver envs
 env_pool: EnvPool,
 /// wrapper around generalization, contains some internal state used to do it's work
@@ -130,6 +139,9 @@ rigid_var_substitutions: std.AutoHashMapUnmanaged(Ident.Idx, Var),
 /// Used to resolve rigid vars in local type decl bodies that were not
 /// rewritten as rigid_var_lookup during canonicalization.
 type_decl_rigid_vars: std.AutoHashMapUnmanaged(Ident.Idx, Var),
+/// Type declaration bodies are generated on demand so forward references
+/// instantiate fully generated declarations instead of predeclared shells.
+type_decl_generation_states: std.ArrayListUnmanaged(TypeDeclGenerationState) = .empty,
 /// scratch vars used to build up intermediate lists, used for various things
 scratch_vars: base.Scratch(Var),
 /// scratch tags used to build up intermediate lists, used for various things
@@ -172,8 +184,8 @@ reported_constraint_errors: std.AutoHashMap(ReportedConstraintError, void),
 reported_effectful_expect: std.AutoHashMap(Var, void),
 /// Region of the expect body currently being checked, if any.
 current_expect_region: ?Region,
-/// Map representation all top level patterns, and if we've processed them yet
-top_level_ptrns: std.AutoHashMap(CIR.Pattern.Idx, DefProcessed),
+/// Dense table of top-level patterns, and whether their defs have been processed.
+top_level_ptrns: std.ArrayListUnmanaged(?DefProcessed),
 /// Read-only platform requirement surface used only when checking an app root.
 platform_requirements: ?PlatformRequirementInput,
 /// App defs constrained by platform requirements before their bodies are checked.
@@ -217,7 +229,7 @@ type_writer: types_mod.TypeWriter,
 /// the checked module.
 check_order: ?DependencyGraph.EvaluationOrder = null,
 /// Which check-order group each top-level def belongs to.
-def_group: std.AutoHashMapUnmanaged(CIR.Def.Idx, u32) = .empty,
+def_group: std.ArrayListUnmanaged(u32) = .empty,
 /// Per-group progress; a `.checking` group has a frame on `group_stack`.
 group_states: std.ArrayListUnmanaged(GroupState) = .empty,
 /// Groups currently being checked, outermost first. Nesting happens only at
@@ -242,7 +254,7 @@ pending_dispatch_targets: std.ArrayListUnmanaged(CIR.Def.Idx) = .empty,
 /// generated again, in the body's frame, sharing vars with the body so
 /// dispatch-evidence publication sees one coherent scheme); references after
 /// that use the def's own pattern var as always.
-predeclared_scheme_vars: std.AutoHashMapUnmanaged(CIR.Def.Idx, Var) = .empty,
+predeclared_scheme_vars: std.ArrayListUnmanaged(?Var) = .empty,
 /// The block-local (`s_decl`) analogue of `predeclared_scheme_vars`, keyed by
 /// pattern and live only while the local def is in flight (entries are
 /// removed when the statement finishes).
@@ -507,6 +519,51 @@ const DefProcessed = struct {
     def_name: ?Ident.Idx,
     status: HasProcessed,
 };
+
+fn topLevelPattern(self: *const Self, pattern: CIR.Pattern.Idx) ?DefProcessed {
+    return self.top_level_ptrns.items[nodeSlot(pattern)];
+}
+
+fn setTopLevelPattern(self: *Self, pattern: CIR.Pattern.Idx, value: DefProcessed) void {
+    self.top_level_ptrns.items[nodeSlot(pattern)] = value;
+}
+
+fn patternIsTopLevelDef(self: *const Self, pattern: CIR.Pattern.Idx) bool {
+    return self.topLevelPattern(pattern) != null;
+}
+
+fn defGroupIndex(self: *const Self, def_idx: CIR.Def.Idx) ?u32 {
+    const group_index = self.def_group.items[nodeSlot(def_idx)];
+    return if (group_index == no_def_group) null else group_index;
+}
+
+fn setDefGroupIndex(self: *Self, def_idx: CIR.Def.Idx, group_index: u32) void {
+    self.def_group.items[nodeSlot(def_idx)] = group_index;
+}
+
+fn predeclaredSchemeVar(self: *const Self, def_idx: CIR.Def.Idx) ?Var {
+    return self.predeclared_scheme_vars.items[nodeSlot(def_idx)];
+}
+
+fn setPredeclaredSchemeVar(self: *Self, def_idx: CIR.Def.Idx, scheme_var: Var) void {
+    self.predeclared_scheme_vars.items[nodeSlot(def_idx)] = scheme_var;
+}
+
+fn typeDeclGenerationState(self: *const Self, decl_idx: CIR.Statement.Idx) TypeDeclGenerationState {
+    return self.type_decl_generation_states.items[nodeSlot(decl_idx)];
+}
+
+fn setTypeDeclGenerationState(self: *Self, decl_idx: CIR.Statement.Idx, state: TypeDeclGenerationState) void {
+    self.type_decl_generation_states.items[nodeSlot(decl_idx)] = state;
+}
+
+fn typeAnnoSeen(self: *const Self, anno_idx: CIR.TypeAnno.Idx) bool {
+    return self.seen_annos.isSet(nodeSlot(anno_idx));
+}
+
+fn markTypeAnnoSeen(self: *Self, anno_idx: CIR.TypeAnno.Idx) void {
+    self.seen_annos.set(nodeSlot(anno_idx));
+}
 
 /// A static-dispatch receiver var created by instantiating a constrained
 /// scheme, recorded for the end-of-check constraint fixpoint
@@ -1257,6 +1314,21 @@ fn preflightForTypeChecking(cir: *ModuleEnv) std.mem.Allocator.Error!void {
     }
 }
 
+fn nodeSlot(idx: anytype) usize {
+    return @intFromEnum(ModuleEnv.nodeIdxFrom(idx));
+}
+
+fn initNodeSlots(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    node_count: usize,
+    value: T,
+) std.mem.Allocator.Error!std.ArrayListUnmanaged(T) {
+    var slots: std.ArrayListUnmanaged(T) = .empty;
+    try slots.appendNTimes(allocator, value, node_count);
+    return slots;
+}
+
 fn initAssumePrepared(
     gpa: std.mem.Allocator,
     types: *types_mod.Store,
@@ -1301,6 +1373,8 @@ fn initAssumePrepared(
     );
     errdefer import_mapping.deinit();
 
+    const node_count: usize = @intCast(cir.store.nodes.len());
+
     const self: Self = .{
         .gpa = gpa,
         .types = types,
@@ -1320,7 +1394,7 @@ fn initAssumePrepared(
         .import_mapping = import_mapping,
         .unify_scratch = try unifier.Scratch.init(gpa),
         .occurs_scratch = try occurs.Scratch.init(gpa),
-        .seen_annos = std.AutoHashMap(CIR.TypeAnno.Idx, Var).init(gpa),
+        .seen_annos = try std.DynamicBitSetUnmanaged.initEmpty(gpa, node_count),
         .env_pool = try EnvPool.init(gpa),
         .generalizer = try Generalizer.init(gpa, types),
         .var_map = std.AutoHashMap(Var, Var).init(gpa),
@@ -1331,6 +1405,7 @@ fn initAssumePrepared(
         .var_set = std.AutoHashMap(Var, void).init(gpa),
         .rigid_var_substitutions = std.AutoHashMapUnmanaged(Ident.Idx, Var){},
         .type_decl_rigid_vars = std.AutoHashMapUnmanaged(Ident.Idx, Var){},
+        .type_decl_generation_states = try initNodeSlots(TypeDeclGenerationState, gpa, node_count, .not_generated),
         .scratch_vars = try base.Scratch(types_mod.Var).init(gpa),
         .scratch_tags = try base.Scratch(types_mod.Tag).init(gpa),
         .scratch_record_fields = try base.Scratch(types_mod.RecordField).init(gpa),
@@ -1348,10 +1423,12 @@ fn initAssumePrepared(
         .reported_constraint_errors = std.AutoHashMap(ReportedConstraintError, void).init(gpa),
         .reported_effectful_expect = std.AutoHashMap(Var, void).init(gpa),
         .current_expect_region = null,
-        .top_level_ptrns = std.AutoHashMap(CIR.Pattern.Idx, DefProcessed).init(gpa),
+        .top_level_ptrns = try initNodeSlots(?DefProcessed, gpa, node_count, null),
         .platform_requirements = null,
         .platform_required_defs = .{},
         .enclosing_func_name = null,
+        .def_group = try initNodeSlots(u32, gpa, node_count, no_def_group),
+        .predeclared_scheme_vars = try initNodeSlots(?Var, gpa, node_count, null),
         // Initialize with null import_mapping - caller should call fixupTypeWriter() after storing Check
         .type_writer = try types_mod.TypeWriter.initFromParts(gpa, types, cir.getIdentStore(), null),
         .value_lookup_tracking = .empty,
@@ -1427,7 +1504,7 @@ pub fn deinit(self: *Self) void {
     self.import_mapping.deinit();
     self.unify_scratch.deinit();
     self.occurs_scratch.deinit();
-    self.seen_annos.deinit();
+    self.seen_annos.deinit(self.gpa);
     if (self.check_order) |*order| order.deinit();
     self.def_group.deinit(self.gpa);
     self.group_states.deinit(self.gpa);
@@ -1469,6 +1546,7 @@ pub fn deinit(self: *Self) void {
     self.var_set.deinit();
     self.rigid_var_substitutions.deinit(self.gpa);
     self.type_decl_rigid_vars.deinit(self.gpa);
+    self.type_decl_generation_states.deinit(self.gpa);
     self.scratch_vars.deinit();
     self.scratch_tags.deinit();
     self.scratch_record_fields.deinit();
@@ -1484,7 +1562,7 @@ pub fn deinit(self: *Self) void {
     self.interpolation_constraint_metadata.deinit(self.gpa);
     self.reported_constraint_errors.deinit();
     self.reported_effectful_expect.deinit();
-    self.top_level_ptrns.deinit();
+    self.top_level_ptrns.deinit(self.gpa);
     self.platform_required_defs.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
     self.type_writer.deinit();
@@ -1768,6 +1846,7 @@ fn recordHoistPatternProvenance(
         .underscore,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -1792,6 +1871,7 @@ fn patternCanOwnHoistedBindingRoot(self: *Self, pattern: CIR.Pattern.Idx) bool {
         .underscore,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -1853,6 +1933,7 @@ fn patternIsIrrefutableForHoistExtraction(self: *Self, pattern: CIR.Pattern.Idx)
         .str_interpolation,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -1931,6 +2012,7 @@ fn recordHoistPatternExtractionProvenanceHelp(
         .underscore,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -2010,6 +2092,7 @@ fn recordHoistContextualPatternBindings(
         .underscore,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -2842,7 +2925,7 @@ test "hoist known value insertion rolls back map when scope tracking allocation 
 }
 
 fn patternIsTopLevel(self: *Self, pattern: CIR.Pattern.Idx) bool {
-    return self.top_level_ptrns.contains(pattern);
+    return self.patternIsTopLevelDef(pattern);
 }
 
 fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
@@ -4725,65 +4808,70 @@ fn recordedNumeralLiteralForExpr(self: *const Self, expr_idx: CIR.Expr.Idx) Modu
     };
 }
 
+/// Build the constraint-carried value facts for a literal expression from its
+/// recorded exact digits: the ONLY construction path for `NumeralInfo`, so
+/// compact and exact literals cannot disagree about fit answers.
 fn exactNumeralInfoForExpr(self: *const Self, expr_idx: CIR.Expr.Idx, region: Region) Allocator.Error!types_mod.NumeralInfo {
     const literal = self.recordedNumeralLiteralForExpr(expr_idx);
-    const fits_dec = numeralLiteralFitsDec(self.cir, literal);
-    const is_fractional = literal.after_decimal_digit_count != 0 or literal.hadDecimalPoint();
-    return types_mod.NumeralInfo.fromExact(literal.isNegative(), is_fractional, fits_dec, region);
+    return self.exactNumeralInfoForLiteral(literal, region);
 }
 
-fn numeralLiteralFitsDec(
-    module_env: *const ModuleEnv,
-    literal: ModuleEnv.NumeralLiteral,
-) bool {
-    const decimal_places = builtins.dec.RocDec.decimal_places;
-    const after_count = literal.after_decimal_digit_count;
-    if (after_count > decimal_places) return false;
-
-    const before = base256BytesToU128(module_env.numeralDigitsBefore(literal)) orelse return false;
-    const after = base256BytesToU128(module_env.numeralDigitsAfter(literal)) orelse return false;
-
-    const before_scaled = checkedMulU128(before, @intCast(builtins.dec.RocDec.one_point_zero_i128)) orelse return false;
-    const after_scale = pow10U128(decimal_places - after_count);
-    const after_scaled = checkedMulU128(after, after_scale) orelse return false;
-    const magnitude = checkedAddU128(before_scaled, after_scaled) orelse return false;
-
-    const max_positive: u128 = @intCast(std.math.maxInt(i128));
-    const limit = if (literal.isNegative()) max_positive + 1 else max_positive;
-    return magnitude <= limit;
+/// Pattern-node counterpart of `exactNumeralInfoForExpr`.
+fn exactNumeralInfoForPattern(self: *const Self, pattern_idx: CIR.Pattern.Idx, region: Region) Allocator.Error!types_mod.NumeralInfo {
+    const literal = self.cir.numeralLiteralForNode(ModuleEnv.nodeIdxFrom(pattern_idx)) orelse {
+        if (builtin.mode == .Debug) {
+            std.debug.panic("missing recorded exact numeral for pattern {}", .{@intFromEnum(pattern_idx)});
+        }
+        unreachable;
+    };
+    return self.exactNumeralInfoForLiteral(literal, region);
 }
 
-fn base256BytesToU128(bytes_be: []const u8) ?u128 {
-    var value: u128 = 0;
-    for (bytes_be) |byte| {
-        const shifted = @mulWithOverflow(value, 256);
-        if (shifted[1] != 0) return null;
-        const added = @addWithOverflow(shifted[0], byte);
-        if (added[1] != 0) return null;
-        value = added[0];
+fn exactNumeralInfoForLiteral(self: *const Self, literal: ModuleEnv.NumeralLiteral, region: Region) Allocator.Error!types_mod.NumeralInfo {
+    const exact = self.cir.exactNumeral(literal);
+    // A literal whose digits were never recorded (too huge to materialize as
+    // a `Num.Numeral`, e.g. `3e6000000000`) fits no builtin type: its exact
+    // value is unknowable, so every concrete candidate must refute it rather
+    // than silently reading the empty digit buffers as zero.
+    const fit_set = if (literal.isMaterialized())
+        try exact_numeral.computeFitSet(self.gpa, exact)
+    else
+        exact_numeral.FitSet.initEmpty();
+    return types_mod.NumeralInfo.fromExact(exact, fit_set, literal.isMaterialized(), region);
+}
+
+/// Bind an unsuffixed (open) numeral literal expression: a fresh flex var
+/// carrying the literal's `from_numeral` constraint, unified with the
+/// expression var.
+fn checkOpenNumeralLiteralExpr(self: *Self, expr_idx: CIR.Expr.Idx, expr_var: Var, expr_region: Region, env: *Env) Allocator.Error!void {
+    const num_literal_info = try self.exactNumeralInfoForExpr(expr_idx, expr_region);
+    const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
+    _ = try self.unify(expr_var, flex_var, env);
+}
+
+/// Bind a suffix-typed numeral literal expression (`123.U64`, `3.14.Dec`, or
+/// a custom-type suffix): the `from_numeral` flex var unifies with the
+/// explicit type, with Dec range validated eagerly when the suffix names Dec.
+fn checkSuffixedNumeralLiteralExpr(self: *Self, expr_idx: CIR.Expr.Idx, expr_var: Var, expr_region: Region, env: *Env) Allocator.Error!void {
+    var num_literal_info = try self.exactNumeralInfoForExpr(expr_idx, expr_region);
+    num_literal_info.explicit_suffix = true;
+    const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
+
+    try self.unifyTypedLiteralWithExplicitType(flex_var, expr_idx, expr_region, env);
+    if (self.typedLiteralTargetsBuiltin(expr_idx, .dec)) {
+        _ = try self.reportInvalidBuiltinFromNumeralInfo(flex_var, .dec, num_literal_info, env);
     }
-    return value;
+
+    _ = try self.unify(expr_var, flex_var, env);
 }
 
-fn checkedMulU128(lhs: u128, rhs: u128) ?u128 {
-    const multiplied = @mulWithOverflow(lhs, rhs);
-    if (multiplied[1] != 0) return null;
-    return multiplied[0];
-}
-
-fn checkedAddU128(lhs: u128, rhs: u128) ?u128 {
-    const added = @addWithOverflow(lhs, rhs);
-    if (added[1] != 0) return null;
-    return added[0];
-}
-
-fn pow10U128(exponent: u32) u128 {
-    var value: u128 = 1;
-    var remaining = exponent;
-    while (remaining > 0) : (remaining -= 1) {
-        value *= 10;
-    }
-    return value;
+/// Pattern flavor of `checkOpenNumeralLiteralExpr`, adding the pattern's
+/// value-equality obligation.
+fn checkOpenNumeralLiteralPattern(self: *Self, pattern_idx: CIR.Pattern.Idx, pattern_var: Var, pattern_region: Region, env: *Env) Allocator.Error!void {
+    const num_literal_info = try self.exactNumeralInfoForPattern(pattern_idx, pattern_region);
+    const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(pattern_idx), num_literal_info, env);
+    _ = try self.unify(pattern_var, flex_var, env);
+    try self.mkPatternLiteralEqConstraint(pattern_var, env, pattern_region);
 }
 
 /// Create a nominal Box type with the given element type
@@ -5175,11 +5263,8 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
         const stmt_var = ModuleEnv.varFrom(stmt_idx);
 
         switch (stmt) {
-            .s_alias_decl => |alias| {
-                try self.generateAliasDecl(stmt_idx, stmt_var, alias, &env);
-            },
-            .s_nominal_decl => |nominal| {
-                try self.generateNominalDecl(stmt_idx, stmt_var, nominal, &env);
+            .s_alias_decl, .s_nominal_decl => {
+                _ = try self.ensureTypeDeclGenerated(stmt_idx, &env);
             },
             .s_runtime_error => {
                 try self.setVarRank(stmt_var, &env);
@@ -5200,7 +5285,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     for (0..self.cir.all_defs.span.len) |def_offset| {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         const def = self.cir.store.getDef(def_idx);
-        try self.top_level_ptrns.put(def.pattern, DefProcessed{
+        self.setTopLevelPattern(def.pattern, DefProcessed{
             .def_idx = def_idx,
             .def_name = null,
             .status = .not_processed,
@@ -5280,29 +5365,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
         }
     }
 
-    // Check any accumulated constraints
-    try self.checkAllConstraints(&env);
-    try self.resolvePendingTupleAccesses(&env, false);
-    try self.checkAllConstraints(&env);
-
-    try self.resolveNumericLiteralsFromContext(&env);
-
-    if (!skip_numeric_defaults) {
-        try self.finalizeLiteralDefaults(&env);
-
-        // After finalizing numeric defaults, resolve any remaining deferred
-        // static dispatch constraints (e.g., Dec.plus, Dec.to_str).
-        if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
-            try self.checkStaticDispatchConstraints(&env, true);
-        }
-    }
-
-    try self.validateToInspectMethodTypes(&env);
-    try self.checkAllFromNumeralFlexConstraintCompatibility(&env, true);
-    try self.validateResolvedOpenNumeralLiterals(&env, true);
-    try self.checkInstantiatedStaticDispatchConstraints(&env, true);
-    try self.resolvePendingTupleAccesses(&env, true);
-    try self.checkAllConstraints(&env);
+    try self.finalizeTypes(&env, .{ .module = .{ .skip_numeric_defaults = skip_numeric_defaults } });
 
     // After solving all deferred constraints, check for infinite types
     for (0..self.cir.all_defs.span.len) |def_offset| {
@@ -6227,6 +6290,7 @@ fn hoistedRootPatternSelectedDependenciesAreKept(
         .underscore,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -6332,6 +6396,7 @@ fn hoistedRootPatternBindersAreConcrete(
         .underscore,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -6399,6 +6464,7 @@ fn appendHoistedDependencyPatternBinders(
         .underscore,
         .runtime_error,
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -7584,7 +7650,7 @@ fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool 
 /// stack — mid-check, or checked but suspended at its boundary, so its
 /// members' vars are not yet generalized.
 fn defInOnStackGroup(self: *const Self, def_idx: CIR.Def.Idx) bool {
-    const group_index = self.def_group.get(def_idx) orelse return false;
+    const group_index = self.defGroupIndex(def_idx) orelse return false;
     for (self.group_stack.items) |frame| {
         if (frame.group_index == group_index) return true;
     }
@@ -7607,7 +7673,7 @@ fn callTargetIsInFlightRecursiveRef(self: *const Self, func_expr_idx: CIR.Expr.I
         else => return false,
     };
     if (self.local_processing_ptrns.contains(pattern_idx)) return true;
-    const processing_def = self.top_level_ptrns.get(pattern_idx) orelse return false;
+    const processing_def = self.topLevelPattern(pattern_idx) orelse return false;
     return switch (processing_def.status) {
         .processing => true,
         .not_processed, .processed => self.defInOnStackGroup(processing_def.def_idx),
@@ -8356,25 +8422,7 @@ pub fn checkExprRepl(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Erro
     // Check the expr
     _ = try self.checkExpr(expr_idx, &env, Expected.none());
 
-    // Check any accumulated constraints
-    try self.checkAllConstraints(&env);
-    try self.resolvePendingTupleAccesses(&env, false);
-    try self.checkAllConstraints(&env);
-    try self.resolveNumericLiteralsFromContext(&env);
-    try self.finalizeLiteralDefaults(&env);
-
-    // After finalizing numeric defaults, resolve any remaining deferred
-    // static dispatch constraints (e.g., Dec.not for !3).
-    if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
-        try self.checkStaticDispatchConstraints(&env, true);
-    }
-
-    // Check if the expression's type has incompatible constraints (e.g., !3)
-    const expr_var = ModuleEnv.varFrom(expr_idx);
-    try self.checkFlexVarConstraintCompatibility(expr_var, &env, true);
-    try self.validateResolvedOpenNumeralLiterals(&env, true);
-    try self.resolvePendingTupleAccesses(&env, true);
-    try self.checkAllConstraints(&env);
+    try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
     try self.reportPolymorphicConstrainedExpr(expr_idx);
 
     // Check for infinite types
@@ -8409,7 +8457,7 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     for (0..self.cir.all_defs.span.len) |def_offset| {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         const def = self.cir.store.getDef(def_idx);
-        try self.top_level_ptrns.put(def.pattern, DefProcessed{
+        self.setTopLevelPattern(def.pattern, DefProcessed{
             .def_idx = def_idx,
             .def_name = null,
             .status = .not_processed,
@@ -8434,37 +8482,16 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     // Check the expr
     _ = try self.checkExpr(expr_idx, &env, Expected.none());
 
-    // Check any accumulated constraints
-    try self.checkAllConstraints(&env);
-    try self.resolvePendingTupleAccesses(&env, false);
-    try self.checkAllConstraints(&env);
-    try self.resolveNumericLiteralsFromContext(&env);
-    try self.finalizeLiteralDefaults(&env);
+    try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
 
-    // After finalizing literal defaults, resolve any remaining deferred static
-    // dispatch constraints: committing a default can generate deferred
-    // method_call constraints (e.g. Dec.to_str returns Str). Without this step,
-    // the return type of methods on numerics stays an unconstrained flex var,
-    // causing incorrect .zst layouts.
-    if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
-        try self.checkStaticDispatchConstraints(&env, true);
-        try self.checkAllConstraints(&env);
-    }
-
-    // After solving all deferred constraints, check for infinite types
+    // After solving all deferred constraints, check for infinite types —
+    // per-def AND for the result expression itself, matching checkExprRepl
+    // (its type may be infinite/anonymously recursive, which the per-def
+    // checks above don't cover).
     for (0..self.cir.all_defs.span.len) |def_offset| {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
     }
-
-    // Check the result expression itself, matching checkExprRepl: its type may
-    // have incompatible constraints (e.g. !3) or be infinite/anonymously
-    // recursive, neither of which is covered by the per-def checks above.
-    const expr_var = ModuleEnv.varFrom(expr_idx);
-    try self.checkFlexVarConstraintCompatibility(expr_var, &env, true);
-    try self.validateResolvedOpenNumeralLiterals(&env, true);
-    try self.resolvePendingTupleAccesses(&env, true);
-    try self.checkAllConstraints(&env);
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);
 
     try self.reportPolymorphicConstrainedExpr(expr_idx);
@@ -8480,7 +8507,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
 
     const def = self.cir.store.getDef(def_idx);
 
-    if (self.top_level_ptrns.get(def.pattern)) |processing_def| {
+    if (self.topLevelPattern(def.pattern)) |processing_def| {
         if (processing_def.status == .processed) {
             // If we've already processed this def, return immediately
             return;
@@ -8504,7 +8531,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
 
     // Make as processing
     const def_name = self.getPatternIdent(def.pattern);
-    try self.top_level_ptrns.put(def.pattern, .{
+    self.setTopLevelPattern(def.pattern, .{
         .def_idx = def_idx,
         .def_name = def_name,
         .status = .processing,
@@ -8611,7 +8638,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     }
 
     // Mark as processed
-    try self.top_level_ptrns.put(def.pattern, .{
+    self.setTopLevelPattern(def.pattern, .{
         .def_idx = def_idx,
         .def_name = def_name,
         .status = .processed,
@@ -8631,7 +8658,7 @@ fn setupCheckOrder(self: *Self) std.mem.Allocator.Error!void {
     try self.group_states.appendNTimes(self.gpa, .pending, sccs.len);
     for (sccs, 0..) |scc, group_index| {
         for (scc.defs) |def_idx| {
-            try self.def_group.put(self.gpa, def_idx, @intCast(group_index));
+            self.setDefGroupIndex(def_idx, @intCast(group_index));
         }
     }
 }
@@ -8649,7 +8676,7 @@ fn predeclareAnnotatedDefSchemes(self: *Self, env: *Env) std.mem.Allocator.Error
         const annotation_idx = def.annotation orelse continue;
         if (!(try self.annotationIsPredeclarableScheme(def.pattern, annotation_idx))) continue;
         const scheme_var = try self.predeclareAnnotationScheme(annotation_idx, env);
-        try self.predeclared_scheme_vars.put(self.gpa, def_idx, scheme_var);
+        self.setPredeclaredSchemeVar(def_idx, scheme_var);
     }
 }
 
@@ -8838,7 +8865,7 @@ fn defInCurrentRecursiveGroup(self: *const Self, def_idx: CIR.Def.Idx) bool {
     if (self.group_stack.items.len == 0) return false;
     const frame = self.group_stack.items[self.group_stack.items.len - 1];
     if (!self.check_order.?.sccs[frame.group_index].is_recursive) return false;
-    const group_index = self.def_group.get(def_idx) orelse return false;
+    const group_index = self.defGroupIndex(def_idx) orelse return false;
     return group_index == frame.group_index;
 }
 
@@ -8933,7 +8960,7 @@ fn checkGroup(self: *Self, group_index: u32, env: *Env) std.mem.Allocator.Error!
 
         for (scc.defs) |member_def_idx| {
             const member_def = self.cir.store.getDef(member_def_idx);
-            if (!self.predeclared_scheme_vars.contains(member_def_idx) and
+            if (self.predeclaredSchemeVar(member_def_idx) == null and
                 isFunctionDef(&self.cir.store, self.cir.store.getExpr(member_def.expr)))
             {
                 // An unannotated member's top-level RHS lives in the group
@@ -9006,7 +9033,7 @@ fn resolveGroupPendingDispatchTargets(self: *Self, env: *Env) std.mem.Allocator.
     while (self.pending_dispatch_targets.items.len > top) {
         while (self.pending_dispatch_targets.items.len > top) {
             const target_def = self.pending_dispatch_targets.pop().?;
-            const target_group = self.def_group.get(target_def).?;
+            const target_group = self.defGroupIndex(target_def).?;
             try self.ensureGroupsCheckedUpTo(target_group, env);
         }
         try self.checkStaticDispatchConstraints(env, false);
@@ -9068,6 +9095,40 @@ fn generateStmtTypeDeclType(
             // Do nothing
         },
     }
+}
+
+fn ensureTypeDeclGenerated(
+    self: *Self,
+    decl_idx: CIR.Statement.Idx,
+    env: *Env,
+) std.mem.Allocator.Error!bool {
+    switch (self.typeDeclGenerationState(decl_idx)) {
+        .generated => return true,
+        .generating => return switch (self.cir.store.getStatement(decl_idx)) {
+            .s_alias_decl => false,
+            .s_nominal_decl => true,
+            else => true,
+        },
+        .not_generated => {},
+    }
+
+    self.setTypeDeclGenerationState(decl_idx, .generating);
+    errdefer self.setTypeDeclGenerationState(decl_idx, .not_generated);
+
+    const outer_seen_annos = self.seen_annos;
+    const outer_type_decl_rigid_vars = self.type_decl_rigid_vars;
+    self.seen_annos = try std.DynamicBitSetUnmanaged.initEmpty(self.gpa, @intCast(self.cir.store.nodes.len()));
+    self.type_decl_rigid_vars = .{};
+    defer {
+        self.seen_annos.deinit(self.gpa);
+        self.seen_annos = outer_seen_annos;
+        self.type_decl_rigid_vars.deinit(self.gpa);
+        self.type_decl_rigid_vars = outer_type_decl_rigid_vars;
+    }
+
+    try self.generateStmtTypeDeclType(decl_idx, env);
+    self.setTypeDeclGenerationState(decl_idx, .generated);
+    return true;
 }
 
 fn aliasOriginModule(self: *const Self) base.ModuleIdentity.Idx {
@@ -9181,7 +9242,7 @@ fn generateAliasDecl(
 
     // Now we have a built of list of rigid variables for the decl lhs (header).
     // With this in hand, we can now generate the type for the lhs (body).
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
     const backing_var: Var = ModuleEnv.varFrom(alias.anno);
     try self.generateAnnoTypeInPlace(alias.anno, env, .{ .type_decl = .{
         .idx = decl_idx,
@@ -9243,7 +9304,7 @@ fn generateNominalDecl(
 
     // Now we have a built of list of rigid variables for the decl lhs (header).
     // With this in hand, we can now generate the type for the lhs (body).
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
     const backing_var: Var = ModuleEnv.varFrom(nominal.anno);
     try self.generateAnnoTypeInPlace(nominal.anno, env, .{ .type_decl = .{
         .idx = decl_idx,
@@ -9267,7 +9328,7 @@ fn generateStandaloneTypeAnno(
     defer trace.end();
 
     // Reset seen type annos
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
 
     // Save top of scratch static dispatch constraints
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
@@ -9361,7 +9422,7 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     const annotation = self.cir.store.getAnnotation(annotation_idx);
 
     // Reset seen type annos
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
 
     // Save top of scratch static dispatch constraints
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
@@ -9454,7 +9515,7 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
 
     // First, check if we've seen this anno before
     // This guards against recursive types
-    if (self.seen_annos.get(anno_idx)) |_| {
+    if (self.typeAnnoSeen(anno_idx)) {
         return;
     }
 
@@ -9465,7 +9526,7 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
     try self.setVarRank(anno_var, env);
 
     // Put this anno in the "seen" map immediately, to support recursive references
-    try self.seen_annos.put(anno_idx, anno_var);
+    self.markTypeAnnoSeen(anno_idx);
 
     switch (anno) {
         .rigid_var => |rigid| {
@@ -9574,6 +9635,14 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                     if (is_for_clause_alias) {
                         _ = try self.unify(anno_var, local_decl_var, env);
                     } else {
+                        if (!try self.ensureTypeDeclGenerated(local.decl_idx, env)) {
+                            _ = try self.problems.appendProblem(self.gpa, .{ .recursive_alias = .{
+                                .type_name = lookup.name,
+                                .region = anno_region,
+                            } });
+                            try self.unifyWith(anno_var, .err, env);
+                            return;
+                        }
                         const instantiated_var = try self.instantiateVar(local_decl_var, env, .{ .explicit = anno_region });
                         _ = try self.unify(anno_var, instantiated_var, env);
                     }
@@ -9670,6 +9739,15 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                             // Otherwise, we're in an annotation and this cannot
                             // be recursive
                         },
+                    }
+
+                    if (!try self.ensureTypeDeclGenerated(local.decl_idx, env)) {
+                        _ = try self.problems.appendProblem(self.gpa, .{ .recursive_alias = .{
+                            .type_name = a.name,
+                            .region = anno_region,
+                        } });
+                        try self.unifyWith(anno_var, .err, env);
+                        return;
                     }
 
                     // Resolve the referenced type
@@ -10451,6 +10529,11 @@ const Expected = struct {
     }
 };
 
+const TryArgs = struct {
+    ok: Var,
+    err: Var,
+};
+
 // pattern //
 
 /// The "polarity" of a tag union or record
@@ -10788,35 +10871,15 @@ fn checkPatternHelp(
             } }, env);
         },
         // nums //
+        .num_from_numeral_literal => {
+            try self.checkOpenNumeralLiteralPattern(pattern_idx, pattern_var, pattern_region, env);
+        },
         .num_literal => |num| {
-            // For unannotated literals (.num_unbound, .int_unbound), create a flex var with from_numeral constraint
             switch (num.kind) {
-                .num_unbound, .int_unbound => {
-                    // Create NumeralInfo for constraint checking
-                    const num_literal_info = switch (num.value.kind) {
-                        .u128 => types_mod.NumeralInfo.fromU128(@bitCast(num.value.bytes), false, pattern_region),
-                        .i128 => types_mod.NumeralInfo.fromI128(num.value.toI128(), num.value.toI128() < 0, false, pattern_region),
-                    };
-
-                    // Create flex var with from_numeral constraint
-                    const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(pattern_idx), num_literal_info, env);
-                    _ = try self.unify(pattern_var, flex_var, env);
-                    try self.mkPatternLiteralEqConstraint(pattern_var, env, pattern_region);
-                },
+                // For unannotated literals, create a flex var with from_numeral constraint
+                .num_unbound, .int_unbound => try self.checkOpenNumeralLiteralPattern(pattern_idx, pattern_var, pattern_region, env),
                 // Phase 5: For explicitly typed literals, use nominal types from Builtin
-                .u8 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.u8, env), env),
-                .i8 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.i8, env), env),
-                .u16 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.u16, env), env),
-                .i16 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.i16, env), env),
-                .u32 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.u32, env), env),
-                .i32 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.i32, env), env),
-                .u64 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.u64, env), env),
-                .i64 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.i64, env), env),
-                .u128 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.u128, env), env),
-                .i128 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.i128, env), env),
-                .f32 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.f32, env), env),
-                .f64 => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.f64, env), env),
-                .dec => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.dec, env), env),
+                else => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(num.kind, env), env),
             }
         },
         .frac_f32_literal => {
@@ -10832,17 +10895,7 @@ fn checkPatternHelp(
                 // Explicit suffix like `3.14dec` - use nominal Dec type
                 try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.dec, env), env);
             } else {
-                // Unannotated decimal literal - create flex var with from_numeral constraint
-                const num_literal_info = types_mod.NumeralInfo.fromI128(
-                    dec.value.num, // RocDec has .num field which is i128 scaled by 10^18
-                    dec.value.num < 0,
-                    true, // Decimal literals are always fractional
-                    pattern_region,
-                );
-
-                const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(pattern_idx), num_literal_info, env);
-                _ = try self.unify(pattern_var, flex_var, env);
-                try self.mkPatternLiteralEqConstraint(pattern_var, env, pattern_region);
+                try self.checkOpenNumeralLiteralPattern(pattern_idx, pattern_var, pattern_region, env);
             }
         },
         .small_dec_literal => |dec| {
@@ -10850,18 +10903,7 @@ fn checkPatternHelp(
                 // Explicit suffix - use nominal Dec type
                 try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.dec, env), env);
             } else {
-                // Unannotated decimal literal - create flex var with from_numeral constraint
-                const scaled_value = dec.value.toRocDec().num;
-                const num_literal_info = types_mod.NumeralInfo.fromI128(
-                    scaled_value,
-                    dec.value.numerator < 0,
-                    true,
-                    pattern_region,
-                );
-
-                const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(pattern_idx), num_literal_info, env);
-                _ = try self.unify(pattern_var, flex_var, env);
-                try self.mkPatternLiteralEqConstraint(pattern_var, env, pattern_region);
+                try self.checkOpenNumeralLiteralPattern(pattern_idx, pattern_var, pattern_region, env);
             }
         },
         .runtime_error => {
@@ -10902,6 +10944,7 @@ const CirPatternRefutabilityAdapter = struct {
             .list => .list,
             .applied_tag,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -10924,6 +10967,7 @@ const CirPatternRefutabilityAdapter = struct {
             .list,
             .tuple,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -10948,6 +10992,7 @@ const CirPatternRefutabilityAdapter = struct {
             .record_destructure,
             .list,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -10972,6 +11017,7 @@ const CirPatternRefutabilityAdapter = struct {
             .record_destructure,
             .list,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -10996,6 +11042,7 @@ const CirPatternRefutabilityAdapter = struct {
             .list,
             .tuple,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11024,6 +11071,7 @@ const CirPatternRefutabilityAdapter = struct {
             .list,
             .tuple,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11048,6 +11096,7 @@ const CirPatternRefutabilityAdapter = struct {
             .record_destructure,
             .tuple,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11072,6 +11121,7 @@ const CirPatternRefutabilityAdapter = struct {
             .record_destructure,
             .tuple,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11096,6 +11146,7 @@ const CirPatternRefutabilityAdapter = struct {
             .record_destructure,
             .tuple,
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -11210,6 +11261,7 @@ fn collectPatternBindings(
             }
         },
         .num_literal,
+        .num_from_numeral_literal,
         .small_dec_literal,
         .dec_literal,
         .frac_f32_literal,
@@ -11514,73 +11566,26 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         // nums //
         .e_num => |num| {
             switch (num.kind) {
-                .num_unbound, .int_unbound => {
-                    // For unannotated literals, create a flex var with from_numeral constraint
-                    const num_literal_info = switch (num.value.kind) {
-                        .u128 => types_mod.NumeralInfo.fromU128(@bitCast(num.value.bytes), false, expr_region),
-                        .i128 => types_mod.NumeralInfo.fromI128(num.value.toI128(), num.value.toI128() < 0, false, expr_region),
-                    };
-
-                    // Create flex var with from_numeral constraint
-                    const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-                    _ = try self.unify(expr_var, flex_var, env);
-                },
-                .u8 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.u8, env), env),
-                .i8 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.i8, env), env),
-                .u16 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.u16, env), env),
-                .i16 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.i16, env), env),
-                .u32 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.u32, env), env),
-                .i32 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.i32, env), env),
-                .u64 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.u64, env), env),
-                .i64 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.i64, env), env),
-                .u128 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.u128, env), env),
-                .i128 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.i128, env), env),
-                .f32 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f32, env), env),
-                .f64 => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f64, env), env),
-                .dec => try self.unifyWith(expr_var, try self.mkNumberTypeContent(.dec, env), env),
+                // For unannotated literals, create a flex var with from_numeral constraint
+                .num_unbound, .int_unbound => try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env),
+                else => try self.unifyWith(expr_var, try self.mkNumberTypeContent(num.kind, env), env),
             }
         },
         .e_num_from_numeral => {
-            const num_literal_info = try self.exactNumeralInfoForExpr(expr_idx, expr_region);
-            const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-            _ = try self.unify(expr_var, flex_var, env);
+            try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
         },
         .e_frac_f32 => |frac| {
             if (frac.has_suffix) {
                 try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f32, env), env);
             } else {
-                // Unsuffixed fractional literal - create constrained flex var
-                var num_literal_info = types_mod.NumeralInfo.fromI128(
-                    @as(i128, @as(u32, @bitCast(frac.value))),
-                    frac.value < 0,
-                    true,
-                    expr_region,
-                );
-                num_literal_info.frac_requirements = .{
-                    .fits_in_f32 = true,
-                    .fits_in_dec = CIR.fitsInDec(@as(f64, @floatCast(frac.value))),
-                };
-                const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-                _ = try self.unify(expr_var, flex_var, env);
+                try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
         },
         .e_frac_f64 => |frac| {
             if (frac.has_suffix) {
                 try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f64, env), env);
             } else {
-                // Unsuffixed fractional literal - create constrained flex var
-                var num_literal_info = types_mod.NumeralInfo.fromI128(
-                    @as(i128, @as(u64, @bitCast(frac.value))),
-                    frac.value < 0,
-                    true,
-                    expr_region,
-                );
-                num_literal_info.frac_requirements = .{
-                    .fits_in_f32 = CIR.fitsInF32(frac.value),
-                    .fits_in_dec = CIR.fitsInDec(frac.value),
-                };
-                const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-                _ = try self.unify(expr_var, flex_var, env);
+                try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
         },
         .e_dec => |frac| {
@@ -11589,19 +11594,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 _ = try self.reportInvalidBuiltinFromNumeralInfo(expr_var, .dec, num_literal_info, env);
                 try self.unifyWith(expr_var, try self.mkNumberTypeContent(.dec, env), env);
             } else {
-                // Unsuffixed Dec literal - create constrained flex var
-                var num_literal_info = types_mod.NumeralInfo.fromI128(
-                    frac.value.num,
-                    frac.value.num < 0,
-                    true,
-                    expr_region,
-                );
-                num_literal_info.frac_requirements = .{
-                    .fits_in_f32 = CIR.fitsInF32(frac.value.toF64()),
-                    .fits_in_dec = true,
-                };
-                const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-                _ = try self.unify(expr_var, flex_var, env);
+                try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
         },
         .e_dec_small => |frac| {
@@ -11610,90 +11603,19 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 _ = try self.reportInvalidBuiltinFromNumeralInfo(expr_var, .dec, num_literal_info, env);
                 try self.unifyWith(expr_var, try self.mkNumberTypeContent(.dec, env), env);
             } else {
-                // Unsuffixed small Dec literal - create constrained flex var
-                const scaled_value = frac.value.toRocDec().num;
-                const literal = self.recordedNumeralLiteralForExpr(expr_idx);
-                const is_fractional = literal.hadDecimalPoint() or frac.value.denominator_power_of_ten != 0;
-                const literal_value: i128 = if (is_fractional) scaled_value else frac.value.numerator;
-                var num_literal_info = types_mod.NumeralInfo.fromI128(
-                    literal_value,
-                    literal_value < 0,
-                    is_fractional,
-                    expr_region,
-                );
-                const f64_val = frac.value.toF64();
-                num_literal_info.frac_requirements = .{
-                    .fits_in_f32 = CIR.fitsInF32(f64_val),
-                    .fits_in_dec = true,
-                };
-                const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-                _ = try self.unify(expr_var, flex_var, env);
+                try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
         },
-        .e_typed_int => |typed_num| {
+        .e_typed_int => {
             // Typed integer literal like 123.U64
-            // Create from_numeral constraint and unify with the explicit type
-            var num_literal_info = if (self.typedLiteralTargetsBuiltin(expr_idx, .dec))
-                try self.exactNumeralInfoForExpr(expr_idx, expr_region)
-            else switch (typed_num.value.kind) {
-                .u128 => types_mod.NumeralInfo.fromU128(@bitCast(typed_num.value.bytes), false, expr_region),
-                .i128 => types_mod.NumeralInfo.fromI128(typed_num.value.toI128(), typed_num.value.toI128() < 0, false, expr_region),
-            };
-            num_literal_info.explicit_suffix = true;
-
-            // Create flex var with from_numeral constraint
-            const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-
-            try self.unifyTypedLiteralWithExplicitType(
-                flex_var,
-                expr_idx,
-                expr_region,
-                env,
-            );
-            if (self.typedLiteralTargetsBuiltin(expr_idx, .dec)) {
-                _ = try self.reportInvalidBuiltinFromNumeralInfo(flex_var, .dec, num_literal_info, env);
-            }
-
-            // Unify expr_var with the flex_var (which is now constrained to the explicit type)
-            _ = try self.unify(expr_var, flex_var, env);
+            try self.checkSuffixedNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
         },
         .e_typed_frac => {
             // Typed fractional literal like 3.14.Dec
-            var num_literal_info = try self.exactNumeralInfoForExpr(expr_idx, expr_region);
-            num_literal_info.explicit_suffix = true;
-
-            // Create flex var with from_numeral constraint
-            const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-
-            try self.unifyTypedLiteralWithExplicitType(
-                flex_var,
-                expr_idx,
-                expr_region,
-                env,
-            );
-            if (self.typedLiteralTargetsBuiltin(expr_idx, .dec)) {
-                _ = try self.reportInvalidBuiltinFromNumeralInfo(flex_var, .dec, num_literal_info, env);
-            }
-
-            // Unify expr_var with the flex_var (which is now constrained to the explicit type)
-            _ = try self.unify(expr_var, flex_var, env);
+            try self.checkSuffixedNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
         },
         .e_typed_num_from_numeral => {
-            var num_literal_info = try self.exactNumeralInfoForExpr(expr_idx, expr_region);
-            num_literal_info.explicit_suffix = true;
-            const flex_var = try self.mkFlexWithFromNumeralConstraint(ModuleEnv.nodeIdxFrom(expr_idx), num_literal_info, env);
-
-            try self.unifyTypedLiteralWithExplicitType(
-                flex_var,
-                expr_idx,
-                expr_region,
-                env,
-            );
-            if (self.typedLiteralTargetsBuiltin(expr_idx, .dec)) {
-                _ = try self.reportInvalidBuiltinFromNumeralInfo(flex_var, .dec, num_literal_info, env);
-            }
-
-            _ = try self.unify(expr_var, flex_var, env);
+            try self.checkSuffixedNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
         },
         // list //
         .e_empty_list => {
@@ -11931,7 +11853,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 .pattern_idx = lookup.pattern_idx,
             });
 
-            const mb_processing_def = self.top_level_ptrns.get(lookup.pattern_idx);
+            const mb_processing_def = self.topLevelPattern(lookup.pattern_idx);
             if (mb_processing_def) |processing_def| {
                 const referenced_def = self.cir.store.getDef(processing_def.def_idx);
                 // A reference to an annotated def whose body has not been
@@ -11939,7 +11861,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 // uniform rule: annotated references never need the body.
                 // (Once the def is `.processed`, its own pattern var carries
                 // the checked scheme and the ordinary tail below applies.)
-                const mb_predeclared_scheme = self.predeclared_scheme_vars.get(processing_def.def_idx);
+                const mb_predeclared_scheme = self.predeclaredSchemeVar(processing_def.def_idx);
 
                 switch (processing_def.status) {
                     .not_processed => {
@@ -13174,7 +13096,7 @@ fn validateToInspectMethodTypeForArg(
 
 fn exprIsTopLevelLookup(self: *Self, expr_idx: CIR.Expr.Idx) bool {
     return switch (self.cir.store.getExpr(expr_idx)) {
-        .e_lookup_local => |lookup| self.top_level_ptrns.contains(lookup.pattern_idx),
+        .e_lookup_local => |lookup| self.patternIsTopLevelDef(lookup.pattern_idx),
         else => false,
     };
 }
@@ -13805,6 +13727,7 @@ fn checkDestructureExhaustiveness(
     const result = exhaustive.checkDestructure(
         self.cir.gpa,
         self.types,
+        self.cir,
         &self.cir.store,
         self.exhaustiveBuiltinIdents(),
         pattern_idx,
@@ -13877,6 +13800,7 @@ fn checkParamPatternExhaustiveness(
     const result = exhaustive.checkDestructure(
         self.cir.gpa,
         self.types,
+        self.cir,
         &self.cir.store,
         self.exhaustiveBuiltinIdents(),
         pattern_idx,
@@ -14404,6 +14328,170 @@ fn functionTypeFromVar(self: *Self, fn_var: Var) ?Func {
     }
 }
 
+fn tryArgsFromVar(self: *Self, try_var: Var) ?TryArgs {
+    var current = try_var;
+    var guard = types_mod.debug.IterationGuard.init("tryArgsFromVar");
+    while (true) {
+        guard.tick();
+        const resolved = self.types.resolveVar(current);
+        switch (resolved.desc.content) {
+            .structure => |flat| switch (flat) {
+                .nominal_type => |nominal| {
+                    if (!self.nominalIsBuiltinTryType(nominal)) return null;
+                    const args = self.types.sliceNominalArgs(nominal);
+                    if (args.len != 2) return null;
+                    return .{ .ok = args[0], .err = args[1] };
+                },
+                else => return null,
+            },
+            .alias => |alias| current = self.types.getAliasBackingVar(alias),
+            else => return null,
+        }
+    }
+}
+
+fn widenTryConditionForExpectedReturn(
+    self: *Self,
+    cond_var: Var,
+    expected_return: Var,
+    env: *Env,
+    region: Region,
+) std.mem.Allocator.Error!void {
+    const actual_try = self.tryArgsFromVar(cond_var) orelse return;
+    const expected_try = self.tryArgsFromVar(expected_return) orelse return;
+
+    if (!try self.tryErrorRowNeedsUseSiteWidening(actual_try.err, expected_try.err)) {
+        return;
+    }
+
+    // `?` injects the callee's error row into the enclosing return row. Ordinary
+    // tag-union unification still rejects closed-vs-open rigid rows; this use-site
+    // rewrite runs only after proving the callee's visible errors are included.
+    const widened_try_var = try self.freshFromContent(
+        try self.mkTryContent(actual_try.ok, expected_try.err, env),
+        env,
+        region,
+    );
+    const cond_root = self.types.resolveVar(cond_var).var_;
+    if (cond_root != widened_try_var) {
+        try self.types.dangerousSetVarRedirect(cond_root, widened_try_var);
+    }
+}
+
+fn tryErrorRowNeedsUseSiteWidening(self: *Self, actual_err: Var, expected_err: Var) std.mem.Allocator.Error!bool {
+    if (try self.probeCanUseAs(expected_err, actual_err)) {
+        return false;
+    }
+
+    var visited_actual = std.AutoHashMap(Var, void).init(self.gpa);
+    defer visited_actual.deinit();
+    return try self.actualTagRowIsIncludedInExpected(actual_err, expected_err, &visited_actual);
+}
+
+fn probeCanUseAs(self: *Self, expected_var: Var, actual_var: Var) std.mem.Allocator.Error!bool {
+    var probe = try self.beginProbe();
+    defer probe.rollback();
+    return try self.probeUnifyWithoutRecordingProblems(expected_var, actual_var);
+}
+
+fn actualTagRowIsIncludedInExpected(
+    self: *Self,
+    actual_var: Var,
+    expected_var: Var,
+    visited_actual: *std.AutoHashMap(Var, void),
+) std.mem.Allocator.Error!bool {
+    const actual_resolved = self.types.resolveVar(actual_var);
+    if (visited_actual.contains(actual_resolved.var_)) return true;
+    try visited_actual.put(actual_resolved.var_, {});
+
+    switch (actual_resolved.desc.content) {
+        .alias => |alias| return try self.actualTagRowIsIncludedInExpected(
+            self.types.getAliasBackingVar(alias),
+            expected_var,
+            visited_actual,
+        ),
+        .structure => |flat| switch (flat) {
+            .empty_tag_union => return true,
+            .tag_union => |tag_union| {
+                const tags = self.types.getTagsSlice(tag_union.tags);
+                const names = tags.items(.name);
+                const args_ranges = tags.items(.args);
+                for (names, args_ranges) |name, args| {
+                    const actual_tag = types_mod.Tag{ .name = name, .args = args };
+                    if (!try self.expectedTagRowContainsTag(expected_var, actual_tag)) {
+                        return false;
+                    }
+                }
+                return try self.actualTagRowIsIncludedInExpected(tag_union.ext, expected_var, visited_actual);
+            },
+            else => return false,
+        },
+        .err => return true,
+        .flex, .rigid => return false,
+    }
+}
+
+fn expectedTagRowContainsTag(
+    self: *Self,
+    expected_var: Var,
+    actual_tag: types_mod.Tag,
+) std.mem.Allocator.Error!bool {
+    var visited_expected = std.AutoHashMap(Var, void).init(self.gpa);
+    defer visited_expected.deinit();
+
+    const expected_tag = try self.findVisibleTagInRow(expected_var, actual_tag.name, &visited_expected) orelse return false;
+    return try self.tagsCanUseSamePayloads(expected_tag, actual_tag);
+}
+
+fn findVisibleTagInRow(
+    self: *Self,
+    row_var: Var,
+    tag_name: Ident.Idx,
+    visited: *std.AutoHashMap(Var, void),
+) std.mem.Allocator.Error!?types_mod.Tag {
+    const row_resolved = self.types.resolveVar(row_var);
+    if (visited.contains(row_resolved.var_)) return null;
+    try visited.put(row_resolved.var_, {});
+
+    switch (row_resolved.desc.content) {
+        .alias => |alias| return try self.findVisibleTagInRow(
+            self.types.getAliasBackingVar(alias),
+            tag_name,
+            visited,
+        ),
+        .structure => |flat| switch (flat) {
+            .tag_union => |tag_union| {
+                const tags = self.types.getTagsSlice(tag_union.tags);
+                const names = tags.items(.name);
+                const args_ranges = tags.items(.args);
+                for (names, args_ranges) |name, args| {
+                    if (name.eql(tag_name)) {
+                        return types_mod.Tag{ .name = name, .args = args };
+                    }
+                }
+                return try self.findVisibleTagInRow(tag_union.ext, tag_name, visited);
+            },
+            .empty_tag_union => return null,
+            else => return null,
+        },
+        .err, .flex, .rigid => return null,
+    }
+}
+
+fn tagsCanUseSamePayloads(self: *Self, expected_tag: types_mod.Tag, actual_tag: types_mod.Tag) std.mem.Allocator.Error!bool {
+    if (expected_tag.args.len() != actual_tag.args.len()) return false;
+
+    var expected_args = self.types.iterVars(expected_tag.args);
+    var actual_args = self.types.iterVars(actual_tag.args);
+    while (expected_args.next()) |expected_arg| {
+        const actual_arg = actual_args.next().?;
+        if (!try self.probeCanUseAs(expected_arg, actual_arg)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // if-else //
 
 /// Check the types for an if-else expr
@@ -14624,6 +14712,8 @@ fn checkMatchExpr(
         } });
         if (!try_result.isOk()) {
             has_invalid_try = true;
+        } else if (expected.returnResult()) |expected_return| {
+            try self.widenTryConditionForExpectedReturn(cond_var, expected_return, env, expr_region);
         }
     }
     if (!match.is_try_suffix and !match.skip_exhaustiveness) {
@@ -14833,6 +14923,7 @@ fn checkMatchExpr(
         const result = exhaustive.checkMatch(
             self.cir.gpa,
             self.types,
+            self.cir,
             &self.cir.store,
             self.exhaustiveBuiltinIdents(),
             match.branches,
@@ -16333,6 +16424,72 @@ fn finalizeLiteralDefaults(self: *Self, env: *Env) std.mem.Allocator.Error!void 
     } });
 }
 
+/// What `finalizeTypes` is finalizing: the whole module, or a single REPL
+/// expression (whose var gets the expression-scoped compatibility check the
+/// module-wide passes would skip).
+const FinalizeScope = union(enum) {
+    module: struct {
+        /// True when the caller intentionally leaves numeric defaults open
+        /// (e.g. type-introspection flows that re-check with context later).
+        skip_numeric_defaults: bool,
+    },
+    repl_expr: CIR.Expr.Idx,
+};
+
+/// THE type-finalization point: every checking entry point (module check and
+/// both REPL flavors) lands here exactly once, after its own constraint
+/// traversal. Literal defaults are decided here — by the defaulting oracle
+/// (src/types/literal_defaulting.zig) driving `runLiteralDefaultingRounds` —
+/// and every validation that needs final types (open-numeral range checks,
+/// default-type method compatibility, instantiated dispatch constraints)
+/// runs after the decision, so dispatch plans and evidence freeze only on
+/// finalized types.
+///
+/// The generalization-boundary defaulting (`defaultLiteralsAtGeneralizationBoundary`)
+/// is NOT a second decision point: it runs the same engine under the same
+/// oracle for the vars a def's generalize call is about to promote — a rank
+/// constraint (the leak warning and let-polymorphism filtering must see
+/// pre-promotion ranks), not a separate policy.
+fn finalizeTypes(self: *Self, env: *Env, scope: FinalizeScope) std.mem.Allocator.Error!void {
+    try self.checkAllConstraints(env);
+    try self.resolvePendingTupleAccesses(env, false);
+    try self.checkAllConstraints(env);
+
+    try self.resolveNumericLiteralsFromContext(env);
+    const run_defaults = switch (scope) {
+        .module => |module| !module.skip_numeric_defaults,
+        .repl_expr => true,
+    };
+    if (run_defaults) {
+        try self.finalizeLiteralDefaults(env);
+
+        // Committing a default can spawn deferred static-dispatch
+        // constraints (e.g. Dec.plus, Dec.to_str returning Str); resolve
+        // them so the validations below see settled types.
+        if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
+            try self.checkStaticDispatchConstraints(env, true);
+            try self.checkAllConstraints(env);
+        }
+    }
+
+    switch (scope) {
+        .module => {
+            try self.validateToInspectMethodTypes(env);
+            try self.checkAllFromNumeralFlexConstraintCompatibility(env, true);
+        },
+        // The REPL result expression is not module state; its type may have
+        // incompatible constraints (e.g. !3) the module-wide walk over open
+        // literal vars would not visit.
+        .repl_expr => |expr_idx| try self.checkFlexVarConstraintCompatibility(ModuleEnv.varFrom(expr_idx), env, true),
+    }
+    try self.validateResolvedOpenNumeralLiterals(env);
+    if (scope == .module) {
+        try self.checkInstantiatedStaticDispatchConstraints(env, true);
+    }
+    try self.resolvePendingTupleAccesses(env, true);
+    try self.checkAllConstraints(env);
+}
+
 /// The candidate universe `runLiteralDefaultingRounds` gathers from — the only
 /// structural difference between module finalize and a def's generalization
 /// boundary. Both lengths are SNAPSHOTS taken before the first round: committing
@@ -16555,9 +16712,22 @@ fn runLiteralDefaultingRounds(self: *Self, env: *Env, universe: LiteralDefaultUn
             if (componentFind(self.literal_defaulting_component_parent.items, leader) != leader) continue;
             self.literal_defaulting_group_drivers.clearRetainingCapacity();
             var member_count: usize = 0;
+            // A candidate the component commits pins EVERY member literal, so
+            // the digit-fit precheck must consult every member's exact value
+            // facts — not just the driver's own. Intersecting the members'
+            // precomputed fit sets keeps the check O(1) per candidate and
+            // makes the outcome independent of which member carries the
+            // driving constraint (mirror-image programs commit identically).
+            var component_fits = exact_numeral.FitSet.initFull();
             for (self.literal_defaulting_open_roots.items, 0..) |member_root, member_idx| {
                 if (componentFind(self.literal_defaulting_component_parent.items, member_idx) != leader) continue;
                 member_count += 1;
+                const member_range = self.types.resolveVar(member_root).desc.content.flex.constraints;
+                for (self.types.sliceStaticDispatchConstraints(member_range)) |constraint| {
+                    if (constraint.origin.numeralInfo()) |info| {
+                        component_fits = component_fits.intersectWith(info.fits);
+                    }
+                }
                 if (self.literal_defaulting_is_driver.items[member_idx]) {
                     try self.literal_defaulting_group_drivers.append(self.gpa, member_root);
                 }
@@ -16573,13 +16743,13 @@ fn runLiteralDefaultingRounds(self: *Self, env: *Env, universe: LiteralDefaultUn
                 std.debug.assert(member_count == 1);
                 const passive_root = self.literal_defaulting_open_roots.items[leader];
                 const kind = self.varLiteralKind(passive_root) orelse unreachable;
-                try self.commitGatheredLiteral(passive_root, kind, universe, env);
+                try self.commitGatheredLiteral(passive_root, kind, component_fits, universe, env);
             } else if (self.literal_defaulting_group_drivers.items.len == 1) {
                 const driver_root = self.literal_defaulting_group_drivers.items[0];
                 const kind = self.varLiteralKind(driver_root) orelse unreachable;
-                try self.commitGatheredLiteral(driver_root, kind, universe, env);
+                try self.commitGatheredLiteral(driver_root, kind, component_fits, universe, env);
             } else {
-                try self.commitGatheredGroup(self.literal_defaulting_group_drivers.items, &self.literal_defaulting_group_warnings, universe, env);
+                try self.commitGatheredGroup(self.literal_defaulting_group_drivers.items, component_fits, &self.literal_defaulting_group_warnings, universe, env);
             }
         }
 
@@ -16599,14 +16769,15 @@ fn commitGatheredLiteral(
     self: *Self,
     root: Var,
     kind: StaticDispatchConstraint.LiteralKind,
+    component_fits: exact_numeral.FitSet,
     universe: LiteralDefaultUniverse,
     env: *Env,
 ) std.mem.Allocator.Error!void {
     switch (universe) {
-        .finalize => _ = try self.commitLiteralDefault(root, kind, env),
+        .finalize => _ = try self.commitLiteralDefault(root, kind, component_fits, env),
         .boundary => {
             const pending = try self.boundaryWarningBeforeCommit(root);
-            const default_var = try self.commitLiteralDefault(root, kind, env);
+            const default_var = try self.commitLiteralDefault(root, kind, component_fits, env);
             try self.emitBoundaryWarningAfterCommit(pending, root, default_var);
         },
     }
@@ -16626,18 +16797,19 @@ fn commitGatheredLiteral(
 fn commitGatheredGroup(
     self: *Self,
     drivers: []const Var,
+    component_fits: exact_numeral.FitSet,
     warnings_scratch: *std.ArrayListUnmanaged(PendingBoundaryWarning),
     universe: LiteralDefaultUniverse,
     env: *Env,
 ) std.mem.Allocator.Error!void {
     switch (universe) {
-        .finalize => try self.commitLiteralGroupDefault(drivers, env),
+        .finalize => try self.commitLiteralGroupDefault(drivers, component_fits, env),
         .boundary => {
             warnings_scratch.clearRetainingCapacity();
             for (drivers) |driver| {
                 try warnings_scratch.append(self.gpa, try self.boundaryWarningBeforeCommit(driver));
             }
-            try self.commitLiteralGroupDefault(drivers, env);
+            try self.commitLiteralGroupDefault(drivers, component_fits, env);
             // The group commit unified each driver with its committed var, so the
             // driver root itself renders the committed type for the snapshot.
             for (drivers, warnings_scratch.items) |driver, pending| {
@@ -16712,7 +16884,7 @@ fn componentUnion(parent: []usize, a: usize, b: usize) void {
 /// `commitQuoteDefault` / Str for quotes), so the dispatch cascade reports the
 /// conflicts against the documented default type — the same failure shape as the
 /// single-literal path.
-fn commitLiteralGroupDefault(self: *Self, drivers: []const Var, env: *Env) Allocator.Error!void {
+fn commitLiteralGroupDefault(self: *Self, drivers: []const Var, component_fits: exact_numeral.FitSet, env: *Env) Allocator.Error!void {
     std.debug.assert(drivers.len >= 2);
 
     // Constraint ranges and literal kinds captured while the drivers are still
@@ -16739,10 +16911,18 @@ fn commitLiteralGroupDefault(self: *Self, drivers: []const Var, env: *Env) Alloc
         numeral_default_candidates[0..1];
 
     candidate: for (candidate_scan) |candidate_kind| {
+        // The component's passive literals get pinned by phase 1's assignments
+        // too, so their exact values must accept the candidate — the O(1) bit
+        // test on the precomputed intersection runs before the per-driver walk.
+        if (has_numeral_driver and !componentFitsAcceptNumKind(component_fits, candidate_kind)) continue :candidate;
         // Digit-fit precheck for every numeral driver's literal payload — pure
-        // arithmetic on the constraint payloads, before any speculation. Quote
-        // drivers are assigned Str, which their own literal-conversion provenance
-        // accepts by definition, so they have nothing to precheck.
+        // arithmetic on the constraint payloads, before any speculation. Not
+        // subsumed by the bit test above: a driver's range can carry
+        // from_literal QUOTE constraints (a numeral flex unified with a quote
+        // flex defers the conflict), which refute every numeric candidate but
+        // contribute nothing to the numeral fit-set intersection. Quote
+        // drivers are assigned Str, which their own literal-conversion
+        // provenance accepts by definition, so they have nothing to precheck.
         for (self.literal_defaulting_constraint_ranges.items, self.literal_defaulting_kinds.items) |range, kind| {
             if (kind != .numeral) continue;
             if (!self.rangeNumeralDigitsFit(range, candidate_kind)) continue :candidate;
@@ -17169,23 +17349,13 @@ fn literalSourceRegion(self: *Self, var_: Var) ?Region {
 
 /// The literal kind this var is an open literal of — derived from its constraint
 /// set, never stored. Returns null if the var carries no literal-conversion
-/// constraint.
-///
-/// DUAL-KIND TIE-BREAK: a var can carry BOTH kinds (a flex/flex merge like
-/// `if c 1 else "s"` unions the two literals' constraint sets). Such a var can
-/// never type-check, but the kind reported here picks which head default is
-/// attempted (Dec vs Str) and hence which literal-kind diagnostic fires — so it
-/// must not depend on constraint storage order (which unify side each literal
-/// arrived on), or mirror-image programs would get different diagnostics.
-/// Delegates to `StaticDispatchConstraint.dominantLiteralKind`, the single
-/// source of truth for the numeral > quote > interpolation tie-break shared
-/// with `flexLiteralDefaultKind` (canonical_type_keys.zig) and
-/// `numericDefaultPhaseForConstraints` (checked_artifact.zig).
+/// constraint. The kind tie-break lives in the defaulting oracle
+/// (src/types/literal_defaulting.zig), the one implementation every stage uses.
 fn varLiteralKind(self: *Self, var_: Var) ?StaticDispatchConstraint.LiteralKind {
     const resolved = self.types.resolveVar(var_);
     if (resolved.desc.content != .flex) return null;
     const constraints = self.types.sliceStaticDispatchConstraints(resolved.desc.content.flex.constraints);
-    return StaticDispatchConstraint.dominantLiteralKind(constraints);
+    return literal_defaulting.dominantKind(constraints);
 }
 
 // --- Per-kind literal facts, each an exhaustive `switch (LiteralKind)` ---------
@@ -17203,7 +17373,7 @@ fn varLiteralKind(self: *Self, var_: Var) ?StaticDispatchConstraint.LiteralKind 
 /// directly (the common case, no probing). If no candidate satisfies, the head is
 /// committed via the normal unify path anyway, so the post-finalize dispatch pass
 /// reports the conflict against the documented default type.
-fn commitLiteralDefault(self: *Self, literal_var: Var, kind: StaticDispatchConstraint.LiteralKind, env: *Env) Allocator.Error!Var {
+fn commitLiteralDefault(self: *Self, literal_var: Var, kind: StaticDispatchConstraint.LiteralKind, component_fits: exact_numeral.FitSet, env: *Env) Allocator.Error!Var {
     switch (kind) {
         .numeral => {
             const constraint_range = self.types.resolveVar(literal_var).desc.content.flex.constraints;
@@ -17235,14 +17405,14 @@ fn commitLiteralDefault(self: *Self, literal_var: Var, kind: StaticDispatchConst
                         // per-instance debug-only fields, compiled out entirely in
                         // release builds (no global state, no hot-path cost).
                         if (comptime std.debug.runtime_safety) {
-                            const witness = try self.tryCommitNumeralCandidate(literal_var, candidate_kind, constraint_range, env);
+                            const witness = try self.tryCommitNumeralCandidate(literal_var, candidate_kind, constraint_range, component_fits, env);
                             std.debug.assert(witness == null);
                             self.bench_probe_refuted += 1;
                         }
                         continue;
                     }
                     if (comptime std.debug.runtime_safety) self.bench_probe_attempts += 1;
-                    if (try self.tryCommitNumeralCandidate(literal_var, candidate_kind, constraint_range, env)) |committed_var| {
+                    if (try self.tryCommitNumeralCandidate(literal_var, candidate_kind, constraint_range, component_fits, env)) |committed_var| {
                         return committed_var;
                     }
                 }
@@ -17286,17 +17456,24 @@ fn commitLiteralDefaultHead(self: *Self, literal_var: Var, env: *Env) Allocator.
     return default_var;
 }
 
-/// Candidate order for numeral defaulting (first satisfier wins). `Dec` (the
-/// canonical default) heads the list; then integers — signed before unsigned,
-/// `I64` first (Roc's historical integer default), wider before narrower so a tie
-/// never lands on a type that overflows sooner than it must; floats last. Order
-/// past `Dec` only matters when the constraints refute `Dec` yet accept several
-/// candidates — a pinned concrete arg or return admits exactly one regardless of
-/// order. That single-admission claim holds because builtin numeric methods are
-/// homogeneous (`T, T -> T`, e.g. `Dec.plus : Dec, Dec -> Dec`): every signature
-/// position is the dispatcher type itself, so pinning ANY position pins the
-/// candidate.
-const numeral_default_candidates = [_]CIR.NumKind{ .dec, .i64, .u64, .i128, .u128, .i32, .u32, .i16, .u16, .i8, .u8, .f64, .f32 };
+/// Candidate order for numeral defaulting, owned by the defaulting oracle
+/// (src/types/literal_defaulting.zig — see its doc for the ordering rationale)
+/// and mapped here into the `CIR.NumKind` values the probe machinery consumes.
+const numeral_default_candidates = blk: {
+    var kinds: [literal_defaulting.numeral_default_candidates.len]CIR.NumKind = undefined;
+    for (literal_defaulting.numeral_default_candidates, 0..) |target, index| {
+        kinds[index] = numKindFromNumeralTarget(target);
+    }
+    break :blk kinds;
+};
+
+/// The `CIR.NumKind` for a builtin numeral target type (exhaustive by tag
+/// name: a new target fails to compile until NumKind has a matching tag).
+fn numKindFromNumeralTarget(target: exact_numeral.Target) CIR.NumKind {
+    return switch (target) {
+        inline else => |t| @field(CIR.NumKind, @tagName(t)),
+    };
+}
 
 /// Whether the constraint range carries any obligation besides literal-conversion
 /// provenance — i.e. whether defaulting must consult the candidate probe at all.
@@ -17420,12 +17597,19 @@ fn tryCommitNumeralCandidate(
     literal_var: Var,
     candidate_kind: CIR.NumKind,
     constraint_range: StaticDispatchConstraint.SafeList.Range,
+    component_fits: exact_numeral.FitSet,
     env: *Env,
 ) Allocator.Error!?Var {
-    // The candidate must be able to represent the literal payload itself (for
-    // numerals: the digits fit `candidate_kind`). Pure arithmetic on the
-    // constraint payloads, checked before any store mutation so refuting a
+    // The candidate must be able to represent every literal in this literal's
+    // interference component — the O(1) bit test on the precomputed
+    // intersection runs first — AND every from_literal payload in the
+    // driver's own range. The walk is NOT subsumed by the bit test: a range
+    // can carry from_literal QUOTE constraints (a numeral flex unified with a
+    // quote flex defers the conflict), which refute every numeric candidate
+    // but contribute nothing to the numeral fit-set intersection. Both are
+    // pure arithmetic, checked before any store mutation so refuting a
     // candidate on digits alone costs no speculation at all.
+    if (!componentFitsAcceptNumKind(component_fits, candidate_kind)) return null;
     if (!self.rangeNumeralDigitsFit(constraint_range, candidate_kind)) return null;
 
     var commit_probe = try self.beginCommitProbe(env);
@@ -17516,6 +17700,13 @@ fn staticDispatchConstraintAcceptsCandidate(
     // commit-probe rollback rewinds.
     const result = try self.unify(method_var, constraint.fn_var, env);
     return result.isOk();
+}
+
+/// Whether every numeral literal in a defaulting component's combined fit set
+/// accepts the candidate. Unbound kinds impose no obligation.
+fn componentFitsAcceptNumKind(component_fits: exact_numeral.FitSet, candidate_kind: CIR.NumKind) bool {
+    const target = numeralTargetFromNumKind(candidate_kind) orelse return true;
+    return component_fits.contains(target);
 }
 
 /// Whether the builtin numeric candidate `candidate_kind` can represent every
@@ -17782,9 +17973,6 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                 while (constraints_iter.next()) |constraint| {
                     if (constraint.origin == .from_literal) {
                         if (self.builtinNumKindFromTypeName(rigid.name)) |num_kind| {
-                            if (skipDefaultedDecIntegerLiteralValidation(is_numeric_default_pass, num_kind, constraint)) {
-                                continue;
-                            }
                             if (try self.reportInvalidBuiltinFromNumeralLiteral(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17902,7 +18090,6 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         constraint,
                         nominal_type,
                         env,
-                        is_numeric_default_pass,
                     )) {
                         continue;
                     }
@@ -18085,6 +18272,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         );
                         continue;
                     };
+                    if (constraint.fn_name.eql(self.cir.idents.from_numeral) and
+                        !self.nominalIsBuiltinNumberType(nominal_type))
+                    {
+                        if (try self.reportUnmaterializableNumeralLiteral(deferred_constraint.var_, constraint, env)) {
+                            continue;
+                        }
+                    }
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
@@ -18103,10 +18297,10 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         // Check if we've processed this def already. An
                         // annotated def whose body is unchecked or in flight
                         // resolves through its pre-declared scheme instead.
-                        const mb_processing_def = self.top_level_ptrns.get(def.pattern);
+                        const mb_processing_def = self.topLevelPattern(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
-                            const mb_predeclared_scheme = self.predeclared_scheme_vars.get(def_idx);
+                            const mb_predeclared_scheme = self.predeclaredSchemeVar(def_idx);
                             switch (processing_def.status) {
                                 .not_processed => if (mb_predeclared_scheme) |scheme_var| {
                                     predeclared_scheme_for_method = scheme_var;
@@ -18377,6 +18571,11 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     const method_is_this_module = method_lookup.is_this_module;
                     const method_binding = method_lookup.binding;
                     const def_idx = method_binding.def_idx;
+                    if (constraint.fn_name.eql(self.cir.idents.from_numeral)) {
+                        if (try self.reportUnmaterializableNumeralLiteral(deferred_constraint.var_, constraint, env)) {
+                            continue;
+                        }
+                    }
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
@@ -18391,10 +18590,10 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         // unannotated unchecked targets are recorded for the
                         // group boundary; in-flight unannotated targets link
                         // monomorphically (the binding-group recursion rule).
-                        const mb_processing_def = self.top_level_ptrns.get(def.pattern);
+                        const mb_processing_def = self.topLevelPattern(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
-                            const mb_predeclared_scheme = self.predeclared_scheme_vars.get(def_idx);
+                            const mb_predeclared_scheme = self.predeclaredSchemeVar(def_idx);
                             switch (processing_def.status) {
                                 .not_processed => if (mb_predeclared_scheme) |scheme_var| {
                                     predeclared_scheme_for_method = scheme_var;
@@ -19815,106 +20014,55 @@ const BuiltinFromNumeralLiteralProblem = enum {
     out_of_range,
 };
 
+/// The exact-numeral target for a concrete builtin NumKind, or null for the
+/// unbound kinds (which impose no fit obligation).
+fn numeralTargetFromNumKind(num_kind: CIR.NumKind) ?exact_numeral.Target {
+    return switch (num_kind) {
+        .num_unbound, .int_unbound => null,
+        inline else => |k| @field(exact_numeral.Target, @tagName(k)),
+    };
+}
+
+/// Whether the literal's exact value is representable at the builtin target —
+/// answered by the precomputed fit set (the one fits() authority) — and, when
+/// it is not, which problem flavor the diagnostic should carry.
 fn validateBuiltinFromNumeralLiteral(
     num_kind: CIR.NumKind,
     num_literal: types_mod.NumeralInfo,
 ) ?BuiltinFromNumeralLiteralProblem {
-    return switch (num_kind) {
-        .u8 => validateUnsignedFromNumeralLiteral(u8, num_literal),
-        .u16 => validateUnsignedFromNumeralLiteral(u16, num_literal),
-        .u32 => validateUnsignedFromNumeralLiteral(u32, num_literal),
-        .u64 => validateUnsignedFromNumeralLiteral(u64, num_literal),
-        .u128 => validateUnsignedFromNumeralLiteral(u128, num_literal),
-        .i8 => validateSignedFromNumeralLiteral(i8, num_literal),
-        .i16 => validateSignedFromNumeralLiteral(i16, num_literal),
-        .i32 => validateSignedFromNumeralLiteral(i32, num_literal),
-        .i64 => validateSignedFromNumeralLiteral(i64, num_literal),
-        .i128 => validateSignedFromNumeralLiteral(i128, num_literal),
-        .dec => validateDecFromNumeralLiteral(num_literal),
-        .f32, .f64 => null,
-        .num_unbound, .int_unbound => null,
+    const target = numeralTargetFromNumKind(num_kind) orelse return null;
+    if (num_literal.fits.contains(target)) return null;
+    return switch (target) {
+        // Floats represent every materializable literal (out-of-range becomes
+        // ±inf), so they are in every materialized fit set; only a literal
+        // whose digits were never recorded reaches this branch.
+        .f32, .f64 => .out_of_range,
+        .u8, .u16, .u32, .u64, .u128 => blk: {
+            if (num_literal.is_fractional) break :blk .fractional_integer;
+            // `is_negative` is a syntactic flag (a leading `-`); a `-0` has a
+            // zero magnitude and is IN the fit set, so reaching here negative
+            // means a genuinely negative value.
+            if (num_literal.is_negative) break :blk .negative_unsigned;
+            break :blk .out_of_range;
+        },
+        .i8, .i16, .i32, .i64, .i128 => if (num_literal.is_fractional) .fractional_integer else .out_of_range,
+        .dec => .out_of_range,
     };
-}
-
-fn skipDefaultedDecIntegerLiteralValidation(
-    is_numeric_default_pass: bool,
-    num_kind: CIR.NumKind,
-    constraint: StaticDispatchConstraint,
-) bool {
-    if (!is_numeric_default_pass or num_kind != .dec) return false;
-    const num_literal = constraint.origin.numeralInfo() orelse return false;
-    return !num_literal.is_fractional;
-}
-
-fn validateUnsignedFromNumeralLiteral(
-    comptime T: type,
-    num_literal: types_mod.NumeralInfo,
-) ?BuiltinFromNumeralLiteralProblem {
-    if (num_literal.is_fractional) return .fractional_integer;
-    // `is_negative` is a syntactic flag (a leading `-`); guard on the actual
-    // magnitude so `-0` (a valid unsigned value) is not rejected. Real
-    // negatives have a nonzero magnitude, and a large negative whose i128
-    // representation overflowed is still nonzero, so this stays correct.
-    if (num_literal.is_negative and num_literal.toI128() != 0) return .negative_unsigned;
-
-    const value = if (num_literal.is_u128) blk: {
-        break :blk num_literal.toU128();
-    } else blk: {
-        const signed_value = num_literal.toI128();
-        if (signed_value < 0) return .negative_unsigned;
-        break :blk @as(u128, @intCast(signed_value));
-    };
-
-    if (value > @as(u128, @intCast(std.math.maxInt(T)))) return .out_of_range;
-    return null;
 }
 
 test "unsuffixed positive integer literal validates against unsigned builtin type" {
-    const info = types_mod.NumeralInfo.fromI128(42, false, false, Region.zero());
+    const info = types_mod.NumeralInfo.testOnlyInt(42, false, Region.zero());
     try std.testing.expectEqual(@as(?BuiltinFromNumeralLiteralProblem, null), validateBuiltinFromNumeralLiteral(.u64, info));
 }
 
-fn validateSignedFromNumeralLiteral(
-    comptime T: type,
-    num_literal: types_mod.NumeralInfo,
-) ?BuiltinFromNumeralLiteralProblem {
-    if (num_literal.is_fractional) return .fractional_integer;
-
-    if (num_literal.is_u128) {
-        if (num_literal.toU128() > @as(u128, @intCast(std.math.maxInt(T)))) return .out_of_range;
-        return null;
-    }
-
-    const value = num_literal.toI128();
-    if (value < @as(i128, std.math.minInt(T)) or value > @as(i128, std.math.maxInt(T))) {
-        return .out_of_range;
-    }
-    return null;
-}
-
-fn validateDecFromNumeralLiteral(
-    num_literal: types_mod.NumeralInfo,
-) ?BuiltinFromNumeralLiteralProblem {
-    if (num_literal.fits_dec) |fits| {
-        return if (fits) null else .out_of_range;
-    }
-
-    if (num_literal.frac_requirements) |requirements| {
-        if (!requirements.fits_in_dec) return .out_of_range;
-    }
-
-    if (num_literal.is_fractional) return null;
-
-    const max_whole_dec: u128 = 170141183460469231731;
-    if (num_literal.is_u128) {
-        if (num_literal.toU128() > max_whole_dec) return .out_of_range;
-        return null;
-    }
-
-    const value = num_literal.toI128();
-    const max_signed: i128 = @intCast(max_whole_dec);
-    if (value < -max_signed or value > max_signed) return .out_of_range;
-    return null;
+test "out-of-range and negative literals report the right problem flavor" {
+    const too_big = types_mod.NumeralInfo.testOnlyInt(300, false, Region.zero());
+    try std.testing.expectEqual(@as(?BuiltinFromNumeralLiteralProblem, .out_of_range), validateBuiltinFromNumeralLiteral(.u8, too_big));
+    const negative = types_mod.NumeralInfo.testOnlyInt(5, true, Region.zero());
+    try std.testing.expectEqual(@as(?BuiltinFromNumeralLiteralProblem, .negative_unsigned), validateBuiltinFromNumeralLiteral(.u8, negative));
+    try std.testing.expectEqual(@as(?BuiltinFromNumeralLiteralProblem, null), validateBuiltinFromNumeralLiteral(.i8, negative));
+    const negative_zero = types_mod.NumeralInfo.testOnlyInt(0, true, Region.zero());
+    try std.testing.expectEqual(@as(?BuiltinFromNumeralLiteralProblem, null), validateBuiltinFromNumeralLiteral(.u8, negative_zero));
 }
 
 fn reportInvalidBuiltinFromNumeralLiteral(
@@ -19938,10 +20086,7 @@ fn reportInvalidBuiltinFromNumeralInfo(
     num_literal: types_mod.NumeralInfo,
     env: *Env,
 ) Allocator.Error!bool {
-    const literal_problem = if (num_kind == .dec)
-        validateDecFromNumeralLiteral(num_literal)
-    else
-        validateBuiltinFromNumeralLiteral(num_kind, num_literal);
+    const literal_problem = validateBuiltinFromNumeralLiteral(num_kind, num_literal);
     if (literal_problem == null) return false;
 
     const expected_snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, dispatcher_var);
@@ -19956,18 +20101,37 @@ fn reportInvalidBuiltinFromNumeralInfo(
     return true;
 }
 
+fn reportUnmaterializableNumeralLiteral(
+    self: *Self,
+    dispatcher_var: Var,
+    constraint: StaticDispatchConstraint,
+    env: *Env,
+) Allocator.Error!bool {
+    const num_literal = constraint.origin.numeralInfo() orelse return false;
+    if (num_literal.can_materialize_numeral) return false;
+
+    const expected_snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, dispatcher_var);
+    _ = try self.problems.appendProblem(self.gpa, .{ .invalid_numeric_literal = .{
+        .literal_var = dispatcher_var,
+        .expected_type = expected_snapshot,
+        .is_fractional = num_literal.is_fractional,
+        .region = num_literal.region,
+    } });
+
+    try self.unifyWith(dispatcher_var, .err, env);
+    try self.markConstraintFunctionAsError(constraint, env);
+    return true;
+}
+
 fn validateFromNumeralLiteralForBuiltinNominal(
     self: *Self,
     dispatcher_var: Var,
     constraint: StaticDispatchConstraint,
     nominal_type: types_mod.NominalType,
     env: *Env,
-    is_numeric_default_pass: bool,
 ) Allocator.Error!bool {
     if (constraint.origin != .from_literal) return true;
     const num_kind = self.builtinNumKindFromNominalType(nominal_type) orelse return true;
-
-    if (skipDefaultedDecIntegerLiteralValidation(is_numeric_default_pass, num_kind, constraint)) return true;
 
     return !try self.reportInvalidBuiltinFromNumeralLiteral(dispatcher_var, constraint, num_kind, env);
 }
@@ -19986,7 +20150,6 @@ fn validateFromNumeralLiteralForBuiltinAlias(
 fn validateResolvedOpenNumeralLiterals(
     self: *Self,
     env: *Env,
-    is_numeric_default_pass: bool,
 ) Allocator.Error!void {
     const literal_count = self.open_numeral_literals.items.len;
     var i: usize = 0;
@@ -20002,13 +20165,6 @@ fn validateResolvedOpenNumeralLiterals(
             else => continue,
         };
         const num_kind = self.builtinNumKindFromNominalType(nominal_type) orelse continue;
-        if (is_numeric_default_pass and
-            !entry.info.explicit_suffix and
-            num_kind == .dec and
-            !entry.info.is_fractional)
-        {
-            continue;
-        }
         _ = try self.reportInvalidBuiltinFromNumeralInfo(resolved.var_, num_kind, entry.info, env);
     }
 }
@@ -21823,25 +21979,17 @@ fn checkFlexVarConstraintCompatibility(self: *Self, var_: Var, env: *Env, is_num
     const constraints = self.types.sliceStaticDispatchConstraints(flex.constraints);
     if (constraints.len == 0) return;
 
-    // Find the literal-origin constraint that determines the default type.
-    var has_from_numeral = false;
-    var has_str_defaultable_literal = false;
-    for (constraints) |c| {
-        switch (c.origin) {
-            .from_literal => |lit| switch (lit) {
-                .numeral => has_from_numeral = true,
-                .quote, .interpolation => has_str_defaultable_literal = true,
-            },
-            else => {},
-        }
-    }
-    if (!has_from_numeral and !has_str_defaultable_literal) return;
+    // The defaulting oracle decides which default type this flex lands on.
+    const kind = literal_defaulting.dominantKind(constraints) orelse return;
+    const default_target = literal_defaulting.defaultTargetForKind(kind);
 
-    // This flex will default to Dec (numerals) or Str (quotes/interpolations).
     // Validate that all other constraints can be satisfied by the default type.
     const builtin_env = self.builtin_ctx.builtin_module orelse return;
     const indices = self.builtin_ctx.builtin_indices orelse return;
-    const default_type_stmt = if (has_from_numeral) indices.dec_type else indices.str_type;
+    const default_type_stmt = switch (default_target) {
+        .dec => indices.dec_type,
+        .str => indices.str_type,
+    };
 
     for (constraints) |constraint| {
         // Skip the literal-origin constraint the default type satisfies by
@@ -21849,8 +21997,8 @@ fn checkFlexVarConstraintCompatibility(self: *Self, var_: Var, env: *Env, is_num
         // the from_quote constraint must still be validated against it.)
         switch (constraint.origin) {
             .from_literal => |lit| switch (lit) {
-                .numeral => if (has_from_numeral) continue,
-                .quote, .interpolation => if (!has_from_numeral) continue,
+                .numeral => if (default_target == .dec) continue,
+                .quote, .interpolation => if (default_target == .str) continue,
             },
             else => {},
         }

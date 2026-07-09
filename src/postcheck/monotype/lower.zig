@@ -27,6 +27,7 @@ const EntryRoot = solve.EntryRoot;
 const Allocator = std.mem.Allocator;
 const checked = check.CheckedModule;
 const ExhaustivenessContext = check.ExhaustivenessContext;
+const exact_numeral = checked.exact_numeral;
 const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
 const Ident = base.Ident;
@@ -888,44 +889,12 @@ const Builder = struct {
         };
     }
 
-    fn declaredModuleForAlias(self: *Builder, view: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
-        return self.moduleDigestForOrigin(view, alias.origin_module);
+    fn declaredModuleForAlias(_: *Builder, _: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
+        return moduleDigestFromId(alias.owner_module);
     }
 
-    fn declaredModuleForNominal(self: *Builder, view: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
-        return switch (nominal.representation) {
-            .imported_declaration => |imported| moduleDigestFromId(checked.importedNominalDeclarationModuleId(imported)),
-            .imported_box_payload_capability => |imported| moduleDigestFromId(checked.importedBoxPayloadCapabilityModuleId(imported)),
-            .builtin,
-            .local_declaration,
-            .local_box_payload_capability,
-            .opaque_without_backing,
-            => self.moduleDigestForOrigin(view, nominal.origin_module),
-        };
-    }
-
-    /// Resolve a named type's declaring module by 32-byte content identity —
-    /// an exact comparison against each candidate view's module identity
-    /// hash. Byte-identical module content reached through several checked
-    /// modules is interchangeable as a declaring module; the first match wins.
-    fn moduleDigestForOrigin(self: *Builder, view: ModuleView, origin_module: names.ModuleIdentityId) names.CheckedModuleDigest {
-        const origin_hash = view.names.moduleIdentityBytes(origin_module);
-        if (moduleViewIdentityMatches(view, origin_hash)) return moduleDigestFromId(view.key);
-
-        const root = moduleView(self.root_view);
-        if (moduleViewIdentityMatches(root, origin_hash)) return moduleDigestFromId(root.key);
-
-        for (self.modules.imports) |imported| {
-            const imported_view = moduleView(imported);
-            if (moduleViewIdentityMatches(imported_view, origin_hash)) return moduleDigestFromId(imported_view.key);
-        }
-
-        for (self.modules.root.relation_modules) |relation| {
-            const relation_view = moduleView(relation);
-            if (moduleViewIdentityMatches(relation_view, origin_hash)) return moduleDigestFromId(relation_view.key);
-        }
-
-        Common.invariant("checked named type origin module was not available to Monotype lowering");
+    fn declaredModuleForNominal(_: *Builder, _: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
+        return moduleDigestFromId(nominal.owner_module);
     }
 
     fn lowerRoot(self: *Builder, request: checked.RootRequest) Allocator.Error!void {
@@ -1388,17 +1357,71 @@ const Builder = struct {
 
         switch (template.target) {
             .hosted => {
+                // The host is compiled against the declared hosted signature,
+                // so that exact type is the only one the extern boundary may
+                // use. A use site can still widen a (closed) tag-union row in
+                // the result through ordinary unification (e.g. `?` re-wraps
+                // the hosted error into the caller's wider error union); such
+                // requests get a generated Roc adapter that calls the
+                // declared-type boundary and re-tags the result, instead of a
+                // hosted spec whose layout would not match the host ABI.
+                const declared_source_fn_ty = template.checked_fn_root;
+                const declared_source_fn_key = view.types.rootKey(declared_source_fn_ty);
+                const declared_mono_fn_ty = try self.lowerType(view, declared_source_fn_ty);
+                const hosted_fn_template = self.fnDefForTemplate(
+                    view,
+                    template_ref,
+                    declared_source_fn_ty,
+                    declared_source_fn_key,
+                    lower_fn_ty,
+                );
                 const fn_data = self.functionShape(lower_fn_ty, "hosted procedure template root type was not a function");
                 const args = try self.typedLocalsForArgs(self.program.types.span(fn_data.args));
+                if (self.hostedUseNeedsTryAdapter(declared_mono_fn_ty, lower_fn_ty)) {
+                    const source_def = try self.lowerTemplateWithMonoFor(
+                        template_ref,
+                        declared_source_fn_ty,
+                        declared_source_fn_key,
+                        declared_mono_fn_ty,
+                        &.{},
+                        null,
+                        null,
+                        null,
+                        null,
+                    );
+                    const adapter_template = Ast.FnTemplate{
+                        .fn_def = .{ .checked_generated = template_ref },
+                        .source_fn_ty = source_fn_ty,
+                        .source_fn_key = source_fn_key,
+                        .mono_fn_ty = lower_fn_ty,
+                    };
+                    const body = try self.hostedTryAdapterBody(
+                        args,
+                        self.defFnId(source_def),
+                        declared_mono_fn_ty,
+                        lower_fn_ty,
+                    );
+                    self.program.setDef(reservation.def, .{
+                        .symbol = reservation.symbol,
+                        .fn_def = adapter_template,
+                        .fn_id = reservation.fn_id,
+                        .args = args,
+                        .body = .{ .roc = body },
+                        .ret = fn_data.ret,
+                    });
+                    self.program.setFnSource(reservation.fn_id, adapter_template);
+                    try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
+                    return reservation.def;
+                }
                 self.program.setDef(reservation.def, .{
                     .symbol = reservation.symbol,
-                    .fn_def = fn_template,
+                    .fn_def = hosted_fn_template,
                     .fn_id = reservation.fn_id,
                     .args = args,
                     .body = .hosted,
                     .ret = fn_data.ret,
                 });
-                self.program.setFnSource(reservation.fn_id, fn_template);
+                self.program.setFnSource(reservation.fn_id, hosted_fn_template);
                 try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
                 return reservation.def;
             },
@@ -1887,10 +1910,11 @@ const Builder = struct {
 
     fn lowerCheckedTypeVariable(variable: checked.CheckedTypeVariable) Type.Content {
         if (variable.numeric_default_phase) |phase| {
-            return switch (phase) {
-                .mono_specialization => .{ .primitive = .dec },
-                .mono_specialization_str => .{ .primitive = .str },
-                .checking_finalized => Common.invariant("checking-finalized numeric variable reached Monotype unresolved"),
+            const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
+                Common.invariant("checking-finalized numeric variable reached Monotype unresolved");
+            return switch (target) {
+                .dec => .{ .primitive = .dec },
+                .str => .{ .primitive = .str },
             };
         }
         if (variable.row_default) |row_default| {
@@ -1900,13 +1924,6 @@ const Builder = struct {
             };
         }
         return .{ .tag_union = .empty() };
-    }
-
-    fn typeIsDec(self: *Builder, ty: Type.TypeId) bool {
-        return switch (self.shapeContent(ty)) {
-            .primitive => |primitive| primitive == .dec,
-            else => false,
-        };
     }
 
     fn namedBackingType(self: *Builder, ty: Type.TypeId) ?Type.TypeId {
@@ -2470,7 +2487,7 @@ const Builder = struct {
                 break :blk .{ .view = sv, .declaration = decl, .padding_field_tys = capability.paddingFieldTys(sv.interface_capabilities) };
             },
             .builtin => blk: {
-                const source_view = self.moduleForDigest(self.moduleDigestForOrigin(view, nominal.origin_module));
+                const source_view = self.moduleForId(nominal.owner_module);
                 const source_decl = nominal.source_decl orelse break :blk null;
                 for (source_view.types.nominal_declarations) |decl| {
                     if (decl.source_statement != source_decl) continue;
@@ -4624,6 +4641,294 @@ const Builder = struct {
             } },
         });
     }
+
+    const BuilderTryInfo = struct {
+        ok_ty: Type.TypeId,
+        err_ty: Type.TypeId,
+        ok_tag: Type.Tag,
+        err_tag: Type.Tag,
+    };
+
+    /// Whether a hosted specialization request differs from the declared host
+    /// ABI only by a widened `Try` error row. Such requests get a generated
+    /// Roc adapter that calls the declared-type boundary and re-tags the
+    /// error into the wider row.
+    fn hostedUseNeedsTryAdapter(self: *Builder, declared_fn_ty: Type.TypeId, requested_fn_ty: Type.TypeId) bool {
+        if (self.sameMonoType(declared_fn_ty, requested_fn_ty)) return false;
+
+        const declared = self.functionShape(declared_fn_ty, "hosted declared type was not a function");
+        const requested = self.functionShape(requested_fn_ty, "hosted requested type was not a function");
+        if (self.sameMonoType(declared.ret, requested.ret)) return false;
+
+        const declared_try = self.tryInfoOrNull(declared.ret) orelse return false;
+        const requested_try = self.tryInfoOrNull(requested.ret) orelse return false;
+        if (!self.sameMonoType(declared_try.ok_ty, requested_try.ok_ty)) return false;
+        if (!self.errorRowIsIncludedIn(declared_try.err_ty, requested_try.err_ty)) return false;
+
+        const declared_args = self.program.types.span(declared.args);
+        const requested_args = self.program.types.span(requested.args);
+        if (declared_args.len != requested_args.len) {
+            Common.invariant("hosted function use changed arity from the declared ABI");
+        }
+        for (0..declared_args.len) |index| {
+            const declared_arg = GuardedList.at(declared_args, index);
+            const requested_arg = GuardedList.at(requested_args, index);
+            if (!self.sameMonoType(declared_arg, requested_arg)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn hostedTryAdapterBody(
+        self: *Builder,
+        args: Ast.Span(Ast.TypedLocal),
+        source_fn: Ast.FnId,
+        source_fn_ty: Type.TypeId,
+        target_fn_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        const source = self.functionShape(source_fn_ty, "hosted source adapter type was not a function");
+        const target = self.functionShape(target_fn_ty, "hosted target adapter type was not a function");
+        const source_args = self.program.types.span(source.args);
+        const target_args = self.program.types.span(target.args);
+        const adapter_args = self.program.typedLocalSpan(args);
+        if (source_args.len != target_args.len or source_args.len != GuardedList.borrowLen(adapter_args)) {
+            Common.invariant("hosted Try adapter arity differed from its function types");
+        }
+
+        const call_args = try self.allocator.alloc(Ast.ExprId, GuardedList.borrowLen(adapter_args));
+        defer self.allocator.free(call_args);
+        for (0..GuardedList.borrowLen(adapter_args)) |index| {
+            const arg = GuardedList.at(adapter_args, index);
+            const source_arg_ty = GuardedList.at(source_args, index);
+            const target_arg_ty = GuardedList.at(target_args, index);
+            if (!self.sameMonoType(arg.ty, source_arg_ty) or !self.sameMonoType(arg.ty, target_arg_ty)) {
+                Common.invariant("hosted Try adapter argument type differed from source or target function type");
+            }
+            call_args[index] = try self.localExpr(arg.local, arg.ty);
+        }
+
+        const source_call = try self.program.addExpr(.{
+            .ty = source.ret,
+            .data = .{ .call_proc = .{
+                .callee = Ast.localProcCallee(source_fn),
+                .args = try self.program.addExprSpan(call_args),
+            } },
+        });
+        return try self.tryReturnInjectionExpr(source_call, source.ret, target.ret);
+    }
+
+    fn tryReturnInjectionExpr(
+        self: *Builder,
+        source_expr: Ast.ExprId,
+        source_try_ty: Type.TypeId,
+        target_try_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        if (self.sameMonoType(source_try_ty, target_try_ty)) return source_expr;
+
+        const source_info = self.tryInfo(source_try_ty);
+        const target_info = self.tryInfo(target_try_ty);
+        if (!self.sameMonoType(source_info.ok_ty, target_info.ok_ty)) {
+            Common.invariant("Try adapter changed Ok type");
+        }
+        if (!self.errorRowIsIncludedIn(source_info.err_ty, target_info.err_ty)) {
+            Common.invariant("Try adapter error row was not included in target row");
+        }
+
+        const ok_local = try self.program.addLocal(self.symbols.fresh(), source_info.ok_ty);
+        const ok_payload_pat = try self.bindPat(ok_local, source_info.ok_ty);
+        const ok_pat = try self.program.addPat(.{ .ty = source_try_ty, .data = .{ .tag = .{
+            .name = source_info.ok_tag.name,
+            .payloads = try self.program.addPatSpan(&[_]Ast.PatId{ok_payload_pat}),
+        } } });
+        const ok_value = try self.localExpr(ok_local, source_info.ok_ty);
+        const ok_body = try self.tryOkExpr(target_try_ty, ok_value);
+
+        const err_local = try self.program.addLocal(self.symbols.fresh(), source_info.err_ty);
+        const err_payload_pat = try self.bindPat(err_local, source_info.err_ty);
+        const err_pat = try self.program.addPat(.{ .ty = source_try_ty, .data = .{ .tag = .{
+            .name = source_info.err_tag.name,
+            .payloads = try self.program.addPatSpan(&[_]Ast.PatId{err_payload_pat}),
+        } } });
+        const err_value = try self.localExpr(err_local, source_info.err_ty);
+        const injected_err = try self.errorRowInjectionExpr(err_value, source_info.err_ty, target_info.err_ty);
+        const err_body = try self.tryErrExpr(target_try_ty, injected_err);
+
+        const branches = [_]Ast.Branch{
+            .{ .pat = ok_pat, .body = ok_body },
+            .{ .pat = err_pat, .body = err_body },
+        };
+        return try self.program.addExpr(.{ .ty = target_try_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.program.addBranchSpan(&branches),
+        } } });
+    }
+
+    fn errorRowInjectionExpr(
+        self: *Builder,
+        source_expr: Ast.ExprId,
+        source_err_ty: Type.TypeId,
+        target_err_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        if (self.sameMonoType(source_err_ty, target_err_ty)) return source_expr;
+
+        const source_tags = self.tagUnionTags(source_err_ty);
+        if (source_tags.len == 0) {
+            Common.invariant("cannot inject an empty error row into a different error row");
+        }
+
+        const branches = try self.allocator.alloc(Ast.Branch, source_tags.len);
+        defer self.allocator.free(branches);
+        for (0..source_tags.len) |index| {
+            const source_tag = GuardedList.at(source_tags, index);
+            const source_payload_tys = self.program.types.span(source_tag.payloads);
+            const target_tag = self.tagByName(target_err_ty, source_tag.name);
+            const target_payload_tys = self.program.types.span(target_tag.payloads);
+            if (source_payload_tys.len != target_payload_tys.len) {
+                Common.invariant("Try adapter error tag payload arity differed in target row");
+            }
+
+            const payload_pats = try self.allocator.alloc(Ast.PatId, source_payload_tys.len);
+            defer self.allocator.free(payload_pats);
+            const payload_exprs = try self.allocator.alloc(Ast.ExprId, source_payload_tys.len);
+            defer self.allocator.free(payload_exprs);
+            for (0..source_payload_tys.len) |payload_index| {
+                const source_payload_ty = GuardedList.at(source_payload_tys, payload_index);
+                const target_payload_ty = GuardedList.at(target_payload_tys, payload_index);
+                if (!self.sameMonoType(source_payload_ty, target_payload_ty)) {
+                    Common.invariant("Try adapter error tag payload type differed in target row");
+                }
+                const local = try self.program.addLocal(self.symbols.fresh(), source_payload_ty);
+                payload_pats[payload_index] = try self.bindPat(local, source_payload_ty);
+                payload_exprs[payload_index] = try self.localExpr(local, source_payload_ty);
+            }
+
+            const pat = try self.program.addPat(.{ .ty = source_err_ty, .data = .{ .tag = .{
+                .name = source_tag.name,
+                .payloads = try self.program.addPatSpan(payload_pats),
+            } } });
+            const body = try self.tagValueExpr(target_err_ty, target_tag, payload_exprs);
+            branches[index] = .{ .pat = pat, .body = body };
+        }
+
+        return try self.program.addExpr(.{ .ty = target_err_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.program.addBranchSpan(branches),
+        } } });
+    }
+
+    fn tryOkExpr(self: *Builder, try_ty: Type.TypeId, value_expr: Ast.ExprId) Allocator.Error!Ast.ExprId {
+        const info = self.tryInfo(try_ty);
+        return try self.tagValueExpr(try_ty, info.ok_tag, &[_]Ast.ExprId{value_expr});
+    }
+
+    fn tryErrExpr(self: *Builder, try_ty: Type.TypeId, err_expr: Ast.ExprId) Allocator.Error!Ast.ExprId {
+        const info = self.tryInfo(try_ty);
+        return try self.tagValueExpr(try_ty, info.err_tag, &[_]Ast.ExprId{err_expr});
+    }
+
+    fn tagValueExpr(
+        self: *Builder,
+        ty: Type.TypeId,
+        tag: Type.Tag,
+        payloads: []const Ast.ExprId,
+    ) Allocator.Error!Ast.ExprId {
+        const backing_ty = self.nominalExprBackingType(ty) orelse ty;
+        const tag_expr = try self.program.addExpr(.{
+            .ty = backing_ty,
+            .data = .{ .tag = .{
+                .name = tag.name,
+                .payloads = try self.program.addExprSpan(payloads),
+            } },
+        });
+        if (self.nominalExprBackingType(ty) != null) {
+            return try self.program.addExpr(.{ .ty = ty, .data = .{ .nominal = tag_expr } });
+        }
+        return tag_expr;
+    }
+
+    fn tryInfo(self: *Builder, try_ty: Type.TypeId) BuilderTryInfo {
+        return self.tryInfoOrNull(try_ty) orelse Common.invariant("expected a named Try type");
+    }
+
+    fn tryInfoOrNull(self: *Builder, try_ty: Type.TypeId) ?BuilderTryInfo {
+        const backing_ty = self.namedBackingType(try_ty) orelse return null;
+        const ok_tag = self.tagByTextOrNull(backing_ty, "Ok") orelse return null;
+        const err_tag = self.tagByTextOrNull(backing_ty, "Err") orelse return null;
+        const ok_payloads = self.program.types.span(ok_tag.payloads);
+        const err_payloads = self.program.types.span(err_tag.payloads);
+        if (ok_payloads.len != 1 or err_payloads.len != 1) return null;
+        return .{
+            .ok_ty = GuardedList.at(ok_payloads, 0),
+            .err_ty = GuardedList.at(err_payloads, 0),
+            .ok_tag = ok_tag,
+            .err_tag = err_tag,
+        };
+    }
+
+    fn errorRowIsIncludedIn(self: *Builder, source_err_ty: Type.TypeId, target_err_ty: Type.TypeId) bool {
+        if (self.sameMonoType(source_err_ty, target_err_ty)) return true;
+        const source_tags = self.tagUnionTags(source_err_ty);
+        for (0..source_tags.len) |index| {
+            const source_tag = GuardedList.at(source_tags, index);
+            const target_tag = self.tagByNameOrNull(target_err_ty, source_tag.name) orelse return false;
+            const source_payloads = self.program.types.span(source_tag.payloads);
+            const target_payloads = self.program.types.span(target_tag.payloads);
+            if (source_payloads.len != target_payloads.len) return false;
+            for (0..source_payloads.len) |payload_index| {
+                const source_payload = GuardedList.at(source_payloads, payload_index);
+                const target_payload = GuardedList.at(target_payloads, payload_index);
+                if (!self.sameMonoType(source_payload, target_payload)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn tagByName(self: *Builder, ty: Type.TypeId, name: names.TagNameId) Type.Tag {
+        return self.tagByNameOrNull(ty, name) orelse Common.invariant("tag operation referenced tag absent from Monotype type");
+    }
+
+    fn tagByNameOrNull(self: *Builder, ty: Type.TypeId, name: names.TagNameId) ?Type.Tag {
+        const tags = self.tagUnionTags(ty);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(tags, index);
+            if (tag.name == name) return tag;
+        }
+        return null;
+    }
+
+    fn tagByTextOrNull(self: *Builder, ty: Type.TypeId, text: []const u8) ?Type.Tag {
+        const tags = self.tagUnionTags(ty);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(tags, index);
+            if (std.mem.eql(u8, self.program.names.tagLabelText(tag.name), text)) return tag;
+        }
+        return null;
+    }
+
+    fn tagUnionTags(self: *Builder, ty: Type.TypeId) Type.StoreSpanBorrow(Type.Tag, "tags") {
+        return switch (self.shapeContent(ty)) {
+            .tag_union => |tags| self.program.types.tagSpan(tags),
+            else => Common.invariant("tag operation expected tag-union type"),
+        };
+    }
+
+    fn nominalExprBackingType(self: *Builder, ty: Type.TypeId) ?Type.TypeId {
+        return switch (self.program.types.get(ty)) {
+            .named => |named| if (named.kind != .alias) blk: {
+                const backing = named.backing orelse break :blk null;
+                break :blk backing.ty;
+            } else null,
+            else => null,
+        };
+    }
+
+    fn sameMonoType(self: *Builder, a: Type.TypeId, b: Type.TypeId) bool {
+        if (a == b) return true;
+        const a_digest = self.program.types.typeDigest(&self.program.names, a);
+        const b_digest = self.program.types.typeDigest(&self.program.names, b);
+        return std.mem.eql(u8, a_digest.bytes[0..], b_digest.bytes[0..]);
+    }
 };
 
 const LoweredTemplateBody = struct {
@@ -6190,8 +6495,16 @@ const BodyContext = struct {
 
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
-        conversion: checked.CheckedExprId,
         ty: Type.TypeId,
+        check: union(enum) {
+            /// Compare against the literal's `from_numeral`/`from_quote`
+            /// conversion result.
+            conversion: checked.CheckedExprId,
+            /// The literal's value is unrepresentable at the scrutinee's
+            /// concrete type, so the branch can never match (checking reports
+            /// these; an I8 can never equal 300).
+            never,
+        },
     };
 
     const ParserPrecomputedRecord = struct {
@@ -8497,20 +8810,9 @@ const BodyContext = struct {
             .anno_only,
             => Common.invariant("non-runtime checked expression reached Monotype lowering"),
             .runtime_error => return try self.runtimeCrashExpr(ty, "runtime error"),
-            .num => |num| self.lowerIntLiteral(num.value, ty),
-            .typed_int => |num| self.lowerIntLiteral(num.value, ty),
-            .frac_f32 => |frac| self.lowerFracLiteral(.{ .f32 = frac.value }, ty),
-            .frac_f64 => |frac| self.lowerFracLiteral(.{ .f64 = frac.value }, ty),
-            .dec => |dec| self.lowerFracLiteral(.{ .dec = dec.value }, ty),
-            .dec_small => Common.invariant("small decimal literal reached Monotype after numeric finalization"),
-            .num_from_numeral => |plan| {
+            .numeral => |numeral| {
                 if (try self.restoredNumeralConst(expr_id, ty)) |restored| return restored;
-                return try self.lowerNumeralFold(expr.ty, plan, ty);
-            },
-            .typed_frac => Common.invariant("typed fractional integer literal reached Monotype after numeric finalization"),
-            .typed_num_from_numeral => |plan| {
-                if (try self.restoredNumeralConst(expr_id, ty)) |restored| return restored;
-                return try self.lowerNumeralFold(expr.ty, plan, ty);
+                return try self.lowerNumeralExpr(expr.ty, numeral, ty);
             },
             .str_from_quote => |quote| {
                 if (try self.restoredNumeralConst(expr_id, ty)) |restored| return restored;
@@ -16443,7 +16745,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const expr = self.view.bodies.expr(expr_id);
         const plan = switch (expr.data) {
-            .num_from_numeral, .typed_num_from_numeral => |plan| plan,
+            .numeral => |numeral| numeral.plan,
             .str_from_quote => |quote| quote.plan,
             else => Common.invariant("literal conversion root did not point at a conversion expression"),
         };
@@ -16470,54 +16772,89 @@ const BodyContext = struct {
         };
     }
 
-    /// Fold a `from_numeral` conversion into a constant at its concrete target
-    /// type. Compile-time finalization only registers a constant for literals
-    /// whose type is already concrete at Check time; a literal inside a generic
-    /// body (e.g. the `1` in `Iter.exclusive_range`'s `start.add_try(1)`) is
-    /// typed by the abstract `num` var and only gains a concrete type here, after
-    /// monomorphization. Rather than emit a runtime `num_from_numeral` low-level
-    /// op — which the compiled backends deliberately reject — we evaluate the
-    /// conversion at the stage that owns monomorphic types, reusing the exact
-    /// decimal-text + parse behavior the finalization/interpreter path uses so
-    /// the constant is identical regardless of where the literal is monomorphized.
-    fn lowerNumeralFold(
+    /// Produce a numeric literal's constant — the ONE place in the compiler
+    /// that turns a literal's exact digits into a bit pattern, always for
+    /// the instantiated Monotype primitive. A custom numeric target keeps its
+    /// real user-defined `from_numeral` dispatch call instead.
+    fn lowerNumeralExpr(
         self: *BodyContext,
         checked_ret_ty: checked.CheckedTypeId,
-        maybe_plan: ?static_dispatch.StaticDispatchPlanId,
+        numeral: checked.CheckedNumeralData,
         target_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        // Only the builtin numeric types implement `from_numeral` as the
-        // `num_from_numeral` low-level op that compiled backends reject. A custom
-        // numeric type carries a user-defined `from_numeral` body that lowers to
-        // an ordinary call the backends handle, so it must keep going through the
-        // real dispatch rather than being folded.
         const primitive = switch (self.builder.shapeContent(target_ty)) {
             .primitive => |p| p,
-            else => return try self.lowerNumeralCall(checked_ret_ty, maybe_plan, target_ty),
+            else => return try self.lowerNumeralCall(checked_ret_ty, numeral.plan, target_ty),
         };
-
-        const plan_id = maybe_plan orelse Common.invariant("checked from_numeral expression reached Monotype without a dispatch plan");
-        const plan = self.view.static_dispatch_plans.plans[@intFromEnum(plan_id)];
-        const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
-        if (plan_args.len != 1) Common.invariant("from_numeral plan did not carry exactly one operand");
-        const literal = switch (plan_args[0]) {
-            .generated_numeral => |lit| lit,
-            else => Common.invariant("from_numeral plan operand was not a generated numeral"),
-        };
-
-        const text = try checked.numeralLiteralDecimalText(self.allocator, self.view.module_env, literal);
-        defer self.allocator.free(text);
-
-        const folded = foldNumeralPrimitive(primitive, text);
-
-        // A value that does not fit its concrete target (e.g. a literal forced to
-        // a too-narrow type after monomorphization) matches the existing generic
-        // from_numeral behavior: a runtime crash on the conversion's Err branch.
-        const data = folded orelse blk: {
+        const data = (try self.numeralBits(numeral.literal, primitive)) orelse blk: {
+            // A value that does not fit its concrete integer or Dec target (a
+            // literal forced to an unrepresentable type after monomorphization;
+            // checking reports these, so this is unreachable for error-free
+            // programs) matches the generic from_numeral behavior: a runtime
+            // crash on the conversion's Err branch.
             const msg = try self.addStringLiteral("invalid numeric literal");
             break :blk BodyExprData{ .crash = msg };
         };
         return try self.addExpr(.{ .ty = target_ty, .data = data });
+    }
+
+    /// A numeric literal's scalar constant at a builtin numeric primitive —
+    /// the payload both the expression and pattern lowerers map into their
+    /// own IR node flavor.
+    const NumeralScalarBits = union(enum) {
+        int: can.CIR.IntValue,
+        f32: f32,
+        f64: f64,
+        dec: builtins.dec.RocDec,
+    };
+
+    /// The literal's bit pattern at a builtin primitive, from its exact
+    /// digits — the ONE place that turns digits into bits: integers by limb
+    /// assembly with a fit check, Dec by exact scale shift, floats by
+    /// correctly-rounded decimal→binary conversion (total: out-of-range
+    /// rounds toward ±inf). Null when an integer or Dec target cannot
+    /// represent the exact value; each caller maps null to its own failure
+    /// mode (expression: runtime crash node; pattern: never-matching branch).
+    /// Checking reports every such literal, so null is unreachable for
+    /// error-free programs.
+    fn numeralScalarBits(
+        self: *BodyContext,
+        literal: can.ModuleEnv.NumeralLiteral,
+        primitive: Type.Primitive,
+    ) Allocator.Error!?NumeralScalarBits {
+        const exact = self.view.module_env.exactNumeral(literal);
+        return switch (primitive) {
+            .u8, .u16, .u32, .u64, .u128, .i8, .i16, .i32, .i64, .i128 => blk: {
+                const bits = exact_numeral.intBits(exact, numeralTargetFromPrimitive(primitive)) orelse break :blk null;
+                break :blk switch (bits) {
+                    .i128 => |value| .{ .int = .{ .bytes = @bitCast(value), .kind = .i128 } },
+                    .u128 => |value| .{ .int = .{ .bytes = @bitCast(value), .kind = .u128 } },
+                };
+            },
+            .f32 => .{ .f32 = try exact_numeral.floatBits(f32, self.allocator, exact) },
+            .f64 => .{ .f64 = try exact_numeral.floatBits(f64, self.allocator, exact) },
+            .dec => blk: {
+                const num = (try exact_numeral.decBits(self.allocator, exact)) orelse break :blk null;
+                break :blk .{ .dec = .{ .num = num } };
+            },
+            .bool, .str => Common.invariant("numeric literal instantiated at a non-numeric Monotype primitive"),
+        };
+    }
+
+    /// The expression flavor of `numeralScalarBits`; null passes through for
+    /// the caller's crash-node mapping.
+    fn numeralBits(
+        self: *BodyContext,
+        literal: can.ModuleEnv.NumeralLiteral,
+        primitive: Type.Primitive,
+    ) Allocator.Error!?BodyExprData {
+        const bits = (try self.numeralScalarBits(literal, primitive)) orelse return null;
+        return switch (bits) {
+            .int => |value| .{ .int_lit = value },
+            .f32 => |value| .{ .frac_f32_lit = value },
+            .f64 => |value| .{ .frac_f64_lit = value },
+            .dec => |value| .{ .dec_lit = value },
+        };
     }
 
     /// Materialize a string literal as the `Str` argument of a `from_quote`
@@ -16563,6 +16900,9 @@ const BodyContext = struct {
         literal: can.ModuleEnv.NumeralLiteral,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        if (!literal.isMaterialized()) {
+            Common.invariant("checked from_numeral argument literal was not materialized");
+        }
         const field_span = switch (self.builder.shapeContent(ty)) {
             .record => |span| span,
             else => Common.invariant("Numeral Literal payload was not a record"),
@@ -20579,11 +20919,7 @@ const BodyContext = struct {
             .applied_tag,
             .nominal,
             .tuple,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .str_interpolation,
             .underscore,
@@ -20613,11 +20949,7 @@ const BodyContext = struct {
                 .record_destructure => .record,
                 .list => .list,
                 .applied_tag,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 => .can_miss,
@@ -20635,11 +20967,7 @@ const BodyContext = struct {
                 .record_destructure,
                 .list,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -20659,11 +20987,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .list,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -20683,11 +21007,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .list,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -20707,11 +21027,7 @@ const BodyContext = struct {
                 .nominal,
                 .list,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -20733,11 +21049,7 @@ const BodyContext = struct {
                 .nominal,
                 .list,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -20757,11 +21069,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -20781,11 +21089,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -20805,11 +21109,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -21021,11 +21321,7 @@ const BodyContext = struct {
                 }
             },
             .pending,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -21085,11 +21381,7 @@ const BodyContext = struct {
                 }
             },
             .pending,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -21165,20 +21457,10 @@ const BodyContext = struct {
                 }
                 break :blk .{ .tuple = try self.lowerPatternSpanAtTypesCollectingLists(items, self.builder.tupleItemTypes(ty), checks_out) };
             },
-            .num_literal => |num| if (num.conversion) |conversion|
+            .numeral_literal => |num| if (num.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
-                self.lowerNumPattern(num.value, ty),
-            .small_dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                Common.invariant("small decimal pattern reached Monotype after numeric finalization"),
-            .dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                .{ .dec_lit = dec.value },
-            .frac_f32_literal => |value| .{ .frac_f32_lit = value },
-            .frac_f64_literal => |value| .{ .frac_f64_lit = value },
+                try self.numeralPatBits(num.literal, ty),
             .str_literal => |str| if (str.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
@@ -21379,11 +21661,7 @@ const BodyContext = struct {
             .applied_tag,
             .nominal,
             .tuple,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .str_interpolation,
             .underscore,
@@ -21767,11 +22045,7 @@ const BodyContext = struct {
                 }
             },
             .pending,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -22452,15 +22726,7 @@ const BodyContext = struct {
             .for_ => |for_| try self.lowerDivergentExprForEffectDataAtType(for_.expr, ty),
             .run_low_level => |low_level| try self.lowerFirstDivergentExprForEffectDataAtType(low_level.args, ty),
             .pending,
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .num_from_numeral,
-            .typed_int,
-            .typed_frac,
-            .typed_num_from_numeral,
+            .numeral,
             .str_from_quote,
             .str_segment,
             .bytes_literal,
@@ -22619,15 +22885,7 @@ const BodyContext = struct {
             .for_ => |for_| self.checkedExprDivergesInLoweredRuntime(for_.expr),
             .run_low_level => |low_level| self.checkedAnyExprDivergesInLoweredRuntime(low_level.args),
             .pending,
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .num_from_numeral,
-            .typed_int,
-            .typed_frac,
-            .typed_num_from_numeral,
+            .numeral,
             .str_from_quote,
             .str_segment,
             .bytes_literal,
@@ -23335,15 +23593,7 @@ const BodyContext = struct {
             .closure,
             .hosted_lambda,
             .pending,
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .num_from_numeral,
-            .typed_int,
-            .typed_frac,
-            .typed_num_from_numeral,
+            .numeral,
             .str_from_quote,
             .str_segment,
             .bytes_literal,
@@ -23796,20 +24046,10 @@ const BodyContext = struct {
                 }
                 break :blk .{ .tuple = try self.lowerTuplePattern(items, ty) };
             },
-            .num_literal => |num| if (num.conversion) |conversion|
+            .numeral_literal => |num| if (num.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
-                self.lowerNumPattern(num.value, ty),
-            .small_dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                Common.invariant("small decimal pattern reached Monotype after numeric finalization"),
-            .dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                .{ .dec_lit = dec.value },
-            .frac_f32_literal => |value| .{ .frac_f32_lit = value },
-            .frac_f64_literal => |value| .{ .frac_f64_lit = value },
+                try self.numeralPatBits(num.literal, ty),
             .str_literal => |str| if (str.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
@@ -23969,18 +24209,37 @@ const BodyContext = struct {
         const local = try self.addLocal(self.builder.symbols.fresh(), ty);
         try self.pattern_literal_guards.append(self.allocator, .{
             .local = local,
-            .conversion = conversion,
             .ty = ty,
+            .check = .{ .conversion = conversion },
+        });
+        return .{ .bind = local };
+    }
+
+    /// Lower a literal pattern whose value its concrete type cannot represent
+    /// to a fresh bind guarded by a constant-false condition: the branch
+    /// falls through to the next one, exactly as if the scrutinee had been
+    /// compared against the unrepresentable value.
+    fn bindNeverMatchPattern(self: *BodyContext, ty: Type.TypeId) Allocator.Error!BodyPatData {
+        const local = try self.addLocal(self.builder.symbols.fresh(), ty);
+        try self.pattern_literal_guards.append(self.allocator, .{
+            .local = local,
+            .ty = ty,
+            .check = .never,
         });
         return .{ .bind = local };
     }
 
     /// Compare a bound match value against a literal's converted constant,
     /// dispatching to the type's `is_eq` method when it has one and falling
-    /// back to structural equality otherwise, mirroring `==`.
+    /// back to structural equality otherwise, mirroring `==`. A never-match
+    /// guard is the constant `false` instead.
     fn lowerPatternLiteralEq(self: *BodyContext, entry: PatternLiteralGuard) Allocator.Error!DraftExprId {
+        const conversion = switch (entry.check) {
+            .conversion => |conversion| conversion,
+            .never => return try self.boolLiteral(false, try self.builder.primitiveType(.bool)),
+        };
         const scrutinee = try self.localExpr(entry.local, entry.ty);
-        const expected = try self.lowerExpr(entry.conversion);
+        const expected = try self.lowerExpr(conversion);
         if (methodOwnerFromType(&self.builder.program.types, entry.ty)) |owner| {
             if (self.builder.lookupMethodTargetByName(owner, "is_eq")) |lookup| {
                 var target_ctx = try self.methodTargetContext(lookup);
@@ -24045,45 +24304,33 @@ const BodyContext = struct {
         return cond;
     }
 
-    fn lowerNumPattern(self: *BodyContext, value: can.CIR.IntValue, ty: Type.TypeId) BodyPatData {
-        return if (self.builder.typeIsDec(ty))
-            .{ .dec_lit = intValueToDec(value) }
-        else
-            .{ .int_lit = value };
-    }
-
-    fn lowerIntLiteral(self: *BodyContext, value: can.CIR.IntValue, ty: Type.TypeId) BodyExprData {
-        return switch (self.builder.shapeContent(ty)) {
-            .primitive => |primitive| switch (primitive) {
-                .f32 => .{ .frac_f32_lit = @floatCast(intValueToF64(value)) },
-                .f64 => .{ .frac_f64_lit = intValueToF64(value) },
-                .dec => .{ .dec_lit = intValueToDec(value) },
-                else => .{ .int_lit = value },
-            },
-            else => .{ .int_lit = value },
+    /// The pattern flavor of `numeralScalarBits`: an unrepresentable value
+    /// lowers to a never-matching branch instead of an expression crash node
+    /// (checking reports it; the arm falls through, since e.g. an I8 can
+    /// never equal 300).
+    fn numeralPatBits(self: *BodyContext, literal: can.ModuleEnv.NumeralLiteral, ty: Type.TypeId) Allocator.Error!BodyPatData {
+        const primitive = switch (self.builder.shapeContent(ty)) {
+            .primitive => |p| p,
+            else => Common.invariant("numeric literal pattern at a non-primitive Monotype type without a conversion"),
         };
-    }
-
-    /// Lower a fractional literal to the constant form its instantiated
-    /// monotype demands. The checked stage finalizes a fractional literal's
-    /// value to one numeric representation, but a generalized literal can be
-    /// instantiated at a different fractional primitive than its finalized
-    /// default (for example, a literal finalized to `Dec` that this
-    /// specialization unifies to `F64`). The constant kind must follow the
-    /// instantiated type so backends store bits the destination layout
-    /// expects, mirroring `lowerIntLiteral`.
-    fn lowerFracLiteral(self: *BodyContext, value: FracLiteralValue, ty: Type.TypeId) BodyExprData {
-        return switch (self.builder.shapeContent(ty)) {
-            .primitive => |primitive| switch (primitive) {
-                .f32 => .{ .frac_f32_lit = value.asF32() },
-                .f64 => .{ .frac_f64_lit = value.asF64() },
-                .dec => .{ .dec_lit = value.asDec() },
-                else => Common.invariant("fractional literal instantiated to a non-fractional Monotype primitive"),
-            },
-            else => Common.invariant("fractional literal instantiated to a non-primitive Monotype type"),
+        const bits = (try self.numeralScalarBits(literal, primitive)) orelse
+            return try self.bindNeverMatchPattern(ty);
+        return switch (bits) {
+            .int => |value| .{ .int_lit = value },
+            .f32 => |value| .{ .frac_f32_lit = value },
+            .f64 => |value| .{ .frac_f64_lit = value },
+            .dec => |value| .{ .dec_lit = value },
         };
     }
 };
+
+/// The exact-numeral target for a numeric Monotype primitive.
+fn numeralTargetFromPrimitive(primitive: Type.Primitive) exact_numeral.Target {
+    return switch (primitive) {
+        .bool, .str => Common.invariant("non-numeric Monotype primitive has no numeral target"),
+        inline else => |p| @field(exact_numeral.Target, @tagName(p)),
+    };
+}
 
 test "monotype sameType keeps failed alias alternatives out of recursion stack" {
     var program = Ast.Program.init(std.testing.allocator);
@@ -24514,40 +24761,6 @@ const HashDeriver = struct {
     }
 };
 
-/// A fractional literal value in its checked-stage representation, used to
-/// re-derive the constant kind the instantiated Monotype primitive requires.
-const FracLiteralValue = union(enum) {
-    f32: f32,
-    f64: f64,
-    dec: builtins.dec.RocDec,
-
-    fn asF64(self: FracLiteralValue) f64 {
-        return switch (self) {
-            .f32 => |v| @floatCast(v),
-            .f64 => |v| v,
-            .dec => |v| v.toF64(),
-        };
-    }
-
-    fn asF32(self: FracLiteralValue) f32 {
-        return switch (self) {
-            .f32 => |v| v,
-            .f64 => |v| @floatCast(v),
-            .dec => |v| @floatCast(v.toF64()),
-        };
-    }
-
-    fn asDec(self: FracLiteralValue) builtins.dec.RocDec {
-        return switch (self) {
-            .f32 => |v| builtins.dec.RocDec.fromF64(@floatCast(v)) orelse
-                Common.invariant("f32 fractional literal could not be represented as Dec at its instantiated type"),
-            .f64 => |v| builtins.dec.RocDec.fromF64(v) orelse
-                Common.invariant("f64 fractional literal could not be represented as Dec at its instantiated type"),
-            .dec => |v| v,
-        };
-    }
-};
-
 /// Record a local's source-level name from its pattern binder. An `assign`
 /// pattern's region is exactly the identifier token's span, so the name is
 /// the source text at that region. Binders from other pattern forms (`as`)
@@ -24637,40 +24850,6 @@ fn restoreScalarBody(scalar: checked.ConstScalar) BodyExprData {
         .f64_bits => |bits| .{ .frac_f64_lit = @bitCast(bits) },
         .dec_bits => |bits| .{ .dec_lit = .{ .num = bits } },
     };
-}
-
-/// Parse a numeral's decimal text into a constant literal of the
-/// concrete numeric `primitive`, mirroring the interpreter's `parseNumeralPayload`
-/// (`std.fmt.parseInt`/`parseFloat`/`RocDec.fromNonemptySlice`). Returns null
-/// when the value does not fit the target representation (out of range, or a
-/// fractional text parsed as an integer), so the caller can lower the Err branch.
-fn foldNumeralPrimitive(primitive: Type.Primitive, text: []const u8) ?BodyExprData {
-    return switch (primitive) {
-        .u8 => foldUnsignedNumeral(u8, text),
-        .u16 => foldUnsignedNumeral(u16, text),
-        .u32 => foldUnsignedNumeral(u32, text),
-        .u64 => foldUnsignedNumeral(u64, text),
-        .u128 => foldUnsignedNumeral(u128, text),
-        .i8 => foldSignedNumeral(i8, text),
-        .i16 => foldSignedNumeral(i16, text),
-        .i32 => foldSignedNumeral(i32, text),
-        .i64 => foldSignedNumeral(i64, text),
-        .i128 => foldSignedNumeral(i128, text),
-        .f32 => if (std.fmt.parseFloat(f32, text)) |v| .{ .frac_f32_lit = v } else |_| null,
-        .f64 => if (std.fmt.parseFloat(f64, text)) |v| .{ .frac_f64_lit = v } else |_| null,
-        .dec => if (builtins.dec.RocDec.fromNonemptySlice(text)) |d| .{ .dec_lit = .{ .num = d.num } } else null,
-        .bool, .str => Common.invariant("from_numeral target was a non-numeric primitive"),
-    };
-}
-
-fn foldUnsignedNumeral(comptime T: type, text: []const u8) ?BodyExprData {
-    const value = std.fmt.parseInt(T, text, 10) catch return null;
-    return .{ .int_lit = unsignedIntLiteral(value) };
-}
-
-fn foldSignedNumeral(comptime T: type, text: []const u8) ?BodyExprData {
-    const value = std.fmt.parseInt(T, text, 10) catch return null;
-    return .{ .int_lit = signedIntLiteral(value) };
 }
 
 fn signedIntLiteral(value: anytype) can.CIR.IntValue {
@@ -25011,29 +25190,6 @@ fn checkedRecordFieldByName(
         }
     }
     Common.invariant("expected checked record field was absent");
-}
-
-fn intValueToDec(value: can.CIR.IntValue) builtins.dec.RocDec {
-    const whole = switch (value.kind) {
-        .i128 => @as(i128, @bitCast(value.bytes)),
-        .u128 => blk: {
-            const unsigned = @as(u128, @bitCast(value.bytes));
-            if (unsigned > @as(u128, @intCast(std.math.maxInt(i128)))) {
-                Common.invariant("integer pattern solved as Dec exceeded Dec whole-number range");
-            }
-            break :blk @as(i128, @intCast(unsigned));
-        },
-    };
-    return builtins.dec.RocDec.fromWholeInt(whole) orelse {
-        Common.invariant("integer pattern solved as Dec exceeded Dec range");
-    };
-}
-
-fn intValueToF64(value: can.CIR.IntValue) f64 {
-    return switch (value.kind) {
-        .i128 => builtins.compiler_rt_128.i128_to_f64(@as(i128, @bitCast(value.bytes))),
-        .u128 => builtins.compiler_rt_128.u128_to_f64(@as(u128, @bitCast(value.bytes))),
-    };
 }
 
 fn branchCount(branches: anytype) usize {

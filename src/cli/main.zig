@@ -941,8 +941,8 @@ pub fn main(init: std.process.Init) Allocator.Error!void {
         if (use_debug_allocator) {
             // Under Valgrind, use libc's malloc instead: Valgrind can't see the
             // debug allocator's sub-allocations (it carves them out of mmap'd
-            // pages) but tracks every malloc/free. Debug builds carry the client
-            // requests, so this auto-switches with no flag.
+            // pages) but tracks every malloc/free. Builds with Valgrind support
+            // carry the client requests, so this can auto-switch under Valgrind.
             if (builtin.link_libc and std.valgrind.runningOnValgrind() != 0) {
                 break :gpa .{ std.heap.c_allocator, false };
             }
@@ -5480,8 +5480,8 @@ fn lowerLirWithCoordinator(
 
     // Run global package version resolution: downloads every (transitive)
     // URL dependency, solves versions, and yields the final package graph.
-    // Resolution still receives a logical absolute path; package identities
-    // are canonicalized separately by compile.package_identity.
+    // Resolution works on logical absolute paths; canonical (realpath)
+    // forms are used only for package identity, via compile.package_identity.
     const roc_file_abs = std.fs.path.resolve(ctx.arena, &.{roc_file_path}) catch
         try ctx.arena.dupe(u8, roc_file_path);
     var resolved = try resolvePackages(ctx, roc_file_abs, resolution_config);
@@ -5547,7 +5547,7 @@ fn lowerLirWithCoordinator(
     {
         // Record notes for packages whose declared dependency versions were
         // bumped by solving, so errors inside them can explain the bump.
-        const bump_notes = try compile.package_identity.versionBumpNotesForPackageKeys(&resolved, package_keys, ctx.gpa);
+        const bump_notes = try compile.package_resolution.versionBumpNotes(&resolved, package_keys.identities, ctx.gpa);
         defer ctx.gpa.free(bump_notes);
         for (bump_notes) |note| {
             const gop = try coord.version_notes.getOrPut(note.package_identity);
@@ -11311,7 +11311,7 @@ fn rocRepl(ctx: *CliCtx, repl_args: cli_args.ReplArgs) CliMainError!void {
     // it before printing the greeting so the greeting and the first prompt appear
     // together and the REPL is immediately interactive — otherwise the greeting
     // shows with no prompt until this finishes.
-    var session = try ReplSession.init(ctx.gpa, ctx.io.std_io, backend_kind);
+    var session = try ReplSession.init(ctx.gpa, ctx.coreCtx(), backend_kind);
     defer session.deinit();
 
     if (mode == .interactive) {
@@ -11867,6 +11867,7 @@ fn checkFileWithBuildEnvPreserved(
     resolution_config: compile.package_resolution.Config,
     source_dir_override: ?[]const u8,
     track_watch_inputs: bool,
+    synthetic_default_app: bool,
 ) CheckFileWithBuildEnvPreservedError!CheckResultWithBuildEnv {
     const trace = tracy.trace(@src());
     defer trace.end();
@@ -11881,6 +11882,13 @@ fn checkFileWithBuildEnvPreserved(
     var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
     build_env.setWatchInputTracking(track_watch_inputs);
     build_env.resolution_config = resolution_config;
+    if (synthetic_default_app) {
+        // Staged default-app roots and their synthesized platform live in a
+        // per-invocation temp dir; identity must be the stable synthetic one
+        // so cache keys and nominal identity match across runs and pipelines.
+        build_env.setSyntheticRootPackageIdentity();
+        build_env.setSyntheticRootPlatformPackageIdentity();
+    }
     if (source_dir_override) |source_dir| {
         build_env.setRootSourceDirOverride(source_dir);
     }
@@ -12040,6 +12048,7 @@ fn checkFileWithBuildEnv(
     max_threads: ?usize,
     resolution_config: compile.package_resolution.Config,
     source_dir_override: ?[]const u8,
+    synthetic_default_app: bool,
 ) CheckFileWithBuildEnvPreservedError!CheckResult {
     const trace = tracy.trace(@src());
     defer trace.end();
@@ -12051,6 +12060,13 @@ fn checkFileWithBuildEnv(
     defer ctx.gpa.free(cwd);
     var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
     build_env.resolution_config = resolution_config;
+    if (synthetic_default_app) {
+        // Staged default-app roots and their synthesized platform live in a
+        // per-invocation temp dir; identity must be the stable synthetic one
+        // so cache keys and nominal identity match across runs and pipelines.
+        build_env.setSyntheticRootPackageIdentity();
+        build_env.setSyntheticRootPlatformPackageIdentity();
+    }
     if (source_dir_override) |source_dir| {
         build_env.setRootSourceDirOverride(source_dir);
     }
@@ -12269,6 +12285,7 @@ fn rocCheckDefaultApp(
         args.max_threads,
         resolutionConfigFromLimits(args.resolve_limits),
         original_source_dir,
+        true,
     );
     errdefer check_result.deinit(ctx.gpa);
 
@@ -12320,6 +12337,7 @@ fn rocCheckDefaultAppPreserved(
         resolutionConfigFromLimits(args.resolve_limits),
         original_source_dir,
         track_watch_inputs,
+        true,
     );
     errdefer result_with_env.deinit(ctx.gpa);
 
@@ -12414,6 +12432,7 @@ fn rocCheck(ctx: *CliCtx, args: cli_args.CheckArgs, arg0: []const u8) RocCheckEr
             resolutionConfigFromLimits(args.resolve_limits),
             null,
             true,
+            false,
         ) catch |err| {
             reporter.fail();
             try writeWatchInputsFile(ctx, file_path, null, extra_paths);
@@ -12448,6 +12467,7 @@ fn rocCheck(ctx: *CliCtx, args: cli_args.CheckArgs, arg0: []const u8) RocCheckEr
             args.max_threads,
             resolutionConfigFromLimits(args.resolve_limits),
             null,
+            false,
         ) catch |err| {
             reporter.fail();
             return handleProcessFileError(err, stderr, args.path);
@@ -12828,6 +12848,7 @@ fn bumpCheckSide(
         resolutionConfigFromLimits(args.resolve_limits),
         null,
         false,
+        false,
     ) catch |err| {
         try handleProcessFileError(err, stderr, path);
         return error.CliError;
@@ -12928,6 +12949,16 @@ fn bumpExtractApi(ctx: *CliCtx, build_env: *compile.BuildEnv, side: []const u8) 
     var origins = bump.extract.OriginMap{};
     defer origins.deinit(ctx.gpa);
     {
+        const builtin_env = build_env.builtin_modules.builtin_module.env;
+        const builtin_identity_hash = builtin_env.contentIdentityHash() orelse return error.Internal;
+        const builtin_origin = bump.extract.OriginMap.Origin{
+            .kind = .builtin,
+            .module_name = builtin_env.module_name,
+        };
+        try origins.putIdentity(ctx.gpa, builtin_identity_hash, builtin_origin);
+        try origins.put(ctx.gpa, builtin_env.module_name, builtin_origin);
+        try origins.put(ctx.gpa, builtin_env.getIdentText(builtin_env.qualified_module_ident), builtin_origin);
+
         var sched_iter = build_env.schedulers.iterator();
         while (sched_iter.next()) |sched_entry| {
             const pkg_name = sched_entry.key_ptr.*;
@@ -13087,6 +13118,7 @@ fn rocDocs(ctx: *CliCtx, args: cli_args.DocsArgs) CliMainError!void {
         resolutionConfigFromLimits(args.resolve_limits),
         null,
         false,
+        false,
     ) catch |err| {
         return handleProcessFileError(err, stderr, args.path);
     };
@@ -13179,9 +13211,9 @@ fn generateDocs(
     defer ctx.gpa.free(modules);
 
     for (modules) |module_info| {
-        // Docs show the alias the root uses for a package, not its internal
-        // identity name (full URL or absolute path).
-        const sched_pkg_name = build_env.rootAliasForPackage(module_info.package_name) orelse module_info.package_name;
+        // Docs show display names (root alias, or "app"/"module" for the
+        // root itself), never internal identity keys (URLs, absolute paths).
+        const sched_pkg_name = build_env.displayNameForPackage(module_info.package_name);
         modules_seen += 1;
 
         var mod_docs = extract.extractModuleDocs(ctx.gpa, module_info.semantic.env, sched_pkg_name, module_info.path) catch |err| {
@@ -13252,6 +13284,7 @@ fn generateDocs(
     // Promote the builtin types (Str, Num, …) to top-level modules so the
     // internal `Builtin` container never surfaces in the generated docs.
     try package_docs.reshapeBuiltin(ctx.gpa);
+    try package_docs.resolveDocRefs(ctx.gpa);
 
     // Remove existing output directory to ensure a clean build
     try std.Io.Dir.cwd().deleteTree(ctx.io.std_io, base_output_dir);

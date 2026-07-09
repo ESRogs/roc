@@ -2689,38 +2689,7 @@ fn mergeFromNumeralLiteralInfo(
 ) ?types_mod.NumeralInfo {
     const a_info = a orelse return b;
     const b_info = b orelse return a;
-
-    var merged = if (!numeralInfoFitsDec(a_info)) a_info else b_info;
-    merged.is_negative = a_info.is_negative or b_info.is_negative;
-    merged.is_fractional = a_info.is_fractional or b_info.is_fractional;
-    merged.fits_dec = mergeFitsDec(a_info.fits_dec, b_info.fits_dec);
-    merged.frac_requirements = mergeFracRequirements(a_info, b_info);
-    return merged;
-}
-
-fn mergeFitsDec(a: ?bool, b: ?bool) ?bool {
-    if (a == false or b == false) return false;
-    if (a == true or b == true) return true;
-    return null;
-}
-
-fn mergeFracRequirements(
-    a: types_mod.NumeralInfo,
-    b: types_mod.NumeralInfo,
-) ?types_mod.FracRequirements {
-    if (!a.is_fractional) return b.frac_requirements;
-    if (!b.is_fractional) return a.frac_requirements;
-
-    const a_req = a.frac_requirements orelse return null;
-    const b_req = b.frac_requirements orelse return null;
-    return a_req.unify(b_req);
-}
-
-fn numeralInfoFitsDec(info: types_mod.NumeralInfo) bool {
-    if (!info.is_fractional) return true;
-    if (info.fits_dec) |fits| return fits;
-    const requirements = info.frac_requirements orelse return false;
-    return requirements.fits_in_dec;
+    return types_mod.NumeralInfo.merged(a_info, b_info);
 }
 
 /// A list of constraint that should apply to concrete type

@@ -154,6 +154,7 @@ pub const Tag = enum {
     pattern_tuple,
     pattern_num_literal,
     pattern_dec_literal,
+    pattern_num_from_numeral_literal,
     pattern_f32_literal,
     pattern_f64_literal,
     pattern_small_dec_literal,
@@ -365,6 +366,7 @@ pub const Payload = extern union {
     pattern_nominal_external: PatternNominalExternal,
     pattern_small_dec_literal: PatternSmallDecLiteral,
     pattern_dec_literal: PatternDecLiteral,
+    pattern_num_from_numeral_literal: PatternNumFromNumeralLiteral,
     pattern_str_literal: PatternStrLiteral,
     pattern_str_interpolation: PatternStrInterpolation,
     pattern_frac_f32: PatternFracF32,
@@ -884,6 +886,10 @@ pub const Payload = extern union {
     pub const PatternStrLiteral = extern struct {
         literal: u32,
         _padding: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+
+    pub const PatternNumFromNumeralLiteral = extern struct {
+        _padding: [12]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     pub const PatternStrInterpolation = extern struct {

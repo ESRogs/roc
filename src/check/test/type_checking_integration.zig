@@ -1465,6 +1465,25 @@ test "check type - alias open tag union" {
     try checkTypesModule(source, .{ .pass = .last_def }, "{} -> MyAlias([C])");
 }
 
+test "check type - alias forward reference in open tag union completes" {
+    // repro for https://github.com/roc-lang/roc/issues/9959
+    const source =
+        \\Repro :: U8
+        \\
+        \\hang : Str -> Foo([])
+        \\hang = |_| { foo: Thing }
+        \\
+        \\Foo(tags) : { foo: Union(tags) }
+        \\
+        \\Union(others) : [Thing, ..others]
+    ;
+
+    var test_env = try TestEnv.init("Repro", source);
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+}
+
 test "check type - alias open record" {
     const source =
         \\main! = |_| {}
@@ -1903,8 +1922,8 @@ test "check type - if else - different branch types 3" {
 // unification merges a numeral-origin and a quote-origin constraint onto one var.
 // No type satisfies both, so the program is always
 // rejected — but the diagnostic must not depend on which unify side each literal
-// arrived on. `varLiteralKind` tie-breaks dual-kind vars to `.numeral` (matching
-// `numericDefaultPhaseForConstraints` and `flexLiteralDefaultKind`), so BOTH
+// arrived on. The defaulting oracle (src/types/literal_defaulting.zig)
+// tie-breaks dual-kind vars to `.numeral` for every stage that asks, so BOTH
 // orders default the var toward the numeral head (Dec) and report the quote
 // constraint against it: mirror-image programs get the SAME diagnostic (same
 // title, same prose; only the source region differs).
@@ -4694,10 +4713,8 @@ test "check type - try operator on method call should apply to whole expression 
     try checkTypesModule(source, .{ .pass = .last_def }, "List(Str) -> Try(Str, [ListWasEmpty, ..])");
 }
 
-test "check type - try does not widen closed error row into open return error row" {
-    // Verifies intended behavior for https://github.com/roc-lang/roc/issues/9798:
-    // `?` does not widen a callee's closed error tag union into the enclosing
-    // annotation's open error row, so this program is a type error.
+test "check type - try closed error row satisfies open return error row" {
+    // Regression test for https://github.com/roc-lang/roc/issues/9798
     const source =
         \\inner : {} -> Try({}, [InnerErr])
         \\inner = |{}| Err(InnerErr)
@@ -4708,7 +4725,7 @@ test "check type - try does not widen closed error row into open return error ro
         \\    Ok({})
         \\}
     ;
-    try checkTypesModule(source, .fail, "Type Mismatch");
+    try checkTypesModule(source, .{ .pass = .last_def }, "{} -> Try({}, [InnerErr, ..])");
 }
 
 // record extension in type annotations //

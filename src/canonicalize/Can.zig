@@ -4868,6 +4868,7 @@ fn collectBoundVarsInto(self: *Self, target: *base.Scratch(Pattern.Idx), pattern
                 }
             },
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -5016,6 +5017,7 @@ fn collectReassignBoundVarsToScratch(self: *Self, pattern_idx: Pattern.Idx) Allo
                 }
             },
             .num_literal,
+            .num_from_numeral_literal,
             .small_dec_literal,
             .dec_literal,
             .frac_f32_literal,
@@ -6849,14 +6851,14 @@ fn canonicalizeSingleQuote(
                 .kind = .int_unbound,
             },
         }, region);
-        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(expr_idx), digits[0..digit_len], &.{}, 0, false, false, false);
+        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(expr_idx), digits[0..digit_len], &.{}, 0, false, false, false, true);
         return expr_idx;
     } else if (comptime Idx == Pattern.Idx) {
         const pat_idx = try self.env.addPattern(Pattern{ .num_literal = .{
             .value = value_content,
             .kind = .int_unbound,
         } }, region);
-        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(pat_idx), digits[0..digit_len], &.{}, 0, false, false, false);
+        try self.env.recordNumeralLiteral(ModuleEnv.nodeIdxFrom(pat_idx), digits[0..digit_len], &.{}, 0, false, false, false, true);
         return pat_idx;
     } else {
         @compileError("Unsupported Idx type");
@@ -6913,6 +6915,7 @@ fn recordNumeralLiteralForExpr(
         literal.isNegative(),
         literal.kind == .frac,
         literal.flags.had_decimal_point,
+        literal.isMaterialized(),
     );
 }
 
@@ -6932,6 +6935,7 @@ fn recordNumeralLiteralForPattern(
         literal.isNegative(),
         literal.kind == .frac,
         literal.flags.had_decimal_point,
+        literal.isMaterialized(),
     );
 }
 
@@ -8587,6 +8591,7 @@ const DefiniteInitAnalyzer = struct {
                     }
                 },
                 .num_literal,
+                .num_from_numeral_literal,
                 .small_dec_literal,
                 .dec_literal,
                 .frac_f32_literal,
@@ -16842,6 +16847,11 @@ pub fn canonicalizePattern(
                             try self.recordNumeralLiteralForPattern(pat_idx, literal);
                             break :blk pat_idx;
                         },
+                        .exact => blk: {
+                            const pat_idx = try self.env.addPattern(Pattern{ .num_from_numeral_literal = .{} }, region);
+                            try self.recordNumeralLiteralForPattern(pat_idx, literal);
+                            break :blk pat_idx;
+                        },
                         else => try self.env.pushMalformed(Pattern.Idx, Diagnostic{ .invalid_num_literal = .{ .region = region } }),
                     };
                 },
@@ -16862,6 +16872,11 @@ pub fn canonicalizePattern(
                                 .value = builtins.dec.RocDec{ .num = value },
                                 .has_suffix = false,
                             } }, region);
+                            try self.recordNumeralLiteralForPattern(pat_idx, literal);
+                            break :blk pat_idx;
+                        },
+                        .exact => blk: {
+                            const pat_idx = try self.env.addPattern(Pattern{ .num_from_numeral_literal = .{} }, region);
                             try self.recordNumeralLiteralForPattern(pat_idx, literal);
                             break :blk pat_idx;
                         },
@@ -19521,22 +19536,6 @@ pub fn currentScope(self: *Self) *Scope {
 fn currentScopeIdx(self: *Self) usize {
     std.debug.assert(self.scopes.items.len > 0);
     return self.scopes.items.len - 1;
-}
-
-/// This will be used later for builtins like Num.nan, Num.infinity, etc.
-pub fn addNonFiniteFloat(self: *Self, value: f64, region: base.Region) Allocator.Error!Expr.Idx {
-    // then in the final slot the actual expr is inserted
-    const expr_idx = try self.env.addExpr(
-        CIR.Expr{
-            .e_frac_f64 = .{
-                .value = value,
-                .has_suffix = false,
-            },
-        },
-        region,
-    );
-
-    return expr_idx;
 }
 
 /// Check if an identifier is in scope

@@ -626,7 +626,7 @@ pub const BuildEnv = struct {
             self.filesystem,
             if (self.synthetic_root_identity) .synthetic_app else .{ .local_path = root_abs },
         );
-        defer self.gpa.free(@constCast(root_identity));
+        defer self.gpa.free(root_identity);
 
         const key_pkg = try self.gpa.dupe(u8, root_identity);
         const pkg_root_file = try self.gpa.dupe(u8, root_abs);
@@ -705,6 +705,19 @@ pub const BuildEnv = struct {
             else
                 try coord.ensurePackage(entry.key_ptr.*, pkg.root_dir);
             try coord_pkg.setRootInput(self.gpa, pkg.root_file, pkg.root_file_state);
+
+            // The coordinator gates the hosted transform (and app-root artifact
+            // lookups) on knowing which package is the app; app modules must
+            // never have annotation-only defs rewritten into hosted lambdas,
+            // and app-less builds (platform/package/module roots) record that
+            // explicitly so every module takes the transform.
+            if (is_main_pkg) {
+                if (pkg.kind == .app or pkg.kind == .default_app) {
+                    coord.markAppPackage(coord_pkg.name);
+                } else {
+                    coord.markNoAppPackage();
+                }
+            }
 
             // Copy shorthands to coordinator package
             // Only copy shorthands that map to real packages, not module-as-package entries
@@ -1949,7 +1962,7 @@ pub const BuildEnv = struct {
 
         // Record notes for packages whose declared dependency versions were
         // bumped by solving, so errors inside them can explain the bump.
-        const bump_notes = try package_identity.versionBumpNotesForPackageKeys(resolved, package_keys, self.gpa);
+        const bump_notes = try package_resolution.versionBumpNotes(resolved, package_keys.identities, self.gpa);
         defer self.gpa.free(bump_notes);
         for (bump_notes) |note| {
             const gop = try self.version_notes.getOrPut(self.gpa, note.package_identity);
@@ -2602,6 +2615,26 @@ pub const BuildEnv = struct {
         return null;
     }
 
+    /// User-facing display name for `pkg_name`: the alias the root package
+    /// uses for it when one exists, the root's role label ("app" or "module")
+    /// for the root package itself, and otherwise the internal identity.
+    /// Identity strings (full URLs, canonical paths) are cache and nominal
+    /// keys, not presentation; docs and other user output go through this.
+    pub fn displayNameForPackage(self: *BuildEnv, pkg_name: []const u8) []const u8 {
+        if (self.rootAliasForPackage(pkg_name)) |alias| return alias;
+        if (self.discovered_pkg_name) |root_name| {
+            if (std.mem.eql(u8, root_name, pkg_name)) {
+                if (self.packages.getPtr(root_name)) |root_pkg| {
+                    return switch (root_pkg.kind) {
+                        .app, .default_app => "app",
+                        else => "module",
+                    };
+                }
+            }
+        }
+        return pkg_name;
+    }
+
     pub fn rootIsPackage(self: *const BuildEnv) bool {
         const root_name = self.discovered_pkg_name orelse return false;
         const root_pkg = self.packages.get(root_name) orelse return false;
@@ -2891,12 +2924,16 @@ pub const BuildEnv = struct {
             &self.builtin_modules.checked_artifact,
         );
 
-        for (modules) |module| {
-            const artifact = module.semantic.checked_artifact orelse continue;
-            if (rootRelationContainsArtifact(root_artifact, artifact.key)) continue;
+        for (root_artifact.lowering_visibility.module_ids) |key| {
+            if (rootRelationContainsArtifact(root_artifact, key)) continue;
+            const artifact = artifactByKey(modules, key) orelse {
+                if (builtin.mode == .Debug) {
+                    std.debug.panic("build env invariant violated: missing lowering visibility artifact", .{});
+                }
+                unreachable;
+            };
             try appendImportedArtifactViewIfMissing(&views, allocator, root_artifact.key, artifact);
         }
-        try self.appendRelationClosureDependencyViews(&views, allocator, modules, root_artifact);
 
         return views.toOwnedSlice(allocator);
     }
@@ -2960,49 +2997,6 @@ pub const BuildEnv = struct {
             if (checkedArtifactKeysEqual(binding.app_value.artifact, key)) return true;
         }
         return false;
-    }
-
-    fn appendRelationClosureDependencyViews(
-        self: *BuildEnv,
-        views: *std.ArrayList(check.CheckedArtifact.ImportedModuleView),
-        allocator: Allocator,
-        modules: []const CompiledModuleInfo,
-        root_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    ) Allocator.Error!void {
-        var keys = std.ArrayList(check.CheckedArtifact.CheckedModuleArtifactKey).empty;
-        defer keys.deinit(allocator);
-
-        for (root_artifact.platform_required_bindings.bindings) |binding| {
-            const relation_artifact = artifactByKey(modules, binding.app_value.artifact) orelse {
-                if (@import("builtin").mode == .Debug) {
-                    std.debug.panic("build env invariant violated: platform relation references unavailable app artifact", .{});
-                }
-                unreachable;
-            };
-            try check.CheckedArtifact.appendPlatformRelationDependencyArtifactKeys(
-                allocator,
-                &keys,
-                relation_artifact,
-                binding,
-                root_artifact.platform_required_bindings.relationClosure(binding),
-            );
-        }
-
-        for (keys.items) |key| {
-            if (checkedArtifactKeysEqual(key, root_artifact.key)) continue;
-            if (rootRelationContainsArtifact(root_artifact, key)) continue;
-            if (checkedArtifactKeysEqual(key, self.builtin_modules.checked_artifact.key)) {
-                try appendImportedArtifactViewIfMissing(views, allocator, root_artifact.key, &self.builtin_modules.checked_artifact);
-                continue;
-            }
-            const artifact = artifactByKey(modules, key) orelse {
-                if (@import("builtin").mode == .Debug) {
-                    std.debug.panic("build env invariant violated: platform relation closure references unavailable checked artifact", .{});
-                }
-                unreachable;
-            };
-            try appendImportedArtifactViewIfMissing(views, allocator, root_artifact.key, artifact);
-        }
     }
 
     fn artifactByKey(
