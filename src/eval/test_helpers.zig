@@ -439,6 +439,7 @@ pub const BoolRootModule = struct {
     roots: []const BoolRoot,
 };
 
+/// Per-call mutable observation state passed to optimized test entrypoints.
 pub const TestInvocationContext = extern struct {
     expect_err_set: u32 = 0,
     expect_err_start: u32 = 0,
@@ -468,13 +469,16 @@ pub const BoolRootEvalResult = struct {
     events: []BoolRootEvent,
 };
 
+/// Callback invoked when a bool-root worker has produced its final result.
 pub const BoolRootCompletionCallback = struct {
     context: *anyopaque,
     complete: *const fn (*anyopaque, usize, *const BoolRootEvalResult) void,
 };
 
+/// Borrowed host event payload forwarded from a bool-root worker.
 pub const BoolRootEventView = RuntimeHostEnv.HostEventView;
 
+/// Callback invoked when a bool-root worker records a host transcript event.
 pub const BoolRootEventCallback = struct {
     context: *anyopaque,
     notify: *const fn (*anyopaque, usize, BoolRootEventView) void,

@@ -4486,7 +4486,7 @@ checked modules
   -> one native shared library
   -> parallel test-root calls
   -> deterministic transcript and result merge by test-plan order
-  -> checked-cache writes for fresh semantic results
+  -> checked cache writes for fresh test results
   -> final timing summary
 ```
 
@@ -4498,12 +4498,12 @@ configuration, captured stdout bytes and captured stderr bytes in this
 transcript are independently byte-for-byte identical regardless of selected
 optimization mode, backend, worker count, core count, scheduling, test
 completion order, or whether a result was read from cache. The selected
-optimization mode is not a semantic input and is not a renderer configuration;
-it must never change output facts or rendered transcript bytes. A different
+optimization mode is not checked source input and is not a renderer configuration;
+it must never change test output data or rendered transcript bytes. A different
 per-test transcript under `--opt=size` and `--opt=speed` is a compiler/backend
 bug, not a cache-key distinction. Changing color mode, verbosity, terminal
 width, or another renderer setting may change only the rendering chosen from
-the same structured transcript facts. Determinism tests compare each stream's
+the same structured transcript data. Determinism tests compare each stream's
 transcript bytes directly; they do not normalize source snippets, whitespace,
 ANSI escapes, or cache labels inside the transcript. The final aggregate
 summary is a run epilogue and is outside the byte-for-byte transcript
@@ -4512,13 +4512,13 @@ invocation. Cache-hit labels such as `(cached)` belong only in that epilogue,
 never in the per-test transcript.
 
 The command-level lowering batch may name roots from multiple checked modules.
-Each checked module is still lowered with explicit imported-artifact and
-relation views owned by that module; the batch is the command-level data that
-ties those per-module lowering results back to one test plan. Each lowered test
-root carries root metadata that identifies its test-plan slot and the original
-checked module root order. LIR results do not use symbol text as identity.
-Symbol text is only the exported backend name needed to locate the entrypoint
-in the loaded test library.
+Each per-module lowering request is built with explicit imported checked-module
+views and relation views owned by that checked module. The batch is the
+command-level data that ties those per-module lowering outputs back to one test
+plan. Each lowered test root carries root metadata that identifies its
+test-plan slot and the original checked module root order. LIR results do not
+use symbol text as identity. Symbol text is only the exported backend name
+needed to locate the entrypoint in the loaded test library.
 
 Every optimized test entrypoint uses the compiler-internal test ABI, not the
 public host symbol ABI. The entrypoint receives `RocOps`, a pointer to a
@@ -4539,12 +4539,12 @@ except through explicitly thread-safe runtime services or the invocation data
 passed to that root.
 
 Workers never write test output, diagnostics, stdout, stderr, or cache files
-directly. They publish structured transcript events and final root outcomes to
-a command-level output coordinator. Each event carries the test-plan slot, the
-logical stream, the event kind, and structured payload data. Final root
-outcomes carry the source region, failure detail, and visibility data needed to
-render per-test status or failure reports. The coordinator is the only writer
-for user-visible test transcript output.
+directly. They send structured transcript events and final root status data to a
+command-level output coordinator. Each event carries the test-plan slot, the
+logical stream, the event kind, and structured payload data. Final root status
+data carries the source region, failure detail, and visibility data needed to
+render per-test status or failure reports. The coordinator is the only writer for
+user-visible test transcript output.
 
 The coordinator owns `next_to_print` and per-entry buffers. Events for
 `next_to_print` are rendered and written immediately, so a slow earliest test
@@ -4566,21 +4566,21 @@ results use the same ordering path. Diagnostics, `dbg`, `expect` failures,
 `expect_err` regions, crashes, and backend compiler errors stay attached to
 their test-plan entries until rendering and cache writes replay the plan order.
 
-Checked test-result cache entries use the same semantic checked-module cache
-identity as `roc check`. There is no second semantic test-result cache key.
+Checked test-result cache entries use the same checked module cache identity
+as `roc check`. There is no second test-result cache key.
 The test-result bundle may carry its own payload format and compiler-version
 admission data, but those fields decide whether the decoded bundle can be used;
-they do not extend the checked-module identity. The result cache key does not
+they do not extend the checked module cache identity. The result cache key does not
 include selected optimization mode, backend, worker count, color mode,
 verbosity, terminal width, terminal style, elapsed time, final summary text,
 test-run completion order, test-root identity, or test-root order. Test-root
-identity and order are explicit checked-module data and payload shape, not
+identity and order are explicit checked module data and payload shape, not
 additional cache-key inputs. Cache reads validate that a decoded test-result
 bundle matches the current checked module's test-root shape and cache format
 before admitting it, but this is payload validation rather than a new source of
 identity.
 
-Cached test results store structured, pre-render facts: the outcome, ordered
+Cached test results store structured, pre-render data: the result, ordered
 transcript events, source regions, failure data, and raw or structured Roc
 payloads needed to render `dbg`, failed expects, crashes, and per-test
 status/failure reports.
@@ -4590,11 +4590,11 @@ renderer choices, but it does not store terminal bytes, ANSI escapes, color
 mode, verbosity, terminal width, elapsed time, cache-hit labels, or final
 summary text. A cached result is represented to the output coordinator as an
 already-finished plan entry containing the same structured transcript events
-and result facts that a fresh run would have published. Semantic test results,
+and test status data that a fresh run would have sent. Checked test status data,
 including passes, failed expects, and Roc runtime crashes, may be cached.
-Compiler backend failures
-while building or linking the command-level image are not semantic test results
-and are not written as successful test-result cache entries.
+Compiler backend failures while building or linking the command-level image are
+not checked test status data and are not written as successful test-result cache
+entries.
 
 If compiling or linking the command-level test library fails, each uncached root
 in the plan receives a backend compiler-error result at its original source

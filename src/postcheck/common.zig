@@ -39,6 +39,7 @@ pub const RootTestPlanMetadata = struct {
     root_index: u32,
 };
 
+/// Return the command-level test-plan metadata for a checked root request.
 pub fn testPlanMetadataForRoot(
     roots: RootRequests,
     root: checked.RootRequest,

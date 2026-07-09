@@ -58,12 +58,14 @@ pub const HostEvent = union(enum) {
     }
 };
 
+/// Borrowed host event payload delivered to a live observer during test execution.
 pub const HostEventView = union(enum) {
     dbg: []const u8,
     expect_failed: []const u8,
     crashed: []const u8,
 };
 
+/// Callback used to publish root-local host events as soon as they are recorded.
 pub const EventCallback = struct {
     context: *anyopaque,
     notify: *const fn (*anyopaque, HostEventView) void,
@@ -165,6 +167,7 @@ pub fn setLongjmpOnCrash(self: *RuntimeHostEnv, enabled: bool) void {
     self.longjmp_on_crash = enabled;
 }
 
+/// Install or clear the live host-event observer for this runtime environment.
 pub fn setEventCallback(self: *RuntimeHostEnv, callback: ?EventCallback) void {
     self.event_callback = callback;
 }
