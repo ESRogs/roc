@@ -4115,16 +4115,18 @@ pub const CheckedTypeStore = struct {
         var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
         defer active.deinit();
 
-        // formalArgs aliases type_id_pool, which cloning may grow/reallocate; copy.
+        // formalArgs and nominal args alias type_id_pool, which cloning may grow/reallocate; copy.
         const formals_copy = try allocator.dupe(CheckedTypeId, formal_args);
         defer allocator.free(formals_copy);
+        const actuals_copy = try allocator.dupe(CheckedTypeId, actual_args);
+        defer allocator.free(actuals_copy);
 
         return try self.cloneCheckedTypeRootSubstituting(
             allocator,
             names,
             declaration.backing,
             formals_copy,
-            actual_args,
+            actuals_copy,
             &active,
         );
     }
@@ -5819,7 +5821,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
         const id = self.substitutedRoot(source);
         const raw: usize = @intFromEnum(id);
         if (raw >= self.store.payloadCount()) {
-            checkedArtifactInvariant("checked type substitution key referenced a missing payload", .{});
+            checkedArtifactInvariant("checked type substitution key referenced missing payload {d} with {d} payloads", .{ raw, self.store.payloadCount() });
         }
 
         switch (self.store.payload(@enumFromInt(raw))) {
@@ -16154,7 +16156,14 @@ fn collectResolvedDispatchTargetSubstitutions(
             {
                 return;
             }
-            for (target_nominal.args, plan_nominal.args) |target_arg, plan_arg| {
+            var target_nominal_copy = target_nominal;
+            var plan_nominal_copy = plan_nominal;
+            target_nominal_copy.args = try allocator.dupe(CheckedTypeId, target_nominal.args);
+            defer allocator.free(target_nominal_copy.args);
+            plan_nominal_copy.args = try allocator.dupe(CheckedTypeId, plan_nominal.args);
+            defer allocator.free(plan_nominal_copy.args);
+
+            for (target_nominal_copy.args, plan_nominal_copy.args) |target_arg, plan_arg| {
                 try collectResolvedDispatchTargetSubstitutions(
                     allocator,
                     names,
@@ -16171,12 +16180,12 @@ fn collectResolvedDispatchTargetSubstitutions(
                 const target_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
                     allocator,
                     names,
-                    target_nominal,
+                    target_nominal_copy,
                 )) orelse return;
                 const plan_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
                     allocator,
                     names,
-                    plan_nominal,
+                    plan_nominal_copy,
                 )) orelse return;
                 try collectResolvedDispatchTargetSubstitutions(
                     allocator,
@@ -16468,7 +16477,14 @@ fn collectDispatchPlanIdentitySubstitutions(
             {
                 return;
             }
-            for (target_nominal.args, plan_nominal.args) |target_arg, plan_arg| {
+            var target_nominal_copy = target_nominal;
+            var plan_nominal_copy = plan_nominal;
+            target_nominal_copy.args = try allocator.dupe(CheckedTypeId, target_nominal.args);
+            defer allocator.free(target_nominal_copy.args);
+            plan_nominal_copy.args = try allocator.dupe(CheckedTypeId, plan_nominal.args);
+            defer allocator.free(plan_nominal_copy.args);
+
+            for (target_nominal_copy.args, plan_nominal_copy.args) |target_arg, plan_arg| {
                 try collectDispatchPlanIdentitySubstitutions(
                     allocator,
                     names,
@@ -16484,12 +16500,12 @@ fn collectDispatchPlanIdentitySubstitutions(
                 const target_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
                     allocator,
                     names,
-                    target_nominal,
+                    target_nominal_copy,
                 )) orelse return;
                 const plan_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
                     allocator,
                     names,
-                    plan_nominal,
+                    plan_nominal_copy,
                 )) orelse return;
                 try collectDispatchPlanIdentitySubstitutions(
                     allocator,
