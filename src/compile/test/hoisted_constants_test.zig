@@ -15,28 +15,61 @@ const CoreCtx = @import("ctx").CoreCtx;
 const static_data_exports = @import("../static_data_exports.zig");
 
 const HoistedConstantsTestError = std.mem.Allocator.Error ||
+    Coordinator.AppDiscoveryError ||
+    check.CheckedArtifact.CompileTimeFinalizer.Error ||
+    eval.BuiltinModules.InitError ||
     std.Io.Dir.CreateDirPathError ||
+    std.Io.Dir.RealPathFileAllocError ||
     std.Io.Dir.WriteFileError ||
     std.Io.File.Writer.Error ||
+    std.Thread.SpawnError ||
     error{
         AfterRootHadNoRequest,
         BeforeRootHadNoRequest,
+        BuiltinLowLevelAnnotationMustBeFunction,
+        CompileTimeProblem,
+        DownloadFailed,
         ExportedRuntimeEntrypointNotFound,
+        ExpectedPlatformString,
+        ExpectedString,
+        FileError,
+        HasUserErrors,
         HoistedConstWasNotI64,
         HoistedConstWasNotScalar,
         HoistedRootDidNotStoreConstNode,
         HoistedRootKindMismatch,
         HoistedTemplateWasNotStored,
+        Internal,
+        InvalidDependency,
+        InvalidNullByteInPath,
+        InvalidUrl,
+        Issue806MissingStackProbe,
+        Issue806UnsafeLargeStackCallArgument,
+        Issue806UnsafeLargeStackCallReturn,
+        Issue806UnsafeLargeStackClosureCapture,
+        Issue806UnsafeLargeStackJoinParam,
+        Issue806UnsafeLargeStackPatternPayload,
+        Issue806UnsafeLargeStackReturn,
+        Issue806UnsafeLargeStackSetLocalCopy,
+        Issue806UnsafeLargeStackStructAssign,
+        Issue806UnsafeLargeStackTagAssign,
+        LowLevelOperationsNotFound,
+        NoCacheDir,
+        NoPackageSource,
         OutOfMemory,
         PatternExtractionMissingCheckedRootPattern,
         PatternExtractionMissingSourcePattern,
         PatternExtractionRootValueWasNotSyntheticLookup,
         PatternExtractionRootWasNotSyntheticMatch,
+        PathOutsideWorkspace,
         RootDidNotStoreConstNode,
         StaticDataLiteralNotFound,
         StaticDataSymbolNotFound,
         TestExpectedEqual,
         TestUnexpectedResult,
+        UnsupportedBuiltinAnnotationOnly,
+        UnsupportedHeader,
+        WriteFailed,
     };
 
 test "hoisted local constants are finalized and restored during runtime lowering" {
