@@ -15513,6 +15513,19 @@ const BodyContext = struct {
                     .site = nested.site,
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
                 } };
+                // A compile-time-evaluated closure keeps its dispatch
+                // obligations even when the outer scheme is concrete (a concrete
+                // captured `n` still selects `plus`), but a concrete use site
+                // carries no checked site evidence to fill them. Resolve the
+                // owner scheme's obligations from its checked dispatcher paths
+                // over the closure's concrete callable, mirroring the
+                // compiler-generated-edge synthesis, so the nested body's
+                // constraint refs at depth 0 resolve.
+                if (self.restore_evidence.vector.len == 0) {
+                    if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty)) |synthesized| {
+                        fn_ctx.evidence = .{ .vector = synthesized };
+                    }
+                }
             },
             else => Common.invariant("capturing stored function had no nested function identity"),
         }
@@ -17698,6 +17711,34 @@ const BodyContext = struct {
     ) Allocator.Error![]const SpecEvidence {
         const template = lookup.view.templates.get(template_ref.template);
         return try self.synthesizeParamsEvidence(lookup.view, template, callable_mono_ty);
+    }
+
+    /// Evidence vector for a compile-time-evaluated closure restored without a
+    /// use-site vector: resolve the owner scheme's obligations from its checked
+    /// dispatcher paths over the closure's concrete restored callable.
+    ///
+    /// The owner scheme's evidence-param paths run over the owner's whole
+    /// callable, whose return is the restored closure (a `constraint(0, k)` in
+    /// the closure body forwards to the owner's `k`th param). Instantiate the
+    /// owner root, pin its return to the concrete restored `ty`, and synthesize
+    /// each param's target over the resulting concrete owner callable. Null when
+    /// the owner scheme has no obligations (nothing to fill).
+    fn synthesizeRestoredClosureEvidence(
+        self: *BodyContext,
+        owner_view: ModuleView,
+        owner_ref: names.ProcTemplate,
+        ty: Type.TypeId,
+    ) Allocator.Error!?[]const SpecEvidence {
+        const owner_template = owner_view.templates.get(owner_ref.template);
+        if (owner_template.evidence_params.len == 0) return null;
+
+        const owner_node = try self.instNode(owner_template.checked_fn_root);
+        const owner_mono_ty = try self.activeTypeFromNode(owner_node);
+        const owner_ret = self.functionReturnType(owner_mono_ty);
+        try self.graph.unify(try self.graph.importMono(owner_ret), try self.graph.importMono(ty));
+        try self.graph.drainDirty();
+        const owner_callable_ty = try self.activeTypeFromNode(owner_node);
+        return try self.synthesizeParamsEvidence(owner_view, owner_template, owner_callable_ty);
     }
 
     /// Resolve a template's requirements from its checked dispatcher paths
