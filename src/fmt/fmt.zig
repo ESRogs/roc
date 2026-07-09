@@ -1976,8 +1976,8 @@ const Formatter = struct {
                     // Nominal-value destructure renders as `Type.(args)` (the `.`
                     // distinguishes it from an ordinary applied-tag `Tag(args)`).
                     try fmt.push('.');
-                }
-                if (t.args.span.len > 0) {
+                    try fmt.formatCollection(region, .round, AST.Pattern.Idx, fmt.ast.store.patternSlice(t.args), Formatter.formatPattern);
+                } else if (t.args.span.len > 0) {
                     try fmt.formatCollection(region, .round, AST.Pattern.Idx, fmt.ast.store.patternSlice(t.args), Formatter.formatPattern);
                 }
             },
@@ -3665,6 +3665,13 @@ test "issue 9939: named open tag union type variable is preserved" {
     const result = try moduleFmtsStable(std.testing.allocator, "T(a) : [..a]", false);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("T(a) : [..a]\n", result);
+}
+
+test "issue 10046: empty nominal destructure lambda argument is idempotent" {
+    // Repro for https://github.com/roc-lang/roc/issues/10046
+    const result = try moduleFmtsStable(std.testing.allocator, "g=|D.()|0", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("g = |D.()| 0\n", result);
 }
 
 test "issue 9940: comments in empty collections and blocks are preserved" {
