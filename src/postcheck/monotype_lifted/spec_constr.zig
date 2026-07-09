@@ -269,11 +269,18 @@ const CallableShape = struct {
 
 const Value = union(enum) {
     expr: Ast.ExprId,
+    static_data_candidate: StaticDataCandidateValue,
     tag: TagValue,
     record: RecordValue,
     tuple: TupleValue,
     nominal: NominalValue,
     callable: CallableValue,
+};
+
+const StaticDataCandidateValue = struct {
+    ty: Type.TypeId,
+    static_data: Common.StaticDataId,
+    runtime: *const Value,
 };
 
 const TagValue = struct {
@@ -2956,6 +2963,7 @@ const Pass = struct {
         budget.* -= 1;
         return switch (value) {
             .expr => |expr| try self.constructorShape(expr),
+            .static_data_candidate => |candidate| try self.shapeFromValueBudgeted(candidate.runtime.*, budget),
             .tag => |tag| blk: {
                 const payloads = try self.arena.allocator().alloc(Shape, tag.payloads.len);
                 for (tag.payloads, 0..) |payload, index| {
@@ -3256,7 +3264,15 @@ const Cloner = struct {
                 return .{ .expr = try self.addExpr(.{ .ty = expr.ty, .data = .{ .local = local } }) };
             },
             .fn_ref => |fn_ref| return try self.callableValueFromRef(expr.ty, fn_ref),
-            .static_data_candidate => |candidate| return try self.cloneExprValue(candidate.runtime_expr),
+            .static_data_candidate => |candidate| {
+                const runtime = try self.pass.arena.allocator().create(Value);
+                runtime.* = try self.cloneExprValue(candidate.runtime_expr);
+                return .{ .static_data_candidate = .{
+                    .ty = expr.ty,
+                    .static_data = candidate.static_data,
+                    .runtime = runtime,
+                } };
+            },
             .tag => |tag| {
                 const payload_exprs = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(tag.payloads));
                 defer self.pass.allocator.free(payload_exprs);
@@ -3358,10 +3374,10 @@ const Cloner = struct {
                 // that import would name a local the context does not have,
                 // so the call cannot stay residual and must inline.
                 const captures_foreign = self.callCapturesAreForeign(call.captures);
+                const callee = Ast.localDirectCallee(call) orelse return .{ .expr = try self.cloneExprPlain(expr_id) };
                 if (self.inline_direct_requires_known_arg and !has_known_shape_arg and !captures_foreign) {
                     return .{ .expr = try self.cloneExprPlain(expr_id) };
                 }
-                const callee = Ast.localDirectCallee(call) orelse return .{ .expr = try self.cloneExprPlain(expr_id) };
                 return try self.inlineDirectCallValue(
                     callee,
                     call.args,
@@ -3467,6 +3483,7 @@ const Cloner = struct {
         budget.* -= 1;
         return switch (value) {
             .expr => |expr| self.exprCanSubstitute(expr),
+            .static_data_candidate => |candidate| self.valueCanSubstituteBudgeted(candidate.runtime.*, budget),
             .tag => |tag| blk: {
                 for (tag.payloads) |payload| {
                     if (!self.valueCanSubstituteBudgeted(payload, budget)) break :blk false;
@@ -4301,10 +4318,14 @@ const Cloner = struct {
         value: Value,
         out: *std.ArrayList(Ast.ExprId),
     ) Common.LowerError!void {
+        const structural_value = switch (value) {
+            .static_data_candidate => |candidate| candidate.runtime.*,
+            else => value,
+        };
         switch (shape) {
             .any => try out.append(self.pass.allocator, try self.materialize(value)),
             .tag => |tag| {
-                const tag_value = switch (value) {
+                const tag_value = switch (structural_value) {
                     .tag => |tag_value| tag_value,
                     else => Common.invariant("tag call pattern matched a non-tag value"),
                 };
@@ -4313,7 +4334,7 @@ const Cloner = struct {
                 }
             },
             .record => |record| {
-                const record_value = switch (value) {
+                const record_value = switch (structural_value) {
                     .record => |record_value| record_value,
                     else => Common.invariant("record call pattern matched a non-record value"),
                 };
@@ -4323,7 +4344,7 @@ const Cloner = struct {
                 }
             },
             .tuple => |tuple| {
-                const tuple_value = switch (value) {
+                const tuple_value = switch (structural_value) {
                     .tuple => |tuple_value| tuple_value,
                     else => Common.invariant("tuple call pattern matched a non-tuple value"),
                 };
@@ -4332,14 +4353,14 @@ const Cloner = struct {
                 }
             },
             .nominal => |nominal| {
-                const nominal_value = switch (value) {
+                const nominal_value = switch (structural_value) {
                     .nominal => |nominal_value| nominal_value,
                     else => Common.invariant("nominal call pattern matched a non-nominal value"),
                 };
                 try self.appendExprsFromValue(nominal.backing.*, nominal_value.backing.*, out);
             },
             .callable => |callable| {
-                const callable_value = switch (value) {
+                const callable_value = switch (structural_value) {
                     .callable => |callable_value| callable_value,
                     else => Common.invariant("callable call pattern matched a non-callable value"),
                 };
@@ -4724,7 +4745,7 @@ const Cloner = struct {
                 } };
             },
             // List patterns are not statically destructured during
-            // specialization; fall back to the runtime match.
+            // specialization; use the runtime match.
             .list,
             .int_lit,
             .dec_lit,
@@ -4829,6 +4850,7 @@ const Cloner = struct {
         budget.* -= 1;
         return switch (value) {
             .expr => 0,
+            .static_data_candidate => |candidate| self.knownConstructorSizeBudgeted(candidate.runtime.*, budget),
             .tag => |tag| blk: {
                 var count: usize = 1;
                 for (tag.payloads) |payload| count += self.knownConstructorSizeBudgeted(payload, budget);
@@ -4926,6 +4948,7 @@ const Cloner = struct {
         budget.* -= 1;
         return switch (value) {
             .expr => |expr| if (self.exprCanSubstitute(expr)) 0 else 1,
+            .static_data_candidate => |candidate| self.unsafeLeafCountBudgeted(candidate.runtime.*, budget),
             .tag => |tag| blk: {
                 var count: usize = 0;
                 for (tag.payloads) |payload| count += self.unsafeLeafCountBudgeted(payload, budget);
@@ -4991,6 +5014,19 @@ const Cloner = struct {
                 });
                 break :blk Value{ .expr = try self.addExpr(.{
                     .ty = ty,
+                    .data = .{ .local = local },
+                }) };
+            },
+            .static_data_candidate => |candidate| blk: {
+                const local = try self.pass.program.addLocal(self.pass.symbols.fresh(), candidate.ty);
+                try self.pending.append(self.pass.allocator, .{
+                    .local = local,
+                    .ty = candidate.ty,
+                    .value = try self.materialize(value),
+                    .marks = self.effect_marks,
+                });
+                break :blk Value{ .expr = try self.addExpr(.{
+                    .ty = candidate.ty,
                     .data = .{ .local = local },
                 }) };
             },
@@ -5799,6 +5835,10 @@ const Cloner = struct {
     fn materialize(self: *Cloner, value: Value) Common.LowerError!Ast.ExprId {
         switch (value) {
             .expr => |expr| return expr,
+            .static_data_candidate => |candidate| return try self.addExpr(.{ .ty = candidate.ty, .data = .{ .static_data_candidate = .{
+                .static_data = candidate.static_data,
+                .runtime_expr = try self.materialize(candidate.runtime.*),
+            } } }),
             .tag => |tag| {
                 const payloads = try self.pass.allocator.alloc(Ast.ExprId, tag.payloads.len);
                 defer self.pass.allocator.free(payloads);
@@ -6052,6 +6092,7 @@ const Cloner = struct {
             .nominal,
             => true,
             .expr,
+            .static_data_candidate,
             .callable,
             => false,
         };
@@ -6449,7 +6490,7 @@ fn exprHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []cons
             break :blk true;
         },
         .tag => |tag| exprSpanHasNoObservableEffect(program, fn_effect_free, tag.payloads, allow_control),
-        .static_data_candidate => |candidate| exprHasNoObservableEffect(program, fn_effect_free, candidate.runtime_expr, allow_control),
+        .static_data_candidate => true,
         .nominal => |child| exprHasNoObservableEffect(program, fn_effect_free, child, allow_control),
         .field_access => |field| exprHasNoObservableEffect(program, fn_effect_free, field.receiver, allow_control),
         .tuple_access => |access| exprHasNoObservableEffect(program, fn_effect_free, access.tuple, allow_control),
@@ -6796,6 +6837,7 @@ fn shapeType(shape: Shape) Type.TypeId {
 fn valueType(program: *const Ast.Program, value: Value) Type.TypeId {
     return switch (value) {
         .expr => |expr| program.getExpr(expr).ty,
+        .static_data_candidate => |candidate| candidate.ty,
         .tag => |tag| tag.ty,
         .record => |record| record.ty,
         .tuple => |tuple| tuple.ty,
@@ -6881,10 +6923,14 @@ fn shapeEql(program: *const Ast.Program, lhs: Shape, rhs: Shape) bool {
 }
 
 fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bool {
+    const structural_value = switch (value) {
+        .static_data_candidate => |candidate| candidate.runtime.*,
+        else => value,
+    };
     return switch (shape) {
         .any => true,
         .tag => |tag| blk: {
-            const value_tag = switch (value) {
+            const value_tag = switch (structural_value) {
                 .tag => |value_tag| value_tag,
                 else => break :blk false,
             };
@@ -6900,7 +6946,7 @@ fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bo
             break :blk true;
         },
         .record => |record| blk: {
-            const value_record = switch (value) {
+            const value_record = switch (structural_value) {
                 .record => |value_record| value_record,
                 else => break :blk false,
             };
@@ -6915,7 +6961,7 @@ fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bo
             break :blk true;
         },
         .tuple => |tuple| blk: {
-            const value_tuple = switch (value) {
+            const value_tuple = switch (structural_value) {
                 .tuple => |value_tuple| value_tuple,
                 else => break :blk false,
             };
@@ -6926,14 +6972,14 @@ fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bo
             break :blk true;
         },
         .nominal => |nominal| blk: {
-            const value_nominal = switch (value) {
+            const value_nominal = switch (structural_value) {
                 .nominal => |value_nominal| value_nominal,
                 else => break :blk false,
             };
             break :blk sameType(program, nominal.ty, value_nominal.ty) and shapeMatchesValue(program, nominal.backing.*, value_nominal.backing.*);
         },
         .callable => |callable| blk: {
-            const value_callable = switch (value) {
+            const value_callable = switch (structural_value) {
                 .callable => |value_callable| value_callable,
                 else => break :blk false,
             };
@@ -6986,6 +7032,7 @@ fn itemFromValue(value: Value, index: u32) ?Value {
 
 fn tagFromValue(value: Value) ?TagValue {
     return switch (value) {
+        .static_data_candidate => |candidate| tagFromValue(candidate.runtime.*),
         .tag => |tag| tag,
         .nominal => |nominal| tagFromValue(nominal.backing.*),
         else => null,
@@ -6994,6 +7041,7 @@ fn tagFromValue(value: Value) ?TagValue {
 
 fn recordFromValue(value: Value) ?RecordValue {
     return switch (value) {
+        .static_data_candidate => |candidate| recordFromValue(candidate.runtime.*),
         .record => |record| record,
         .nominal => |nominal| recordFromValue(nominal.backing.*),
         else => null,
@@ -7002,6 +7050,7 @@ fn recordFromValue(value: Value) ?RecordValue {
 
 fn tupleFromValue(value: Value) ?TupleValue {
     return switch (value) {
+        .static_data_candidate => |candidate| tupleFromValue(candidate.runtime.*),
         .tuple => |tuple| tuple,
         .nominal => |nominal| tupleFromValue(nominal.backing.*),
         else => null,

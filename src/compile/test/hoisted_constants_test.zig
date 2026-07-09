@@ -500,6 +500,115 @@ test "hoisted list constants lower to internal static data" {
     return error.StaticDataSymbolNotFound;
 }
 
+test "inline list iter constants lower to internal static data" {
+    try expectInlineListStaticDataLiteral(
+        std.testing.allocator,
+        \\app [main!] { pf: platform "./.roc_echo_platform/main.roc" }
+        \\
+        \\import pf.Echo
+        \\
+        \\main! = |args| {
+        \\    var $sum = List.len(args).to_i64_wrap()
+        \\    for n in [11.I64, 22.I64, 33.I64, 44.I64].iter() {
+        \\        $sum = $sum + n
+        \\    }
+        \\    _ = $sum
+        \\    Echo.line!("done")
+        \\    Ok({})
+        \\}
+        ,
+    );
+}
+
+test "inline list for constants lower to internal static data" {
+    try expectInlineListStaticDataLiteral(
+        std.testing.allocator,
+        \\app [main!] { pf: platform "./.roc_echo_platform/main.roc" }
+        \\
+        \\import pf.Echo
+        \\
+        \\main! = |args| {
+        \\    var $sum = List.len(args).to_i64_wrap()
+        \\    for n in [11.I64, 22.I64, 33.I64, 44.I64] {
+        \\        $sum = $sum + n
+        \\    }
+        \\    _ = $sum
+        \\    Echo.line!("done")
+        \\    Ok({})
+        \\}
+        ,
+    );
+}
+
+fn expectInlineListStaticDataLiteral(gpa: std.mem.Allocator, source: []const u8) !void {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeEchoPlatform(tmp_dir.dir);
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.roc",
+        .data = source,
+    });
+    const app_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.roc", gpa);
+    defer gpa.free(app_path);
+
+    var arena_impl = collections.SingleThreadArena.init(gpa);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var builtin_modules = try eval.BuiltinModules.init(gpa);
+    defer builtin_modules.deinit();
+
+    var coord = try Coordinator.init(
+        gpa,
+        .single_threaded,
+        1,
+        .x64linux,
+        &builtin_modules,
+        build_options.compiler_version,
+        null,
+        CoreCtx.default(gpa, arena, std.testing.io),
+    );
+    defer coord.deinit();
+    coord.enable_hosted_transform = true;
+
+    try coord.start();
+    try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
+    try coord.coordinatorLoop();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    try coord.finalizeExecutableArtifacts();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    const root = coord.executableRootCheckedArtifact();
+    const imports = try coord.collectImportedArtifactViews(arena, root);
+    const relations = try coord.collectRelationArtifactViews(arena, root);
+    const lir_roots = try lir.CheckedPipeline.selectPlatformEntrypointRoots(gpa, root.root_requests.runtime_requests);
+    defer gpa.free(lir_roots);
+
+    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+        gpa,
+        .{
+            .root = check.CheckedArtifact.loweringViewWithRelations(root, relations),
+            .imports = imports,
+        },
+        .{
+            .requests = lir_roots,
+            .include_static_data_exports = true,
+        },
+        .{
+            .target_usize = base.target.TargetUsize.u32,
+            .inline_mode = .wrappers,
+            .list_in_place_map = true,
+            .tag_reachability = true,
+        },
+    );
+    defer lowered.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.lir_result.static_data_values.items.len);
+    try expectStaticDataLiteralPresent(&lowered.lir_result);
+}
+
 test "hoisted constant crash reports original source region" {
     const gpa = std.testing.allocator;
 

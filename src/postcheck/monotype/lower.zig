@@ -8490,10 +8490,7 @@ const BodyContext = struct {
         if (self.current_entry_root) |root| {
             return entry.root == root;
         }
-
-        const wrapper = self.view.entry_wrappers.lookupByRoot(entry.root) orelse
-            Common.invariant("hoisted const root had no checked entry wrapper");
-        return names.procedureTemplateRefEql(wrapper.template, self.owner_template);
+        return false;
     }
 
     fn restoredHoistedConstAtType(
