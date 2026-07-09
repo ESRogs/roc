@@ -385,6 +385,7 @@ const CustomCase = enum {
     verbose_and_non_verbose_failure_format_match,
     build_warning_interpreter,
     issue_9392_deterministic_no_cache,
+    issue_10015_url_random_test_size,
     docs_main_platform_url_package,
     build_issue_9435_hosted_nominal_return,
     bundle_complex_package,
@@ -830,6 +831,7 @@ const subcommand_cases = [_]CliCase{
     // size/speed backend. The crash guard inside the program makes a wrong
     // result fail too, so a clean exit means it both built and computed 25.
     .{ .id = 0, .suite = .subcommands, .name = "issue 9690: recursive capturing closure builds and runs on LLVM size backend", .backend = .size, .body = .{ .command = .{ .args = &.{ "--opt=size", "--no-cache" }, .roc_file = "test/cli/Issue9690RecursiveCaptureClosure.roc", .exit = .success } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 10015: roc test imported closure expect passes on LLVM size backend", .backend = .size, .body = .{ .custom = .issue_10015_url_random_test_size } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9897: nested callback capture count matches target", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/Issue9897NestedCaptureCount.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "function reference capture count differs from its target" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test finalizes nested closure captures by identity", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/CaptureOrderFinalization.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test lowers opaque generic Try function wrappers", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/OpaqueTryFunction.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "panic" } } } } },
@@ -2087,6 +2089,7 @@ fn runCustomCase(
         .verbose_and_non_verbose_failure_format_match => customVerboseAndNonVerboseFailureFormatMatch(io, allocator, &timer, timeout_ms, spec.backend orelse .interpreter),
         .build_warning_interpreter => customBuildWarningInterpreter(io, allocator, &env, &timer, timeout_ms),
         .issue_9392_deterministic_no_cache => customIssue9392Deterministic(io, allocator, &env, &timer, timeout_ms),
+        .issue_10015_url_random_test_size => customIssue10015UrlRandomTestSize(io, allocator, &env, &timer, timeout_ms),
         .docs_main_platform_url_package => customDocsMainPlatformUrlPackage(io, allocator, &env, &timer, timeout_ms),
         .build_issue_9435_hosted_nominal_return => customBuildIssue9435(io, allocator, &env, &timer, timeout_ms),
         .bundle_complex_package => customBundleComplexPackage(io, allocator, &env, &timer, timeout_ms),
@@ -4959,6 +4962,92 @@ fn customIssue9392Deterministic(io: std.Io, allocator: Allocator, env: *const Ca
     };
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
+    return null;
+}
+
+fn customIssue10015UrlRandomTestSize(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+) ?TestResult {
+    const platform_hash = "8GdFEvQYS3TeAZxKvTzCLVdQiomweGtXcdZkXNDEeABq";
+    const random_hash = "4mHqd7aiQ1hYkoso9C8JRfnx3GuwcwoDqv8EdqAsLbfN";
+
+    const cache_platform_dir = std.fs.path.join(allocator, &.{ env.dirs.roc_cache_dir, "roc", "packages", platform_hash }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached platform path: {}", .{err});
+    defer allocator.free(cache_platform_dir);
+    std.Io.Dir.cwd().createDirPath(io, cache_platform_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create cached platform package: {}", .{err});
+
+    const cached_platform_main = std.fs.path.join(allocator, &.{ cache_platform_dir, "main.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached platform main path: {}", .{err});
+    defer allocator.free(cached_platform_main);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_platform_main,
+        .data =
+        \\platform ""
+        \\    requires {} { main! : List(Str) => Try({}, [Exit(I32), ..]) }
+        \\    exposes []
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host! }
+        \\    hosted {}
+        \\    targets: {}
+        \\
+        \\main_for_host! : List(Str) => I32
+        \\main_for_host! = |args|
+        \\    match main!(args) {
+        \\        Ok({}) => 0
+        \\        Err(Exit(code)) => code
+        \\        Err(_) => 1
+        \\    }
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached platform main: {}", .{err});
+
+    const cache_package_dir = std.fs.path.join(allocator, &.{ env.dirs.roc_cache_dir, "roc", "packages", random_hash }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached random package path: {}", .{err});
+    defer allocator.free(cache_package_dir);
+    std.Io.Dir.cwd().createDirPath(io, cache_package_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create cached random package: {}", .{err});
+
+    const cached_main = std.fs.path.join(allocator, &.{ cache_package_dir, "main.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached random package main path: {}", .{err});
+    defer allocator.free(cached_main);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_main,
+        .data = "package [Random] {}\n",
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached random package main: {}", .{err});
+
+    const cached_random = std.fs.path.join(allocator, &.{ cache_package_dir, "Random.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached Random module path: {}", .{err});
+    defer allocator.free(cached_random);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_random,
+        .data =
+        \\Random :: {}.{
+        \\    State := [State(U64)]
+        \\
+        \\    seed : U64 -> State
+        \\    seed = |value| State(value)
+        \\}
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached Random module: {}", .{err});
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=size", "--no-cache" },
+        .roc_file = "test/cli/Issue10015OptSizeImportedClosureExpect.roc",
+        .exit = .success,
+        .contains = &.{.{ .stream = .stdout, .text = "passed" }},
+        .not_contains = &.{
+            .{ .stream = .stderr, .text = "Segmentation fault" },
+            .{ .stream = .stderr, .text = "SIGSEGV" },
+            .{ .stream = .stderr, .text = "panic" },
+        },
+    })) |failure| return failure;
+
     return null;
 }
 
