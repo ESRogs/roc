@@ -58,6 +58,17 @@ pub const HostEvent = union(enum) {
     }
 };
 
+pub const HostEventView = union(enum) {
+    dbg: []const u8,
+    expect_failed: []const u8,
+    crashed: []const u8,
+};
+
+pub const EventCallback = struct {
+    context: *anyopaque,
+    notify: *const fn (*anyopaque, HostEventView) void,
+};
+
 /// Public struct `RecordedRun`.
 pub const RecordedRun = struct {
     events: []HostEvent,
@@ -107,6 +118,7 @@ events: std.ArrayListUnmanaged(HostEvent) = .empty,
 allocation_tracker: std.AutoHashMap(usize, AllocationInfo),
 allocation_call_count: u32 = 0,
 longjmp_on_crash: bool = true,
+event_callback: ?EventCallback = null,
 
 pub fn init(allocator: std.mem.Allocator) RuntimeHostEnv {
     // Runtime byte leak checking is handled by allocation_tracker itself, so
@@ -151,6 +163,10 @@ pub fn allocationCallCount(self: *const RuntimeHostEnv) u32 {
 /// Controls whether the crash callback exits through the active crash boundary.
 pub fn setLongjmpOnCrash(self: *RuntimeHostEnv, enabled: bool) void {
     self.longjmp_on_crash = enabled;
+}
+
+pub fn setEventCallback(self: *RuntimeHostEnv, callback: ?EventCallback) void {
+    self.event_callback = callback;
 }
 
 /// Public function `get_ops`.
@@ -244,6 +260,9 @@ fn appendEvent(
         self.allocator.free(owned);
         std.debug.panic("RuntimeHostEnv: failed to append host event", .{});
     };
+    if (self.event_callback) |callback| {
+        callback.notify(callback.context, @unionInit(HostEventView, @tagName(tag), bytes));
+    }
 }
 
 fn rocDbgFn(ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {

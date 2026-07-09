@@ -37,7 +37,7 @@ const LirImage = lir.LirImage;
 const GuardedList = lir.LirStore.GuardedList;
 
 /// Errors surfaced by shared eval test helpers.
-pub const TestHelperError = Allocator.Error || std.DynLib.Error || std.Io.File.OpenError || std.Io.File.Reader.Error || std.Io.File.Writer.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || std.Io.Writer.Error || check.CheckedArtifact.CompileTimeFinalizer.Error || error{
+pub const TestHelperError = Allocator.Error || std.Thread.SpawnError || std.DynLib.Error || std.Io.File.OpenError || std.Io.File.Reader.Error || std.Io.File.Writer.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || std.Io.Writer.Error || check.CheckedArtifact.CompileTimeFinalizer.Error || error{
     InvalidUtf8,
     LlvmBackendUnavailable,
     DevBackendUnavailable,
@@ -432,14 +432,63 @@ pub const BoolRoot = struct {
     ret_layout: LayoutIdx,
 };
 
-/// Result of evaluating a bool-returning test root: passed (bool), crashed
+/// A group of bool-returning test roots that share one lowered LIR module.
+pub const BoolRootModule = struct {
+    store: *const lir.LirStore,
+    layouts: *const LayoutStore,
+    roots: []const BoolRoot,
+};
+
+pub const TestInvocationContext = extern struct {
+    expect_err_set: u32 = 0,
+    expect_err_start: u32 = 0,
+    expect_err_end: u32 = 0,
+};
+
+/// A host event observed while evaluating a bool-returning test root.
+pub const BoolRootEvent = union(enum) {
+    dbg: []const u8,
+    expect_failed: []const u8,
+    crashed: []const u8,
+};
+
+/// Outcome of evaluating a bool-returning test root: passed (bool), crashed
 /// (message), or failed because a `?` operator evaluated an Err inside the
 /// expect (message plus the source region of the `?` expression).
-pub const BoolRootEvalResult = union(enum) {
+pub const BoolRootEvalOutcome = union(enum) {
     passed: bool,
     crashed: []const u8,
     expect_err: ExpectErrFailure,
 };
+
+/// Complete result for one bool-returning test root. `events` is a structured,
+/// pre-render transcript captured from the root-local RocOps environment.
+pub const BoolRootEvalResult = struct {
+    outcome: BoolRootEvalOutcome,
+    events: []BoolRootEvent,
+};
+
+pub const BoolRootCompletionCallback = struct {
+    context: *anyopaque,
+    complete: *const fn (*anyopaque, usize, *const BoolRootEvalResult) void,
+};
+
+pub const BoolRootEventView = RuntimeHostEnv.HostEventView;
+
+pub const BoolRootEventCallback = struct {
+    context: *anyopaque,
+    notify: *const fn (*anyopaque, usize, BoolRootEventView) void,
+};
+
+const RuntimeHostEventForwarder = struct {
+    callback: BoolRootEventCallback,
+    call_index: usize,
+};
+
+fn forwardRuntimeHostEvent(context: *anyopaque, event: RuntimeHostEnv.HostEventView) void {
+    const forwarder: *RuntimeHostEventForwarder = @ptrCast(@alignCast(context));
+    forwarder.callback.notify(forwarder.callback.context, forwarder.call_index, event);
+}
 
 /// Failure detail for a `?` operator that evaluated an Err inside a
 /// top-level expect: the runtime-built message and the byte offsets of the
@@ -456,15 +505,35 @@ pub const LlvmTestOpt = enum {
     speed,
 };
 
-/// Free all crash messages and the results slice.
-pub fn deinitBoolRootEvalResults(allocator: Allocator, results: []BoolRootEvalResult) void {
-    for (results) |result| {
-        switch (result) {
-            .passed => {},
-            .crashed => |message| allocator.free(message),
-            .expect_err => |failure| allocator.free(failure.message),
-        }
+fn deinitBoolRootEvent(allocator: Allocator, event: BoolRootEvent) void {
+    switch (event) {
+        .dbg => |message| allocator.free(message),
+        .expect_failed => |message| allocator.free(message),
+        .crashed => |message| allocator.free(message),
     }
+}
+
+fn deinitBoolRootEvents(allocator: Allocator, events: []BoolRootEvent) void {
+    for (events) |event| deinitBoolRootEvent(allocator, event);
+    if (events.len > 0) allocator.free(events);
+}
+
+fn deinitBoolRootEvalOutcome(allocator: Allocator, outcome: BoolRootEvalOutcome) void {
+    switch (outcome) {
+        .passed => {},
+        .crashed => |message| allocator.free(message),
+        .expect_err => |failure| allocator.free(failure.message),
+    }
+}
+
+fn deinitBoolRootEvalResult(allocator: Allocator, result: BoolRootEvalResult) void {
+    deinitBoolRootEvalOutcome(allocator, result.outcome);
+    deinitBoolRootEvents(allocator, result.events);
+}
+
+/// Free all crash messages, transcript events, and the results slice.
+pub fn deinitBoolRootEvalResults(allocator: Allocator, results: []BoolRootEvalResult) void {
+    for (results) |result| deinitBoolRootEvalResult(allocator, result);
     allocator.free(results);
 }
 
@@ -1981,14 +2050,33 @@ fn copyRuntimeCrashMessage(allocator: Allocator, runtime_env: *const RuntimeHost
 }
 
 fn deinitPartialBoolRootEvalResults(allocator: Allocator, results: []BoolRootEvalResult, len: usize) void {
-    for (results[0..len]) |result| {
-        switch (result) {
-            .passed => {},
-            .crashed => |message| allocator.free(message),
-            .expect_err => |failure| allocator.free(failure.message),
-        }
-    }
+    for (results[0..len]) |result| deinitBoolRootEvalResult(allocator, result);
     allocator.free(results);
+}
+
+fn copyRuntimeHostEvents(allocator: Allocator, runtime_env: *const RuntimeHostEnv) TestHelperError![]BoolRootEvent {
+    var snapshot = try runtime_env.snapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    if (snapshot.events.len == 0) return &.{};
+
+    const events = try allocator.alloc(BoolRootEvent, snapshot.events.len);
+    var events_len: usize = 0;
+    errdefer {
+        for (events[0..events_len]) |event| deinitBoolRootEvent(allocator, event);
+        allocator.free(events);
+    }
+
+    for (snapshot.events, 0..) |event, index| {
+        events[index] = switch (event) {
+            .dbg => |message| .{ .dbg = try allocator.dupe(u8, message) },
+            .expect_failed => |message| .{ .expect_failed = try allocator.dupe(u8, message) },
+            .crashed => |message| .{ .crashed = try allocator.dupe(u8, message) },
+        };
+        events_len += 1;
+    }
+
+    return events;
 }
 
 fn runExecutableBoolRoot(
@@ -2021,7 +2109,7 @@ fn runExecutableBoolRoot(
         );
     }
 
-    const result: BoolRootEvalResult = switch (runtime_env.crashState()) {
+    const outcome: BoolRootEvalOutcome = switch (runtime_env.crashState()) {
         .did_not_crash => .{ .passed = ret_buf[0] != 0 },
         .crashed => if (builtins.dev_wrappers.takeExpectErrRegion()) |region| .{ .expect_err = .{
             .message = try copyRuntimeCrashMessage(allocator, runtime_env),
@@ -2029,8 +2117,13 @@ fn runExecutableBoolRoot(
             .region_end = region.end,
         } } else .{ .crashed = try copyRuntimeCrashMessage(allocator, runtime_env) },
     };
+    errdefer deinitBoolRootEvalOutcome(allocator, outcome);
+    const events = try copyRuntimeHostEvents(allocator, runtime_env);
     runtime_env.resetAllocationTracker();
-    return result;
+    return .{
+        .outcome = outcome,
+        .events = events,
+    };
 }
 
 /// JIT-compile and run bool-returning test roots via the dev backend.
@@ -2108,14 +2201,29 @@ fn llvmCompileOptions(target_usize: base.target.TargetUsize, opt: LlvmTestOpt) @
 fn callLlvmBoolRoot(
     allocator: Allocator,
     layouts: *const LayoutStore,
-    entry: *const fn (*builtins.host_abi.RocOps, [*]u8, ?*anyopaque) callconv(.c) void,
+    entry: *const fn (*builtins.host_abi.RocOps, *TestInvocationContext, [*]u8, ?*anyopaque) callconv(.c) void,
     root: BoolRoot,
-    runtime_env: *RuntimeHostEnv,
-    expect_err_region: ?*[3]u32,
+    longjmp_on_crash: bool,
+    call_index: usize,
+    event_callback: ?BoolRootEventCallback,
 ) TestHelperError!BoolRootEvalResult {
+    var runtime_env = RuntimeHostEnv.init(allocator);
+    defer runtime_env.deinit();
+    runtime_env.setLongjmpOnCrash(longjmp_on_crash);
+    var event_forwarder: RuntimeHostEventForwarder = undefined;
+    if (event_callback) |callback| {
+        event_forwarder = .{
+            .callback = callback,
+            .call_index = call_index,
+        };
+        runtime_env.setEventCallback(.{
+            .context = &event_forwarder,
+            .notify = &forwardRuntimeHostEvent,
+        });
+    }
     runtime_env.resetObservation();
     runtime_env.resetAllocationTracker();
-    if (expect_err_region) |region| region[0] = 0;
+    var test_context: TestInvocationContext = .{};
 
     const arg_buffer = try zeroedEntrypointArgBufferForLayouts(allocator, layouts, root.arg_layouts);
     defer if (arg_buffer) |buf| allocator.free(buf);
@@ -2129,26 +2237,153 @@ fn callLlvmBoolRoot(
     if (sj == 0) {
         entry(
             runtime_env.get_ops(),
+            &test_context,
             ret_buf.ptr,
             if (arg_buffer) |buf| @ptrCast(buf.ptr) else null,
         );
     }
 
-    const result: BoolRootEvalResult = switch (runtime_env.crashState()) {
+    const outcome: BoolRootEvalOutcome = switch (runtime_env.crashState()) {
         .did_not_crash => .{ .passed = ret_buf[0] != 0 },
         .crashed => blk: {
-            if (expect_err_region) |region| {
-                if (region[0] != 0) break :blk .{ .expect_err = .{
-                    .message = try copyRuntimeCrashMessage(allocator, runtime_env),
-                    .region_start = region[1],
-                    .region_end = region[2],
+            if (test_context.expect_err_set != 0) {
+                break :blk .{ .expect_err = .{
+                    .message = try copyRuntimeCrashMessage(allocator, &runtime_env),
+                    .region_start = test_context.expect_err_start,
+                    .region_end = test_context.expect_err_end,
                 } };
             }
-            break :blk .{ .crashed = try copyRuntimeCrashMessage(allocator, runtime_env) };
+            break :blk .{ .crashed = try copyRuntimeCrashMessage(allocator, &runtime_env) };
         },
     };
-    runtime_env.resetAllocationTracker();
-    return result;
+    errdefer deinitBoolRootEvalOutcome(allocator, outcome);
+    const events = try copyRuntimeHostEvents(allocator, &runtime_env);
+    return .{
+        .outcome = outcome,
+        .events = events,
+    };
+}
+
+const LlvmBoolRootEntryFn = *const fn (*builtins.host_abi.RocOps, *TestInvocationContext, [*]u8, ?*anyopaque) callconv(.c) void;
+
+const LlvmBoolRootCall = struct {
+    layouts: *const LayoutStore,
+    entry: LlvmBoolRootEntryFn,
+    root: BoolRoot,
+};
+
+const LlvmBoolRootWorkerState = struct {
+    allocator: Allocator,
+    calls: []const LlvmBoolRootCall,
+    longjmp_on_crash: bool,
+    next_call: std.atomic.Value(usize),
+    results: []?BoolRootEvalResult,
+    errors: []?TestHelperError,
+    completion_callback: ?BoolRootCompletionCallback,
+    event_callback: ?BoolRootEventCallback,
+};
+
+fn llvmBoolRootWorker(state: *LlvmBoolRootWorkerState) void {
+    while (true) {
+        const index = state.next_call.fetchAdd(1, .monotonic);
+        if (index >= state.calls.len) break;
+
+        const call = state.calls[index];
+        state.results[index] = callLlvmBoolRoot(
+            state.allocator,
+            call.layouts,
+            call.entry,
+            call.root,
+            state.longjmp_on_crash,
+            index,
+            state.event_callback,
+        ) catch |err| {
+            state.errors[index] = err;
+            return;
+        };
+        if (state.completion_callback) |callback| {
+            callback.complete(callback.context, index, &state.results[index].?);
+        }
+    }
+}
+
+fn deinitBoolRootEvalSlots(allocator: Allocator, slots: []?BoolRootEvalResult) void {
+    for (slots) |*slot| {
+        if (slot.*) |result| {
+            deinitBoolRootEvalResult(allocator, result);
+            slot.* = null;
+        }
+    }
+}
+
+fn optimizedTestWorkerCount(root_count: usize, max_workers: ?usize) usize {
+    if (root_count <= 1 or builtin.single_threaded) return 1;
+    const requested = max_workers orelse (std.Thread.getCpuCount() catch 1);
+    return @min(@max(requested, 1), root_count);
+}
+
+fn runLlvmBoolRootCalls(
+    allocator: Allocator,
+    calls: []const LlvmBoolRootCall,
+    longjmp_on_crash: bool,
+    max_workers: ?usize,
+    completion_callback: ?BoolRootCompletionCallback,
+    event_callback: ?BoolRootEventCallback,
+) TestHelperError![]BoolRootEvalResult {
+    const slots = try allocator.alloc(?BoolRootEvalResult, calls.len);
+    defer allocator.free(slots);
+    for (slots) |*slot| slot.* = null;
+    errdefer deinitBoolRootEvalSlots(allocator, slots);
+
+    const errors = try allocator.alloc(?TestHelperError, calls.len);
+    defer allocator.free(errors);
+    for (errors) |*slot| slot.* = null;
+
+    var state = LlvmBoolRootWorkerState{
+        .allocator = allocator,
+        .calls = calls,
+        .longjmp_on_crash = longjmp_on_crash,
+        .next_call = std.atomic.Value(usize).init(0),
+        .results = slots,
+        .errors = errors,
+        .completion_callback = completion_callback,
+        .event_callback = event_callback,
+    };
+
+    const worker_count = optimizedTestWorkerCount(calls.len, max_workers);
+    if (worker_count == 1) {
+        llvmBoolRootWorker(&state);
+    } else {
+        const threads = try allocator.alloc(std.Thread, worker_count);
+        defer allocator.free(threads);
+
+        var spawned: usize = 0;
+        var spawn_error: ?std.Thread.SpawnError = null;
+        while (spawned < worker_count) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, llvmBoolRootWorker, .{&state}) catch |err| {
+                spawn_error = err;
+                break;
+            };
+        }
+        for (threads[0..spawned]) |thread| {
+            thread.join();
+        }
+        if (spawn_error) |err| return err;
+    }
+
+    const results = try allocator.alloc(BoolRootEvalResult, calls.len);
+    var result_len: usize = 0;
+    errdefer deinitPartialBoolRootEvalResults(allocator, results, result_len);
+
+    for (slots, errors) |*slot, maybe_error| {
+        if (maybe_error) |err| return err;
+        const result = slot.* orelse return error.Internal;
+        results[result_len] = result;
+        slot.* = null;
+        result_len += 1;
+    }
+
+    return results;
 }
 
 /// Compile and run bool-returning test roots via the LLVM backend.
@@ -2159,35 +2394,109 @@ pub fn llvmEvalBoolRoots(
     roots: []const BoolRoot,
     opt: LlvmTestOpt,
 ) TestHelperError![]BoolRootEvalResult {
+    const modules = [_]BoolRootModule{.{
+        .store = store,
+        .layouts = layouts,
+        .roots = roots,
+    }};
+    return llvmEvalBoolRootModules(allocator, modules[0..], opt);
+}
+
+/// Compile bool-returning test roots from multiple lowered LIR modules via the
+/// LLVM backend, link them into one shared library, and run roots in parallel.
+pub fn llvmEvalBoolRootModules(
+    allocator: Allocator,
+    modules: []const BoolRootModule,
+    opt: LlvmTestOpt,
+) TestHelperError![]BoolRootEvalResult {
+    return llvmEvalBoolRootModulesWithMaxWorkers(allocator, modules, opt, null);
+}
+
+/// Compile bool-returning test roots from multiple lowered LIR modules via the
+/// LLVM backend, link them into one shared library, and run roots in parallel.
+pub fn llvmEvalBoolRootModulesWithMaxWorkers(
+    allocator: Allocator,
+    modules: []const BoolRootModule,
+    opt: LlvmTestOpt,
+    max_workers: ?usize,
+) TestHelperError![]BoolRootEvalResult {
+    return llvmEvalBoolRootModulesWithMaxWorkersAndCallback(allocator, modules, opt, max_workers, null);
+}
+
+/// Compile bool-returning test roots from multiple lowered LIR modules via the
+/// LLVM backend, link them into one shared library, run roots in parallel, and
+/// publish each successful root result as soon as its worker finishes.
+pub fn llvmEvalBoolRootModulesWithMaxWorkersAndCallback(
+    allocator: Allocator,
+    modules: []const BoolRootModule,
+    opt: LlvmTestOpt,
+    max_workers: ?usize,
+    completion_callback: ?BoolRootCompletionCallback,
+) TestHelperError![]BoolRootEvalResult {
+    return llvmEvalBoolRootModulesWithMaxWorkersAndCallbacks(allocator, modules, opt, max_workers, completion_callback, null);
+}
+
+/// Compile bool-returning test roots from multiple lowered LIR modules via the
+/// LLVM backend, link them into one shared library, run roots in parallel, and
+/// publish root-local host events and successful root results while workers run.
+pub fn llvmEvalBoolRootModulesWithMaxWorkersAndCallbacks(
+    allocator: Allocator,
+    modules: []const BoolRootModule,
+    opt: LlvmTestOpt,
+    max_workers: ?usize,
+    completion_callback: ?BoolRootCompletionCallback,
+    event_callback: ?BoolRootEventCallback,
+) TestHelperError![]BoolRootEvalResult {
     if (@import("builtin").target.os.tag == .freestanding) return error.LlvmBackendUnavailable;
+    if (modules.len == 0) return error.LlvmBackendUnavailable;
 
     const llvm_compile = @import("llvm_compile");
-    var codegen = llvm_compile.MonoLlvmCodeGen.init(allocator, store);
-    codegen.layout_store = layouts;
-    defer codegen.deinit();
 
-    const entrypoints = try allocator.alloc(llvm_compile.MonoLlvmCodeGen.Entrypoint, roots.len);
-    defer allocator.free(entrypoints);
-    for (roots, 0..) |root, i| {
-        entrypoints[i] = .{
-            .symbol_name = root.symbol_name,
-            .proc = root.proc,
-            .arg_layouts = root.arg_layouts,
-            .ret_layout = root.ret_layout,
-        };
-    }
-
-    const bitcode = try codegen.generateEntrypointModule("roc_test_module", entrypoints);
+    var bitcodes = try allocator.alloc(llvm_compile.MonoLlvmCodeGen.GenerateResult, modules.len);
+    var bitcode_len: usize = 0;
     defer {
-        var owned = bitcode;
-        owned.deinit();
+        for (bitcodes[0..bitcode_len]) |*bitcode| {
+            bitcode.deinit();
+        }
+        allocator.free(bitcodes);
     }
 
-    const dylib_path = try llvm_compile.compileToSharedLibrary(
+    var bitcode_slices = try allocator.alloc([]const u32, modules.len);
+    defer allocator.free(bitcode_slices);
+
+    var total_roots: usize = 0;
+    for (modules) |module| {
+        total_roots += module.roots.len;
+    }
+
+    for (modules, 0..) |module, module_index| {
+        var codegen = llvm_compile.MonoLlvmCodeGen.init(allocator, module.store);
+        codegen.layout_store = module.layouts;
+        defer codegen.deinit();
+
+        const entrypoints = try allocator.alloc(llvm_compile.MonoLlvmCodeGen.Entrypoint, module.roots.len);
+        defer allocator.free(entrypoints);
+        for (module.roots, 0..) |root, i| {
+            entrypoints[i] = .{
+                .symbol_name = root.symbol_name,
+                .proc = root.proc,
+                .arg_layouts = root.arg_layouts,
+                .ret_layout = root.ret_layout,
+            };
+        }
+
+        const module_name = try std.fmt.allocPrint(allocator, "roc_test_module_{d}", .{module_index});
+        defer allocator.free(module_name);
+        bitcodes[bitcode_len] = try codegen.generateEntrypointModule(module_name, entrypoints);
+        bitcode_slices[bitcode_len] = bitcodes[bitcode_len].bitcode;
+        bitcode_len += 1;
+    }
+
+    const dylib_path = try llvm_compile.compileBitcodeModulesToSharedLibrary(
         allocator,
         std.Options.debug_io,
-        bitcode.bitcode,
-        llvmCompileOptions(layouts.targetUsize(), opt),
+        bitcode_slices,
+        llvmCompileOptions(modules[0].layouts.targetUsize(), opt),
     );
     defer {
         std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, std.mem.sliceTo(dylib_path, 0)) catch {};
@@ -2197,29 +2506,27 @@ pub fn llvmEvalBoolRoots(
     var lib = try EvalDynLib.open(allocator, std.mem.sliceTo(dylib_path, 0));
     defer lib.close();
 
-    var runtime_env = RuntimeHostEnv.init(allocator);
-    defer runtime_env.deinit();
+    var longjmp_on_crash = true;
     if (builtin.target.cpu.arch == .aarch64 and builtin.target.os.tag == .linux) {
-        runtime_env.setLongjmpOnCrash(false);
+        longjmp_on_crash = false;
     }
 
-    const EntryFn = *const fn (*builtins.host_abi.RocOps, [*]u8, ?*anyopaque) callconv(.c) void;
-    const results = try allocator.alloc(BoolRootEvalResult, roots.len);
-    var result_len: usize = 0;
-    errdefer deinitPartialBoolRootEvalResults(allocator, results, result_len);
+    const calls = try allocator.alloc(LlvmBoolRootCall, total_roots);
+    defer allocator.free(calls);
 
-    // Present only when the module contains an expect_err statement; written
-    // by the generated code so the harness can point the failure report at
-    // the `?` expression.
-    const expect_err_region = lib.lookup(*[3]u32, "roc_expect_err_region");
-
-    for (roots, 0..) |root, i| {
-        const entry = lib.lookup(EntryFn, root.symbol_name) orelse return error.LlvmBackendUnavailable;
-        results[i] = try callLlvmBoolRoot(allocator, layouts, entry, root, &runtime_env, expect_err_region);
-        result_len += 1;
+    var call_index: usize = 0;
+    for (modules) |module| {
+        for (module.roots) |root| {
+            calls[call_index] = .{
+                .layouts = module.layouts,
+                .entry = lib.lookup(LlvmBoolRootEntryFn, root.symbol_name) orelse return error.LlvmBackendUnavailable,
+                .root = root,
+            };
+            call_index += 1;
+        }
     }
 
-    return results;
+    return runLlvmBoolRootCalls(allocator, calls, longjmp_on_crash, max_workers, completion_callback, event_callback);
 }
 
 /// Evaluate a lowered program via the LIR interpreter and return the output string.
@@ -2389,7 +2696,7 @@ pub fn llvmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredPr
     var lib = try EvalDynLib.open(allocator, std.mem.sliceTo(dylib_path, 0));
     defer lib.close();
 
-    const EntryFn = *const fn (*builtins.host_abi.RocOps, [*]u8, ?*anyopaque) callconv(.c) void;
+    const EntryFn = *const fn (*builtins.host_abi.RocOps, *TestInvocationContext, [*]u8, ?*anyopaque) callconv(.c) void;
     const entry = lib.lookup(EntryFn, "roc_eval_test_main") orelse return error.LlvmBackendUnavailable;
 
     var runtime_env = RuntimeHostEnv.init(allocator);
@@ -2412,8 +2719,10 @@ pub fn llvmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredPr
     const sj = crash_boundary.set();
     if (sj != 0) return error.Crash;
 
+    var test_context: TestInvocationContext = .{};
     entry(
         runtime_env.get_ops(),
+        &test_context,
         ret_buf.ptr,
         if (arg_buffer) |buf| @ptrCast(buf.ptr) else null,
     );

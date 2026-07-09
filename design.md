@@ -4451,6 +4451,164 @@ signaling overhead, not the reporting period. Roots that exceed the threshold
 are reported, then the worker waits interruptibly until the next per-root report
 deadline or finalization stop.
 
+## Optimized Test Execution
+
+`roc test --opt=size` and `roc test --opt=speed` use one command-level test
+plan for all discovered test roots in the app and its imports. The plan is
+explicit compiler data. It owns the stable source-order display order, the
+checked module owner for each root, the source region used for reporting, the
+checked cache id for the root's result, the generated test symbol for uncached
+roots, the cached or uncached execution decision, and the result slot. Later
+stages consume this plan directly; they never reconstruct test identity from
+source paths, symbol names, module traversal order, filesystem order, package
+cache paths, or backend output.
+
+Optimized test execution performs at most one LLVM shared-library link for the
+whole command for the selected optimization mode and native target. It must not
+link one shared library per checked module. The per-module checked cache
+boundary remains intact, but cache boundaries are not native link/load
+boundaries for optimized tests. Cached test results are merged into the command
+result stream before reporting; uncached test roots are compiled into the single
+test library and written back to their original checked-module cache entries
+after execution.
+
+The command-level plan is built after checking has produced all checked modules
+and before any optimized test backend code is generated:
+
+```text
+checked modules
+  -> command-level test plan
+  -> cached-result admission for plan entries
+  -> one command-level lowering batch containing every uncached test root
+  -> ARC insertion for each checked-module lowering result
+  -> per-module LLVM bitcode with exported test entrypoints
+  -> one merged LLVM module/object
+  -> one native shared library
+  -> parallel test-root calls
+  -> deterministic transcript and result merge by test-plan order
+  -> checked-cache writes for fresh semantic results
+  -> final timing summary
+```
+
+The user-visible per-test transcript is deterministic. It contains `dbg`
+output, failed-expect output, crash diagnostics, and per-test status or failure
+rendering. It ends before the final aggregate timing summary. That boundary is
+the byte-for-byte contract: for the same source code and the same renderer
+configuration, captured stdout bytes and captured stderr bytes in this
+transcript are independently byte-for-byte identical regardless of selected
+optimization mode, backend, worker count, core count, scheduling, test
+completion order, or whether a result was read from cache. The selected
+optimization mode is not a semantic input and is not a renderer configuration;
+it must never change output facts or rendered transcript bytes. A different
+per-test transcript under `--opt=size` and `--opt=speed` is a compiler/backend
+bug, not a cache-key distinction. Changing color mode, verbosity, terminal
+width, or another renderer setting may change only the rendering chosen from
+the same structured transcript facts. Determinism tests compare each stream's
+transcript bytes directly; they do not normalize source snippets, whitespace,
+ANSI escapes, or cache labels inside the transcript. The final aggregate
+summary is a run epilogue and is outside the byte-for-byte transcript
+guarantee; it may include elapsed time and cache/timing annotations for this
+invocation. Cache-hit labels such as `(cached)` belong only in that epilogue,
+never in the per-test transcript.
+
+The command-level lowering batch may name roots from multiple checked modules.
+Each checked module is still lowered with explicit imported-artifact and
+relation views owned by that module; the batch is the command-level data that
+ties those per-module lowering results back to one test plan. Each lowered test
+root carries root metadata that identifies its test-plan slot and the original
+checked module root order. LIR results do not use symbol text as identity.
+Symbol text is only the exported backend name needed to locate the entrypoint
+in the loaded test library.
+
+Every optimized test entrypoint uses the compiler-internal test ABI, not the
+public host symbol ABI. The entrypoint receives `RocOps`, a pointer to a
+test-invocation context, the return buffer, and the argument buffer. The
+invocation context stores mutable observation output produced by generated test
+code that cannot live in `RocOps`; currently this includes the `expect_err`
+source region. The LLVM backend must not use a shared exported global such as
+`roc_expect_err_region` for optimized tests, because a command-level test
+library runs multiple roots in parallel.
+
+After the single library is loaded, test roots run on a worker pool. Each root
+call owns its `RuntimeHostEnv`, `RocOps`, allocation tracker, crash boundary,
+argument buffer, return buffer, test-invocation context, and result slot. The
+loaded code and immutable static data are shared across workers. Mutable
+observation state is per invocation. Generated test code must be reentrant with
+respect to test-root calls: a root call must not write process-global state
+except through explicitly thread-safe runtime services or the invocation data
+passed to that root.
+
+Workers never write test output, diagnostics, stdout, stderr, or cache files
+directly. They publish structured transcript events and final root outcomes to
+a command-level output coordinator. Each event carries the test-plan slot, the
+logical stream, the event kind, and structured payload data. Final root
+outcomes carry the source region, failure detail, and visibility data needed to
+render per-test status or failure reports. The coordinator is the only writer
+for user-visible test transcript output.
+
+The coordinator owns `next_to_print` and per-entry buffers. Events for
+`next_to_print` are rendered and written immediately, so a slow earliest test
+can show `dbg` output in real time. Events for later tests are buffered in that
+test's own entry. When `next_to_print` finishes, the coordinator advances
+through the longest contiguous prefix of already-finished entries, flushing each
+entry's buffered transcript and result before moving to the next entry. If a
+running buffered test becomes `next_to_print`, its buffered prefix is flushed
+and later events from that test are written live. This produces sequential
+plan-order output while still allowing parallel execution. If a buffered
+transcript is too large to keep in memory, the coordinator may spill it to a
+command-owned temporary file in the command's isolated temp directory; it must
+not write transcript spill files into user source directories.
+
+Worker completion order is never user-visible. Results are merged by the
+command-level test-plan order: checked module source order first, then checked
+test root source order within each module. Cached results and freshly-run
+results use the same ordering path. Diagnostics, `dbg`, `expect` failures,
+`expect_err` regions, crashes, and backend compiler errors stay attached to
+their test-plan entries until rendering and cache writes replay the plan order.
+
+Checked test-result cache entries use the same semantic checked-module cache
+identity as `roc check`. There is no second semantic test-result cache key.
+The test-result bundle may carry its own payload format and compiler-version
+admission data, but those fields decide whether the decoded bundle can be used;
+they do not extend the checked-module identity. The result cache key does not
+include selected optimization mode, backend, worker count, color mode,
+verbosity, terminal width, terminal style, elapsed time, final summary text,
+test-run completion order, test-root identity, or test-root order. Test-root
+identity and order are explicit checked-module data and payload shape, not
+additional cache-key inputs. Cache reads validate that a decoded test-result
+bundle matches the current checked module's test-root shape and cache format
+before admitting it, but this is payload validation rather than a new source of
+identity.
+
+Cached test results store structured, pre-render facts: the outcome, ordered
+transcript events, source regions, failure data, and raw or structured Roc
+payloads needed to render `dbg`, failed expects, crashes, and per-test
+status/failure reports.
+This cache format predates terminal rendering. It stores enough information to
+render the current stdout/stderr transcript just in time, under the current
+renderer choices, but it does not store terminal bytes, ANSI escapes, color
+mode, verbosity, terminal width, elapsed time, cache-hit labels, or final
+summary text. A cached result is represented to the output coordinator as an
+already-finished plan entry containing the same structured transcript events
+and result facts that a fresh run would have published. Semantic test results,
+including passes, failed expects, and Roc runtime crashes, may be cached.
+Compiler backend failures
+while building or linking the command-level image are not semantic test results
+and are not written as successful test-result cache entries.
+
+If compiling or linking the command-level test library fails, each uncached root
+in the plan receives a backend compiler-error result at its original source
+region. If one root crashes while running, that root records a failed result
+from its own invocation state. Other roots continue unless the process receives
+a hard fault that escapes the crash boundary.
+
+The interpreter and dev backend may consume the same command-level test plan,
+but they are not allowed to change the result contract. The interpreter may run
+roots serially. The dev backend may compile one callable batch and then execute
+roots through the same per-invocation state model. Backend choice changes only
+how entrypoints are produced, not how tests are identified, ordered, cached, or
+reported.
+
 `ConstStore` uses node ids so stored constants can preserve sharing without
 duplicating large values. Multiple fields may reference the same `ConstNodeId`.
 Stored constants are acyclic. Roc source cannot define recursive non-function

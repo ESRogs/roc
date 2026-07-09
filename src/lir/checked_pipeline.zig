@@ -37,6 +37,7 @@ pub const RootRequestSet = struct {
     requests: []const checked.RootRequest = &.{},
     layout_requests: []const checked.CheckedTypeId = &.{},
     include_static_data_exports: bool = false,
+    test_plan_metadata: []const postcheck.Common.RootTestPlanMetadata = &.{},
 };
 
 /// Target settings and checked module state for the checked-to-LIR pipeline.
@@ -253,6 +254,7 @@ pub fn lowerCheckedModulesToLir(
         .list_in_place_map = target.list_in_place_map,
         .proc_debug_names = target.proc_debug_names,
         .layout_request_const_plans = target.layout_request_const_plans,
+        .test_plan_metadata = roots.test_plan_metadata,
     });
     solved_owned = false;
     solved = undefined;
@@ -320,6 +322,7 @@ fn rootRequests(
         .requests = roots.requests,
         .layout_requests = layout_requests,
         .static_data_requests = static_data_requests,
+        .test_plan_metadata = roots.test_plan_metadata,
     };
 }
 
