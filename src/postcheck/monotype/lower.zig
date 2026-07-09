@@ -15458,14 +15458,14 @@ const BodyContext = struct {
                     .site = nested.site,
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
                 } };
-                // A compile-time-evaluated closure keeps its dispatch
-                // obligations even when the outer scheme is concrete (a concrete
+                // A compile-time-evaluated closure keeps its dispatch evidence
+                // params even when the outer scheme is concrete (a concrete
                 // captured `n` still selects `plus`), but a concrete use site
                 // carries no checked site evidence to fill them. Resolve the
-                // owner scheme's obligations from its checked dispatcher paths
-                // over the closure's concrete callable, mirroring the
-                // compiler-generated-edge synthesis, so the nested body's
-                // constraint refs at depth 0 resolve.
+                // owner scheme's evidence params from its checked dispatcher
+                // paths over the closure's concrete callable, mirroring the
+                // compiler-generated-edge evidence construction, so the nested
+                // body's constraint refs at depth 0 resolve.
                 if (self.restore_evidence.vector.len == 0) {
                     if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty)) |synthesized| {
                         fn_ctx.evidence = .{ .vector = synthesized };
@@ -17659,15 +17659,15 @@ const BodyContext = struct {
     }
 
     /// Evidence vector for a compile-time-evaluated closure restored without a
-    /// use-site vector: resolve the owner scheme's obligations from its checked
-    /// dispatcher paths over the closure's concrete restored callable.
+    /// use-site vector: resolve the owner scheme's evidence params from its
+    /// checked dispatcher paths over the closure's concrete restored callable.
     ///
     /// The owner scheme's evidence-param paths run over the owner's whole
     /// callable, whose return is the restored closure (a `constraint(0, k)` in
     /// the closure body forwards to the owner's `k`th param). Instantiate the
     /// owner root, pin its return to the concrete restored `ty`, and synthesize
     /// each param's target over the resulting concrete owner callable. Null when
-    /// the owner scheme has no obligations (nothing to fill).
+    /// the owner scheme has no evidence params.
     fn synthesizeRestoredClosureEvidence(
         self: *BodyContext,
         owner_view: ModuleView,
