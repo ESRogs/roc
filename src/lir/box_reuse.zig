@@ -22,9 +22,11 @@
 //! ret result
 //! ```
 //!
-//! The pass deliberately does not chase aliases, branch tails, erased calls, or
-//! non-adjacent statements. Broader destination-passing rewrites should consume
-//! explicit data from earlier analysis rather than derive it here.
+//! It also accepts equivalent wrapper shapes when lowering routes the call
+//! result through a one-parameter join before the final `box_box`, including the
+//! platform-entrypoint form where the unbox and update call live in the join's
+//! remainder. The join matchers only cross local aliases and zero-sized struct
+//! statements, and validate the payload/box layouts before rewriting.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -83,6 +85,7 @@ const Transform = struct {
 
     fn rewriteAt(self: *Transform, unbox_stmt_id: CFStmtId) ResourceError!bool {
         if (try self.rewritePackedErasedAt(unbox_stmt_id)) return true;
+        if (try self.rewriteJoinBoxAt(unbox_stmt_id)) return true;
         return try self.rewriteBoxAt(unbox_stmt_id);
     }
 
@@ -94,7 +97,18 @@ const Transform = struct {
         if (unbox_stmt.op != .box_unbox) return false;
         const unbox_args = self.store.getLocalSpan(unbox_stmt.args);
         if (unbox_args.len != 1) return false;
+        const boxed = GuardedList.at(unbox_args, 0);
 
+        if (try self.rewriteDirectBoxAt(unbox_stmt_id, unbox_stmt, boxed)) return true;
+        return try self.rewriteJoinedBoxAt(unbox_stmt_id, unbox_stmt, boxed);
+    }
+
+    fn rewriteDirectBoxAt(
+        self: *Transform,
+        unbox_stmt_id: CFStmtId,
+        unbox_stmt: @FieldType(LIR.CFStmt, "assign_low_level"),
+        boxed: LocalId,
+    ) ResourceError!bool {
         const call_stmt_id = unbox_stmt.next;
         const call_stmt = switch (self.store.getCFStmt(call_stmt_id)) {
             .assign_call => |s| s,
@@ -121,7 +135,6 @@ const Transform = struct {
         };
         if (ret_stmt.value != box_stmt.target) return false;
 
-        const boxed = GuardedList.at(unbox_args, 0);
         const result_box = box_stmt.target;
         if (boxed == result_box) return false;
 
@@ -168,6 +181,235 @@ const Transform = struct {
             .rc_effect = LowLevelOp.ptr_store.rcEffect(),
             .args = try self.store.addLocalSpan(&.{ payload_ptr, payload_value }),
             .next = ret_stmt_id,
+        } };
+
+        return true;
+    }
+
+    fn rewriteJoinedBoxAt(
+        self: *Transform,
+        unbox_stmt_id: CFStmtId,
+        unbox_stmt: @FieldType(LIR.CFStmt, "assign_low_level"),
+        boxed: LocalId,
+    ) ResourceError!bool {
+        const prelude = self.forwardThroughLocalAliasesAndZsts(unbox_stmt.target, unbox_stmt.next);
+        const join_stmt_id = prelude.next;
+        const join_stmt = switch (self.store.getCFStmt(join_stmt_id)) {
+            .join => |s| s,
+            else => return false,
+        };
+
+        const join_params = self.store.getLocalSpan(join_stmt.params);
+        if (join_params.len != 1) return false;
+        if (self.store.getLocalSpan(join_stmt.maybe_uninitialized_params).len != 0) return false;
+        if (self.store.getLocalSpan(join_stmt.maybe_uninitialized_conditions).len != 0) return false;
+        if (self.store.getU64Span(join_stmt.maybe_uninitialized_condition_masks).len != 0) return false;
+        const join_payload = GuardedList.at(join_params, 0);
+
+        const body_alias = self.forwardLocalAliasChain(join_payload, join_stmt.body);
+        const payload_value = body_alias.value;
+        const box_stmt_id = body_alias.next;
+        const box_stmt = switch (self.store.getCFStmt(box_stmt_id)) {
+            .assign_low_level => |s| s,
+            else => return false,
+        };
+        if (box_stmt.op != .box_box) return false;
+        const box_args = self.store.getLocalSpan(box_stmt.args);
+        if (box_args.len != 1 or GuardedList.at(box_args, 0) != payload_value) return false;
+
+        const ret_stmt_id = box_stmt.next;
+        const ret_stmt = switch (self.store.getCFStmt(ret_stmt_id)) {
+            .ret => |s| s,
+            else => return false,
+        };
+        if (ret_stmt.value != box_stmt.target) return false;
+
+        const call_prelude = self.forwardThroughLocalAliasesAndZsts(prelude.value, join_stmt.remainder);
+        const call_stmt_id = call_prelude.next;
+        const call_stmt = switch (self.store.getCFStmt(call_stmt_id)) {
+            .assign_call => |s| s,
+            else => return false,
+        };
+        if (call_stmt.target != join_payload) return false;
+        const call_args = self.store.getLocalSpan(call_stmt.args);
+        if (!spanHasLocal(call_args, call_prelude.value)) return false;
+
+        const jump_stmt = switch (self.store.getCFStmt(call_stmt.next)) {
+            .jump => |s| s,
+            else => return false,
+        };
+        if (jump_stmt.target != join_stmt.id) return false;
+
+        const result_box = box_stmt.target;
+        if (boxed == result_box) return false;
+
+        const box_layout = self.store.getLocal(boxed).layout_idx;
+        if (self.store.getLocal(result_box).layout_idx != box_layout) return false;
+        if (self.store.getProcSpec(self.proc_id).ret_layout != box_layout) return false;
+
+        const box_layout_value = self.layouts.getLayout(box_layout);
+        if (box_layout_value.tag != .box) return false;
+        const payload_layout = box_layout_value.getIdx();
+        if (self.store.getLocal(unbox_stmt.target).layout_idx != payload_layout) return false;
+        if (self.store.getLocal(prelude.value).layout_idx != payload_layout) return false;
+        if (self.store.getLocal(call_prelude.value).layout_idx != payload_layout) return false;
+        if (self.store.getLocal(join_payload).layout_idx != payload_layout) return false;
+        if (self.store.getLocal(payload_value).layout_idx != payload_layout) return false;
+
+        const ptr_layout = try self.layouts.insertPtr(payload_layout);
+        const payload_ptr = try self.addLocal(ptr_layout);
+        const store_unit = try self.addLocal(.zst);
+
+        const load_stmt_id = try self.store.addCFStmt(.{ .assign_low_level = .{
+            .target = unbox_stmt.target,
+            .op = .ptr_load,
+            .rc_effect = LowLevelOp.ptr_load.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{payload_ptr}),
+            .next = unbox_stmt.next,
+        } });
+        const cast_stmt_id = try self.store.addCFStmt(.{ .assign_low_level = .{
+            .target = payload_ptr,
+            .op = .ptr_cast,
+            .rc_effect = LowLevelOp.ptr_cast.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{result_box}),
+            .next = load_stmt_id,
+        } });
+
+        self.store.getCFStmtPtr(unbox_stmt_id).* = .{ .assign_low_level = .{
+            .target = result_box,
+            .op = .box_prepare_update,
+            .rc_effect = LowLevelOp.box_prepare_update.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{boxed}),
+            .next = cast_stmt_id,
+        } };
+
+        self.store.getCFStmtPtr(box_stmt_id).* = .{ .assign_low_level = .{
+            .target = store_unit,
+            .op = .ptr_store,
+            .rc_effect = LowLevelOp.ptr_store.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{ payload_ptr, payload_value }),
+            .next = ret_stmt_id,
+        } };
+
+        return true;
+    }
+
+    fn rewriteJoinBoxAt(self: *Transform, join_stmt_id: CFStmtId) ResourceError!bool {
+        const join_stmt = switch (self.store.getCFStmt(join_stmt_id)) {
+            .join => |s| s,
+            else => return false,
+        };
+
+        const join_params = self.store.getLocalSpan(join_stmt.params);
+        if (join_params.len != 1) return false;
+        if (self.store.getLocalSpan(join_stmt.maybe_uninitialized_params).len != 0) return false;
+        if (self.store.getLocalSpan(join_stmt.maybe_uninitialized_conditions).len != 0) return false;
+        if (self.store.getU64Span(join_stmt.maybe_uninitialized_condition_masks).len != 0) return false;
+        const join_payload = GuardedList.at(join_params, 0);
+
+        const body_alias = self.forwardLocalAliasChain(join_payload, join_stmt.body);
+        const payload_value = body_alias.value;
+        const box_stmt_id = body_alias.next;
+        const box_stmt = switch (self.store.getCFStmt(box_stmt_id)) {
+            .assign_low_level => |s| s,
+            else => return false,
+        };
+        if (box_stmt.op != .box_box) return false;
+        const box_args = self.store.getLocalSpan(box_stmt.args);
+        if (box_args.len != 1 or GuardedList.at(box_args, 0) != payload_value) return false;
+
+        const ret_stmt_id = box_stmt.next;
+        const ret_stmt = switch (self.store.getCFStmt(ret_stmt_id)) {
+            .ret => |s| s,
+            else => return false,
+        };
+        if (ret_stmt.value != box_stmt.target) return false;
+
+        const unbox_stmt_id = self.skipLocalAliasesAndZsts(join_stmt.remainder);
+        const unbox_stmt = switch (self.store.getCFStmt(unbox_stmt_id)) {
+            .assign_low_level => |s| s,
+            else => return false,
+        };
+        if (unbox_stmt.op != .box_unbox) return false;
+        const unbox_args = self.store.getLocalSpan(unbox_stmt.args);
+        if (unbox_args.len != 1) return false;
+        const boxed = GuardedList.at(unbox_args, 0);
+
+        const call_prelude = self.forwardThroughLocalAliasesAndZsts(unbox_stmt.target, unbox_stmt.next);
+        const call_stmt_id = call_prelude.next;
+        const call_stmt = switch (self.store.getCFStmt(call_stmt_id)) {
+            .assign_call => |s| s,
+            else => return false,
+        };
+        if (call_stmt.target != join_payload) return false;
+        const call_args = self.store.getLocalSpan(call_stmt.args);
+        if (!spanHasLocal(call_args, call_prelude.value)) return false;
+
+        const jump_stmt = switch (self.store.getCFStmt(call_stmt.next)) {
+            .jump => |s| s,
+            else => return false,
+        };
+        if (jump_stmt.target != join_stmt.id) return false;
+        if (try self.jumpCountToJoin(join_stmt.id) != 1) return false;
+
+        const result_box = box_stmt.target;
+        if (boxed == result_box) return false;
+
+        const box_layout = self.store.getLocal(boxed).layout_idx;
+        if (self.store.getLocal(result_box).layout_idx != box_layout) return false;
+        if (self.store.getProcSpec(self.proc_id).ret_layout != box_layout) return false;
+
+        const box_layout_value = self.layouts.getLayout(box_layout);
+        if (box_layout_value.tag != .box) return false;
+        const payload_layout = box_layout_value.getIdx();
+        if (self.store.getLocal(unbox_stmt.target).layout_idx != payload_layout) return false;
+        if (self.store.getLocal(call_prelude.value).layout_idx != payload_layout) return false;
+        if (self.store.getLocal(join_payload).layout_idx != payload_layout) return false;
+        if (self.store.getLocal(payload_value).layout_idx != payload_layout) return false;
+
+        const ptr_layout = try self.layouts.insertPtr(payload_layout);
+        const payload_ptr = try self.addLocal(ptr_layout);
+        const store_unit = try self.addLocal(.zst);
+
+        const load_stmt_id = try self.store.addCFStmt(.{ .assign_low_level = .{
+            .target = unbox_stmt.target,
+            .op = .ptr_load,
+            .rc_effect = LowLevelOp.ptr_load.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{payload_ptr}),
+            .next = unbox_stmt.next,
+        } });
+        const cast_stmt_id = try self.store.addCFStmt(.{ .assign_low_level = .{
+            .target = payload_ptr,
+            .op = .ptr_cast,
+            .rc_effect = LowLevelOp.ptr_cast.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{result_box}),
+            .next = load_stmt_id,
+        } });
+
+        self.store.getCFStmtPtr(unbox_stmt_id).* = .{ .assign_low_level = .{
+            .target = result_box,
+            .op = .box_prepare_update,
+            .rc_effect = LowLevelOp.box_prepare_update.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{boxed}),
+            .next = cast_stmt_id,
+        } };
+
+        self.store.getCFStmtPtr(box_stmt_id).* = .{ .assign_low_level = .{
+            .target = store_unit,
+            .op = .ptr_store,
+            .rc_effect = LowLevelOp.ptr_store.rcEffect(),
+            .args = try self.store.addLocalSpan(&.{ payload_ptr, payload_value }),
+            .next = ret_stmt_id,
+        } };
+
+        self.store.getCFStmtPtr(join_stmt_id).* = .{ .join = .{
+            .id = join_stmt.id,
+            .params = try self.store.addLocalSpan(&.{ join_payload, result_box, payload_ptr }),
+            .maybe_uninitialized_params = join_stmt.maybe_uninitialized_params,
+            .maybe_uninitialized_conditions = join_stmt.maybe_uninitialized_conditions,
+            .maybe_uninitialized_condition_masks = join_stmt.maybe_uninitialized_condition_masks,
+            .body = join_stmt.body,
+            .remainder = join_stmt.remainder,
         } };
 
         return true;
@@ -248,6 +490,140 @@ const Transform = struct {
         }
     }
 
+    fn forwardThroughLocalAliasesAndZsts(self: *const Transform, source: LocalId, first_stmt: CFStmtId) ForwardedAlias {
+        var value = source;
+        var current = first_stmt;
+        while (true) {
+            switch (self.store.getCFStmt(current)) {
+                .assign_ref => |stmt| {
+                    switch (stmt.op) {
+                        .local => |local| {
+                            if (local == value and self.store.getLocal(stmt.target).layout_idx == self.store.getLocal(value).layout_idx) {
+                                value = stmt.target;
+                            }
+                            current = stmt.next;
+                            continue;
+                        },
+                        else => return .{ .value = value, .next = current },
+                    }
+                },
+                .assign_struct => |stmt| {
+                    if (self.store.getLocal(stmt.target).layout_idx != .zst) return .{ .value = value, .next = current };
+                    if (self.store.getLocalSpan(stmt.fields).len != 0) return .{ .value = value, .next = current };
+                    current = stmt.next;
+                    continue;
+                },
+                else => return .{ .value = value, .next = current },
+            }
+        }
+    }
+
+    fn skipLocalAliasesAndZsts(self: *const Transform, first_stmt: CFStmtId) CFStmtId {
+        var current = first_stmt;
+        while (true) {
+            switch (self.store.getCFStmt(current)) {
+                .assign_ref => |stmt| switch (stmt.op) {
+                    .local => current = stmt.next,
+                    else => return current,
+                },
+                .assign_struct => |stmt| {
+                    if (self.store.getLocal(stmt.target).layout_idx != .zst) return current;
+                    if (self.store.getLocalSpan(stmt.fields).len != 0) return current;
+                    current = stmt.next;
+                },
+                else => return current,
+            }
+        }
+    }
+
+    fn jumpCountToJoin(self: *Transform, join_id: LIR.JoinPointId) ResourceError!usize {
+        const proc = self.store.getProcSpec(self.proc_id);
+        const body = proc.body orelse return 0;
+
+        var work = std.ArrayList(CFStmtId).empty;
+        defer work.deinit(self.store.allocator);
+        var visited = std.AutoHashMap(CFStmtId, void).init(self.store.allocator);
+        defer visited.deinit();
+
+        var count: usize = 0;
+        try work.append(self.store.allocator, body);
+        while (work.pop()) |stmt_id| {
+            const entry = try visited.getOrPut(stmt_id);
+            if (entry.found_existing) continue;
+
+            switch (self.store.getCFStmt(stmt_id)) {
+                .jump => |stmt| {
+                    if (stmt.target == join_id) count += 1;
+                },
+                else => try self.appendSuccessors(&work, stmt_id),
+            }
+        }
+
+        return count;
+    }
+
+    fn appendSuccessors(self: *Transform, work: *std.ArrayList(CFStmtId), stmt_id: CFStmtId) ResourceError!void {
+        switch (self.store.getCFStmt(stmt_id)) {
+            inline .assign_ref,
+            .assign_literal,
+            .init_uninitialized,
+            .assign_call,
+            .assign_call_erased,
+            .assign_packed_erased_fn,
+            .assign_low_level,
+            .assign_list,
+            .assign_struct,
+            .assign_tag,
+            .store_struct,
+            .store_tag,
+            .set_local,
+            .debug,
+            .expect,
+            .comptime_branch_taken,
+            .incref,
+            .decref,
+            .decref_if_initialized,
+            .free,
+            => |stmt| try work.append(self.store.allocator, stmt.next),
+            .switch_stmt => |stmt| {
+                if (stmt.continuation) |continuation| try work.append(self.store.allocator, continuation);
+                const cases = self.store.getCFSwitchBranches(stmt.branches);
+                for (0..cases.len) |case_index| {
+                    try work.append(self.store.allocator, GuardedList.at(cases, case_index).body);
+                }
+                try work.append(self.store.allocator, stmt.default_branch);
+            },
+            .switch_initialized_payload => |stmt| {
+                try work.append(self.store.allocator, stmt.initialized_branch);
+                try work.append(self.store.allocator, stmt.uninitialized_branch);
+            },
+            .str_match => |stmt| {
+                try work.append(self.store.allocator, stmt.on_match);
+                try work.append(self.store.allocator, stmt.on_miss);
+            },
+            .str_match_set => |stmt| {
+                const arms = self.store.getStrMatchArms(stmt.arms);
+                for (0..arms.len) |arm_index| {
+                    try work.append(self.store.allocator, GuardedList.at(arms, arm_index).on_match);
+                }
+                try work.append(self.store.allocator, stmt.on_miss);
+            },
+            .join => |stmt| {
+                try work.append(self.store.allocator, stmt.body);
+                try work.append(self.store.allocator, stmt.remainder);
+            },
+            .runtime_error,
+            .comptime_exhaustiveness_failed,
+            .loop_continue,
+            .loop_break,
+            .jump,
+            .ret,
+            .crash,
+            .expect_err,
+            => {},
+        }
+    }
+
     fn addLocal(self: *Transform, layout_idx: layout_mod.Idx) ResourceError!LocalId {
         const local = try self.store.addLocal(.{ .layout_idx = layout_idx });
         try self.new_locals.append(self.store.allocator, local);
@@ -286,6 +662,13 @@ const Transform = struct {
     }
 };
 
+fn spanHasLocal(locals: anytype, needle: LocalId) bool {
+    for (0..locals.len) |index| {
+        if (GuardedList.at(locals, index) == needle) return true;
+    }
+    return false;
+}
+
 fn testLocal(store: *LirStore, layout_idx: layout_mod.Idx) ResourceError!LocalId {
     return try store.addLocal(.{ .layout_idx = layout_idx });
 }
@@ -296,6 +679,22 @@ fn testLowLevel(store: *LirStore, target: LocalId, op: LowLevelOp, args: []const
         .op = op,
         .rc_effect = op.rcEffect(),
         .args = try store.addLocalSpan(args),
+        .next = next,
+    } });
+}
+
+fn testLocalRef(store: *LirStore, target: LocalId, source: LocalId, next: CFStmtId) ResourceError!CFStmtId {
+    return try store.addCFStmt(.{ .assign_ref = .{
+        .target = target,
+        .op = .{ .local = source },
+        .next = next,
+    } });
+}
+
+fn testZst(store: *LirStore, target: LocalId, next: CFStmtId) ResourceError!CFStmtId {
+    return try store.addCFStmt(.{ .assign_struct = .{
+        .target = target,
+        .fields = try store.addLocalSpan(&.{}),
         .next = next,
     } });
 }
@@ -366,6 +765,217 @@ test "box reuse rewrites the direct unbox call rebox return chain" {
 
     const frame_locals = store.getLocalSpan(store.getProcSpec(caller).frame_locals);
     try std.testing.expect(frame_locals.len >= 6);
+}
+
+test "box reuse rewrites joined update wrappers" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(allocator, @import("base").target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const box_u64 = try layouts.insertBox(.u64);
+
+    const callee_old = try testLocal(&store, .u64);
+    const callee_delta = try testLocal(&store, .u64);
+    const callee = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{ callee_old, callee_delta }),
+        .frame_locals = try store.addLocalSpan(&.{ callee_old, callee_delta }),
+        .ret_layout = .u64,
+    });
+
+    const boxed_arg = try testLocal(&store, box_u64);
+    const delta_arg = try testLocal(&store, .u64);
+    const old_payload = try testLocal(&store, .u64);
+    const old_payload_alias = try testLocal(&store, .u64);
+    const call_payload_alias = try testLocal(&store, .u64);
+    const delta_alias = try testLocal(&store, .u64);
+    const join_payload = try testLocal(&store, .u64);
+    const body_payload_alias = try testLocal(&store, .u64);
+    const result_box = try testLocal(&store, box_u64);
+    const prelude_zst = try testLocal(&store, .zst);
+    const remainder_zst = try testLocal(&store, .zst);
+
+    const join_id: LIR.JoinPointId = @enumFromInt(0);
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = result_box } });
+    const rebox = try testLowLevel(&store, result_box, .box_box, &.{body_payload_alias}, ret);
+    const body_alias = try testLocalRef(&store, body_payload_alias, join_payload, rebox);
+
+    const jump = try store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const call = try store.addCFStmt(.{ .assign_call = .{
+        .target = join_payload,
+        .proc = callee,
+        .args = try store.addLocalSpan(&.{ call_payload_alias, delta_alias }),
+        .next = jump,
+    } });
+    const delta_ref = try testLocalRef(&store, delta_alias, delta_arg, call);
+    const call_payload_ref = try testLocalRef(&store, call_payload_alias, old_payload_alias, delta_ref);
+    const remainder_zst_stmt = try testZst(&store, remainder_zst, call_payload_ref);
+
+    const join = try store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = try store.addLocalSpan(&.{join_payload}),
+        .body = body_alias,
+        .remainder = remainder_zst_stmt,
+    } });
+    const prelude_zst_stmt = try testZst(&store, prelude_zst, join);
+    const old_payload_ref = try testLocalRef(&store, old_payload_alias, old_payload, prelude_zst_stmt);
+    const unbox = try testLowLevel(&store, old_payload, .box_unbox, &.{boxed_arg}, old_payload_ref);
+    const caller = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{ boxed_arg, delta_arg }),
+        .frame_locals = try store.addLocalSpan(&.{
+            boxed_arg,
+            delta_arg,
+            old_payload,
+            old_payload_alias,
+            call_payload_alias,
+            delta_alias,
+            join_payload,
+            body_payload_alias,
+            result_box,
+            prelude_zst,
+            remainder_zst,
+        }),
+        .body = unbox,
+        .ret_layout = box_u64,
+    });
+
+    try run(&store, &layouts);
+
+    const prepare = store.getCFStmt(unbox).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.box_prepare_update, prepare.op);
+    try std.testing.expectEqual(result_box, prepare.target);
+    try std.testing.expectEqual(boxed_arg, GuardedList.at(store.getLocalSpan(prepare.args), 0));
+
+    const cast = store.getCFStmt(prepare.next).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.ptr_cast, cast.op);
+    const payload_ptr = cast.target;
+    try std.testing.expectEqual(result_box, GuardedList.at(store.getLocalSpan(cast.args), 0));
+
+    const load = store.getCFStmt(cast.next).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.ptr_load, load.op);
+    try std.testing.expectEqual(old_payload, load.target);
+    try std.testing.expectEqual(payload_ptr, GuardedList.at(store.getLocalSpan(load.args), 0));
+    try std.testing.expectEqual(old_payload_ref, load.next);
+
+    const store_payload = store.getCFStmt(rebox).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.ptr_store, store_payload.op);
+    const store_args = store.getLocalSpan(store_payload.args);
+    try std.testing.expectEqual(payload_ptr, GuardedList.at(store_args, 0));
+    try std.testing.expectEqual(body_payload_alias, GuardedList.at(store_args, 1));
+    try std.testing.expectEqual(ret, store_payload.next);
+
+    const frame_locals = store.getLocalSpan(store.getProcSpec(caller).frame_locals);
+    try std.testing.expect(frame_locals.len >= 13);
+}
+
+test "box reuse rewrites platform-style join remainder update wrappers" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(allocator, @import("base").target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const box_u64 = try layouts.insertBox(.u64);
+
+    const callee_old = try testLocal(&store, .u64);
+    const callee = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{callee_old}),
+        .frame_locals = try store.addLocalSpan(&.{callee_old}),
+        .ret_layout = .u64,
+    });
+
+    const boxed_arg = try testLocal(&store, box_u64);
+    const boxed_alias_a = try testLocal(&store, box_u64);
+    const boxed_alias_b = try testLocal(&store, box_u64);
+    const old_payload = try testLocal(&store, .u64);
+    const join_payload = try testLocal(&store, .u64);
+    const body_payload_alias = try testLocal(&store, .u64);
+    const result_box = try testLocal(&store, box_u64);
+    const proc_zst = try testLocal(&store, .zst);
+    const remainder_zst = try testLocal(&store, .zst);
+
+    const join_id: LIR.JoinPointId = @enumFromInt(0);
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = result_box } });
+    const rebox = try testLowLevel(&store, result_box, .box_box, &.{body_payload_alias}, ret);
+    const body_alias = try testLocalRef(&store, body_payload_alias, join_payload, rebox);
+
+    const jump = try store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const call = try store.addCFStmt(.{ .assign_call = .{
+        .target = join_payload,
+        .proc = callee,
+        .args = try store.addLocalSpan(&.{old_payload}),
+        .next = jump,
+    } });
+    const unbox = try testLowLevel(&store, old_payload, .box_unbox, &.{boxed_alias_b}, call);
+    const boxed_ref_b = try testLocalRef(&store, boxed_alias_b, boxed_alias_a, unbox);
+    const boxed_ref_a = try testLocalRef(&store, boxed_alias_a, boxed_arg, boxed_ref_b);
+    const remainder_zst_stmt = try testZst(&store, remainder_zst, boxed_ref_a);
+
+    const join = try store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = try store.addLocalSpan(&.{join_payload}),
+        .body = body_alias,
+        .remainder = remainder_zst_stmt,
+    } });
+    const proc_zst_stmt = try testZst(&store, proc_zst, join);
+    const caller = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{boxed_arg}),
+        .frame_locals = try store.addLocalSpan(&.{
+            boxed_arg,
+            boxed_alias_a,
+            boxed_alias_b,
+            old_payload,
+            join_payload,
+            body_payload_alias,
+            result_box,
+            proc_zst,
+            remainder_zst,
+        }),
+        .body = proc_zst_stmt,
+        .ret_layout = box_u64,
+    });
+
+    try run(&store, &layouts);
+
+    const prepare = store.getCFStmt(unbox).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.box_prepare_update, prepare.op);
+    try std.testing.expectEqual(result_box, prepare.target);
+    try std.testing.expectEqual(boxed_alias_b, GuardedList.at(store.getLocalSpan(prepare.args), 0));
+
+    const cast = store.getCFStmt(prepare.next).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.ptr_cast, cast.op);
+    const payload_ptr = cast.target;
+    try std.testing.expectEqual(result_box, GuardedList.at(store.getLocalSpan(cast.args), 0));
+
+    const load = store.getCFStmt(cast.next).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.ptr_load, load.op);
+    try std.testing.expectEqual(old_payload, load.target);
+    try std.testing.expectEqual(payload_ptr, GuardedList.at(store.getLocalSpan(load.args), 0));
+    try std.testing.expectEqual(call, load.next);
+
+    const rewritten_join = store.getCFStmt(join).join;
+    const rewritten_params = store.getLocalSpan(rewritten_join.params);
+    try std.testing.expectEqual(@as(usize, 3), rewritten_params.len);
+    try std.testing.expectEqual(join_payload, GuardedList.at(rewritten_params, 0));
+    try std.testing.expectEqual(result_box, GuardedList.at(rewritten_params, 1));
+    try std.testing.expectEqual(payload_ptr, GuardedList.at(rewritten_params, 2));
+
+    const store_payload = store.getCFStmt(rebox).assign_low_level;
+    try std.testing.expectEqual(LowLevelOp.ptr_store, store_payload.op);
+    const store_args = store.getLocalSpan(store_payload.args);
+    try std.testing.expectEqual(payload_ptr, GuardedList.at(store_args, 0));
+    try std.testing.expectEqual(body_payload_alias, GuardedList.at(store_args, 1));
+    try std.testing.expectEqual(ret, store_payload.next);
+
+    const frame_locals = store.getLocalSpan(store.getProcSpec(caller).frame_locals);
+    try std.testing.expect(frame_locals.len >= 11);
 }
 
 test "erased callable reuse rewrites adjacent same-shape repack" {

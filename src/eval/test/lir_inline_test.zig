@@ -3420,6 +3420,32 @@ test "destination phase 3: direct boxed update wrapper calls a return-slot varia
     try std.testing.expectEqual(@as(usize, 1), try reachableReturnSlotProcCount(allocator, &lowered_source.lowered));
 }
 
+test "destination phase 3: effectful boxed update wrapper prepares box update" {
+    const allocator = std.testing.allocator;
+    var lowered_source = try lowerModule(allocator,
+        \\module [main]
+        \\
+        \\Model : {
+        \\    tick : U64,
+        \\    label : Str,
+        \\}
+        \\
+        \\update! : Model => Model
+        \\update! = |model| {
+        \\    tick = model.tick + 1
+        \\    { ..model, tick }
+        \\}
+        \\
+        \\main : Box(Model) => Box(Model)
+        \\main = |boxed| Box.box(update!(Box.unbox(boxed)))
+    , .wrappers);
+    defer lowered_source.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &lowered_source.lowered, "box_unbox_count"));
+    try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &lowered_source.lowered, "box_box_count"));
+    try std.testing.expectEqual(@as(usize, 1), try reachableProcShapeFieldTotal(allocator, &lowered_source.lowered, "box_prepare_update_count"));
+}
+
 test "destination baseline: boxed lambda is packed then boxed" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,
