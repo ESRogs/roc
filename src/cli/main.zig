@@ -12928,6 +12928,16 @@ fn bumpExtractApi(ctx: *CliCtx, build_env: *compile.BuildEnv, side: []const u8) 
     var origins = bump.extract.OriginMap{};
     defer origins.deinit(ctx.gpa);
     {
+        const builtin_env = build_env.builtin_modules.builtin_module.env;
+        const builtin_identity_hash = builtin_env.contentIdentityHash() orelse return error.Internal;
+        const builtin_origin = bump.extract.OriginMap.Origin{
+            .kind = .builtin,
+            .module_name = builtin_env.module_name,
+        };
+        try origins.putIdentity(ctx.gpa, builtin_identity_hash, builtin_origin);
+        try origins.put(ctx.gpa, builtin_env.module_name, builtin_origin);
+        try origins.put(ctx.gpa, builtin_env.getIdentText(builtin_env.qualified_module_ident), builtin_origin);
+
         var sched_iter = build_env.schedulers.iterator();
         while (sched_iter.next()) |sched_entry| {
             const pkg_name = sched_entry.key_ptr.*;
