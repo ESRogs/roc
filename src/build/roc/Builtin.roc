@@ -2110,6 +2110,27 @@ Builtin :: [].{
 		## ```
 		count_utf8_bytes : Str -> U64
 
+		## Split a string at a byte offset into `before` and `after` halves, both
+		## zero-copy slices of the original. The offset counts UTF-8 bytes (as in
+		## [Str.count_utf8_bytes]) and must be at most the string's length and on a
+		## character boundary: the start of a code point, or the end of the string.
+		## ```roc
+		## expect "café".split_at_utf8_byte(3) == Ok({ before: "caf", after: "é" })
+		## expect "café".split_at_utf8_byte(4) == Err(NotACharacterBoundary)
+		## expect "café".split_at_utf8_byte(9) == Err(OutOfBounds)
+		## ```
+		split_at_utf8_byte : Str, U64 -> Try({ before : Str, after : Str }, [OutOfBounds, NotACharacterBoundary])
+		split_at_utf8_byte = |self, index| {
+			result = str_split_at_utf8_byte_raw(self, index)
+			if result.is_out_of_bounds {
+				Err(OutOfBounds)
+			} else if result.is_not_char_boundary {
+				Err(NotACharacterBoundary)
+			} else {
+				Ok({ before: result.before, after: result.after })
+			}
+		}
+
 		## Returns a string of the specified capacity without any content.
 		##
 		## This is like calling [Str.reserve] on an empty string. It's intended for
@@ -17162,20 +17183,15 @@ scan_json_string_tail = |tail| {
 			# Because we consume escapes atomically, if we hit a quote we know that it's the end
 			# of the string.
 			'"' => {
-				raw = match Str.from_utf8(List.take_first(bytes, $index)) {
-					Ok(body) => body
-					# unreachable: the split point is an ASCII quote, so the prefix is always valid UTF-8
-					Err(_) => {
-						crash "Json scanner invariant violated: split at a quote was not valid UTF-8"
-					}
+				split = str_split_at_utf8_byte_raw(tail, $index)
+				if split.is_out_of_bounds or split.is_not_char_boundary {
+					# unreachable: the walk only stops on an ASCII quote inside the string
+					crash "Json scanner invariant violated: split at a quote was not a valid split"
 				}
 
-				# Str has no index-based slicing, so recover `after` by dropping the
-				# body (a content-matched prefix of `tail`) and then the closing
-				# quote — both zero-copy slice operations.
-				after = Str.drop_prefix(Str.drop_prefix(tail, raw), "\"")
+				after = Str.drop_prefix(split.after, "\"")
 
-				return Ok({ after, body: if $had_escape HasEscapes(raw) else NoEscapes(raw) })
+				return Ok({ after, body: if $had_escape HasEscapes(split.before) else NoEscapes(split.before) })
 			}
 			# If we find any backslashes, we mark that we found an escape and consume the full
 			# escape sequence atomically
@@ -17352,6 +17368,12 @@ list_swap_unsafe : List(item), U64, U64 -> List(item)
 
 # Implemented by the compiler. Returns string slices into the source string.
 str_find_first_raw : Str, Str -> { before : Str, found : Bool, after : Str }
+
+# Implemented by the compiler. Returns string slices into the source string.
+# Each flag names one failure: is_out_of_bounds when the index exceeds the
+# string length, is_not_char_boundary when it lands inside a multi-byte
+# character. Both False means the split succeeded; they are never both True.
+str_split_at_utf8_byte_raw : Str, U64 -> { before : Str, after : Str, is_not_char_boundary : Bool, is_out_of_bounds : Bool }
 
 # Implemented by the compiler. Returns a string slice after the prefix when the
 # source starts with the prefix using ASCII-caseless comparison.

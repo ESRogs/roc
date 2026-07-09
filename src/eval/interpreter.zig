@@ -4684,6 +4684,35 @@ pub const Interpreter = struct {
                 val.offset(self.layout_store.getStructFieldOffsetByOriginalIndex(record_idx, 2)).write(u8, if (result.found) 1 else 0);
                 break :blk val;
             },
+            .str_split_at_utf8_byte => blk: {
+                var crash_boundary = self.enterCrashBoundary();
+                defer crash_boundary.deinit();
+                const sj = crash_boundary.set();
+                if (sj != 0) return error.Crash;
+                const result = builtins.str.splitAt(valueToRocStr(args[0]), args[1].read(u64), &self.roc_ops);
+
+                const layout_val = self.layout_store.getLayout(ll.ret_layout);
+                if (layout_val.tag != .struct_) {
+                    return self.runtimeError("str_split_at_utf8_byte expected a record return layout");
+                }
+                const record_idx = layout_val.getStruct().idx;
+                const fields = self.layout_store.struct_fields.sliceRange(self.layout_store.getStructData(record_idx).getFields());
+                if (fields.len != 4 or
+                    self.layout_store.getStructFieldLayoutByOriginalIndex(record_idx, 0) != .str or
+                    self.layout_store.getStructFieldLayoutByOriginalIndex(record_idx, 1) != .str or
+                    self.layout_store.getStructFieldLayoutByOriginalIndex(record_idx, 2) != .bool or
+                    self.layout_store.getStructFieldLayoutByOriginalIndex(record_idx, 3) != .bool)
+                {
+                    return self.runtimeError("str_split_at_utf8_byte expected fields after Str, before Str, is_not_char_boundary Bool, is_out_of_bounds Bool");
+                }
+
+                const val = try self.alloc(ll.ret_layout);
+                @memcpy(val.offset(self.layout_store.getStructFieldOffsetByOriginalIndex(record_idx, 0)).ptr[0..@sizeOf(RocStr)], std.mem.asBytes(&result.after));
+                @memcpy(val.offset(self.layout_store.getStructFieldOffsetByOriginalIndex(record_idx, 1)).ptr[0..@sizeOf(RocStr)], std.mem.asBytes(&result.before));
+                val.offset(self.layout_store.getStructFieldOffsetByOriginalIndex(record_idx, 2)).write(u8, if (result.is_not_char_boundary) 1 else 0);
+                val.offset(self.layout_store.getStructFieldOffsetByOriginalIndex(record_idx, 3)).write(u8, if (result.is_out_of_bounds) 1 else 0);
+                break :blk val;
+            },
             .str_drop_prefix_caseless_ascii => blk: {
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();

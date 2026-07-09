@@ -1035,6 +1035,18 @@ pub const FindFirstResult = struct {
     after: RocStr,
 };
 
+/// Result layout for `str_split_at_utf8_byte_raw`. Each flag names one
+/// failure; both false means the split succeeded, and the two are never both
+/// true. If this ever accumulates additional failure modes, consider
+/// switching to from_utf8's `is_ok` + problem-code shape instead of adding
+/// a third flag.
+pub const SplitAtResult = struct {
+    before: RocStr,
+    after: RocStr,
+    is_not_char_boundary: bool,
+    is_out_of_bounds: bool,
+};
+
 /// Result layout for `Str.drop_prefix_caseless_ascii`.
 pub const DropPrefixCaselessAsciiResult = struct {
     after: RocStr,
@@ -1082,6 +1094,40 @@ pub fn findFirst(source: RocStr, delimiter: RocStr, roc_ops: *RocOps) FindFirstR
         .before = retainedSlice(source, 0, index, roc_ops),
         .found = true,
         .after = retainedSlice(source, index + delimiter_bytes.len, source_bytes.len - index - delimiter_bytes.len, roc_ops),
+    };
+}
+
+/// Split `source` at a byte index, returning seamless slices on both sides.
+/// Checked: `index` must be at most the string length (`is_out_of_bounds`
+/// otherwise) and fall on a code-point boundary (`is_not_char_boundary`
+/// otherwise).
+pub fn splitAt(source: RocStr, index: u64, roc_ops: *RocOps) SplitAtResult {
+    const bytes = source.asSlice();
+    if (index > bytes.len) {
+        return .{
+            .before = RocStr.empty(),
+            .after = RocStr.empty(),
+            .is_not_char_boundary = false,
+            .is_out_of_bounds = true,
+        };
+    }
+    const idx: usize = @intCast(index);
+    // A split is only valid on a character boundary: either at the very end,
+    // or where the next byte starts a character (not a 0b10xxxxxx
+    // continuation byte). Splitting a valid Str there yields two valid Strs.
+    if (idx != bytes.len and (bytes[idx] & 0xC0) == 0x80) {
+        return .{
+            .before = RocStr.empty(),
+            .after = RocStr.empty(),
+            .is_not_char_boundary = true,
+            .is_out_of_bounds = false,
+        };
+    }
+    return .{
+        .before = retainedSlice(source, 0, idx, roc_ops),
+        .after = retainedSlice(source, idx, bytes.len - idx, roc_ops),
+        .is_not_char_boundary = false,
+        .is_out_of_bounds = false,
     };
 }
 

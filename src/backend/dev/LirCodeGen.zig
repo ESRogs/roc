@@ -76,6 +76,7 @@ const strDropPrefix = builtins.str.strDropPrefix;
 const strDropPrefixCaselessAscii = builtins.str.strDropPrefixCaselessAscii;
 const strDropSuffix = builtins.str.strDropSuffix;
 const strFindFirst = builtins.str.findFirst;
+const strSplitAtUtf8Byte = builtins.str.splitAt;
 const strWithAsciiLowercased = builtins.str.strWithAsciiLowercased;
 const strWithAsciiUppercased = builtins.str.strWithAsciiUppercased;
 const strFromUtf8Lossy = builtins.str.fromUtf8Lossy;
@@ -211,6 +212,7 @@ pub const BuiltinFn = enum {
     str_static_small_word_caseless_eq,
     str_count_utf8_bytes,
     str_find_first,
+    str_split_at_utf8_byte,
     str_drop_prefix_caseless_ascii,
     str_caseless_ascii_equals,
     str_repeat,
@@ -367,6 +369,7 @@ pub const BuiltinFn = enum {
             .str_static_small_word_caseless_eq => "roc_builtins_str_static_small_word_caseless_eq",
             .str_count_utf8_bytes => "roc_builtins_str_count_utf8_bytes",
             .str_find_first => "roc_builtins_str_find_first",
+            .str_split_at_utf8_byte => "roc_builtins_str_split_at_utf8_byte",
             .str_drop_prefix_caseless_ascii => "roc_builtins_str_drop_prefix_caseless_ascii",
             .str_caseless_ascii_equals => "roc_builtins_str_caseless_ascii_equals",
             .str_repeat => "roc_builtins_str_repeat",
@@ -603,6 +606,17 @@ fn wrapStrStaticSmallWordCaselessEq(a_bytes: ?[*]u8, a_len: usize, a_cap: usize,
 fn wrapStrCountUtf8Bytes(str_bytes: ?[*]u8, str_len: usize, str_cap: usize) callconv(.c) u64 {
     const s = RocStr{ .bytes = str_bytes, .length = str_len, .capacity_or_alloc_ptr = str_cap };
     return strCountUtf8Bytes(s);
+}
+
+fn wrapStrSplitAtUtf8Byte(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, index: u64, split_layout: *const dev_wrappers.StrSplitAtUtf8ByteLayout, roc_ops: *RocOps) callconv(.c) void {
+    const a = RocStr{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
+    const result = strSplitAtUtf8Byte(a, index, roc_ops);
+    const out_bytes: [*]u8 = @ptrCast(out);
+
+    @as(*RocStr, @ptrCast(@alignCast(out_bytes + split_layout.after_offset))).* = result.after;
+    @as(*RocStr, @ptrCast(@alignCast(out_bytes + split_layout.before_offset))).* = result.before;
+    @as(*u8, @ptrCast(@alignCast(out_bytes + split_layout.is_not_char_boundary_offset))).* = if (result.is_not_char_boundary) 1 else 0;
+    @as(*u8, @ptrCast(@alignCast(out_bytes + split_layout.is_out_of_bounds_offset))).* = if (result.is_out_of_bounds) 1 else 0;
 }
 
 fn wrapStrFindFirst(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, find_layout: *const dev_wrappers.StrFindFirstLayout, roc_ops: *RocOps) callconv(.c) void {
@@ -3151,6 +3165,59 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try builder.addLeaArg(frame_ptr, layout_slot);
                     try builder.addRegArg(roc_ops_reg);
                     try self.callBuiltin(&builder, @intFromPtr(&wrapStrFindFirst), .str_find_first);
+
+                    return self.stackLocationForLayout(ll.ret_layout, result_offset);
+                },
+                .str_split_at_utf8_byte => {
+                    if (args.len != 2) unreachable;
+                    const a_loc = try self.emitValueLocal(GuardedList.at(args, 0));
+                    const idx_loc = try self.emitValueLocal(GuardedList.at(args, 1));
+                    const a_off = try self.ensureOnStack(a_loc, roc_str_size);
+                    const idx_off = try self.ensureOnStack(idx_loc, 8);
+                    const roc_ops_reg = self.roc_ops_reg orelse unreachable;
+
+                    const ls = self.layout_store;
+                    const ret_layout_val = ls.getLayout(ll.ret_layout);
+                    if (ret_layout_val.tag != .struct_) {
+                        std.debug.panic("LIR/codegen invariant violated: str_split_at_utf8_byte expected record return layout", .{});
+                    }
+                    const record_idx = ret_layout_val.getStruct().idx;
+                    const record_data = ls.getStructData(record_idx);
+                    const fields = ls.struct_fields.sliceRange(record_data.getFields());
+                    if (fields.len != 4 or
+                        ls.getStructFieldLayoutByOriginalIndex(record_idx, 0) != .str or
+                        ls.getStructFieldLayoutByOriginalIndex(record_idx, 1) != .str or
+                        ls.getStructFieldLayoutByOriginalIndex(record_idx, 2) != .bool or
+                        ls.getStructFieldLayoutByOriginalIndex(record_idx, 3) != .bool)
+                    {
+                        std.debug.panic("LIR/codegen invariant violated: str_split_at_utf8_byte expected fields after Str, before Str, is_not_char_boundary Bool, is_out_of_bounds Bool", .{});
+                    }
+
+                    const record_size = record_data.size.get(ls.targetUsize());
+                    const result_offset = self.codegen.allocStackSlot(record_size);
+                    try self.zeroStackArea(result_offset, record_size);
+
+                    const layout_slot = self.codegen.allocStackSlot(@sizeOf(dev_wrappers.StrSplitAtUtf8ByteLayout));
+                    const layout_reg = try self.allocTempGeneral();
+                    try self.codegen.emitLoadImm(layout_reg, @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 0)));
+                    try self.emitStore(.w32, frame_ptr, layout_slot, layout_reg);
+                    try self.codegen.emitLoadImm(layout_reg, @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 1)));
+                    try self.emitStore(.w32, frame_ptr, layout_slot + 4, layout_reg);
+                    try self.codegen.emitLoadImm(layout_reg, @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 2)));
+                    try self.emitStore(.w32, frame_ptr, layout_slot + 8, layout_reg);
+                    try self.codegen.emitLoadImm(layout_reg, @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 3)));
+                    try self.emitStore(.w32, frame_ptr, layout_slot + 12, layout_reg);
+                    self.codegen.freeGeneral(layout_reg);
+
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    try builder.addLeaArg(frame_ptr, result_offset);
+                    try builder.addMemArg(frame_ptr, a_off);
+                    try builder.addMemArg(frame_ptr, a_off + 16);
+                    try builder.addMemArg(frame_ptr, a_off + 8);
+                    try builder.addMemArg(frame_ptr, idx_off);
+                    try builder.addLeaArg(frame_ptr, layout_slot);
+                    try builder.addRegArg(roc_ops_reg);
+                    try self.callBuiltin(&builder, @intFromPtr(&wrapStrSplitAtUtf8Byte), .str_split_at_utf8_byte);
 
                     return self.stackLocationForLayout(ll.ret_layout, result_offset);
                 },

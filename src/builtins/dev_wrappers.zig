@@ -33,6 +33,14 @@ pub const StrFindFirstLayout = extern struct {
     found_offset: u32,
 };
 
+/// Field offsets for the dev backend's `str_split_at_utf8_byte` result copy.
+pub const StrSplitAtUtf8ByteLayout = extern struct {
+    after_offset: u32,
+    before_offset: u32,
+    is_not_char_boundary_offset: u32,
+    is_out_of_bounds_offset: u32,
+};
+
 /// Field offsets for the dev backend's `Str.drop_prefix_caseless_ascii` result copy.
 pub const StrDropPrefixCaselessAsciiLayout = extern struct {
     after_offset: u32,
@@ -253,6 +261,18 @@ pub fn roc_builtins_str_find_first(out: *anyopaque, a_bytes: ?[*]u8, a_len: usiz
     @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.after_offset))).* = result.after;
     @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.before_offset))).* = result.before;
     @as(*u8, @ptrCast(@alignCast(out_bytes + layout.found_offset))).* = if (result.found) 1 else 0;
+}
+
+/// Wrapper: splitAt(RocStr, u64, *RocOps) -> { before, after, is_not_char_boundary, is_out_of_bounds }
+pub fn roc_builtins_str_split_at_utf8_byte(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, index: u64, layout: *const StrSplitAtUtf8ByteLayout, roc_ops: *RocOps) callconv(.c) void {
+    const a = RocStr{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
+    const result = str.splitAt(a, index, roc_ops);
+    const out_bytes: [*]u8 = @ptrCast(out);
+
+    @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.after_offset))).* = result.after;
+    @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.before_offset))).* = result.before;
+    @as(*u8, @ptrCast(@alignCast(out_bytes + layout.is_not_char_boundary_offset))).* = if (result.is_not_char_boundary) 1 else 0;
+    @as(*u8, @ptrCast(@alignCast(out_bytes + layout.is_out_of_bounds_offset))).* = if (result.is_out_of_bounds) 1 else 0;
 }
 
 /// Wrapper: strDropPrefixCaselessAscii(RocStr, RocStr, *RocOps) -> { after, found }

@@ -271,6 +271,7 @@ pub fn runWasmStrWithStats(
             env_imports.addHostFunction(entry[0], &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, entry[1], null) catch return error.WasmExecFailed;
         }
         env_imports.addHostFunction("roc_str_find_first", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrFindFirst, null) catch return error.WasmExecFailed;
+        env_imports.addHostFunction("roc_str_split_at_utf8_byte", &[_]bytebox.ValType{ .I32, .I64, .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrSplitAtUtf8Byte, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_str_drop_prefix_caseless_ascii", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrDropPrefixCaselessAscii, null) catch return error.WasmExecFailed;
 
         env_imports.addHostFunction("roc_str_caseless_ascii_equals", &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{.I32}, hostStrCaselessAsciiEquals, null) catch return error.WasmExecFailed;
@@ -1591,6 +1592,33 @@ fn hostStrFindFirst(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]
         writeWasmEmptyStr(buffer, result_ptr + after_offset);
         buffer[result_ptr + found_offset] = 0;
     }
+}
+
+fn hostStrSplitAtUtf8Byte(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
+    const buffer = module.store.getMemory(0).buffer();
+    const str = readWasmStr(buffer, @intCast(params[0].I32));
+    const index: usize = @intCast(params[1].I64);
+    const result_ptr: usize = @intCast(params[2].I32);
+    const after_offset: usize = @intCast(params[3].I32);
+    const before_offset: usize = @intCast(params[4].I32);
+    const is_not_char_boundary_offset: usize = @intCast(params[5].I32);
+    const is_out_of_bounds_offset: usize = @intCast(params[6].I32);
+
+    const out_of_bounds = index > str.len;
+    // valid split points are the end of the string or the start of a
+    // character (not a 0b10xxxxxx continuation byte)
+    const not_boundary = !out_of_bounds and index != str.len and (str.data[index] & 0xC0) == 0x80;
+    if (out_of_bounds or not_boundary) {
+        writeWasmEmptyStr(buffer, @intCast(result_ptr + before_offset));
+        writeWasmEmptyStr(buffer, @intCast(result_ptr + after_offset));
+        buffer[result_ptr + is_not_char_boundary_offset] = if (not_boundary) 1 else 0;
+        buffer[result_ptr + is_out_of_bounds_offset] = if (out_of_bounds) 1 else 0;
+        return;
+    }
+    writeWasmStrViewFromStr(buffer, result_ptr + before_offset, str, 0, index);
+    writeWasmStrViewFromStr(buffer, result_ptr + after_offset, str, index, str.len - index);
+    buffer[result_ptr + is_not_char_boundary_offset] = 0;
+    buffer[result_ptr + is_out_of_bounds_offset] = 0;
 }
 
 fn hostStrConcat(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
