@@ -1457,9 +1457,10 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
                 .opaque_without_backing => break :blk true,
                 else => {},
             }
-            // The use payload's backing is a projection of the declaration's
-            // backing TEMPLATE: its formals stand for the args checked above.
-            break :blk try checkedTypeIsConcreteCompileTimeRootInner(.decl_template, checked_types, nominal.backing, active);
+            const backing = checked_types.nominalBackingTemplateForPayload(nominal) orelse break :blk true;
+            // Declaration formals stand for the args checked above, so they
+            // count as concrete while walking the backing template.
+            break :blk try checkedTypeIsConcreteCompileTimeRootInner(.decl_template, checked_types, backing, active);
         },
         // A function scheme is a concrete compile-time root exactly when its
         // args and return contain no identity variables; the recursion returns
@@ -2075,7 +2076,8 @@ const PlatformRelationSubstitutionCollector = struct {
                 if (platform_nominal.is_opaque) {
                     checkedArtifactInvariant("platform relation substitution expected nominal-compatible resolved payload", .{});
                 }
-                return try self.collect(platform_nominal.backing, resolved_root, context);
+                const platform_backing = try self.nominalBacking(platform_nominal);
+                return try self.collect(platform_backing, resolved_root, context);
             },
         };
         if (platform_nominal.name != resolved_nominal.name or
@@ -2090,7 +2092,21 @@ const PlatformRelationSubstitutionCollector = struct {
         }
         try self.collectSlices(platform_nominal.args, resolved_nominal.args);
         try self.collectSlices(platform_nominal.padding_field_types, resolved_nominal.padding_field_types);
-        return try self.collect(platform_nominal.backing, resolved_nominal.backing, .value);
+        if (platform_nominal.is_opaque) return;
+        const platform_backing = try self.nominalBacking(platform_nominal);
+        const resolved_backing = try self.nominalBacking(resolved_nominal);
+        return try self.collect(platform_backing, resolved_backing, .value);
+    }
+
+    fn nominalBacking(
+        self: *PlatformRelationSubstitutionCollector,
+        nominal: CheckedNominalType,
+    ) Allocator.Error!CheckedTypeId {
+        return (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+            self.allocator,
+            self.names,
+            nominal,
+        )) orelse checkedArtifactInvariant("platform relation substitution opened a nominal without backing", .{});
     }
 
     fn collectRecord(
@@ -2860,7 +2876,6 @@ pub const CheckedNominalType = struct {
     source_decl: ?u32 = null,
     builtin: ?CheckedBuiltinNominal = null,
     is_opaque: bool,
-    backing: CheckedTypeId,
     representation: CheckedNominalRepresentationRef,
     args: []const CheckedTypeId = &.{},
     /// Resolved types of the declaration's unnamed (`_` / `_name`) fields, in
@@ -2869,6 +2884,53 @@ pub const CheckedNominalType = struct {
     /// a nominal with no unnamed fields.
     padding_field_types: []const CheckedTypeId = &.{},
 };
+
+fn checkedNominalTypeKey(nominal: CheckedNominalType) canonical.NominalTypeKey {
+    return .{
+        .module = nominal.origin_module,
+        .type_name = nominal.name,
+        .source_decl = nominal.source_decl,
+    };
+}
+
+fn instantiatedNominalBackingForPayload(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    nominal: CheckedNominalType,
+    comptime context: []const u8,
+) Allocator.Error!CheckedTypeId {
+    return (try store.ensureInstantiatedNominalBackingRootForPayload(
+        allocator,
+        names,
+        nominal,
+    )) orelse checkedArtifactInvariant(context ++ " opened a nominal without backing", .{});
+}
+
+fn builtinNominalHasDeclarationBacking(builtin_nominal: CheckedBuiltinNominal) bool {
+    return switch (builtinRuntimeEncoding(builtin_nominal)) {
+        .primitive,
+        .list,
+        .box,
+        .dict,
+        .set,
+        .parse_tag_union_spec,
+        .fields,
+        .field,
+        => false,
+        .bool_tag_union,
+        .crypto_sha256_digest,
+        .crypto_sha256_hasher,
+        .crypto_blake3_digest,
+        .crypto_blake3_hasher,
+        => true,
+    };
+}
+
+test "checked nominal payloads do not carry instantiated backing roots" {
+    try std.testing.expect(!@hasField(CheckedNominalType, "backing"));
+    try std.testing.expect(!@hasField(StoredNominal, "backing"));
+}
 
 /// Public `CheckedTypePayload` declaration (read form).
 ///
@@ -2942,7 +3004,6 @@ pub const StoredNominal = struct {
     source_decl: ?u32 = null,
     builtin: ?CheckedBuiltinNominal = null,
     is_opaque: bool,
-    backing: CheckedTypeId,
     representation: CheckedNominalRepresentationRef,
     args: CheckedTypeRange = .{},
     padding_field_types: CheckedTypeRange = .{},
@@ -3032,7 +3093,6 @@ fn reconstructCheckedTypePayload(pool_owner: anytype, stored: StoredCheckedTypeP
             .source_decl = n.source_decl,
             .builtin = n.builtin,
             .is_opaque = n.is_opaque,
-            .backing = n.backing,
             .representation = n.representation,
             .args = pool_owner.typeIdPool()[n.args.start .. n.args.start + n.args.len],
             .padding_field_types = pool_owner.typeIdPool()[n.padding_field_types.start .. n.padding_field_types.start + n.padding_field_types.len],
@@ -3177,19 +3237,6 @@ pub const CheckedTypeStoreView = struct {
         return null;
     }
 
-    pub fn nominalDeclarationBySource(
-        self: CheckedTypeStoreView,
-        module_name: canonical.ModuleNameId,
-        type_name: canonical.TypeNameId,
-        source_decl: ?u32,
-    ) ?CheckedNominalDeclaration {
-        return self.nominalDeclaration(.{
-            .module_name = module_name,
-            .type_name = type_name,
-            .source_decl = source_decl,
-        });
-    }
-
     pub fn nominalDeclarationById(
         self: CheckedTypeStoreView,
         id: CheckedNominalDeclarationId,
@@ -3203,6 +3250,27 @@ pub const CheckedTypeStoreView = struct {
             checkedArtifactInvariant("checked nominal declaration id disagrees with declaration slot", .{});
         }
         return declaration;
+    }
+
+    pub fn nominalDeclarationForPayload(
+        self: CheckedTypeStoreView,
+        nominal: CheckedNominalType,
+    ) ?CheckedNominalDeclaration {
+        return self.nominalDeclaration(checkedNominalTypeKey(nominal));
+    }
+
+    pub fn nominalBackingTemplateForPayload(
+        self: CheckedTypeStoreView,
+        nominal: CheckedNominalType,
+    ) ?CheckedTypeId {
+        if (nominal.representation == .opaque_without_backing) return null;
+        if (nominal.builtin) |builtin_nominal| {
+            if (!builtinNominalHasDeclarationBacking(builtin_nominal)) return null;
+        }
+        const declaration = self.nominalDeclarationForPayload(nominal) orelse {
+            checkedArtifactInvariant("checked nominal payload referenced a missing nominal declaration", .{});
+        };
+        return declaration.backing;
     }
 };
 
@@ -3314,7 +3382,7 @@ fn checkedTypeViewResolvedPayload(
         }
         switch (view.payload(@enumFromInt(index))) {
             .alias => |alias| current = alias.backing,
-            .nominal => |nominal| current = nominal.backing,
+            .nominal => |nominal| current = view.nominalBackingTemplateForPayload(nominal) orelse return null,
             .pending => checkedArtifactInvariant("checked type source child lookup reached a pending payload", .{}),
             else => |payload| return .{
                 .root = current,
@@ -3352,7 +3420,8 @@ fn checkedTypeViewIsConcreteConstProducerSchemeInner(
         .nominal => |nominal| blk: {
             if (!try checkedTypeViewSpanIsConcreteConstProducerScheme(checked_types, nominal.args, active)) break :blk false;
             if (nominal.builtin != null) break :blk true;
-            break :blk try checkedTypeViewIsConcreteConstProducerSchemeInner(checked_types, nominal.backing, active);
+            const backing = checked_types.nominalBackingTemplateForPayload(nominal) orelse break :blk true;
+            break :blk try checkedTypeViewIsConcreteConstProducerSchemeInner(checked_types, backing, active);
         },
         // Concrete exactly when args and return carry no undefaulted identity
         // variables; the recursion decides that, so no separate flag is needed.
@@ -3659,7 +3728,6 @@ pub const CheckedTypeStore = struct {
                     .source_decl = n.source_decl,
                     .builtin = n.builtin,
                     .is_opaque = n.is_opaque,
-                    .backing = n.backing,
                     .representation = n.representation,
                     .args = args,
                     .padding_field_types = padding_field_types,
@@ -4004,6 +4072,43 @@ pub const CheckedTypeStore = struct {
         return self.view().nominalDeclarationById(id);
     }
 
+    pub fn nominalDeclarationForPayload(
+        self: *const CheckedTypeStore,
+        nominal: CheckedNominalType,
+    ) ?CheckedNominalDeclaration {
+        return self.nominalDeclaration(checkedNominalTypeKey(nominal));
+    }
+
+    pub fn nominalBackingTemplateForPayload(
+        self: *const CheckedTypeStore,
+        nominal: CheckedNominalType,
+    ) ?CheckedTypeId {
+        if (nominal.representation == .opaque_without_backing) return null;
+        if (nominal.builtin) |builtin_nominal| {
+            if (!builtinNominalHasDeclarationBacking(builtin_nominal)) return null;
+        }
+        const declaration = self.nominalDeclarationForPayload(nominal) orelse {
+            checkedArtifactInvariant("checked nominal payload referenced a missing nominal declaration", .{});
+        };
+        return declaration.backing;
+    }
+
+    pub fn ensureInstantiatedNominalBackingRootForPayload(
+        self: *CheckedTypeStore,
+        allocator: Allocator,
+        names: *const canonical.CanonicalNameStore,
+        nominal: CheckedNominalType,
+    ) Allocator.Error!?CheckedTypeId {
+        if (nominal.representation == .opaque_without_backing) return null;
+        if (nominal.builtin) |builtin_nominal| {
+            if (!builtinNominalHasDeclarationBacking(builtin_nominal)) return null;
+        }
+        const declaration = self.nominalDeclarationForPayload(nominal) orelse {
+            checkedArtifactInvariant("checked nominal payload referenced a missing nominal declaration", .{});
+        };
+        return try self.ensureInstantiatedNominalBackingRoot(allocator, names, declaration, nominal.args);
+    }
+
     pub fn ensureInstantiatedNominalBackingRoot(
         self: *CheckedTypeStore,
         allocator: Allocator,
@@ -4241,7 +4346,6 @@ pub const CheckedTypeStore = struct {
                 .source_decl = n.source_decl,
                 .builtin = n.builtin,
                 .is_opaque = n.is_opaque,
-                .backing = n.backing,
                 .representation = n.representation,
                 .args = try allocator.dupe(CheckedTypeId, n.args),
                 .padding_field_types = try allocator.dupe(CheckedTypeId, n.padding_field_types),
@@ -4317,7 +4421,6 @@ pub const CheckedTypeStore = struct {
                 .source_decl = nominal.source_decl,
                 .builtin = nominal.builtin,
                 .is_opaque = nominal.is_opaque,
-                .backing = try self.cloneCheckedTypeRootSubstituting(allocator, names, nominal.backing, formals, actuals, active),
                 .representation = nominal.representation,
                 .args = try self.cloneCheckedTypeIdSliceSubstituting(allocator, names, nominal.args, formals, actuals, active),
                 .padding_field_types = try self.cloneCheckedTypeIdSliceSubstituting(allocator, names, nominal.padding_field_types, formals, actuals, active),
@@ -4715,7 +4818,6 @@ fn appendCheckedNominalDeclarationFromStatement(
         .source_decl = @intFromEnum(statement_idx),
         .builtin = statement_nominal.builtin,
         .is_opaque = statement_nominal.is_opaque,
-        .backing = backing,
         .representation = if (statement_nominal.builtin) |builtin_id|
             .{ .builtin = builtin_id }
         else
@@ -4732,7 +4834,7 @@ fn appendCheckedNominalDeclarationFromStatement(
         store,
         nominal_payload,
     );
-    try appendCheckedNominalDeclarationFromPayload(allocator, store, declaration_root, declared_record_fields);
+    try appendCheckedNominalDeclarationFromPayload(allocator, store, declaration_root, backing, declared_record_fields);
 }
 
 const DeclarationFormal = struct {
@@ -5040,14 +5142,6 @@ fn appendInstantiatedNamedApplicationFromTemplate(
 
             var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
             defer active.deinit();
-            const backing = try store.cloneCheckedTypeRootSubstituting(
-                allocator,
-                names,
-                nominal.backing,
-                formals,
-                actual_args,
-                &active,
-            );
             const padding_field_types = try store.cloneCheckedTypeIdSliceSubstituting(
                 allocator,
                 names,
@@ -5068,7 +5162,6 @@ fn appendInstantiatedNamedApplicationFromTemplate(
                 .source_decl = nominal.source_decl,
                 .builtin = nominal.builtin,
                 .is_opaque = nominal.is_opaque,
-                .backing = backing,
                 .representation = nominal.representation,
                 .args = payload_args,
                 .padding_field_types = padding_field_types,
@@ -5425,7 +5518,7 @@ fn appendNominalDeclarationRootPayload(
             checkedArtifactInvariant("nominal declaration key collided with a different nominal payload", .{});
         }
 
-        if (existing_nominal.backing == nominal.backing and existing_nominal.builtin == nominal.builtin) {
+        if (existing_nominal.builtin == nominal.builtin) {
             deinitCheckedTypePayloadBuild(allocator, &owned_payload);
             payload_owned = false;
             return existing;
@@ -5475,6 +5568,7 @@ fn appendCheckedNominalDeclarationFromPayload(
     allocator: Allocator,
     store: *CheckedTypeStore,
     root: CheckedTypeId,
+    backing: CheckedTypeId,
     declared_record_fields: []const CheckedNominalRecordField,
 ) Allocator.Error!void {
     const declarations = &store.nominal_declarations;
@@ -5494,7 +5588,7 @@ fn appendCheckedNominalDeclarationFromPayload(
     };
     for (declarations.items) |existing| {
         if (canonicalNominalTypeKeyEql(existing.nominal, nominal_key)) {
-            if (existing.backing == nominal.backing and
+            if (existing.backing == backing and
                 checkedTypeIdSliceEql(existing.formalArgs(store), nominal.args) and
                 checkedTypeIdSliceEql(existing.paddingFieldTypes(store), nominal.padding_field_types) and
                 checkedNominalRecordFieldSliceEql(existing.declaredRecordFields(store), declared_record_fields))
@@ -5520,7 +5614,7 @@ fn appendCheckedNominalDeclarationFromPayload(
         .source_statement = nominal.source_decl orelse
             checkedArtifactInvariant("checked nominal declaration payload had no source declaration", .{}),
         .declaration_root = root,
-        .backing = nominal.backing,
+        .backing = backing,
         .fa_start = fa.start,
         .fa_len = fa.len,
         .pf_start = pf.start,
@@ -5620,7 +5714,8 @@ fn embedOneImportedNominalDecl(
     };
     defer if (local_fields.len != 0) allocator.free(local_fields);
 
-    try appendCheckedNominalDeclarationFromPayload(allocator, store, local_root, local_fields);
+    const local_backing = try projector.project(owner_decl.backing);
+    try appendCheckedNominalDeclarationFromPayload(allocator, store, local_root, local_backing, local_fields);
 }
 
 /// Ensure the artifact's declaration table holds a copy of every IMPORTED
@@ -6501,38 +6596,6 @@ fn copyCheckedFlatType(
         },
         .nominal_type => |nominal| blk: {
             const builtin_nominal = categorizeBuiltinNominal(module, imports, nominal);
-            // The application carries no backing; the use payload's `backing`
-            // is a projection of the DECLARATION's backing template (formals
-            // appear as rigid type variables). Each use projects the template
-            // into a PRIVATE id space (see `template_use_active`): the ids
-            // feed Monotype instantiation graphs that bind them to the use's
-            // monos, so they must not be shared across uses.
-            const backing_id: CheckedTypeId = backing_blk: {
-                const type_store = module.typeStoreConst();
-                if (type_store.lookupNominalDecl(nominal)) |decl_idx| {
-                    const decl = type_store.getNominalDecl(decl_idx);
-                    if (decl.isValid()) {
-                        if (store.template_use_active) |use_active| {
-                            // Nested/mutual template reference inside the
-                            // same use: stay in its private id space (its
-                            // in-progress entries close recursive cycles).
-                            break :backing_blk try appendCheckedTypeRoot(allocator, module, names, imports, store, use_active, decl.backing);
-                        }
-                        var use_active = std.AutoHashMap(Var, CheckedTypeId).init(allocator);
-                        defer use_active.deinit();
-                        store.template_use_active = &use_active;
-                        defer store.template_use_active = null;
-                        break :backing_blk try appendCheckedTypeRoot(allocator, module, names, imports, store, &use_active, decl.backing);
-                    }
-                }
-                // Applications of invalid/unresolvable declarations are
-                // poisoned to err during checking, and erroneous modules never
-                // publish artifacts (same contract as the `.err` arm below).
-                if (builtin.mode == .Debug) {
-                    std.debug.panic("checked artifact invariant violated: nominal application without a valid declaration reached artifact publication", .{});
-                }
-                unreachable;
-            };
             break :blk .{
                 .nominal = .{
                     .name = try names.internTypeIdent(module.identStoreConst(), nominal.ident.ident_idx),
@@ -6541,7 +6604,6 @@ fn copyCheckedFlatType(
                     .source_decl = nominal.sourceDeclOptional(),
                     .builtin = builtin_nominal,
                     .is_opaque = nominal.isOpaque(),
-                    .backing = backing_id,
                     .representation = try checkedNominalRepresentationForSourceNominal(module, names, imports, nominal, builtin_nominal),
                     .args = try copyCheckedTypeRange(allocator, module, names, imports, store, active, module.typeStoreConst().sliceNominalArgs(nominal)),
                     // Padding lives on the nominal declaration (built from its source
@@ -16073,11 +16135,16 @@ fn collectResolvedDispatchTargetSubstitutions(
                 .nominal => |nominal| nominal,
                 else => {
                     if (!target_nominal.is_opaque) {
+                        const target_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
+                            allocator,
+                            names,
+                            target_nominal,
+                        )) orelse return;
                         try collectResolvedDispatchTargetSubstitutions(
                             allocator,
                             names,
                             store,
-                            target_nominal.backing,
+                            target_backing,
                             plan,
                             formals,
                             actuals,
@@ -16111,12 +16178,22 @@ fn collectResolvedDispatchTargetSubstitutions(
                 );
             }
             if (!target_nominal.is_opaque) {
+                const target_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
+                    allocator,
+                    names,
+                    target_nominal,
+                )) orelse return;
+                const plan_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
+                    allocator,
+                    names,
+                    plan_nominal,
+                )) orelse return;
                 try collectResolvedDispatchTargetSubstitutions(
                     allocator,
                     names,
                     store,
-                    target_nominal.backing,
-                    plan_nominal.backing,
+                    target_backing,
+                    plan_backing,
                     formals,
                     actuals,
                     active,
@@ -16373,11 +16450,16 @@ fn collectDispatchPlanIdentitySubstitutions(
                 .nominal => |nominal| nominal,
                 else => {
                     if (!target_nominal.is_opaque) {
+                        const target_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
+                            allocator,
+                            names,
+                            target_nominal,
+                        )) orelse return;
                         try collectDispatchPlanIdentitySubstitutions(
                             allocator,
                             names,
                             store,
-                            target_nominal.backing,
+                            target_backing,
                             plan,
                             formals,
                             actuals,
@@ -16409,12 +16491,22 @@ fn collectDispatchPlanIdentitySubstitutions(
                 );
             }
             if (!target_nominal.is_opaque) {
+                const target_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
+                    allocator,
+                    names,
+                    target_nominal,
+                )) orelse return;
+                const plan_backing = (try store.ensureInstantiatedNominalBackingRootForPayload(
+                    allocator,
+                    names,
+                    plan_nominal,
+                )) orelse return;
                 try collectDispatchPlanIdentitySubstitutions(
                     allocator,
                     names,
                     store,
-                    target_nominal.backing,
-                    plan_nominal.backing,
+                    target_backing,
+                    plan_backing,
                     formals,
                     actuals,
                     active,
@@ -16965,7 +17057,7 @@ fn platformRequirementTypesCompatible(
     defer app_projector.deinit();
     const scratch_actual = try app_projector.project(actual);
 
-    var checker = PlatformRequirementTypeCompatibilityChecker.init(allocator, &scratch_store);
+    var checker = PlatformRequirementTypeCompatibilityChecker.init(allocator, &scratch_names, &scratch_store);
     defer checker.deinit();
     return try checker.compatible(scratch_expected, scratch_actual);
 }
@@ -16977,15 +17069,18 @@ const PlatformRequirementTypePair = struct {
 
 const PlatformRequirementTypeCompatibilityChecker = struct {
     allocator: Allocator,
-    store: *const CheckedTypeStore,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
     active: std.AutoHashMap(PlatformRequirementTypePair, void),
 
     fn init(
         allocator: Allocator,
-        store: *const CheckedTypeStore,
+        names: *const canonical.CanonicalNameStore,
+        store: *CheckedTypeStore,
     ) PlatformRequirementTypeCompatibilityChecker {
         return .{
             .allocator = allocator,
+            .names = names,
             .store = store,
             .active = std.AutoHashMap(PlatformRequirementTypePair, void).init(allocator),
         };
@@ -17149,7 +17244,8 @@ const PlatformRequirementTypeCompatibilityChecker = struct {
             .nominal => |nominal| nominal,
             else => {
                 if (expected_nominal.is_opaque) return false;
-                return try self.compatible(expected_nominal.backing, actual);
+                const expected_backing = try self.nominalBacking(expected_nominal);
+                return try self.compatible(expected_backing, actual);
             },
         };
         if (expected_nominal.name != actual_nominal.name) return false;
@@ -17163,11 +17259,24 @@ const PlatformRequirementTypeCompatibilityChecker = struct {
             if (!try self.compatible(expected_arg, actual_arg)) return false;
         }
         if (expected_nominal.is_opaque) return true;
-        if (try self.compatible(expected_nominal.backing, actual_nominal.backing)) return true;
+        const expected_backing = try self.nominalBacking(expected_nominal);
+        const actual_backing = try self.nominalBacking(actual_nominal);
+        if (try self.compatible(expected_backing, actual_backing)) return true;
         return canonicalTypeKeyEql(
             self.store.roots.items[@intFromEnum(expected)].key,
             self.store.roots.items[@intFromEnum(actual)].key,
         );
+    }
+
+    fn nominalBacking(
+        self: *PlatformRequirementTypeCompatibilityChecker,
+        nominal: CheckedNominalType,
+    ) Allocator.Error!CheckedTypeId {
+        return (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+            self.allocator,
+            self.names,
+            nominal,
+        )) orelse checkedArtifactInvariant("platform requirement compatibility opened a nominal without backing", .{});
     }
 
     fn compatibleRecord(
@@ -17611,7 +17720,8 @@ const PlatformAppRelationTypeResolver = struct {
                     if (platform_nominal.is_opaque) {
                         checkedArtifactInvariant("platform/app relation expected nominal-compatible app payload", .{});
                     }
-                    return try self.merge(platform_nominal.backing, app_root, .value);
+                    const platform_backing = try self.nominalBacking(platform_nominal);
+                    return try self.merge(platform_backing, app_root, .value);
                 },
             },
             else => {},
@@ -17934,7 +18044,6 @@ const PlatformAppRelationTypeResolver = struct {
                 errdefer self.allocator.free(args);
                 const padding_field_types = try self.finalizeRootSlice(nominal.padding_field_types);
                 errdefer self.allocator.free(padding_field_types);
-                const backing = try self.finalize(nominal.backing, .value);
                 break :blk .{ .nominal = .{
                     .name = nominal.name,
                     .origin_module = nominal.origin_module,
@@ -17942,7 +18051,6 @@ const PlatformAppRelationTypeResolver = struct {
                     .source_decl = nominal.source_decl,
                     .builtin = nominal.builtin,
                     .is_opaque = nominal.is_opaque,
-                    .backing = backing,
                     .representation = nominal.representation,
                     .args = args,
                     .padding_field_types = padding_field_types,
@@ -17998,7 +18106,6 @@ const PlatformAppRelationTypeResolver = struct {
         errdefer self.allocator.free(args);
         const padding_field_types = try self.mergeRootSlices(platform_nominal.padding_field_types, app_nominal.padding_field_types);
         errdefer self.allocator.free(padding_field_types);
-        const backing = try self.merge(platform_nominal.backing, app_nominal.backing, .value);
         return .{ .nominal = .{
             .name = platform_nominal.name,
             .origin_module = platform_nominal.origin_module,
@@ -18006,7 +18113,6 @@ const PlatformAppRelationTypeResolver = struct {
             .source_decl = platform_nominal.source_decl,
             .builtin = platform_nominal.builtin,
             .is_opaque = platform_nominal.is_opaque,
-            .backing = backing,
             .representation = platform_nominal.representation,
             .args = args,
             .padding_field_types = padding_field_types,
@@ -18396,6 +18502,17 @@ const PlatformAppRelationTypeResolver = struct {
         }
         return self.store.payload(@enumFromInt(index));
     }
+
+    fn nominalBacking(
+        self: *PlatformAppRelationTypeResolver,
+        nominal: CheckedNominalType,
+    ) Allocator.Error!CheckedTypeId {
+        return (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+            self.allocator,
+            self.names,
+            nominal,
+        )) orelse checkedArtifactInvariant("platform/app relation opened a nominal without backing", .{});
+    }
 };
 
 const PlatformAppRelationIdentityScan = struct {
@@ -18431,7 +18548,7 @@ const PlatformAppRelationIdentityScan = struct {
 fn platformAppRelationMergeResultKey(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
+    store: *CheckedTypeStore,
     platform_root: CheckedTypeId,
     app_root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
@@ -18446,7 +18563,7 @@ fn platformAppRelationMergeResultKey(
 fn platformAppRelationFinalizeResultKey(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
+    store: *CheckedTypeStore,
     root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
     substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
@@ -18460,7 +18577,7 @@ fn platformAppRelationFinalizeResultKey(
 fn platformAppRelationMergeResultIsEmptyRecord(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
+    store: *CheckedTypeStore,
     platform_root: CheckedTypeId,
     app_root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
@@ -18474,7 +18591,7 @@ fn platformAppRelationMergeResultIsEmptyRecord(
 fn platformAppRelationMergeResultIsEmptyTagUnion(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
+    store: *CheckedTypeStore,
     platform_root: CheckedTypeId,
     app_root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
@@ -18488,7 +18605,7 @@ fn platformAppRelationMergeResultIsEmptyTagUnion(
 fn platformAppRelationFinalizeResultIsEmptyRecord(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
+    store: *CheckedTypeStore,
     root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
     substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
@@ -18501,7 +18618,7 @@ fn platformAppRelationFinalizeResultIsEmptyRecord(
 fn platformAppRelationFinalizeResultIsEmptyTagUnion(
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
+    store: *CheckedTypeStore,
     root: CheckedTypeId,
     context: PlatformAppRelationMergeContext,
     substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
@@ -18514,7 +18631,7 @@ fn platformAppRelationFinalizeResultIsEmptyTagUnion(
 const PlatformAppRelationTypeDigestBuilder = struct {
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
+    store: *CheckedTypeStore,
     hasher: std.crypto.hash.sha2.Sha256,
     source_active: std.AutoHashMap(CheckedTypeId, u32),
     finalizing: std.AutoHashMap(PlatformAppRelationFinalizeInput, u32),
@@ -18548,7 +18665,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     fn init(
         allocator: Allocator,
         names: *const canonical.CanonicalNameStore,
-        store: *const CheckedTypeStore,
+        store: *CheckedTypeStore,
         substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
     ) PlatformAppRelationTypeDigestBuilder {
         return .{
@@ -18586,6 +18703,17 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     fn substitution(self: *const PlatformAppRelationTypeDigestBuilder, root: CheckedTypeId) ?CheckedTypeId {
         const substitutions = self.substitutions orelse return null;
         return substitutions.get(root);
+    }
+
+    fn nominalBacking(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        nominal: CheckedNominalType,
+    ) Allocator.Error!CheckedTypeId {
+        return (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+            self.allocator,
+            self.names,
+            nominal,
+        )) orelse checkedArtifactInvariant("platform/app relation digest opened a nominal without backing", .{});
     }
 
     fn writeMerge(
@@ -18635,7 +18763,8 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                     if (platform_nominal.is_opaque) {
                         checkedArtifactInvariant("platform/app relation digest expected nominal-compatible app payload", .{});
                     }
-                    return try self.writeMerge(platform_nominal.backing, app_root, .value);
+                    const platform_backing = try self.nominalBacking(platform_nominal);
+                    return try self.writeMerge(platform_backing, app_root, .value);
                 },
             },
             else => {},
@@ -19467,7 +19596,8 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                 .alias => unreachable,
                 else => {
                     if (platform_nominal.is_opaque) return false;
-                    return try self.mergeIsEmptyRecord(platform_nominal.backing, app_root, .value);
+                    const platform_backing = try self.nominalBacking(platform_nominal);
+                    return try self.mergeIsEmptyRecord(platform_backing, app_root, .value);
                 },
             },
             .record, .record_unbound => {},
@@ -19751,7 +19881,8 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                     if (platform_nominal.is_opaque) {
                         checkedArtifactInvariant("platform/app relation digest identity scan expected nominal-compatible app payload", .{});
                     }
-                    return try self.mergeContainsIdentityVariables(platform_nominal.backing, app_root, .value);
+                    const platform_backing = try self.nominalBacking(platform_nominal);
+                    return try self.mergeContainsIdentityVariables(platform_backing, app_root, .value);
                 },
             },
             else => {},
@@ -20707,7 +20838,6 @@ fn appendRecursiveNominalTestType(
         .source_decl = source_decl,
         .builtin = null,
         .is_opaque = false,
-        .backing = backing_root,
         .representation = .{ .local_declaration = declaration_id },
         .args = nominal_args,
     } });
@@ -20720,7 +20850,7 @@ fn appendRecursiveNominalTestType(
     store.roots.items[@intFromEnum(nominal_root)].key = nominal_key;
     try store.ensureSyntheticSchemeForRoot(allocator, nominal_root, nominal_key);
     if (should_append_declaration) {
-        try appendCheckedNominalDeclarationFromPayload(allocator, store, nominal_root, &.{});
+        try appendCheckedNominalDeclarationFromPayload(allocator, store, nominal_root, backing_root, &.{});
     }
 
     return .{ .nominal = nominal_root, .backing = backing_root };
@@ -20827,7 +20957,8 @@ fn checkedTypeHasNoReachableCallableSlotsInner(
                     },
                 }
             }
-            break :blk try checkedTypeHasNoReachableCallableSlotsInner(checked_types, nominal.backing, active);
+            const backing = checked_types.nominalBackingTemplateForPayload(nominal) orelse break :blk true;
+            break :blk try checkedTypeHasNoReachableCallableSlotsInner(checked_types, backing, active);
         },
         .record => |record| blk: {
             if (!try checkedRecordHasNoReachableCallableSlots(checked_types, record.fields, active)) break :blk false;
@@ -23362,7 +23493,9 @@ fn appendPublicApiTypeDependencies(
                 keys,
                 type_owner_keys,
             );
-            try appendPublicApiTypeDependencies(allocator, names, module_identity, artifact_key, checked_types, nominal.backing, active, imports, available_artifacts, keys, type_owner_keys);
+            if (checked_types.nominalBackingTemplateForPayload(nominal)) |backing| {
+                try appendPublicApiTypeDependencies(allocator, names, module_identity, artifact_key, checked_types, backing, active, imports, available_artifacts, keys, type_owner_keys);
+            }
             try appendPublicApiTypeDependencyRange(allocator, names, module_identity, artifact_key, checked_types, nominal.args, active, imports, available_artifacts, keys, type_owner_keys);
         },
         .record => |record| {
@@ -23879,7 +24012,9 @@ const LoweringVisibilityBuilder = struct {
             },
             .nominal => |nominal| {
                 try self.appendKey(nominal.owner_module);
-                try self.appendTypeRoot(artifact, nominal.backing);
+                if (store.nominalBackingTemplateForPayload(nominal)) |backing| {
+                    try self.appendTypeRoot(artifact, backing);
+                }
                 try self.appendTypeRoots(artifact, nominal.args);
                 try self.appendTypeRoots(artifact, nominal.padding_field_types);
             },
@@ -25869,7 +26004,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 15;
+    const serialized_layout_version: u32 = 16;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -26721,7 +26856,7 @@ pub const CheckedTypeProjector = struct {
             .builtin,
             .local_declaration,
             .imported_declaration,
-            => nominal.backing,
+            => self.target.checked_types.nominalBackingTemplateForPayload(nominal),
             .local_box_payload_capability => |capability| self.target.interface_capabilities.boxPayloadCapability(capability.capability).backing_ty,
             .imported_box_payload_capability,
             .opaque_without_backing,
@@ -26823,7 +26958,6 @@ pub const CheckedTypeProjector = struct {
                 .source_decl = nominal.source_decl,
                 .builtin = nominal.builtin,
                 .is_opaque = nominal.is_opaque,
-                .backing = try self.projectCheckedTypeViewRootInner(source, source_names, nominal.backing, active),
                 .representation = remapViewNominalRepresentation(nominal.representation),
                 .args = try self.projectCheckedTypeViewIds(source, source_names, nominal.args, active),
                 .padding_field_types = try self.projectCheckedTypeViewIds(source, source_names, nominal.padding_field_types, active),
@@ -27167,7 +27301,6 @@ pub const CheckedTypeProjector = struct {
             .source_decl = nominal.source_decl,
             .builtin = nominal.builtin,
             .is_opaque = nominal.is_opaque,
-            .backing = try self.projectImportedCheckedType(imported, nominal.backing),
             .representation = try self.remapImportedNominalRepresentation(imported, nominal),
             .args = args,
             .padding_field_types = padding_field_types,
@@ -27384,7 +27517,6 @@ const CheckedTypeStoreImportProjector = struct {
                 .source_decl = nominal.source_decl,
                 .builtin = nominal.builtin,
                 .is_opaque = nominal.is_opaque,
-                .backing = try self.project(nominal.backing),
                 .representation = try self.remapNominalRepresentation(nominal),
                 .args = try self.projectIds(nominal.args),
                 .padding_field_types = try self.projectIds(nominal.padding_field_types),
@@ -29962,8 +30094,7 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
         .source_decl = 16,
         .builtin = null,
         .is_opaque = true,
-        .backing = c,
-        .representation = .opaque_without_backing,
+        .representation = .{ .local_declaration = @enumFromInt(0) },
         .args = nominal_args,
         .padding_field_types = nominal_padding,
     } });
@@ -29980,18 +30111,18 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
         .gv_len = gv.len,
     });
 
-    // A nominal declaration with formal args [b], padding fields [a], and a
+    // A nominal declaration with formal args [c], backing c, padding fields [a], and a
     // declared record sequence [{field}, {_ : a}].
-    const fa = try store.appendTypeIds(gpa, &.{b});
+    const fa = try store.appendTypeIds(gpa, &.{c});
     const pf = try store.appendTypeIds(gpa, &.{a});
     const field_name: canonical.RecordFieldLabelId = @enumFromInt(4);
     const rf = try store.appendNominalRecordFields(gpa, &.{ .{ .named = field_name }, .{ .padding = a } });
     try store.nominal_declarations.append(gpa, .{
         .id = @enumFromInt(@as(u32, @intCast(store.nominal_declarations.items.len))),
-        .nominal = .{ .module = @enumFromInt(3), .type_name = @enumFromInt(2), .source_decl = null },
-        .source_statement = 0,
-        .declaration_root = b,
-        .backing = a,
+        .nominal = .{ .module = @as(canonical.ModuleIdentityId, @enumFromInt(15)), .type_name = @as(canonical.TypeNameId, @enumFromInt(14)), .source_decl = 16 },
+        .source_statement = 16,
+        .declaration_root = d,
+        .backing = c,
         .fa_start = fa.start,
         .fa_len = fa.len,
         .pf_start = pf.start,
@@ -30041,11 +30172,11 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     try std.testing.expectEqual(@as(canonical.ModuleIdentityId, @enumFromInt(15)), nominal.origin_module);
     try std.testing.expectEqualSlices(CheckedTypeId, &.{c}, nominal.args);
     try std.testing.expectEqualSlices(CheckedTypeId, &.{a}, nominal.padding_field_types);
-    try std.testing.expectEqual(c, nominal.backing);
 
     // Scheme generalized vars + decl formal args.
     try std.testing.expectEqualSlices(CheckedTypeId, &.{ a, b }, loaded.schemes.items[0].generalizedVars(&loaded));
-    try std.testing.expectEqualSlices(CheckedTypeId, &.{b}, loaded.nominal_declarations.items[0].formalArgs(&loaded));
+    try std.testing.expectEqualSlices(CheckedTypeId, &.{c}, loaded.nominal_declarations.items[0].formalArgs(&loaded));
+    try std.testing.expectEqual(c, loaded.nominal_declarations.items[0].backing);
     try std.testing.expectEqualSlices(CheckedTypeId, &.{a}, loaded.nominal_declarations.items[0].paddingFieldTypes(&loaded));
     const declared_fields = loaded.nominal_declarations.items[0].declaredRecordFields(&loaded);
     try std.testing.expectEqual(@as(usize, 2), declared_fields.len);
@@ -30338,8 +30469,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xC0, 0xD4, 0xD8, 0x78, 0xAC, 0x02, 0x3F, 0xFD, 0xD1, 0xA4, 0xBA, 0x9D, 0x93, 0x05, 0xFC, 0xEF,
-        0xF5, 0xEE, 0x10, 0xAD, 0x69, 0x61, 0x4B, 0x38, 0xB4, 0xF1, 0x17, 0x23, 0x9F, 0xCA, 0x51, 0xBB,
+        0x17, 0x49, 0xD3, 0xE8, 0xB4, 0x14, 0xB4, 0x4E, 0xBA, 0x3F, 0x83, 0x56, 0x1A, 0xCB, 0x56, 0x6F,
+        0xBB, 0xC4, 0xD2, 0x20, 0x0F, 0x37, 0x13, 0xA3, 0x68, 0xE2, 0xE4, 0x43, 0x75, 0x6C, 0xB0, 0xDD,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

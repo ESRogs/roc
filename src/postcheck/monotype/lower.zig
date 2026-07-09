@@ -2215,15 +2215,14 @@ const Builder = struct {
         for (nominal.args, mono_args) |checked_arg, mono_arg| {
             try ctx.constrainTypeToMono(checked_arg, mono_arg);
         }
-        if (ctx.nominalInstantiationSource(nominal)) |source| {
-            const arg_nodes = try graph.arena().alloc(NodeId, mono_args.len);
-            for (mono_args, 0..) |mono_arg, index| {
-                arg_nodes[index] = try graph.importMono(mono_arg);
-            }
-            const backing = try graph.sealNode(try ctx.instNominalDeclarationBackingNode(source, arg_nodes));
-            return try self.structuralBackingForNominal(view, nominal, mono_args, backing);
+        const source = ctx.nominalInstantiationSource(nominal) orelse {
+            Common.invariant("nominal backing type lowering could not resolve a declaration-backed nominal");
+        };
+        const arg_nodes = try graph.arena().alloc(NodeId, mono_args.len);
+        for (mono_args, 0..) |mono_arg, index| {
+            arg_nodes[index] = try graph.importMono(mono_arg);
         }
-        const backing = try graph.sealNode(try ctx.instNode(ctx.nominalBackingRoot(nominal)));
+        const backing = try graph.sealNode(try ctx.instNominalDeclarationBackingNode(source, arg_nodes));
         return try self.structuralBackingForNominal(view, nominal, mono_args, backing);
     }
 
@@ -8209,7 +8208,7 @@ const BodyContext = struct {
         args: []NodeId,
     ) Allocator.Error!NodeId {
         const source = self.nominalInstantiationSource(nominal) orelse
-            return try self.instNode(self.nominalBackingRoot(nominal));
+            Common.invariant("nominal backing instantiation could not resolve a declaration-backed nominal");
         return try self.instNominalDeclarationBackingNode(source, args);
     }
 
@@ -8304,25 +8303,6 @@ const BodyContext = struct {
                 };
             },
             .opaque_without_backing => null,
-        };
-    }
-
-    fn nominalBackingRoot(
-        self: *BodyContext,
-        nominal: checked.CheckedNominalType,
-    ) checked.CheckedTypeId {
-        return switch (nominal.representation) {
-            .local_declaration => |id| self.view.types.nominalDeclarationById(id).backing,
-            .imported_declaration => nominal.backing,
-            .local_box_payload_capability => |capability| self.view.interface_capabilities.boxPayloadCapability(capability.capability).backing_ty,
-            .imported_box_payload_capability => |capability| blk: {
-                const source_view = self.builder.moduleForId(checked.importedBoxPayloadCapabilityModuleId(capability));
-                const backing = source_view.interface_capabilities.boxPayloadCapability(capability.capability).backing_ty;
-                break :blk self.checkedTypeInCurrentView(source_view, backing);
-            },
-            .builtin,
-            .opaque_without_backing,
-            => nominal.backing,
         };
     }
 
@@ -25213,7 +25193,8 @@ fn checkedRecordFieldByName(
     while (remaining > 0) : (remaining -= 1) {
         switch (checkedPayload(view, current)) {
             .alias => |alias| current = alias.backing,
-            .nominal => |nominal| current = nominal.backing,
+            .nominal => |nominal| current = view.types.nominalBackingTemplateForPayload(nominal) orelse
+                Common.invariant("checked record field lookup reached a nominal without backing"),
             .empty_record => break,
             .record_unbound => |fields| {
                 for (fields) |field| {
