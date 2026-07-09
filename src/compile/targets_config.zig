@@ -566,6 +566,7 @@ pub const TargetsConfig = struct {
     }
 };
 
+/// Result of checking that every declared target file exists on disk.
 pub const TargetFileValidation = struct {
     issues: []TargetFileValidationIssue,
 
@@ -589,6 +590,7 @@ pub const TargetFileValidation = struct {
     }
 };
 
+/// A file-system issue found while validating declared target files.
 pub const TargetFileValidationIssue = union(enum) {
     missing_inputs_directory: struct {
         inputs_dir: []const u8,
