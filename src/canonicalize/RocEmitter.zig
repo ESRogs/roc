@@ -307,7 +307,7 @@ fn emitExprFrame(
                 try self.output.print(self.allocator, "{}.{}", .{ whole, frac_part });
             }
         },
-        .e_num_from_numeral => try self.emitRecordedNumeral(expr_idx, null),
+        .e_num_from_numeral => try self.emitRecordedNumeral(ModuleEnv.nodeIdxFrom(expr_idx), null),
         .e_typed_int => |typed| {
             try self.emitIntValue(typed.value);
             try self.output.print(self.allocator, ".{s}", .{self.module_env.getIdent(typed.type_name)});
@@ -324,7 +324,7 @@ fn emitExprFrame(
             }
             try self.output.print(self.allocator, ".{s}", .{self.module_env.getIdent(typed.type_name)});
         },
-        .e_typed_num_from_numeral => |typed| try self.emitRecordedNumeral(expr_idx, typed.type_name),
+        .e_typed_num_from_numeral => |typed| try self.emitRecordedNumeral(ModuleEnv.nodeIdxFrom(expr_idx), typed.type_name),
         .e_str_segment => |seg| try self.output.print(self.allocator, "\"{s}\"", .{self.module_env.common.getString(seg.literal)}),
         .e_bytes_literal => |bytes| try self.output.print(self.allocator, "<bytes:{d}>", .{self.module_env.common.getString(bytes.literal).len}),
         .e_str => |str| {
@@ -606,6 +606,7 @@ fn emitPatternFrame(
         .assign => |ident| try self.emitIdent(self.module_env.getIdent(ident.ident)),
         .underscore => try self.write("_"),
         .num_literal => |num| try self.emitIntValue(num.value),
+        .num_from_numeral_literal => try self.emitRecordedNumeral(ModuleEnv.nodeIdxFrom(pattern_idx), null),
         .str_literal => |str| try self.output.print(self.allocator, "\"{s}\"", .{self.module_env.common.getString(str.literal)}),
         .str_interpolation => |str| {
             try self.write("\"");
@@ -810,12 +811,12 @@ comptime {
 
 const EmitError = std.mem.Allocator.Error || std.fmt.BufPrintError;
 
-fn emitRecordedNumeral(self: *Self, expr_idx: Expr.Idx, maybe_type_name: ?base.Ident.Idx) EmitError!void {
-    const literal = self.module_env.numeralLiteralForNode(ModuleEnv.nodeIdxFrom(expr_idx)) orelse {
-        std.debug.panic("missing recorded numeral for expression {}", .{@intFromEnum(expr_idx)});
+fn emitRecordedNumeral(self: *Self, node_idx: CIR.Node.Idx, maybe_type_name: ?base.Ident.Idx) EmitError!void {
+    const literal = self.module_env.numeralLiteralForNode(node_idx) orelse {
+        std.debug.panic("missing recorded numeral for node {}", .{@intFromEnum(node_idx)});
     };
     if (!literal.isMaterialized()) {
-        std.debug.panic("cannot emit an unmaterialized numeral for expression {}", .{@intFromEnum(expr_idx)});
+        std.debug.panic("cannot emit an unmaterialized numeral for node {}", .{@intFromEnum(node_idx)});
     }
 
     if (literal.isNegative()) {

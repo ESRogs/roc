@@ -40,7 +40,9 @@ pub const Constants = struct {
     /// 15: Checked encoder_for runtime representation changed serialized compiler state.
     /// 16: Static dispatch constraints carry introducing-site provenance.
     /// 17: Numeral literals carry materialization metadata.
-    pub const CACHE_VERSION = 17;
+    /// 18: Exact-numeral pipeline: parser-owned numeral digit tables, the
+    ///     exact-numeral pattern node, and NumeralInfo constraint payloads.
+    pub const CACHE_VERSION = 18;
 };
 
 /// Configuration for the Roc cache system.
