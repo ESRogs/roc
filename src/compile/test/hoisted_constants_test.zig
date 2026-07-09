@@ -540,7 +540,7 @@ test "inline list for constants lower to internal static data" {
     );
 }
 
-fn expectInlineListStaticDataLiteral(gpa: std.mem.Allocator, source: []const u8) !void {
+fn expectInlineListStaticDataLiteral(gpa: std.mem.Allocator, source: []const u8) HoistedConstantsTestError!void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
