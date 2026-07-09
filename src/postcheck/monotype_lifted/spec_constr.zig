@@ -497,9 +497,11 @@ const Pass = struct {
         try self.peelBranchAppendLoops(original_fn_count);
         try self.collectArgUses(original_fn_count);
         try self.collectCallPatterns(original_fn_count);
+        try self.collectValueAwareCallPatterns(original_fn_count);
         try self.reserveSpecIds();
         try self.createSpecializations(original_fn_count);
         try self.rewriteExistingCalls();
+        try self.rewriteValueAwareCalls();
         try self.scalarizeIteratorLoops(original_fn_count);
         try Lift.recomputeCaptures(self.allocator, self.program);
 
@@ -564,6 +566,25 @@ const Pass = struct {
             };
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
             try self.collectCallPatternsInExpr(fn_id, body);
+        }
+    }
+
+    /// The syntax-directed collector above cannot see that a direct-call
+    /// argument is known when it is first named by a `let`. Walk with the
+    /// cloner's substitution environment so those calls still reserve workers.
+    fn collectValueAwareCallPatterns(self: *Pass, original_fn_count: usize) Common.LowerError!void {
+        var index: usize = 0;
+        while (index < original_fn_count) : (index += 1) {
+            const fn_ = self.program.getFnAt(index);
+            const body = switch (fn_.body) {
+                .roc => |body| body,
+                .hosted => continue,
+            };
+            const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
+            var cloner = Cloner.initForRewrite(self);
+            cloner.rewrite_call_patterns = false;
+            defer cloner.deinit();
+            try cloner.collectCallPatternsInExpr(fn_id, body);
         }
     }
 
@@ -930,21 +951,36 @@ const Pass = struct {
         const fn_args = self.program.typedLocalSpan(self.program.getFnAt(raw).args);
         if (args.len != fn_args.len) Common.invariant("direct call arity differed from lifted function arity");
 
-        const shapes = try self.arena.allocator().alloc(Shape, args.len);
+        const values = try self.allocator.alloc(Value, args.len);
+        defer self.allocator.free(values);
+        for (args, 0..) |arg, index| {
+            var cloner = Cloner.initForRewrite(self);
+            defer cloner.deinit();
+            values[index] = try cloner.cloneExprValue(arg);
+        }
+
+        try self.recordCallPatternForValues(fn_id, values);
+    }
+
+    fn recordCallPatternForValues(self: *Pass, fn_id: Ast.FnId, values: []const Value) Common.LowerError!void {
+        const raw = @intFromEnum(fn_id);
+        if (raw >= self.plans.len) return;
+
+        const fn_args = self.program.typedLocalSpan(self.program.getFnAt(raw).args);
+        if (values.len != fn_args.len) Common.invariant("direct call arity differed from lifted function arity");
+
+        const shapes = try self.arena.allocator().alloc(Shape, values.len);
         var has_constructor = false;
 
-        for (args, 0..) |arg, index| {
+        for (values, 0..) |value, index| {
             if (self.plans[raw].used_args[index]) {
-                var cloner = Cloner.initForRewrite(self);
-                defer cloner.deinit();
-                const value = try cloner.cloneExprValue(arg);
                 if (try self.shapeFromValue(value)) |shape| {
                     shapes[index] = shape;
                     has_constructor = true;
                     continue;
                 }
             }
-            shapes[index] = .{ .any = self.program.getExpr(arg).ty };
+            shapes[index] = .{ .any = valueType(self.program, value) };
         }
 
         if (!has_constructor) return;
@@ -1048,6 +1084,29 @@ const Pass = struct {
                 .hosted => continue,
             };
             try self.rewriteCallsInExpr(body, done);
+        }
+    }
+
+    /// Detect call sites that only match a worker after `let` substitutions are
+    /// visible, then clone the whole body through the value pass. Cloning the
+    /// body dissolves the now-split construction bindings instead of leaving
+    /// their strict runtime construction behind.
+    fn rewriteValueAwareCalls(self: *Pass) Common.LowerError!void {
+        const fn_count = self.program.fnCount();
+        for (0..fn_count) |index| {
+            const fn_ = self.program.getFnAt(index);
+            const body = switch (fn_.body) {
+                .roc => |body| body,
+                .hosted => continue,
+            };
+            const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
+            var cloner = Cloner.initForRewrite(self);
+            cloner.value_aware_detect_only = true;
+            defer cloner.deinit();
+            try cloner.rewriteCallsWithValuesInExpr(body);
+            if (cloner.value_aware_rewrite_changed) {
+                try self.cloneFnBodyInPlace(fn_id, body);
+            }
         }
     }
 
@@ -3049,6 +3108,9 @@ const Cloner = struct {
     region_entry_marks: usize,
     inline_direct_calls: bool,
     inline_direct_requires_known_arg: bool,
+    rewrite_call_patterns: bool,
+    value_aware_rewrite_changed: bool,
+    value_aware_detect_only: bool,
     /// When set, a loop's initial values inline their construction call even
     /// without a known-shape argument, exposing an iterator constructor whose
     /// arguments (a source list, a range bound) are opaque scalars. Only set for
@@ -3081,6 +3143,9 @@ const Cloner = struct {
             .region_entry_marks = 0,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = true,
+            .rewrite_call_patterns = true,
+            .value_aware_rewrite_changed = false,
+            .value_aware_detect_only = false,
             .current_loc = SourceLoc.none,
             .current_region = Region.zero(),
         };
@@ -3102,6 +3167,9 @@ const Cloner = struct {
             .region_entry_marks = 0,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = false,
+            .rewrite_call_patterns = true,
+            .value_aware_rewrite_changed = false,
+            .value_aware_detect_only = false,
             .current_loc = SourceLoc.none,
             .current_region = Region.zero(),
         };
@@ -3115,6 +3183,488 @@ const Cloner = struct {
         self.changes.deinit(self.pass.allocator);
         self.binder_subst.deinit();
         self.subst.deinit();
+    }
+
+    fn collectCallPatternsInExpr(self: *Cloner, owner: Ast.FnId, expr_id: Ast.ExprId) Common.LowerError!void {
+        const expr = self.pass.program.getExpr(expr_id);
+        switch (expr.data) {
+            .local,
+            .unit,
+            .int_lit,
+            .frac_f32_lit,
+            .frac_f64_lit,
+            .dec_lit,
+            .str_lit,
+            .bytes_lit,
+            .crash,
+            .comptime_exhaustiveness_failed,
+            .uninitialized,
+            .uninitialized_payload,
+            => {},
+            .fn_ref => |fn_ref| try self.collectCallPatternsInCaptureOperandSpan(owner, fn_ref.captures),
+            .list,
+            .tuple,
+            => |items| try self.collectCallPatternsInExprSpan(owner, items),
+            .record => |fields| try self.collectCallPatternsInFieldExprSpan(owner, fields),
+            .tag => |tag| try self.collectCallPatternsInExprSpan(owner, tag.payloads),
+            .static_data_candidate => |candidate| try self.collectCallPatternsInExpr(owner, candidate.runtime_expr),
+            .nominal,
+            .dbg,
+            .expect,
+            => |child| try self.collectCallPatternsInExpr(owner, child),
+            .return_ => |ret| try self.collectCallPatternsInExpr(owner, ret.value),
+            .expect_err => |expect_err| try self.collectCallPatternsInExpr(owner, expect_err.msg),
+            .comptime_branch_taken => |taken| try self.collectCallPatternsInExpr(owner, taken.body),
+            .let_ => |let_| try self.collectCallPatternsInLet(owner, let_.bind, let_.value, let_.rest, false),
+            .lambda,
+            .def_ref,
+            .fn_def,
+            => Common.invariant("pre-lift function expression reached call-pattern specialization"),
+            .call_value => |call| {
+                try self.collectCallPatternsInExpr(owner, call.callee);
+                try self.collectCallPatternsInExprSpan(owner, call.args);
+            },
+            .call_proc => |call| {
+                try self.collectCallPatternsInExprSpan(owner, call.args);
+                try self.collectCallPatternsInCaptureOperandSpan(owner, call.captures);
+
+                const callee = Ast.localDirectCallee(call) orelse return;
+                const args = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(call.args));
+                defer self.pass.allocator.free(args);
+
+                const pending_start = self.pending.items.len;
+                defer self.pending.shrinkRetainingCapacity(pending_start);
+
+                const values = try self.pass.allocator.alloc(Value, args.len);
+                defer self.pass.allocator.free(values);
+                for (args, 0..) |arg, index| {
+                    values[index] = try self.cloneExprValue(arg);
+                }
+                try self.pass.recordCallPatternForValues(callee, values);
+            },
+            .low_level => |call| try self.collectCallPatternsInExprSpan(owner, call.args),
+            .field_access => |field| try self.collectCallPatternsInExpr(owner, field.receiver),
+            .tuple_access => |access| try self.collectCallPatternsInExpr(owner, access.tuple),
+            .structural_eq => |eq| {
+                try self.collectCallPatternsInExpr(owner, eq.lhs);
+                try self.collectCallPatternsInExpr(owner, eq.rhs);
+            },
+            .structural_hash => |h| {
+                try self.collectCallPatternsInExpr(owner, h.value);
+                try self.collectCallPatternsInExpr(owner, h.hasher);
+            },
+            .match_ => |match| {
+                try self.collectCallPatternsInExpr(owner, match.scrutinee);
+                try self.collectCallPatternsInBranchSpan(owner, match.branches);
+            },
+            .if_ => |if_| {
+                try self.collectCallPatternsInIfBranchSpan(owner, if_.branches);
+                try self.collectCallPatternsInExpr(owner, if_.final_else);
+            },
+            .block => |block| {
+                const change_start = self.changes.items.len;
+                const pending_start = self.pending.items.len;
+                defer {
+                    self.restore(change_start);
+                    self.pending.shrinkRetainingCapacity(pending_start);
+                }
+                try self.collectCallPatternsInStmtSpan(owner, block.statements);
+                try self.collectCallPatternsInExpr(owner, block.final_expr);
+            },
+            .loop_ => |loop| {
+                try self.collectCallPatternsInExprSpan(owner, loop.initial_values);
+                const change_start = self.changes.items.len;
+                defer self.restore(change_start);
+                const params = self.pass.program.typedLocalSpan(loop.params);
+                for (0..params.len) |index| {
+                    try self.shadowLocal(GuardedList.at(params, index).local);
+                }
+                try self.collectCallPatternsInExpr(owner, loop.body);
+            },
+            .break_ => |maybe| if (maybe) |value| try self.collectCallPatternsInExpr(owner, value),
+            .continue_ => |continue_| try self.collectCallPatternsInExprSpan(owner, continue_.values),
+            .if_initialized_payload => |payload_switch| {
+                try self.collectCallPatternsInExpr(owner, payload_switch.cond);
+                try self.collectCallPatternsInExpr(owner, payload_switch.initialized);
+                try self.collectCallPatternsInExpr(owner, payload_switch.uninitialized);
+            },
+            .try_sequence => |sequence| {
+                try self.collectCallPatternsInExpr(owner, sequence.try_expr);
+                const change_start = self.changes.items.len;
+                defer self.restore(change_start);
+                try self.shadowLocal(sequence.ok_local);
+                try self.collectCallPatternsInExpr(owner, sequence.ok_body);
+            },
+            .try_record_sequence => |sequence| {
+                try self.collectCallPatternsInExpr(owner, sequence.try_expr);
+                const change_start = self.changes.items.len;
+                defer self.restore(change_start);
+                try self.shadowLocal(sequence.value_local);
+                try self.shadowLocal(sequence.rest_local);
+                try self.collectCallPatternsInExpr(owner, sequence.ok_body);
+            },
+        }
+    }
+
+    fn collectCallPatternsInLet(
+        self: *Cloner,
+        owner: Ast.FnId,
+        pat_id: Ast.PatId,
+        value_expr: Ast.ExprId,
+        rest_expr: Ast.ExprId,
+        recursive: bool,
+    ) Common.LowerError!void {
+        try self.collectCallPatternsInExpr(owner, value_expr);
+
+        const change_start = self.changes.items.len;
+        const pending_start = self.pending.items.len;
+        defer {
+            self.restore(change_start);
+            self.pending.shrinkRetainingCapacity(pending_start);
+        }
+
+        const value = try self.cloneExprValue(value_expr);
+        if (!try self.bindPatternForValueFlow(pat_id, value_expr, recursive, value)) {
+            try self.shadowPatLocals(pat_id);
+        }
+        try self.collectCallPatternsInExpr(owner, rest_expr);
+    }
+
+    fn collectCallPatternsInExprSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.ExprId)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |expr| try self.collectCallPatternsInExpr(owner, expr);
+    }
+
+    fn collectCallPatternsInCaptureOperandSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.CaptureOperand)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.CaptureOperand, self.pass.program.captureOperandSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |operand| try self.collectCallPatternsInExpr(owner, operand.value);
+    }
+
+    fn collectCallPatternsInFieldExprSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.FieldExpr)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.FieldExpr, self.pass.program.fieldExprSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |field| try self.collectCallPatternsInExpr(owner, field.value);
+    }
+
+    fn collectCallPatternsInBranchSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.Branch)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |branch| {
+            const change_start = self.changes.items.len;
+            defer self.restore(change_start);
+            try self.shadowPatLocals(branch.pat);
+            if (branch.guard) |guard| try self.collectCallPatternsInExpr(owner, guard);
+            try self.collectCallPatternsInExpr(owner, branch.body);
+        }
+    }
+
+    fn collectCallPatternsInIfBranchSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.IfBranch)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |branch| {
+            try self.collectCallPatternsInExpr(owner, branch.cond);
+            try self.collectCallPatternsInExpr(owner, branch.body);
+        }
+    }
+
+    fn collectCallPatternsInStmtSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.StmtId)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |stmt| try self.collectCallPatternsInStmt(owner, stmt);
+    }
+
+    fn collectCallPatternsInStmt(self: *Cloner, owner: Ast.FnId, stmt_id: Ast.StmtId) Common.LowerError!void {
+        switch (self.pass.program.getStmt(stmt_id)) {
+            .let_ => |let_| {
+                try self.collectCallPatternsInExpr(owner, let_.value);
+
+                const pending_start = self.pending.items.len;
+                defer self.pending.shrinkRetainingCapacity(pending_start);
+
+                const value = try self.cloneExprValue(let_.value);
+                if (!try self.bindPatternForValueFlow(let_.pat, let_.value, let_.recursive, value)) {
+                    try self.shadowPatLocals(let_.pat);
+                }
+            },
+            .expr,
+            .expect,
+            .dbg,
+            => |expr| try self.collectCallPatternsInExpr(owner, expr),
+            .return_ => |ret| try self.collectCallPatternsInExpr(owner, ret.value),
+            .uninitialized => |pat| try self.shadowPatLocals(pat),
+            .crash => {},
+        }
+    }
+
+    fn bindPatternForValueFlow(
+        self: *Cloner,
+        pat_id: Ast.PatId,
+        source_value: Ast.ExprId,
+        recursive: bool,
+        value: Value,
+    ) Common.LowerError!bool {
+        const change_before = self.changes.items.len;
+        const pending_before = self.pending.items.len;
+        if (try self.bindPatToReusableValue(pat_id, value)) return true;
+        self.restore(change_before);
+        self.pending.shrinkRetainingCapacity(pending_before);
+
+        const pat = self.pass.program.getPat(pat_id);
+        const self_referential = switch (pat.data) {
+            .bind => |local| localUseCountInExpr(self.pass.program, local, source_value) != 0,
+            else => recursive,
+        };
+        if (self_referential) return false;
+
+        const reusable = try self.makeReusableForMatch(value);
+        if (try self.bindPatToValue(pat_id, reusable)) return true;
+        self.restore(change_before);
+        self.pending.shrinkRetainingCapacity(pending_before);
+        return false;
+    }
+
+    fn rewriteCallsWithValuesInExpr(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!void {
+        const expr = self.pass.program.getExpr(expr_id);
+        switch (expr.data) {
+            .local,
+            .unit,
+            .int_lit,
+            .frac_f32_lit,
+            .frac_f64_lit,
+            .dec_lit,
+            .str_lit,
+            .bytes_lit,
+            .crash,
+            .comptime_exhaustiveness_failed,
+            .uninitialized,
+            .uninitialized_payload,
+            => {},
+            .fn_ref => |fn_ref| try self.rewriteCallsWithValuesInCaptureOperandSpan(fn_ref.captures),
+            .list,
+            .tuple,
+            => |items| try self.rewriteCallsWithValuesInExprSpan(items),
+            .record => |fields| try self.rewriteCallsWithValuesInFieldExprSpan(fields),
+            .tag => |tag| try self.rewriteCallsWithValuesInExprSpan(tag.payloads),
+            .static_data_candidate => |candidate| try self.rewriteCallsWithValuesInExpr(candidate.runtime_expr),
+            .nominal,
+            .dbg,
+            .expect,
+            => |child| try self.rewriteCallsWithValuesInExpr(child),
+            .return_ => |ret| try self.rewriteCallsWithValuesInExpr(ret.value),
+            .expect_err => |expect_err| try self.rewriteCallsWithValuesInExpr(expect_err.msg),
+            .comptime_branch_taken => |taken| try self.rewriteCallsWithValuesInExpr(taken.body),
+            .let_ => |let_| {
+                try self.rewriteCallsWithValuesInExpr(let_.value);
+                const change_start = self.changes.items.len;
+                const pending_start = self.pending.items.len;
+                defer {
+                    self.restore(change_start);
+                    self.pending.shrinkRetainingCapacity(pending_start);
+                }
+                const value = try self.cloneExprValue(let_.value);
+                if (!try self.bindPatternForValueFlow(let_.bind, let_.value, false, value)) {
+                    try self.shadowPatLocals(let_.bind);
+                }
+                try self.rewriteCallsWithValuesInExpr(let_.rest);
+            },
+            .lambda,
+            .def_ref,
+            .fn_def,
+            => Common.invariant("pre-lift function expression reached call-pattern specialization"),
+            .call_value => |call| {
+                try self.rewriteCallsWithValuesInExpr(call.callee);
+                try self.rewriteCallsWithValuesInExprSpan(call.args);
+            },
+            .call_proc => |call| {
+                try self.rewriteCallsWithValuesInExprSpan(call.args);
+                try self.rewriteCallsWithValuesInCaptureOperandSpan(call.captures);
+                try self.rewriteCallProcWithValues(expr_id, call);
+            },
+            .low_level => |call| try self.rewriteCallsWithValuesInExprSpan(call.args),
+            .field_access => |field| try self.rewriteCallsWithValuesInExpr(field.receiver),
+            .tuple_access => |access| try self.rewriteCallsWithValuesInExpr(access.tuple),
+            .structural_eq => |eq| {
+                try self.rewriteCallsWithValuesInExpr(eq.lhs);
+                try self.rewriteCallsWithValuesInExpr(eq.rhs);
+            },
+            .structural_hash => |h| try self.rewriteCallsWithValuesInExpr(h.value),
+            .match_ => |match| {
+                try self.rewriteCallsWithValuesInExpr(match.scrutinee);
+                try self.rewriteCallsWithValuesInBranchSpan(match.branches);
+            },
+            .if_ => |if_| {
+                try self.rewriteCallsWithValuesInIfBranchSpan(if_.branches);
+                try self.rewriteCallsWithValuesInExpr(if_.final_else);
+            },
+            .block => |block| {
+                const change_start = self.changes.items.len;
+                const pending_start = self.pending.items.len;
+                defer {
+                    self.restore(change_start);
+                    self.pending.shrinkRetainingCapacity(pending_start);
+                }
+                try self.rewriteCallsWithValuesInStmtSpan(block.statements);
+                try self.rewriteCallsWithValuesInExpr(block.final_expr);
+            },
+            .loop_ => |loop| {
+                try self.rewriteCallsWithValuesInExprSpan(loop.initial_values);
+                const change_start = self.changes.items.len;
+                defer self.restore(change_start);
+                const params = self.pass.program.typedLocalSpan(loop.params);
+                for (0..params.len) |index| {
+                    try self.shadowLocal(GuardedList.at(params, index).local);
+                }
+                try self.rewriteCallsWithValuesInExpr(loop.body);
+            },
+            .break_ => |maybe| if (maybe) |value| try self.rewriteCallsWithValuesInExpr(value),
+            .continue_ => |continue_| try self.rewriteCallsWithValuesInExprSpan(continue_.values),
+            .if_initialized_payload => |payload_switch| {
+                try self.rewriteCallsWithValuesInExpr(payload_switch.cond);
+                try self.rewriteCallsWithValuesInExpr(payload_switch.initialized);
+                try self.rewriteCallsWithValuesInExpr(payload_switch.uninitialized);
+            },
+            .try_sequence => |sequence| {
+                try self.rewriteCallsWithValuesInExpr(sequence.try_expr);
+                const change_start = self.changes.items.len;
+                defer self.restore(change_start);
+                try self.shadowLocal(sequence.ok_local);
+                try self.rewriteCallsWithValuesInExpr(sequence.ok_body);
+            },
+            .try_record_sequence => |sequence| {
+                try self.rewriteCallsWithValuesInExpr(sequence.try_expr);
+                const change_start = self.changes.items.len;
+                defer self.restore(change_start);
+                try self.shadowLocal(sequence.value_local);
+                try self.shadowLocal(sequence.rest_local);
+                try self.rewriteCallsWithValuesInExpr(sequence.ok_body);
+            },
+        }
+    }
+
+    fn rewriteCallProcWithValues(self: *Cloner, expr_id: Ast.ExprId, call: @import("../monotype/ast.zig").CallProc) Common.LowerError!void {
+        if (call.is_cold) return;
+        const callee = Ast.localDirectCallee(call) orelse return;
+        const raw = @intFromEnum(callee);
+        if (raw >= self.pass.plans.len or self.pass.plans[raw].specs.items.len == 0) return;
+
+        const args = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(call.args));
+        defer self.pass.allocator.free(args);
+
+        const pending_start = self.pending.items.len;
+        defer self.pending.shrinkRetainingCapacity(pending_start);
+
+        const values = try self.pass.allocator.alloc(Value, args.len);
+        defer self.pass.allocator.free(values);
+        for (args, 0..) |arg, index| {
+            values[index] = try self.cloneExprValue(arg);
+        }
+
+        for (self.pass.plans[raw].specs.items) |spec| {
+            if (spec.pattern.args.len != values.len) Common.invariant("call-pattern arity differed from direct call arity");
+            var matches = true;
+            for (spec.pattern.args, values) |shape, value| {
+                if (!shapeMatchesValue(self.pass.program, shape, value)) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
+
+            self.value_aware_rewrite_changed = true;
+            if (self.value_aware_detect_only) return;
+
+            var rewritten_args = std.ArrayList(Ast.ExprId).empty;
+            defer rewritten_args.deinit(self.pass.allocator);
+            for (spec.pattern.args, values) |shape, value| {
+                try self.appendExprsFromValue(shape, value, &rewritten_args);
+            }
+
+            const new_call: Ast.ExprData = .{ .call_proc = .{
+                .callee = .{ .lifted = spec.fn_id orelse Common.invariant("call-pattern specialization id was not assigned before value-aware rewriting") },
+                .args = try self.pass.program.addExprSpan(rewritten_args.items),
+                .captures = call.captures,
+                .is_cold = call.is_cold,
+            } };
+            if (self.pending.items.len == pending_start) {
+                self.pass.program.setExprData(expr_id, new_call);
+            } else {
+                const call_ty = self.pass.program.getExpr(expr_id).ty;
+                const call_expr = try self.addExpr(.{ .ty = call_ty, .data = new_call });
+                const wrapped = try self.flushPendingSince(pending_start, call_expr);
+                self.pass.program.setExprData(expr_id, self.pass.program.getExpr(wrapped).data);
+            }
+            return;
+        }
+    }
+
+    fn rewriteCallsWithValuesInExprSpan(self: *Cloner, span: Ast.Span(Ast.ExprId)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |expr| try self.rewriteCallsWithValuesInExpr(expr);
+    }
+
+    fn rewriteCallsWithValuesInCaptureOperandSpan(self: *Cloner, span: Ast.Span(Ast.CaptureOperand)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.CaptureOperand, self.pass.program.captureOperandSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |operand| try self.rewriteCallsWithValuesInExpr(operand.value);
+    }
+
+    fn rewriteCallsWithValuesInFieldExprSpan(self: *Cloner, span: Ast.Span(Ast.FieldExpr)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.FieldExpr, self.pass.program.fieldExprSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |field| try self.rewriteCallsWithValuesInExpr(field.value);
+    }
+
+    fn rewriteCallsWithValuesInBranchSpan(self: *Cloner, span: Ast.Span(Ast.Branch)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |branch| {
+            const change_start = self.changes.items.len;
+            defer self.restore(change_start);
+            try self.shadowPatLocals(branch.pat);
+            if (branch.guard) |guard| try self.rewriteCallsWithValuesInExpr(guard);
+            try self.rewriteCallsWithValuesInExpr(branch.body);
+        }
+    }
+
+    fn rewriteCallsWithValuesInIfBranchSpan(self: *Cloner, span: Ast.Span(Ast.IfBranch)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |branch| {
+            try self.rewriteCallsWithValuesInExpr(branch.cond);
+            try self.rewriteCallsWithValuesInExpr(branch.body);
+        }
+    }
+
+    fn rewriteCallsWithValuesInStmtSpan(self: *Cloner, span: Ast.Span(Ast.StmtId)) Common.LowerError!void {
+        const source = try GuardedList.dupe(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(span));
+        defer self.pass.allocator.free(source);
+        for (source) |stmt| try self.rewriteCallsWithValuesInStmt(stmt);
+    }
+
+    fn rewriteCallsWithValuesInStmt(self: *Cloner, stmt_id: Ast.StmtId) Common.LowerError!void {
+        switch (self.pass.program.getStmt(stmt_id)) {
+            .let_ => |let_| {
+                try self.rewriteCallsWithValuesInExpr(let_.value);
+
+                const pending_start = self.pending.items.len;
+                defer self.pending.shrinkRetainingCapacity(pending_start);
+
+                const value = try self.cloneExprValue(let_.value);
+                if (!try self.bindPatternForValueFlow(let_.pat, let_.value, let_.recursive, value)) {
+                    try self.shadowPatLocals(let_.pat);
+                }
+            },
+            .expr,
+            .expect,
+            .dbg,
+            => |expr| try self.rewriteCallsWithValuesInExpr(expr),
+            .return_ => |ret| try self.rewriteCallsWithValuesInExpr(ret.value),
+            .uninitialized => |pat| try self.shadowPatLocals(pat),
+            .crash => {},
+        }
     }
 
     fn buildArgs(self: *Cloner) Allocator.Error!Ast.Span(Ast.TypedLocal) {
@@ -4241,7 +4791,7 @@ const Cloner = struct {
             .is_cold = call.is_cold,
         } };
         const raw = @intFromEnum(callee);
-        if (raw < self.pass.plans.len) {
+        if (self.rewrite_call_patterns and raw < self.pass.plans.len) {
             const source_args = self.pass.program.exprSpan(call.args);
             const args = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, source_args);
             defer self.pass.allocator.free(args);
@@ -4323,7 +4873,9 @@ const Cloner = struct {
             else => value,
         };
         switch (shape) {
-            .any => try out.append(self.pass.allocator, try self.materialize(value)),
+            .any => {
+                try out.append(self.pass.allocator, try self.materialize(value));
+            },
             .tag => |tag| {
                 const tag_value = switch (structural_value) {
                     .tag => |tag_value| tag_value,

@@ -5150,6 +5150,32 @@ test "iter alloc static: list append append for-loop has no boxed iterator state
     try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
 }
 
+test "iter alloc static: list append append fold has no boxed iterator state" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\main : U64 -> Str
+        \\main = |_seed| {
+        \\    base_points = [
+        \\        { x: 11.I64, y: 2.I64 }, { x: 13, y: 3 },
+        \\        { x: 3, y: 5 }, { x: 11, y: 6 },
+        \\        { x: 9, y: 8 }, { x: 5, y: 9 },
+        \\        { x: 7, y: 10 }, { x: 5, y: 12 },
+        \\    ].iter()
+        \\    collision_points = base_points.append({ x: 2, y: 1 }).append({ x: 7, y: 1 })
+        \\    sum = Iter.fold(collision_points, 0.I64, |acc, p| acc + p.x + p.y)
+        \\    if sum == 130 { "ok" } else { "bad" }
+        \\}
+    ;
+
+    var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
+    defer optimized.deinit(allocator);
+
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "box_box_count", 0);
+    try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
+}
+
 // Slice H aliasing guard (refcount-exactness for opportunistic mutation).
 //
 // Slice H turns per-element reads of a loop-carried list into borrows anchored
