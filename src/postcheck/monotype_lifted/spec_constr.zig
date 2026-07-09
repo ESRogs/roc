@@ -421,6 +421,10 @@ const Pass = struct {
     /// so it no longer reads as branch-chosen, but its base loop still needs the
     /// whole-body scalarizing clone.
     peeled: []bool,
+    /// Functions that directly call themselves. The value-aware call-pattern
+    /// pass is only needed for these recursive workers, where a `let`-bound
+    /// constructor argument can select an already-reserved specialization.
+    self_recursive_fns: []bool,
 
     fn init(allocator: Allocator, program: *Ast.Program) Allocator.Error!Pass {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -468,6 +472,17 @@ const Pass = struct {
         errdefer allocator.free(peeled);
         @memset(peeled, false);
 
+        const self_recursive_fns = try allocator.alloc(bool, program.fnCount());
+        errdefer allocator.free(self_recursive_fns);
+        for (0..program.fnCount()) |index| {
+            const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
+            const fn_ = program.getFnAt(index);
+            self_recursive_fns[index] = switch (fn_.body) {
+                .roc => |body| exprCallsFn(program, body, fn_id),
+                .hosted => false,
+            };
+        }
+
         return .{
             .allocator = allocator,
             .arena = arena,
@@ -476,10 +491,12 @@ const Pass = struct {
             .symbols = .{ .next = program.next_symbol },
             .fn_effect_free = fn_effect_free,
             .peeled = peeled,
+            .self_recursive_fns = self_recursive_fns,
         };
     }
 
     fn deinit(self: *Pass) void {
+        self.allocator.free(self.self_recursive_fns);
         self.allocator.free(self.fn_effect_free);
         self.allocator.free(self.peeled);
         for (self.plans) |*plan| plan.deinit(self.allocator);
@@ -569,9 +586,10 @@ const Pass = struct {
         }
     }
 
-    /// The syntax-directed collector above cannot see that a direct-call
-    /// argument is known when it is first named by a `let`. Walk with the
-    /// cloner's substitution environment so those calls still reserve workers.
+    /// The syntax-directed collector above cannot see that a recursive
+    /// direct-call argument is known when it is first named by a `let`. Walk
+    /// with the cloner's substitution environment so those calls still reserve
+    /// workers.
     fn collectValueAwareCallPatterns(self: *Pass, original_fn_count: usize) Common.LowerError!void {
         var index: usize = 0;
         while (index < original_fn_count) : (index += 1) {
@@ -951,15 +969,30 @@ const Pass = struct {
         const fn_args = self.program.typedLocalSpan(self.program.getFnAt(raw).args);
         if (args.len != fn_args.len) Common.invariant("direct call arity differed from lifted function arity");
 
-        const values = try self.allocator.alloc(Value, args.len);
-        defer self.allocator.free(values);
+        const shapes = try self.arena.allocator().alloc(Shape, args.len);
+        var has_constructor = false;
+
         for (args, 0..) |arg, index| {
-            var cloner = Cloner.initForRewrite(self);
-            defer cloner.deinit();
-            values[index] = try cloner.cloneExprValue(arg);
+            if (self.plans[raw].used_args[index]) {
+                if (try self.constructorShape(arg)) |shape| {
+                    shapes[index] = shape;
+                    has_constructor = true;
+                    continue;
+                }
+            }
+            shapes[index] = .{ .any = self.program.getExpr(arg).ty };
         }
 
-        try self.recordCallPatternForValues(fn_id, values);
+        if (!has_constructor) return;
+
+        const pattern: CallPattern = .{ .args = shapes };
+        for (self.plans[raw].specs.items) |spec| {
+            if (patternEql(self.program, spec.pattern, pattern)) return;
+        }
+
+        try self.plans[raw].specs.append(self.allocator, .{
+            .pattern = pattern,
+        });
     }
 
     fn recordCallPatternForValues(self: *Pass, fn_id: Ast.FnId, values: []const Value) Common.LowerError!void {
@@ -1087,10 +1120,10 @@ const Pass = struct {
         }
     }
 
-    /// Detect call sites that only match a worker after `let` substitutions are
-    /// visible, then clone the whole body through the value pass. Cloning the
-    /// body dissolves the now-split construction bindings instead of leaving
-    /// their strict runtime construction behind.
+    /// Detect recursive call sites that only match a worker after `let`
+    /// substitutions are visible, then clone the whole body through the value
+    /// pass. Cloning the body dissolves the now-split construction bindings
+    /// instead of leaving their strict runtime construction behind.
     fn rewriteValueAwareCalls(self: *Pass) Common.LowerError!void {
         const fn_count = self.program.fnCount();
         for (0..fn_count) |index| {
@@ -3229,6 +3262,8 @@ const Cloner = struct {
                 try self.collectCallPatternsInCaptureOperandSpan(owner, call.captures);
 
                 const callee = Ast.localDirectCallee(call) orelse return;
+                const callee_raw = @intFromEnum(callee);
+                if (callee_raw >= self.pass.self_recursive_fns.len or !self.pass.self_recursive_fns[callee_raw]) return;
                 const args = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(call.args));
                 defer self.pass.allocator.free(args);
 
@@ -3548,6 +3583,7 @@ const Cloner = struct {
         const callee = Ast.localDirectCallee(call) orelse return;
         const raw = @intFromEnum(callee);
         if (raw >= self.pass.plans.len or self.pass.plans[raw].specs.items.len == 0) return;
+        if (raw >= self.pass.self_recursive_fns.len or !self.pass.self_recursive_fns[raw]) return;
 
         const args = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(call.args));
         defer self.pass.allocator.free(args);
@@ -6749,6 +6785,138 @@ fn localExpr(program: *const Ast.Program, expr_id: Ast.ExprId) ?Ast.LocalId {
     return switch (program.getExpr(expr_id).data) {
         .local => |local| local,
         else => null,
+    };
+}
+
+fn exprCallsFn(program: *const Ast.Program, expr_id: Ast.ExprId, fn_id: Ast.FnId) bool {
+    return switch (program.getExpr(expr_id).data) {
+        .local,
+        .unit,
+        .int_lit,
+        .frac_f32_lit,
+        .frac_f64_lit,
+        .dec_lit,
+        .str_lit,
+        .bytes_lit,
+        .crash,
+        .comptime_exhaustiveness_failed,
+        .uninitialized,
+        .uninitialized_payload,
+        => false,
+        .fn_ref => |fn_ref| captureOperandSpanCallsFn(program, fn_ref.captures, fn_id),
+        .list,
+        .tuple,
+        => |items| exprSpanCallsFn(program, items, fn_id),
+        .record => |fields| fieldExprSpanCallsFn(program, fields, fn_id),
+        .tag => |tag| exprSpanCallsFn(program, tag.payloads, fn_id),
+        .static_data_candidate => |candidate| exprCallsFn(program, candidate.runtime_expr, fn_id),
+        .nominal,
+        .dbg,
+        .expect,
+        => |child| exprCallsFn(program, child, fn_id),
+        .return_ => |ret| exprCallsFn(program, ret.value, fn_id),
+        .expect_err => |expect_err| exprCallsFn(program, expect_err.msg, fn_id),
+        .comptime_branch_taken => |taken| exprCallsFn(program, taken.body, fn_id),
+        .let_ => |let_| exprCallsFn(program, let_.value, fn_id) or exprCallsFn(program, let_.rest, fn_id),
+        .lambda,
+        .def_ref,
+        .fn_def,
+        => Common.invariant("pre-lift function expression reached recursive-call scan"),
+        .call_value => |call| exprCallsFn(program, call.callee, fn_id) or exprSpanCallsFn(program, call.args, fn_id),
+        .call_proc => |call| {
+            if (Ast.localDirectCallee(call)) |callee| {
+                if (callee == fn_id) return true;
+            }
+            return exprSpanCallsFn(program, call.args, fn_id) or captureOperandSpanCallsFn(program, call.captures, fn_id);
+        },
+        .low_level => |call| exprSpanCallsFn(program, call.args, fn_id),
+        .field_access => |field| exprCallsFn(program, field.receiver, fn_id),
+        .tuple_access => |access| exprCallsFn(program, access.tuple, fn_id),
+        .structural_eq => |eq| exprCallsFn(program, eq.lhs, fn_id) or exprCallsFn(program, eq.rhs, fn_id),
+        .structural_hash => |h| exprCallsFn(program, h.value, fn_id) or exprCallsFn(program, h.hasher, fn_id),
+        .match_ => |match| exprCallsFn(program, match.scrutinee, fn_id) or branchSpanCallsFn(program, match.branches, fn_id),
+        .if_ => |if_| ifBranchSpanCallsFn(program, if_.branches, fn_id) or exprCallsFn(program, if_.final_else, fn_id),
+        .block => |block| stmtSpanCallsFn(program, block.statements, fn_id) or exprCallsFn(program, block.final_expr, fn_id),
+        .loop_ => |loop| exprSpanCallsFn(program, loop.initial_values, fn_id) or exprCallsFn(program, loop.body, fn_id),
+        .break_ => |maybe| if (maybe) |value| exprCallsFn(program, value, fn_id) else false,
+        .continue_ => |continue_| exprSpanCallsFn(program, continue_.values, fn_id),
+        .if_initialized_payload => |payload_switch| exprCallsFn(program, payload_switch.cond, fn_id) or
+            exprCallsFn(program, payload_switch.initialized, fn_id) or
+            exprCallsFn(program, payload_switch.uninitialized, fn_id),
+        .try_sequence => |sequence| exprCallsFn(program, sequence.try_expr, fn_id) or exprCallsFn(program, sequence.ok_body, fn_id),
+        .try_record_sequence => |sequence| exprCallsFn(program, sequence.try_expr, fn_id) or exprCallsFn(program, sequence.ok_body, fn_id),
+    };
+}
+
+fn exprSpanCallsFn(program: *const Ast.Program, span: Ast.Span(Ast.ExprId), fn_id: Ast.FnId) bool {
+    const exprs = program.exprSpan(span);
+    for (0..exprs.len) |index| {
+        const expr = GuardedList.at(exprs, index);
+        if (exprCallsFn(program, expr, fn_id)) return true;
+    }
+    return false;
+}
+
+fn captureOperandSpanCallsFn(program: *const Ast.Program, span: Ast.Span(Ast.CaptureOperand), fn_id: Ast.FnId) bool {
+    const operands = program.captureOperandSpan(span);
+    for (0..operands.len) |index| {
+        const operand = GuardedList.at(operands, index);
+        if (exprCallsFn(program, operand.value, fn_id)) return true;
+    }
+    return false;
+}
+
+fn fieldExprSpanCallsFn(program: *const Ast.Program, span: Ast.Span(Ast.FieldExpr), fn_id: Ast.FnId) bool {
+    const field_exprs = program.fieldExprSpan(span);
+    for (0..field_exprs.len) |index| {
+        const field = GuardedList.at(field_exprs, index);
+        if (exprCallsFn(program, field.value, fn_id)) return true;
+    }
+    return false;
+}
+
+fn branchSpanCallsFn(program: *const Ast.Program, span: Ast.Span(Ast.Branch), fn_id: Ast.FnId) bool {
+    const branches = program.branchSpan(span);
+    for (0..branches.len) |index| {
+        const branch = GuardedList.at(branches, index);
+        if (branch.guard) |guard| {
+            if (exprCallsFn(program, guard, fn_id)) return true;
+        }
+        if (exprCallsFn(program, branch.body, fn_id)) return true;
+    }
+    return false;
+}
+
+fn ifBranchSpanCallsFn(program: *const Ast.Program, span: Ast.Span(Ast.IfBranch), fn_id: Ast.FnId) bool {
+    const branches = program.ifBranchSpan(span);
+    for (0..branches.len) |index| {
+        const branch = GuardedList.at(branches, index);
+        if (exprCallsFn(program, branch.cond, fn_id)) return true;
+        if (exprCallsFn(program, branch.body, fn_id)) return true;
+    }
+    return false;
+}
+
+fn stmtSpanCallsFn(program: *const Ast.Program, span: Ast.Span(Ast.StmtId), fn_id: Ast.FnId) bool {
+    const statements = program.stmtSpan(span);
+    for (0..statements.len) |index| {
+        const stmt = GuardedList.at(statements, index);
+        if (stmtCallsFn(program, stmt, fn_id)) return true;
+    }
+    return false;
+}
+
+fn stmtCallsFn(program: *const Ast.Program, stmt_id: Ast.StmtId, fn_id: Ast.FnId) bool {
+    return switch (program.getStmt(stmt_id)) {
+        .let_ => |let_| exprCallsFn(program, let_.value, fn_id),
+        .expr,
+        .expect,
+        .dbg,
+        => |expr| exprCallsFn(program, expr, fn_id),
+        .return_ => |ret| exprCallsFn(program, ret.value, fn_id),
+        .uninitialized,
+        .crash,
+        => false,
     };
 }
 
