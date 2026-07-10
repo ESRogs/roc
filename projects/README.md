@@ -6,8 +6,9 @@ new to the codebase (human or agent) can read that one file and understand the
 problem, the solution approach, what success looks like, how to evaluate the
 result for long-term correctness and performance, and what tests to add.
 
-- `small/` — projects on the order of days each: localized, mostly additive
-  checks or deletions, low design risk.
+- `small/` — localized, mostly additive checks or deletions, low design risk.
+  Several of these are the remaining slivers of larger projects that have
+  otherwise shipped, so they range from hours to days each.
 - `big/` — projects on the order of weeks each: cross-cutting, and several
   require a design decision before implementation starts.
 
@@ -16,8 +17,8 @@ The projects came out of a root-cause analysis of eight weeks of bug fixes
 facts proven during checking get re-derived downstream from type, name, or
 structure content instead of traveling as explicit data, keyed by fragile
 identity (name strings, positional order, mutable keys) and enforced only by
-panics at the consumption site. Most of these projects either move a fact into
-an explicit artifact, assign an identity once and carry it, or delete a
+panics at the consumption site. These projects either move a fact into an
+explicit artifact, assign an identity once and carry it, or delete a
 duplicated computation. `design.md` at the repo root is the authoritative
 post-check design; these projects implement its stated principles more
 completely.
@@ -27,62 +28,51 @@ completely.
 ### Start here
 
 1. [small/cross-phase-coverage-parity-tests.md](small/cross-phase-coverage-parity-tests.md)
-   — cheap insurance before larger migrations: it pins producer/consumer
-   predicate parity so later refactors have a focused regression net.
+   — the divergence-classification parity suite; cheap insurance that gives
+   the big lowering projects below a focused regression net.
 
-### Dependency chains
+### Big projects
 
-**Chain A — dispatch:**
-1. [big/generalization-time-ambiguity.md](big/generalization-time-ambiguity.md)
-   — builds on the landed total static-dispatch plan work and replaces the
-   remaining ambiguity sweep with a generalization-time rule.
-
-**Chain B — ARC:**
-1. [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
-   — applies the certifier's landed finite-summary/dataflow discipline to
-   production ARC insertion, replacing join and liveness re-walks that make
-   generated structural encoders compile in minutes.
-
-**Chain C — numerics:**
-1. [big/exact-numeral-pipeline.md](big/exact-numeral-pipeline.md)
-- [small/checked-arithmetic-lir-ops.md](small/checked-arithmetic-lir-ops.md)
-  is independent of both and can land any time.
-
-### Independent — start any time, in any order
-
-Small:
-- [small/cross-phase-coverage-parity-tests.md](small/cross-phase-coverage-parity-tests.md)
-  — cheap insurance; ideally land early so later projects inherit the harness.
-- [small/centralize-slice-reuse-predicate.md](small/centralize-slice-reuse-predicate.md)
-- [small/store-generation-counters.md](small/store-generation-counters.md)
-- [small/checked-arithmetic-lir-ops.md](small/checked-arithmetic-lir-ops.md)
-- [small/shared-checked-type-traversal.md](small/shared-checked-type-traversal.md)
-- [small/glue-consumes-committed-layouts.md](small/glue-consumes-committed-layouts.md)
-- [small/structural-hoist-contexts.md](small/structural-hoist-contexts.md)
-
-Big:
-- [big/decision-tree-match-compiler.md](big/decision-tree-match-compiler.md)
-  — independent; benefits from landing the coverage-parity test harness first,
-  and pairs naturally with pipeline unification (below) since today every
-  match-lowering change must be made twice.
-- [big/unify-build-pipelines.md](big/unify-build-pipelines.md) — independent;
-  package identity is already centralized, but the run path still hand-wires
+- [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
+  — applies the certifier's finite-summary/dataflow discipline to production
+  ARC insertion, replacing join and liveness re-walks that make generated
+  structural encoders compile in minutes. Independent of everything else.
+- [big/unify-build-pipelines.md](big/unify-build-pipelines.md) — one
+  orchestration core behind check/run/test; the run path still hand-wires
   coordinator setup and report rendering.
+- [big/decision-tree-match-compiler.md](big/decision-tree-match-compiler.md)
+  — benefits from landing the coverage-parity harness first, and pairs
+  naturally with pipeline unification since today every match-lowering
+  change must be made twice.
+
+### Small follow-ups — start any time, in any order
+
+Each closes out the remaining piece of an otherwise-shipped project:
+
+- [small/shared-checked-type-traversal.md](small/shared-checked-type-traversal.md)
+  — the traversal utility exists; migrate the platform-relation walks onto
+  it and collapse the remaining ad-hoc visited/active sets.
+- [small/pin-deferred-spec-requests.md](small/pin-deferred-spec-requests.md)
+  — the pin is in; audit the one remaining propagation hole
+  (`unifyThroughBacking` never pairs named type arguments) with seal-time
+  instrumentation.
+- [small/glue-consumes-committed-layouts.md](small/glue-consumes-committed-layouts.md)
+  — glue reads committed layouts; turn the unresolved-by-value invariant
+  panic into a reported error naming the type, and close issue 9824.
+- [small/associated-block-defining-exclusion.md](small/associated-block-defining-exclusion.md)
+  — both scope-exclusion fixes are in; add the dependency-graph debug
+  assertion that no non-function def depends on itself.
 
 ### Suggested overall sequence
 
-If one person or agent works through everything serially, this order front-loads
-leverage and keeps prerequisites satisfied:
+If one person or agent works through everything serially, this order
+front-loads leverage and keeps prerequisites satisfied:
 
 1. `small/cross-phase-coverage-parity-tests.md`
-2. `small/centralize-slice-reuse-predicate.md`
-3. `small/store-generation-counters.md`
-4. `small/checked-arithmetic-lir-ops.md`
-5. `small/shared-checked-type-traversal.md`
-6. `big/arc-inserter-join-summaries.md`
-7. `big/exact-numeral-pipeline.md`
-8. `big/generalization-time-ambiguity.md`
-9. `big/unify-build-pipelines.md`
-10. `big/decision-tree-match-compiler.md`
-11. `small/glue-consumes-committed-layouts.md`
-12. `small/structural-hoist-contexts.md`
+2. `small/shared-checked-type-traversal.md`
+3. `big/arc-inserter-join-summaries.md`
+4. `big/unify-build-pipelines.md`
+5. `big/decision-tree-match-compiler.md`
+6. `small/pin-deferred-spec-requests.md`
+7. `small/glue-consumes-committed-layouts.md`
+8. `small/associated-block-defining-exclusion.md`

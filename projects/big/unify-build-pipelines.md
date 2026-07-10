@@ -120,7 +120,7 @@ pass-through (`if (args.no_cache) null else build_env.cache_manager`) into
   the shape the whole CLI should have.
 - PRs (roc-lang/roc): 9811, 9459, 9698, 9627, 9759, 9720, 9768. Issues:
   9788 (run never cached, filed as slowness), 9694 (`--opt` ignored),
-  9509 (transitive package failure on run, fixed by PR 9627).
+  9509 (compiler output printed twice on run, fixed by PR 9759).
 
 ## Solution design
 
@@ -209,14 +209,17 @@ work, it deduplicates it.
   (including warning exit 2), identical package resolution, and identical
   cache behavior (second invocation hits the checked-module cache on every
   path — assert via cache stats).
-- Issue 9788 repro: default app, `roc run` twice, second run must load
-  checked modules from cache.
+- Issue 9788 repro, strengthened: the runner case
+  `customDefaultAppAllSyntaxCheckedCache`
+  (`src/cli/test/parallel_cli_runner.zig`) runs a default app twice and
+  asserts the checked-module cache-file count is nonzero and unchanged.
+  Equal counts cannot distinguish a cache hit from a same-key rewrite;
+  the second run must additionally assert actual cache loads (cache
+  stats).
 - Issue 9694 repro: `roc file.roc --opt=speed` produces and executes a
   compiled binary (not the interpreter).
-- Issue 9509 repro: app → package → transitive URL package, `roc run`
-  succeeds exactly when `roc build` does.
-- Single-render test: a program with N diagnostics renders exactly N
-  reports on the run path (PR 9759 regression test).
+- Transitive-package repro: app → package → transitive URL package,
+  `roc run` succeeds exactly when `roc build` does.
 
 ## Related projects
 

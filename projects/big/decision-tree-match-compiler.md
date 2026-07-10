@@ -237,6 +237,3 @@ Migration order:
 - [Unify the two build pipelines](../big/unify-build-pipelines.md) — removes
   the second copy of match lowering; this project's shared module is the
   fallback if that lands later.
-- [Checked arithmetic ops in LIR](../small/checked-arithmetic-lir-ops.md) —
-  same duplicated-lowerer failure mode; its cross-engine conformance suite
-  is the harness this project's differential tests should extend.
