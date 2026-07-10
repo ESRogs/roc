@@ -315,6 +315,9 @@ const setupDocsSoftNavigation = () => {
   let mainScrollBox = document.querySelector(mainSelector);
   let cachedMainScrollTop = mainScrollBox?.scrollTop ?? 0;
   let cachedSidebarScrollTop = 0;
+  const pageCache = new Map();
+  const pageCacheOrder = [];
+  const maxCachedPages = 32;
 
   if (!mainScrollBox?.querySelector(".main-content") || !window.DOMParser) return;
 
@@ -341,6 +344,22 @@ const setupDocsSoftNavigation = () => {
     const key = new URL(url.href);
     key.hash = "";
     return key.href;
+  };
+
+  const cachedPage = (url) => pageCache.get(fetchKey(url));
+
+  const rememberPage = (url, page) => {
+    const key = fetchKey(url);
+    if (!pageCache.has(key)) {
+      pageCacheOrder.push(key);
+    }
+
+    pageCache.set(key, page);
+
+    while (pageCacheOrder.length > maxCachedPages) {
+      const oldestKey = pageCacheOrder.shift();
+      pageCache.delete(oldestKey);
+    }
   };
 
   const canonicalDocsPath = (pathname) =>
@@ -568,6 +587,57 @@ const setupDocsSoftNavigation = () => {
       });
   };
 
+  const appendMainHtmlChunk = (html, url, content) => {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    template.content.querySelectorAll("script").forEach((script) => script.remove());
+    normalizeDocsLinks(template.content, fetchKey(url));
+    setupCodeBlocks(template.content);
+    const nodes = Array.from(template.content.childNodes);
+    content.appendChild(template.content);
+    return nodes;
+  };
+
+  const renderMainHtmlChunk = async (html, url, content, signal) => {
+    if (html.length === 0) return { appendMs: 0, highlightMs: 0 };
+
+    const appendStart = performance.now();
+    const nodes = appendMainHtmlChunk(html, url, content);
+    const appendMs = performance.now() - appendStart;
+
+    const highlightStart = performance.now();
+    window.rocSyntax?.highlightNodes?.(nodes);
+    const highlightMs = performance.now() - highlightStart;
+
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+
+    if (signal.aborted) {
+      throw new DOMException("Navigation aborted", "AbortError");
+    }
+
+    return { appendMs, highlightMs };
+  };
+
+  const renderCachedMainContent = async (page, url, content, signal) => {
+    let appendMs = 0;
+    let highlightMs = 0;
+
+    for (const html of page.htmlChunks) {
+      const stats = await renderMainHtmlChunk(html, url, content, signal);
+      appendMs += stats.appendMs;
+      highlightMs += stats.highlightMs;
+    }
+
+    return {
+      title: page.title,
+      chunks: page.htmlChunks.length,
+      bytesDecoded: page.bytesDecoded,
+      appendMs,
+      highlightMs,
+      fromCache: true,
+    };
+  };
+
   const streamMainContent = async (response, url, content, signal) => {
     if (!response.body) {
       throw new Error("Readable response streams are not available");
@@ -584,6 +654,7 @@ const setupDocsSoftNavigation = () => {
     let bytesDecoded = 0;
     let appendMs = 0;
     let highlightMs = 0;
+    const htmlChunks = [];
 
     const readBodyPart = (bytes) => {
       if (bytes.length === 0) return;
@@ -603,26 +674,11 @@ const setupDocsSoftNavigation = () => {
 
       if (html.length === 0) return;
 
-      const appendStart = performance.now();
-      const template = document.createElement("template");
-      template.innerHTML = html;
-      template.content.querySelectorAll("script").forEach((script) => script.remove());
-      normalizeDocsLinks(template.content, fetchKey(url));
-      setupCodeBlocks(template.content);
-      const nodes = Array.from(template.content.childNodes);
-      content.appendChild(template.content);
-      appendMs += performance.now() - appendStart;
-
-      const highlightStart = performance.now();
-      window.rocSyntax?.highlightNodes?.(nodes);
-      highlightMs += performance.now() - highlightStart;
+      htmlChunks.push(html);
+      const stats = await renderMainHtmlChunk(html, url, content, signal);
+      appendMs += stats.appendMs;
+      highlightMs += stats.highlightMs;
       chunks += 1;
-
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-
-      if (signal.aborted) {
-        throw new DOMException("Navigation aborted", "AbortError");
-      }
     };
 
     while (true) {
@@ -670,7 +726,7 @@ const setupDocsSoftNavigation = () => {
         } else if (marker.type === "end") {
           await flushChunk();
           await reader.cancel();
-          return { title, chunks, bytesDecoded, appendMs, highlightMs };
+          return { title, chunks, bytesDecoded, appendMs, highlightMs, htmlChunks };
         }
       }
     }
@@ -681,7 +737,24 @@ const setupDocsSoftNavigation = () => {
 
     readBodyPart(pending);
     await flushChunk();
-    return { title, chunks, bytesDecoded, appendMs, highlightMs };
+    return { title, chunks, bytesDecoded, appendMs, highlightMs, htmlChunks };
+  };
+
+  const loadMainContent = async (url, content, signal) => {
+    const page = cachedPage(url);
+    if (page) {
+      return renderCachedMainContent(page, url, content, signal);
+    }
+
+    const response = await fetchDocsResponse(url, signal);
+    const stats = await streamMainContent(response, url, content, signal);
+    rememberPage(url, {
+      title: stats.title,
+      bytesDecoded: stats.bytesDecoded,
+      htmlChunks: stats.htmlChunks,
+    });
+
+    return stats;
   };
 
   const syncSidebarForUrl = (targetUrl) => {
@@ -767,6 +840,39 @@ const setupDocsSoftNavigation = () => {
     // console.log(`[docs-nav] ${label} ${(performance.now() - start).toFixed(1)}ms`);
   };
 
+  const createMainShell = (oldMain, oldContent, includePersistentUi) => {
+    const nextMain = oldMain.cloneNode(false);
+    const nextContent = oldContent.cloneNode(false);
+    const currentSearch = document.getElementById("module-search-form");
+
+    nextContent.textContent = "";
+    nextContent.removeAttribute("data-roc-highlight-id");
+
+    if (includePersistentUi && currentSearch) {
+      nextMain.appendChild(currentSearch);
+    }
+
+    nextMain.appendChild(nextContent);
+
+    if (includePersistentUi) {
+      ensureLoader(nextMain);
+    }
+
+    return { nextMain, nextContent };
+  };
+
+  const activateMainShell = (oldMain, oldContent, nextMain, nextContent, url) => {
+    window.rocSyntax?.clear(oldContent, false);
+    oldMain.replaceWith(nextMain);
+    bindMainScrollBox();
+    activeDocumentKey = fragmentKey(url);
+    syncSidebarForUrl(url);
+    hideSearchResults();
+    closeSidebar();
+    nextContent.setAttribute("tabindex", "-1");
+    nextContent.focus({ preventScroll: true });
+  };
+
   const navigate = async (href, options = {}) => {
     const url = docsUrl(href);
     if (!url) {
@@ -792,49 +898,26 @@ const setupDocsSoftNavigation = () => {
     const totalStart = performance.now();
     // console.log(`[docs-nav] start ${url.pathname}${url.hash}`);
 
-    startLoader();
-    oldMain?.setAttribute("aria-busy", "true");
-
     try {
-      let phaseStart = performance.now();
-      const response = await fetchDocsResponse(url, signal);
-      logTiming("fetch response", phaseStart);
-      if (thisNavigation !== navigationId) return;
-
       if (!oldMain || !oldContent) {
         throw new Error(`Could not find docs main content`);
       }
 
-      phaseStart = performance.now();
-      const nextMain = oldMain.cloneNode(false);
-      const nextContent = oldContent.cloneNode(false);
-      const currentSearch = document.getElementById("module-search-form");
-      nextContent.textContent = "";
-      nextContent.removeAttribute("data-roc-highlight-id");
-      nextMain.appendChild(nextContent);
-      if (!stageUntilReady) {
-        const loader = ensureLoader();
-        if (currentSearch) nextMain.insertBefore(currentSearch, nextContent);
-        nextMain.appendChild(loader);
-      }
+      startLoader();
+      oldMain.setAttribute("aria-busy", "true");
+
+      let phaseStart = performance.now();
+      const { nextMain, nextContent } = createMainShell(
+        oldMain,
+        oldContent,
+        !stageUntilReady,
+      );
       logTiming("create shell", phaseStart);
 
       if (!stageUntilReady) {
         phaseStart = performance.now();
-        window.rocSyntax?.clear(oldContent, false);
-        logTiming("clear highlights", phaseStart);
-
-        phaseStart = performance.now();
-        oldMain.replaceWith(nextMain);
-        bindMainScrollBox();
-        activeDocumentKey = fragmentKey(url);
-        logTiming("swap shell", phaseStart);
-
-        phaseStart = performance.now();
-        syncSidebarForUrl(url);
-        hideSearchResults();
-        closeSidebar();
-        logTiming("sidebar", phaseStart);
+        activateMainShell(oldMain, oldContent, nextMain, nextContent, url);
+        logTiming("activate shell", phaseStart);
       }
 
       if (options.history === "push") {
@@ -845,56 +928,31 @@ const setupDocsSoftNavigation = () => {
         logTiming("push state", phaseStart);
       }
 
-      if (!stageUntilReady) {
-        phaseStart = performance.now();
-        nextContent.setAttribute("tabindex", "-1");
-        logTiming("focus prep", phaseStart);
-
-        phaseStart = performance.now();
-        nextContent.focus({ preventScroll: true });
-        logTiming("focus content", phaseStart);
-      }
-
       phaseStart = performance.now();
-      const streamStats = await streamMainContent(response, url, nextContent, signal);
+      const streamStats = await loadMainContent(url, nextContent, signal);
+      if (thisNavigation !== navigationId) return;
       if (streamStats.title) document.title = streamStats.title;
       // console.log(
-      //   `[docs-nav] stream chunks=${streamStats.chunks} bytes=${streamStats.bytesDecoded} append=${streamStats.appendMs.toFixed(1)}ms highlight=${streamStats.highlightMs.toFixed(1)}ms`,
+      //   `[docs-nav] stream chunks=${streamStats.chunks} cache=${streamStats.fromCache === true} bytes=${streamStats.bytesDecoded} append=${streamStats.appendMs.toFixed(1)}ms highlight=${streamStats.highlightMs.toFixed(1)}ms`,
       // );
-      logTiming("stream content", phaseStart);
+      logTiming("load content", phaseStart);
 
       if (stageUntilReady) {
         phaseStart = performance.now();
-        window.rocSyntax?.clear(oldContent, false);
-        logTiming("clear highlights", phaseStart);
-
-        phaseStart = performance.now();
         const currentSearchAfterStream =
           document.getElementById("module-search-form");
-        const loader = ensureLoader();
         if (currentSearchAfterStream) {
           nextMain.insertBefore(currentSearchAfterStream, nextContent);
         }
-        nextMain.appendChild(loader);
-        oldMain.replaceWith(nextMain);
-        bindMainScrollBox();
-        activeDocumentKey = fragmentKey(url);
+        ensureLoader(nextMain);
         logTiming("swap restored shell", phaseStart);
 
         phaseStart = performance.now();
-        syncSidebarForUrl(url);
-        hideSearchResults();
-        closeSidebar();
-        logTiming("sidebar", phaseStart);
-
-        phaseStart = performance.now();
-        nextContent.setAttribute("tabindex", "-1");
-        logTiming("focus prep", phaseStart);
-
-        phaseStart = performance.now();
-        nextContent.focus({ preventScroll: true });
-        logTiming("focus content", phaseStart);
+        activateMainShell(oldMain, oldContent, nextMain, nextContent, url);
+        logTiming("activate restored shell", phaseStart);
       }
+
+      nextMain.removeAttribute("aria-busy");
 
       phaseStart = performance.now();
       scrollToDestination(url, options.scrollY);
