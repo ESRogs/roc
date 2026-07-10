@@ -9777,6 +9777,10 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                     for (decl_arg_vars, anno_arg_vars) |decl_arg_var, anno_arg_var| {
                         const decl_arg_resolved = self.types.resolveVar(decl_arg_var).desc.content;
 
+                        if (decl_arg_resolved == .err) {
+                            try self.unifyWith(anno_var, .err, env);
+                            return;
+                        }
                         std.debug.assert(decl_arg_resolved == .rigid);
                         const decl_arg_rigid = decl_arg_resolved.rigid;
 
@@ -9854,6 +9858,10 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                         for (ext_arg_vars, anno_arg_vars) |decl_arg_var, anno_arg_var| {
                             const decl_arg_resolved = self.types.resolveVar(decl_arg_var).desc.content;
 
+                            if (decl_arg_resolved == .err) {
+                                try self.unifyWith(anno_var, .err, env);
+                                return;
+                            }
                             std.debug.assert(decl_arg_resolved == .rigid);
                             const decl_arg_rigid = decl_arg_resolved.rigid;
 
