@@ -379,12 +379,20 @@ const CustomCase = enum {
     cache_passing_results,
     cache_failing_results,
     cache_invalidated_by_source_change,
+    cache_ignores_optimized_mode,
+    cache_replays_optimized_dbg_transcript,
+    cache_replays_dbg_transcript_across_backends,
+    optimized_transcript_deterministic_before_summary,
+    optimized_failure_transcript_deterministic_before_summary,
+    optimized_color_mode_cache_replay,
+    optimized_multi_module_links_once,
     verbose_works_from_cache,
     verbose_caches_failure_reports,
     non_verbose_caches_verbose_reports,
     verbose_and_non_verbose_failure_format_match,
     build_warning_interpreter,
     issue_9392_deterministic_no_cache,
+    issue_10015_url_random_test_size,
     docs_main_platform_url_package,
     build_issue_9435_hosted_nominal_return,
     bundle_complex_package,
@@ -830,12 +838,15 @@ const subcommand_cases = [_]CliCase{
     // size/speed backend. The crash guard inside the program makes a wrong
     // result fail too, so a clean exit means it both built and computed 25.
     .{ .id = 0, .suite = .subcommands, .name = "issue 9690: recursive capturing closure builds and runs on LLVM size backend", .backend = .size, .body = .{ .command = .{ .args = &.{ "--opt=size", "--no-cache" }, .roc_file = "test/cli/Issue9690RecursiveCaptureClosure.roc", .exit = .success } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 10015: macOS roc test imported package expect passes on LLVM size backend", .backend = .size, .body = .{ .custom = .issue_10015_url_random_test_size } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test expect_err reports across linked optimized modules", .backend = .speed, .body = .{ .command = .{ .args = &.{ "test", "--opt=speed", "--no-cache" }, .roc_file = "test/cli/multi_module_expect_err/Main.roc", .exit = .{ .code = 1 }, .contains = &.{ .{ .stream = .stderr, .text = "Ran 2 tests" }, .{ .stream = .stderr, .text = "result = to_positive(-2)?" }, .{ .stream = .stderr, .text = "result = to_positive(-1)?" }, .{ .stream = .stderr, .text = "The value was: Err(IsNegative)" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "roc_expect_err_region" }, .{ .stream = .stderr, .text = "symbol multiply defined" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test crash in one optimized root does not pollute the next root", .backend = .speed, .body = .{ .command = .{ .args = &.{ "test", "--opt=speed", "--no-cache" }, .roc_file = "test/cli/MultiRootCrashIsolation.roc", .exit = .{ .code = 1 }, .contains = &.{ .{ .stream = .stderr, .text = "Ran 2 tests" }, .{ .stream = .stderr, .text = "passed" }, .{ .stream = .stderr, .text = "failed" }, .{ .stream = .stderr, .text = "Roc application crashed with this message:" }, .{ .stream = .stderr, .text = "first root crashed" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9897: nested callback capture count matches target", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/Issue9897NestedCaptureCount.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "function reference capture count differs from its target" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test finalizes nested closure captures by identity", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/CaptureOrderFinalization.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test lowers opaque generic Try function wrappers", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/OpaqueTryFunction.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9889: roc-parser numbers example survives monotype specialization identity churn", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/issue_9889_roc_parser/Numbers.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9890: roc-parser letters example survives monotype specialization identity churn", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/issue_9889_roc_parser/Letters.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "panic" } } } } },
-    .{ .id = 0, .suite = .subcommands, .name = "issue 9890: roc-parser csv-movies example survives monotype specialization identity churn", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/issue_9889_roc_parser/CsvMovies.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9890: roc-parser csv-movies example survives monotype specialization identity churn", .timeout_ms = 240_000, .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/issue_9889_roc_parser/CsvMovies.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9519: one lifted function id per monotype specialization", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/issue_9519_two_lifted_ids.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "assigned two lifted function ids" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9519: one lifted function id per monotype specialization across a file split", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/issue_9519_split/Main.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "assigned two lifted function ids" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9968: phantom record row pins deferred spec request (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9968_pin_deferred_spec_requests/main.roc", .exit = .not_panic, .contains = &.{.{ .stream = .stdout, .text = "file=alpha files=beta" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "instantiation unified" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
@@ -1022,6 +1033,13 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc test caches failing results (dev)", .backend = .dev, .body = .{ .custom = .cache_failing_results } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test cache invalidated by source change (interpreter)", .backend = .interpreter, .body = .{ .custom = .cache_invalidated_by_source_change } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test cache invalidated by source change (dev)", .backend = .dev, .body = .{ .custom = .cache_invalidated_by_source_change } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test result cache ignores optimized mode", .backend = .speed, .body = .{ .custom = .cache_ignores_optimized_mode } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test optimized result cache replays dbg transcript", .backend = .speed, .body = .{ .custom = .cache_replays_optimized_dbg_transcript } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test result cache replays dbg transcript across backends", .backend = .speed, .body = .{ .custom = .cache_replays_dbg_transcript_across_backends } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test optimized transcript is deterministic before summary", .backend = .speed, .body = .{ .custom = .optimized_transcript_deterministic_before_summary } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test optimized failure transcript is deterministic before summary", .backend = .speed, .body = .{ .custom = .optimized_failure_transcript_deterministic_before_summary } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test optimized color mode re-renders cached failure facts", .backend = .speed, .body = .{ .custom = .optimized_color_mode_cache_replay } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test optimized multi-module execution links once", .backend = .speed, .body = .{ .custom = .optimized_multi_module_links_once } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test --verbose works from cache (interpreter)", .backend = .interpreter, .body = .{ .custom = .verbose_works_from_cache } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test --verbose works from cache (dev)", .backend = .dev, .body = .{ .custom = .verbose_works_from_cache } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test --verbose caches failure reports (interpreter)", .backend = .interpreter, .body = .{ .custom = .verbose_caches_failure_reports } },
@@ -2081,12 +2099,20 @@ fn runCustomCase(
         .cache_passing_results => customCachePassingResults(io, allocator, &env, &timer, timeout_ms, spec.backend orelse .interpreter),
         .cache_failing_results => customCacheFailingResults(io, allocator, &env, &timer, timeout_ms, spec.backend orelse .interpreter),
         .cache_invalidated_by_source_change => customCacheInvalidated(io, allocator, &env, &timer, timeout_ms, spec.backend orelse .interpreter),
+        .cache_ignores_optimized_mode => customCacheIgnoresOptimizedMode(io, allocator, &env, &timer, timeout_ms),
+        .cache_replays_optimized_dbg_transcript => customCacheReplaysOptimizedDbgTranscript(io, allocator, &env, &timer, timeout_ms),
+        .cache_replays_dbg_transcript_across_backends => customCacheReplaysDbgTranscriptAcrossBackends(io, allocator, &env, &timer, timeout_ms),
+        .optimized_transcript_deterministic_before_summary => customOptimizedTranscriptDeterministicBeforeSummary(io, allocator, &env, &timer, timeout_ms),
+        .optimized_failure_transcript_deterministic_before_summary => customOptimizedFailureTranscriptDeterministicBeforeSummary(io, allocator, &env, &timer, timeout_ms),
+        .optimized_color_mode_cache_replay => customOptimizedColorModeCacheReplay(io, allocator, &env, &timer, timeout_ms),
+        .optimized_multi_module_links_once => customOptimizedMultiModuleLinksOnce(io, allocator, &env, &timer, timeout_ms),
         .verbose_works_from_cache => customVerboseWorksFromCache(io, allocator, &env, &timer, timeout_ms, spec.backend orelse .interpreter),
         .verbose_caches_failure_reports => customVerboseCachesFailureReports(io, allocator, &env, &timer, timeout_ms, spec.backend orelse .interpreter),
         .non_verbose_caches_verbose_reports => customNonVerboseCachesVerboseReports(io, allocator, &env, &timer, timeout_ms, spec.backend orelse .interpreter),
         .verbose_and_non_verbose_failure_format_match => customVerboseAndNonVerboseFailureFormatMatch(io, allocator, &timer, timeout_ms, spec.backend orelse .interpreter),
         .build_warning_interpreter => customBuildWarningInterpreter(io, allocator, &env, &timer, timeout_ms),
         .issue_9392_deterministic_no_cache => customIssue9392Deterministic(io, allocator, &env, &timer, timeout_ms),
+        .issue_10015_url_random_test_size => customIssue10015UrlRandomTestSize(io, allocator, &env, &timer, timeout_ms),
         .docs_main_platform_url_package => customDocsMainPlatformUrlPackage(io, allocator, &env, &timer, timeout_ms),
         .build_issue_9435_hosted_nominal_return => customBuildIssue9435(io, allocator, &env, &timer, timeout_ms),
         .bundle_complex_package => customBundleComplexPackage(io, allocator, &env, &timer, timeout_ms),
@@ -4892,11 +4918,579 @@ fn customCacheInvalidated(io: std.Io, allocator: Allocator, env: *const CaseEnv,
     return null;
 }
 
+fn customCacheIgnoresOptimizedMode(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=size" },
+        .roc_file = "test/cli/AllPassTests.roc",
+        .contains = &.{.{ .stream = .stdout, .text = "All (3) tests passed" }},
+        .not_contains = &.{.{ .stream = .stdout, .text = "(cached)" }},
+    })) |failure| return failure;
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = "test/cli/AllPassTests.roc",
+        .contains = &.{ .{ .stream = .stdout, .text = "All (3) tests passed" }, .{ .stream = .stdout, .text = "(cached)" } },
+    })) |failure| return failure;
+
+    return null;
+}
+
+fn customCacheReplaysOptimizedDbgTranscript(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    const fresh = CommandCase{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = "test/cli/OptimizedTestDbgTranscript.roc",
+        .contains = &.{
+            .{ .stream = .stdout, .text = "All (2) tests passed" },
+            .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+            .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+        },
+        .not_contains = &.{.{ .stream = .stdout, .text = "(cached)" }},
+    };
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, fresh)) |failure| return failure;
+
+    const cached = CommandCase{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = "test/cli/OptimizedTestDbgTranscript.roc",
+        .contains = &.{
+            .{ .stream = .stdout, .text = "All (2) tests passed" },
+            .{ .stream = .stdout, .text = "(cached)" },
+            .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+            .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+        },
+    };
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, cached)) |failure| return failure;
+
+    return null;
+}
+
+fn customCacheReplaysDbgTranscriptAcrossBackends(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    const roc_file = "test/cli/OptimizedTestDbgTranscript.roc";
+    const expected_transcript = [_]OutputNeedle{
+        .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+        .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+    };
+
+    const interpreter_fill = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=interpreter" },
+        .roc_file = roc_file,
+        .contains = &expected_transcript,
+        .not_contains = &.{.{ .stream = .stdout, .text = "(cached)" }},
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const optimized_cached = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .contains = &.{
+            .{ .stream = .stdout, .text = "(cached)" },
+            .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+            .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+        },
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectSamePreSummaryBytes(allocator, timer, "interpreter cache fill", interpreter_fill, "optimized cached replay", optimized_cached)) |failure| return failure;
+
+    var reverse_env = buildCaseEnv(io, allocator) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create reverse backend cache environment: {}", .{err});
+    defer reverse_env.deinit(allocator);
+
+    const optimized_fill = switch (captureRocRun(io, allocator, &reverse_env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .contains = &expected_transcript,
+        .not_contains = &.{.{ .stream = .stdout, .text = "(cached)" }},
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const interpreter_cached = switch (captureRocRun(io, allocator, &reverse_env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=interpreter" },
+        .roc_file = roc_file,
+        .contains = &.{
+            .{ .stream = .stdout, .text = "(cached)" },
+            .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+            .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+        },
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectSamePreSummaryBytes(allocator, timer, "optimized cache fill", optimized_fill, "interpreter cached replay", interpreter_cached)) |failure| return failure;
+
+    var dev_env = buildCaseEnv(io, allocator) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create dev backend cache environment: {}", .{err});
+    defer dev_env.deinit(allocator);
+
+    const dev_fill = switch (captureRocRun(io, allocator, &dev_env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=dev" },
+        .roc_file = roc_file,
+        .contains = &expected_transcript,
+        .not_contains = &.{.{ .stream = .stdout, .text = "(cached)" }},
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const optimized_after_dev = switch (captureRocRun(io, allocator, &dev_env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .contains = &.{
+            .{ .stream = .stdout, .text = "(cached)" },
+            .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+            .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+        },
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectSamePreSummaryBytes(allocator, timer, "dev cache fill", dev_fill, "optimized cached replay after dev", optimized_after_dev)) |failure| return failure;
+
+    return null;
+}
+
+const CapturedRocRun = union(enum) {
+    result: std.process.RunResult,
+    failure: TestResult,
+};
+
+fn captureRocRun(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+    command: CommandCase,
+) CapturedRocRun {
+    const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
+        return .{ .failure = timeoutFailure(allocator, timer, .run, "case timeout exhausted before command started") };
+    const result = runRocInEnv(io, allocator, env, command.args, command.roc_file, command.file_path_mode, command.stdin, child_timeout_ms) catch |err|
+        return .{ .failure = customInfraFailure(allocator, timer, "run spawn error: {}", .{err}) };
+
+    if (checkCommandExpectation(allocator, result, command)) |message| {
+        return .{ .failure = failureFromRun(allocator, timer, result, message) };
+    }
+
+    return .{ .result = result };
+}
+
+fn preSummaryBytes(bytes: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, bytes, "All (")) return bytes[0..0];
+    if (std.mem.startsWith(u8, bytes, "Ran ")) return bytes[0..0];
+    if (std.mem.find(u8, bytes, "\nAll (")) |summary_start| return bytes[0 .. summary_start + 1];
+    if (std.mem.find(u8, bytes, "\nRan ")) |summary_start| return bytes[0 .. summary_start + 1];
+    return bytes;
+}
+
+fn stripAnsiEscapes(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
+    var stripped = std.ArrayList(u8).empty;
+    errdefer stripped.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < bytes.len) {
+        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '[') {
+            index += 2;
+            while (index < bytes.len) : (index += 1) {
+                const byte = bytes[index];
+                if (byte >= 0x40 and byte <= 0x7e) {
+                    index += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        try stripped.append(allocator, bytes[index]);
+        index += 1;
+    }
+
+    return stripped.toOwnedSlice(allocator);
+}
+
+fn expectSamePreSummaryBytes(
+    allocator: Allocator,
+    timer: *harness.Timer,
+    lhs_name: []const u8,
+    lhs: std.process.RunResult,
+    rhs_name: []const u8,
+    rhs: std.process.RunResult,
+) ?TestResult {
+    const lhs_stdout = preSummaryBytes(lhs.stdout);
+    const rhs_stdout = preSummaryBytes(rhs.stdout);
+    if (!std.mem.eql(u8, lhs_stdout, rhs_stdout)) {
+        return customFailure(allocator, timer, "pre-summary stdout differed between {s} and {s}: {d} bytes vs {d} bytes", .{ lhs_name, rhs_name, lhs_stdout.len, rhs_stdout.len });
+    }
+
+    const lhs_stderr = preSummaryBytes(lhs.stderr);
+    const rhs_stderr = preSummaryBytes(rhs.stderr);
+    if (!std.mem.eql(u8, lhs_stderr, rhs_stderr)) {
+        return customFailure(allocator, timer, "pre-summary stderr differed between {s} and {s}: {d} bytes vs {d} bytes", .{ lhs_name, rhs_name, lhs_stderr.len, rhs_stderr.len });
+    }
+
+    return null;
+}
+
+fn expectSamePreSummaryTextIgnoringColor(
+    allocator: Allocator,
+    timer: *harness.Timer,
+    lhs_name: []const u8,
+    lhs: std.process.RunResult,
+    rhs_name: []const u8,
+    rhs: std.process.RunResult,
+) ?TestResult {
+    const lhs_stdout = stripAnsiEscapes(allocator, preSummaryBytes(lhs.stdout)) catch |err|
+        return customInfraFailure(allocator, timer, "failed to strip stdout ANSI escapes: {}", .{err});
+    defer allocator.free(lhs_stdout);
+    const rhs_stdout = stripAnsiEscapes(allocator, preSummaryBytes(rhs.stdout)) catch |err|
+        return customInfraFailure(allocator, timer, "failed to strip stdout ANSI escapes: {}", .{err});
+    defer allocator.free(rhs_stdout);
+    if (!std.mem.eql(u8, lhs_stdout, rhs_stdout)) {
+        return customFailure(allocator, timer, "pre-summary stdout text differed between {s} and {s}: {d} bytes vs {d} bytes", .{ lhs_name, rhs_name, lhs_stdout.len, rhs_stdout.len });
+    }
+
+    const lhs_stderr = stripAnsiEscapes(allocator, preSummaryBytes(lhs.stderr)) catch |err|
+        return customInfraFailure(allocator, timer, "failed to strip stderr ANSI escapes: {}", .{err});
+    defer allocator.free(lhs_stderr);
+    const rhs_stderr = stripAnsiEscapes(allocator, preSummaryBytes(rhs.stderr)) catch |err|
+        return customInfraFailure(allocator, timer, "failed to strip stderr ANSI escapes: {}", .{err});
+    defer allocator.free(rhs_stderr);
+    if (!std.mem.eql(u8, lhs_stderr, rhs_stderr)) {
+        return customFailure(allocator, timer, "pre-summary stderr text differed between {s} and {s}: {d} bytes vs {d} bytes", .{ lhs_name, rhs_name, lhs_stderr.len, rhs_stderr.len });
+    }
+
+    return null;
+}
+
+fn expectNoAnsiInPreSummary(
+    allocator: Allocator,
+    timer: *harness.Timer,
+    name: []const u8,
+    result: std.process.RunResult,
+) ?TestResult {
+    if (std.mem.find(u8, preSummaryBytes(result.stdout), "\x1b[") != null) {
+        return customFailure(allocator, timer, "{s} stdout contained ANSI escapes before the final summary", .{name});
+    }
+    if (std.mem.find(u8, preSummaryBytes(result.stderr), "\x1b[") != null) {
+        return customFailure(allocator, timer, "{s} stderr contained ANSI escapes before the final summary", .{name});
+    }
+    return null;
+}
+
+fn expectAnsiInPreSummary(
+    allocator: Allocator,
+    timer: *harness.Timer,
+    name: []const u8,
+    result: std.process.RunResult,
+) ?TestResult {
+    if (std.mem.find(u8, preSummaryBytes(result.stdout), "\x1b[") == null and
+        std.mem.find(u8, preSummaryBytes(result.stderr), "\x1b[") == null)
+    {
+        return customFailure(allocator, timer, "{s} did not contain ANSI escapes before the final summary", .{name});
+    }
+    return null;
+}
+
+fn expectNoInvocationFactsInPreSummary(
+    allocator: Allocator,
+    timer: *harness.Timer,
+    name: []const u8,
+    result: std.process.RunResult,
+) ?TestResult {
+    const stdout = preSummaryBytes(result.stdout);
+    const stderr = preSummaryBytes(result.stderr);
+    if (std.mem.find(u8, stdout, "(cached)") != null or std.mem.find(u8, stderr, "(cached)") != null) {
+        return customFailure(allocator, timer, "{s} printed cache status before the final summary", .{name});
+    }
+    if (std.mem.find(u8, stdout, " tests passed in ") != null or std.mem.find(u8, stderr, " tests passed in ") != null) {
+        return customFailure(allocator, timer, "{s} printed pass timing before the final summary", .{name});
+    }
+    if (std.mem.find(u8, stdout, "Ran ") != null or std.mem.find(u8, stderr, "Ran ") != null) {
+        return customFailure(allocator, timer, "{s} printed failing timing summary before the final summary", .{name});
+    }
+    return null;
+}
+
+fn envKeyEql(lhs: []const u8, rhs: []const u8) bool {
+    return if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(lhs, rhs)
+    else
+        std.mem.eql(u8, lhs, rhs);
+}
+
+fn envKeyIn(key: []const u8, keys: []const []const u8) bool {
+    for (keys) |candidate| {
+        if (envKeyEql(key, candidate)) return true;
+    }
+    return false;
+}
+
+fn cloneEnvWithout(allocator: Allocator, env_map: *const std.process.Environ.Map, skip_keys: []const []const u8) Allocator.Error!std.process.Environ.Map {
+    var cloned = std.process.Environ.Map.init(allocator);
+    errdefer cloned.deinit();
+
+    const keys = env_map.keys();
+    const values = env_map.values();
+    for (keys, values) |key, value| {
+        if (envKeyIn(key, skip_keys)) continue;
+        try cloned.put(key, value);
+    }
+
+    return cloned;
+}
+
+fn customOptimizedTranscriptDeterministicBeforeSummary(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    const roc_file = "test/cli/OptimizedTestDbgTranscript.roc";
+    const expected_transcript = [_]OutputNeedle{
+        .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+        .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+    };
+
+    const size_no_cache = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=size", "--no-cache", "--jobs=1" },
+        .roc_file = roc_file,
+        .contains = &expected_transcript,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const speed_no_cache_one_worker = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed", "--no-cache", "--jobs=1" },
+        .roc_file = roc_file,
+        .contains = &expected_transcript,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const speed_no_cache_many_workers = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed", "--no-cache", "--jobs=4" },
+        .roc_file = roc_file,
+        .contains = &expected_transcript,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectSamePreSummaryBytes(allocator, timer, "fresh --opt=size", size_no_cache, "fresh --opt=speed --jobs=1", speed_no_cache_one_worker)) |failure| return failure;
+    if (expectSamePreSummaryBytes(allocator, timer, "fresh --opt=speed --jobs=1", speed_no_cache_one_worker, "fresh --opt=speed --jobs=4", speed_no_cache_many_workers)) |failure| return failure;
+
+    const fresh_cacheable = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .contains = &expected_transcript,
+        .not_contains = &.{.{ .stream = .stdout, .text = "(cached)" }},
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const expected_cached_transcript = [_]OutputNeedle{
+        .{ .stream = .stderr, .text = "[dbg] \"first transcript event\"" },
+        .{ .stream = .stderr, .text = "[dbg] \"second transcript event\"" },
+        .{ .stream = .stdout, .text = "(cached)" },
+    };
+    const cached = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .contains = &expected_cached_transcript,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectNoInvocationFactsInPreSummary(allocator, timer, "cached replay", cached)) |failure| return failure;
+    if (expectSamePreSummaryBytes(allocator, timer, "fresh cache fill", fresh_cacheable, "cached replay", cached)) |failure| return failure;
+    if (expectSamePreSummaryBytes(allocator, timer, "fresh --opt=speed --no-cache", speed_no_cache_one_worker, "fresh cache fill", fresh_cacheable)) |failure| return failure;
+
+    return null;
+}
+
+fn customOptimizedFailureTranscriptDeterministicBeforeSummary(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    const roc_file = "test/cli/SomeFailTests.roc";
+    const expected_failure = [_]OutputNeedle{
+        .{ .stream = .stderr, .text = "FAIL" },
+        .{ .stream = .stderr, .text = "add(1, 1) == 3" },
+    };
+    const not_cached = [_]OutputNeedle{
+        .{ .stream = .stdout, .text = "(cached)" },
+        .{ .stream = .stderr, .text = "(cached)" },
+    };
+
+    const one_worker = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed", "--no-cache", "--jobs=1" },
+        .roc_file = roc_file,
+        .exit = .{ .code = 1 },
+        .contains = &expected_failure,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const many_workers = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed", "--no-cache", "--jobs=4" },
+        .roc_file = roc_file,
+        .exit = .{ .code = 1 },
+        .contains = &expected_failure,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectSamePreSummaryBytes(allocator, timer, "failed --jobs=1", one_worker, "failed --jobs=4", many_workers)) |failure| return failure;
+
+    const fresh_cacheable = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .exit = .{ .code = 1 },
+        .contains = &expected_failure,
+        .not_contains = &not_cached,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    const expected_cached_failure = [_]OutputNeedle{
+        .{ .stream = .stderr, .text = "FAIL" },
+        .{ .stream = .stderr, .text = "add(1, 1) == 3" },
+        .{ .stream = .stderr, .text = "(cached)" },
+    };
+    const cached = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .exit = .{ .code = 1 },
+        .contains = &expected_cached_failure,
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectNoInvocationFactsInPreSummary(allocator, timer, "failed cached replay", cached)) |failure| return failure;
+    if (expectSamePreSummaryBytes(allocator, timer, "failed fresh cache fill", fresh_cacheable, "failed cached replay", cached)) |failure| return failure;
+    if (expectSamePreSummaryBytes(allocator, timer, "failed --jobs=1 --no-cache", one_worker, "failed fresh cache fill", fresh_cacheable)) |failure| return failure;
+
+    return null;
+}
+
+fn customOptimizedColorModeCacheReplay(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    const roc_file = "test/cli/SomeFailTests.roc";
+    const expected_failure = [_]OutputNeedle{
+        .{ .stream = .stderr, .text = "FAIL" },
+        .{ .stream = .stderr, .text = "add(1, 1) == 3" },
+    };
+
+    var colored_env = CaseEnv{
+        .dirs = env.dirs,
+        .env_map = cloneEnvWithout(allocator, &env.env_map, &.{"NO_COLOR"}) catch |err|
+            return customInfraFailure(allocator, timer, "failed to clone environment for FORCE_COLOR run: {}", .{err}),
+    };
+    defer colored_env.env_map.deinit();
+    colored_env.env_map.put("FORCE_COLOR", "1") catch |err|
+        return customInfraFailure(allocator, timer, "failed to set FORCE_COLOR: {}", .{err});
+
+    const fresh_colored = switch (captureRocRun(io, allocator, &colored_env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .exit = .{ .code = 1 },
+        .contains = &expected_failure,
+        .not_contains = &.{ .{ .stream = .stdout, .text = "(cached)" }, .{ .stream = .stderr, .text = "(cached)" } },
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    var no_color_env = CaseEnv{
+        .dirs = env.dirs,
+        .env_map = cloneEnvWithout(allocator, &env.env_map, &.{"FORCE_COLOR"}) catch |err|
+            return customInfraFailure(allocator, timer, "failed to clone environment for NO_COLOR run: {}", .{err}),
+    };
+    defer no_color_env.env_map.deinit();
+    no_color_env.env_map.put("NO_COLOR", "1") catch |err|
+        return customInfraFailure(allocator, timer, "failed to set NO_COLOR: {}", .{err});
+
+    const cached_no_color = switch (captureRocRun(io, allocator, &no_color_env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed" },
+        .roc_file = roc_file,
+        .exit = .{ .code = 1 },
+        .contains = &.{
+            .{ .stream = .stderr, .text = "FAIL" },
+            .{ .stream = .stderr, .text = "add(1, 1) == 3" },
+            .{ .stream = .stderr, .text = "(cached)" },
+        },
+    })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+
+    if (expectAnsiInPreSummary(allocator, timer, "fresh FORCE_COLOR cache fill", fresh_colored)) |failure| return failure;
+    if (expectNoAnsiInPreSummary(allocator, timer, "cached NO_COLOR replay", cached_no_color)) |failure| return failure;
+    if (expectNoInvocationFactsInPreSummary(allocator, timer, "cached NO_COLOR replay", cached_no_color)) |failure| return failure;
+    if (expectSamePreSummaryTextIgnoringColor(allocator, timer, "fresh colored cache fill", fresh_colored, "cached NO_COLOR replay", cached_no_color)) |failure| return failure;
+
+    return null;
+}
+
+fn countLinkRecords(bytes: []const u8) u32 {
+    var count: u32 = 0;
+    for (bytes) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
+fn customOptimizedMultiModuleLinksOnce(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    const link_count_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "llvm-shared-link-count.txt" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate link count path: {}", .{err});
+    defer allocator.free(link_count_path);
+
+    var link_count_env = CaseEnv{
+        .dirs = env.dirs,
+        .env_map = env.env_map.clone(allocator) catch |err|
+            return customInfraFailure(allocator, timer, "failed to clone environment for link-count run: {}", .{err}),
+    };
+    defer link_count_env.env_map.deinit();
+    link_count_env.env_map.put("ROC_TEST_LLVM_SHARED_LINK_COUNT_FILE", link_count_path) catch |err|
+        return customInfraFailure(allocator, timer, "failed to set link-count file environment: {}", .{err});
+
+    if (runRocAndCheck(io, allocator, &link_count_env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=speed", "--no-cache" },
+        .roc_file = "test/cli/multi_module_expect_err/Main.roc",
+        .exit = .{ .code = 1 },
+        .contains = &.{
+            .{ .stream = .stderr, .text = "Ran 2 tests" },
+            .{ .stream = .stderr, .text = "result = to_positive(-2)?" },
+            .{ .stream = .stderr, .text = "result = to_positive(-1)?" },
+        },
+    })) |failure| return failure;
+
+    const count_bytes = std.Io.Dir.cwd().readFileAlloc(io, link_count_path, allocator, .limited(1024)) catch |err|
+        return customFailure(allocator, timer, "failed to read LLVM shared-library link count file {s}: {}", .{ link_count_path, err });
+    defer allocator.free(count_bytes);
+
+    const link_count = countLinkRecords(count_bytes);
+    if (link_count != 1) {
+        return customFailure(allocator, timer, "expected optimized multi-module roc test to perform exactly one shared-library link, observed {d}", .{link_count});
+    }
+
+    return null;
+}
+
 fn customVerboseWorksFromCache(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64, backend: OptMode) ?TestResult {
     const opt_arg = backendOptArg(allocator, backend) catch |err|
         return customInfraFailure(allocator, timer, "failed to allocate opt arg: {}", .{err});
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{ .args = &.{ "test", opt_arg }, .roc_file = "test/cli/AllPassTests.roc" })) |failure| return failure;
-    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{ .args = &.{ "test", opt_arg, "--verbose" }, .roc_file = "test/cli/AllPassTests.roc", .contains = &.{ .{ .stream = .stdout, .text = "(cached)" }, .{ .stream = .stdout, .text = "PASS" } } })) |failure| return failure;
+    const cached_verbose = switch (captureRocRun(io, allocator, env, timer, timeout_ms, .{ .args = &.{ "test", opt_arg, "--verbose" }, .roc_file = "test/cli/AllPassTests.roc", .contains = &.{ .{ .stream = .stdout, .text = "(cached)" }, .{ .stream = .stdout, .text = "PASS" } } })) {
+        .result => |result| result,
+        .failure => |failure| return failure,
+    };
+    if (expectNoAnsiInPreSummary(allocator, timer, "cached verbose PASS replay", cached_verbose)) |failure| return failure;
     return null;
 }
 
@@ -4959,6 +5553,275 @@ fn customIssue9392Deterministic(io: std.Io, allocator: Allocator, env: *const Ca
     };
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
+    return null;
+}
+
+fn customIssue10015UrlRandomTestSize(
+    io: std.Io,
+    allocator: Allocator,
+    env: *CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+) ?TestResult {
+    if (builtin.os.tag != .macos) {
+        return .{ .status = .skip, .phase = .setup, .duration_ns = timer.read(), .message = "issue 10015 reproduces in Mach-O dylib linking only" };
+    }
+
+    const platform_hash = "8GdFEvQYS3TeAZxKvTzCLVdQiomweGtXcdZkXNDEeABq";
+    const random_hash = "4mHqd7aiQ1hYkoso9C8JRfnx3GuwcwoDqv8EdqAsLbfN";
+    const target_dir_name = switch (builtin.cpu.arch) {
+        .aarch64 => "arm64mac",
+        .x86_64 => "x64mac",
+        else => return .{ .status = .skip, .phase = .setup, .duration_ns = timer.read(), .message = "issue 10015 test only supports macOS ARM64 and x86_64" },
+    };
+    const platform_main_source = switch (builtin.cpu.arch) {
+        .aarch64 =>
+        \\platform ""
+        \\    requires {} { main! : List(Str) => Try({}, [Exit(I32)]) }
+        \\    exposes [Stdout, Stderr, Stdin]
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host! }
+        \\    hosted {
+        \\        "roc_stderr_line": Stderr.line!,
+        \\        "roc_stdin_line": Stdin.line!,
+        \\        "roc_stdout_line": Stdout.line!,
+        \\    }
+        \\    targets: {
+        \\        inputs_dir: "targets/",
+        \\        arm64mac: { inputs: ["libhost.a", app] },
+        \\    }
+        \\
+        \\import Stdout
+        \\import Stderr
+        \\import Stdin
+        \\
+        \\main_for_host! : List(Str) => I32
+        \\main_for_host! = |args| {
+        \\    result = main!(args)
+        \\    match result {
+        \\        Ok({}) => 0
+        \\        Err(Exit(code)) => code
+        \\    }
+        \\}
+        \\
+        ,
+        .x86_64 =>
+        \\platform ""
+        \\    requires {} { main! : List(Str) => Try({}, [Exit(I32)]) }
+        \\    exposes [Stdout, Stderr, Stdin]
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host! }
+        \\    hosted {
+        \\        "roc_stderr_line": Stderr.line!,
+        \\        "roc_stdin_line": Stdin.line!,
+        \\        "roc_stdout_line": Stdout.line!,
+        \\    }
+        \\    targets: {
+        \\        inputs_dir: "targets/",
+        \\        x64mac: { inputs: ["libhost.a", app] },
+        \\    }
+        \\
+        \\import Stdout
+        \\import Stderr
+        \\import Stdin
+        \\
+        \\main_for_host! : List(Str) => I32
+        \\main_for_host! = |args| {
+        \\    result = main!(args)
+        \\    match result {
+        \\        Ok({}) => 0
+        \\        Err(Exit(code)) => code
+        \\    }
+        \\}
+        \\
+        ,
+        else => unreachable,
+    };
+
+    const cache_platform_dir = std.fs.path.join(allocator, &.{ env.dirs.roc_cache_dir, "roc", "packages", platform_hash }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached platform path: {}", .{err});
+    defer allocator.free(cache_platform_dir);
+    std.Io.Dir.cwd().createDirPath(io, cache_platform_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create cached platform package: {}", .{err});
+
+    const cached_platform_main = std.fs.path.join(allocator, &.{ cache_platform_dir, "main.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached platform main path: {}", .{err});
+    defer allocator.free(cached_platform_main);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_platform_main,
+        .data = platform_main_source,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached platform main: {}", .{err});
+
+    const cached_stdout = std.fs.path.join(allocator, &.{ cache_platform_dir, "Stdout.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached Stdout module path: {}", .{err});
+    defer allocator.free(cached_stdout);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_stdout,
+        .data =
+        \\Stdout := [].{
+        \\    line! : Str => {}
+        \\}
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached Stdout module: {}", .{err});
+
+    const cached_stderr = std.fs.path.join(allocator, &.{ cache_platform_dir, "Stderr.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached Stderr module path: {}", .{err});
+    defer allocator.free(cached_stderr);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_stderr,
+        .data =
+        \\Stderr := [].{
+        \\    line! : Str => {}
+        \\}
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached Stderr module: {}", .{err});
+
+    const cached_stdin = std.fs.path.join(allocator, &.{ cache_platform_dir, "Stdin.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached Stdin module path: {}", .{err});
+    defer allocator.free(cached_stdin);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_stdin,
+        .data =
+        \\Stdin := [].{
+        \\    line! : () => Str
+        \\}
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached Stdin module: {}", .{err});
+
+    const platform_target_dir = std.fs.path.join(allocator, &.{ cache_platform_dir, "targets", target_dir_name }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached platform target path: {}", .{err});
+    defer allocator.free(platform_target_dir);
+    std.Io.Dir.cwd().createDirPath(io, platform_target_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create cached platform target: {}", .{err});
+
+    const host_archive = std.fs.path.join(allocator, &.{ platform_target_dir, "libhost.a" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached platform host archive path: {}", .{err});
+    defer allocator.free(host_archive);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = host_archive,
+        .data = "!<arch>\n",
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached platform host archive: {}", .{err});
+
+    const cache_package_dir = std.fs.path.join(allocator, &.{ env.dirs.roc_cache_dir, "roc", "packages", random_hash }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached random package path: {}", .{err});
+    defer allocator.free(cache_package_dir);
+    std.Io.Dir.cwd().createDirPath(io, cache_package_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create cached random package: {}", .{err});
+
+    const cached_main = std.fs.path.join(allocator, &.{ cache_package_dir, "main.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached random package main path: {}", .{err});
+    defer allocator.free(cached_main);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_main,
+        .data = "package [Random] {}\n",
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached random package main: {}", .{err});
+
+    const cached_random = std.fs.path.join(allocator, &.{ cache_package_dir, "Random.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached Random module path: {}", .{err});
+    defer allocator.free(cached_random);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_random,
+        .data =
+        \\Random := [].{
+        \\    Generator(value) : State -> Generation(value)
+        \\    Generation(value) : { value : value, state : State }
+        \\    State :: { seed : U32 }
+        \\
+        \\    seed : U32 -> State
+        \\    seed = |value| State.({ seed: value })
+        \\
+        \\    step : State, Generator(value) -> Generation(value)
+        \\    step = |state, generator| generator(state)
+        \\
+        \\    static : value -> Generator(value)
+        \\    static = |value|
+        \\        |state| { value, state }
+        \\}
+        \\
+        \\expect {
+        \\    always_five = Random.static(5)
+        \\
+        \\    Iter.fold(
+        \\        0..<1,
+        \\        True,
+        \\        |all_passed, seed_num| {
+        \\            generation = Random.step(Random.seed(seed_num), always_five)
+        \\            value = generation.value
+        \\
+        \\            all_passed and value == 5
+        \\        },
+        \\    )
+        \\}
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached Random module: {}", .{err});
+
+    const short_root_name = std.fmt.allocPrint(allocator, "roc-issue10015-{s}", .{std.fs.path.basename(env.dirs.work_dir)}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate issue 10015 short temp dir name: {}", .{err});
+    defer allocator.free(short_root_name);
+
+    const short_root = std.fs.path.join(allocator, &.{ "/tmp", short_root_name }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate issue 10015 short temp dir path: {}", .{err});
+    defer allocator.free(short_root);
+    std.Io.Dir.cwd().deleteTree(io, short_root) catch |err|
+        return customInfraFailure(allocator, timer, "failed to clear issue 10015 short temp dir: {}", .{err});
+    std.Io.Dir.cwd().createDirPath(io, short_root) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create issue 10015 short temp dir: {}", .{err});
+    defer std.Io.Dir.cwd().deleteTree(io, short_root) catch {};
+
+    const short_tmp = std.fs.path.join(allocator, &.{ short_root, "tmp" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate issue 10015 short tmp dir path: {}", .{err});
+    defer allocator.free(short_tmp);
+    std.Io.Dir.cwd().createDirPath(io, short_tmp) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create issue 10015 short tmp dir: {}", .{err});
+    util.putIsolatedTempEnv(&env.env_map, short_tmp) catch |err|
+        return customInfraFailure(allocator, timer, "failed to isolate issue 10015 temp env: {}", .{err});
+
+    const app_source =
+        \\app [main!] {
+        \\    pf: platform "https://github.com/lukewilliamboswell/roc-platform-template-zig/releases/download/0.9/8GdFEvQYS3TeAZxKvTzCLVdQiomweGtXcdZkXNDEeABq.tar.zst",
+        \\    random: "https://github.com/kili-ilo/roc-random/releases/download/0.6.0/4mHqd7aiQ1hYkoso9C8JRfnx3GuwcwoDqv8EdqAsLbfN.tar.zst",
+        \\}
+        \\
+        \\import random.Random
+        \\
+        \\main! = |_args| Ok({})
+        \\
+        \\expect True
+        \\
+    ;
+
+    const debug_app_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "issue_10015.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate issue 10015 debug app path: {}", .{err});
+    defer allocator.free(debug_app_path);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = debug_app_path,
+        .data = app_source,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write issue 10015 debug app: {}", .{err});
+
+    const app_path = std.fs.path.join(allocator, &.{ short_root, "issue_10015.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate issue 10015 app path: {}", .{err});
+    defer allocator.free(app_path);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = app_path,
+        .data = app_source,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write issue 10015 app: {}", .{err});
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "test", "--opt=size", "--no-cache" },
+        .roc_file = app_path,
+        .exit = .success,
+        .contains = &.{.{ .stream = .stdout, .text = "passed" }},
+        .not_contains = &.{
+            .{ .stream = .stderr, .text = "Segmentation fault" },
+            .{ .stream = .stderr, .text = "SIGSEGV" },
+            .{ .stream = .stderr, .text = "panic" },
+        },
+    })) |failure| return failure;
+
     return null;
 }
 

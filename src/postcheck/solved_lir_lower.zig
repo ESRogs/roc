@@ -132,6 +132,8 @@ pub const Options = struct {
     /// Build ConstStore materialization plans for requested layouts.
     /// Static-data exports require this; layout-only consumers such as glue do not.
     layout_request_const_plans: bool = true,
+    /// Optional command-level test-plan metadata keyed by checked root order.
+    test_plan_metadata: []const Common.RootTestPlanMetadata = &.{},
 };
 
 /// Lower Lambda Solved directly into LIR.
@@ -320,6 +322,7 @@ const Lowerer = struct {
     const_type_map: std.AutoHashMap(Type.TypeId, const_store.ConstTypeId),
     mono_const_type_map: std.AutoHashMap(MonoType.TypeId, const_store.ConstTypeId),
     callable_source_fn_map: std.AutoHashMap(Type.TypeId, SolvedType.TypeVarId),
+    root_requests: Common.RootRequests,
     symbols: Common.SymbolGen,
     local_map: []?LIR.LocalId,
     typed_local_map: std.AutoHashMap(TypedLiftedLocal, LIR.LocalId),
@@ -375,6 +378,7 @@ const Lowerer = struct {
             .list_in_place_map = options.list_in_place_map,
             .proc_debug_names = options.proc_debug_names,
             .layout_request_const_plans = options.layout_request_const_plans,
+            .root_requests = .{ .test_plan_metadata = options.test_plan_metadata },
             .folded_map_matches = .empty,
             .source_symbols = std.AutoHashMap(Common.Symbol, Lifted.FnId).init(allocator),
             .capture_types = CaptureTypeMap.initContext(allocator, .{}),
@@ -1232,7 +1236,9 @@ const Lowerer = struct {
             const entry = self.fn_entries.items[@intFromEnum(root.fn_id)];
             const proc = try self.markReachableFn(root.fn_id);
             try self.result.root_procs.append(self.allocator, proc);
-            try self.result.root_metadata.append(self.allocator, RootMetadata.fromCheckedRoot(root.request));
+            var metadata = RootMetadata.fromCheckedRoot(root.request);
+            metadata.test_plan = Common.testPlanMetadataForRoot(self.root_requests, root.request);
+            try self.result.root_metadata.append(self.allocator, metadata);
             if (root.request.abi == .compile_time) {
                 try self.result.const_roots.append(self.allocator, .{
                     .root_order = root.request.order,
