@@ -1464,9 +1464,7 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
             break :blk try checkedTypeIsConcreteCompileTimeRootInner(.decl_template, checked_types, backing, active);
         },
         // A function scheme is a concrete compile-time root exactly when its
-        // args and return contain no identity variables; the recursion returns
-        // false on flex (and non-decl rigid) vars, so no separate flag is
-        // needed. (`needs_instantiation` was a vestigial force-stamp.)
+        // args and return contain no identity variables.
         .function => |function| (try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, function.args, active)) and
             try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, function.ret, active),
         .tag_union => |tag_union| (try checkedTagsAreConcreteCompileTimeRoots(walk, checked_types, tag_union.tags, active)) and

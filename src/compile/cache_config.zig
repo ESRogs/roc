@@ -44,7 +44,7 @@ pub const Constants = struct {
     ///     exact-numeral pattern node, and NumeralInfo constraint payloads.
     /// 19: Annotation node payload records a precomputed `contains_underscore` flag.
     /// 20: Nominal declaration table serialized with the type store.
-    /// 21: Function types no longer carry a needs_instantiation flag.
+    /// 21: Checked function serialization no longer carries instantiation stamps.
     pub const CACHE_VERSION = 21;
 };
 
