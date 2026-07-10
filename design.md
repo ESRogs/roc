@@ -4369,7 +4369,11 @@ targets: {
     inputs_dir: "targets/",
     arm64mac: { inputs: ["libhost.a", app], output: Shared },
     x64glibc: { inputs: ["libhost.a", app], output: Exe },
-    wasm32: { inputs: ["host.wasm", app], output: Shared },
+    wasm32: {
+        inputs: ["host.wasm", app],
+        output: Shared,
+        exports: ["start", "update"],
+    },
 }
 ```
 
@@ -4397,6 +4401,22 @@ linked or loaded by a host application instead.
 The output that static archives previously stood in for on wasm (a linked,
 loadable, no-entry module) is `Shared`, not `Archive`; `Archive` is never a
 linked module.
+
+For wasm targets, `exports:` is the complete final host-visible function ABI.
+Every named function is a link root and is emitted in the module export
+section; no other host function becomes public. An explicitly empty list means
+that the final module has no exported functions. Omitting the field preserves
+compatibility with older platforms by exporting the public function symbols
+found in their wasm object inputs. New platforms should always declare the
+field so object visibility cannot accidentally enlarge the final ABI or retain
+link-only code.
+
+After the final wasm link, size builds run Binaryen at optimize level 2 and
+shrink level 2, validate the resulting module, and remove debug, producer, and
+target-feature custom sections from non-debug output. Target features remain
+encoded in the executable instructions and validated by Binaryen; the removed
+custom section is metadata and is not part of the runtime ABI. Debug builds
+retain debugging and target-feature metadata.
 
 ## Host Symbol ABI
 

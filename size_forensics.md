@@ -1,5 +1,10 @@
 # Rocci Bird `--opt=size` forensics: where the bytes went (Slice G vs checkpoint)
 
+> Historical investigation. These measurements compare old compiler
+> checkpoints and are retained as guidance about the failed shapes they
+> exposed; they are not the current cart baseline. Current measurements and
+> conclusions are recorded in `iter_fusion_design.md` and `plan.md`.
+
 Measurement task under the Slice-G measurement ruling. No optimizer code was
 changed; only temporary probes (since removed) and this report. Numbers are
 from four freshly built `--opt=size` wasm carts:

@@ -11,9 +11,9 @@ lowering.
 
 The shipping iterator goal is complete.
 
-- The authoritative Rocci Bird `--opt=size --target=wasm32` cart is 36,892
+- The authoritative Rocci Bird `--opt=size --target=wasm32` cart is 35,175
   bytes with idiomatic iterators.
-- The equivalent direct-list cart is 36,850 bytes.
+- The equivalent direct-list cart is 35,133 bytes.
 - The iterator premium is 42 bytes.
 - The iterator cart boots with the same `OK 191` result as the direct-list cart.
 - The iterator chain and constant base list perform zero runtime heap
@@ -24,9 +24,9 @@ The shipping iterator goal is complete.
   through the forced-dynamic tier. The committed cart is 541,756 bytes with a
   600,000-byte regression ceiling.
 
-The remaining roughly 26 KB gap to the 10,655-byte Rust cart is general
-runtime, standard-library, platform, ARC, export, and code-generation cost. It
-is not iterator representation overhead.
+The remaining 24,520-byte gap to the 10,655-byte Rust cart is general runtime,
+standard-library, platform, ARC, and code-generation cost. It is not iterator
+representation overhead.
 
 ## Public Contract
 
@@ -276,17 +276,47 @@ parent release adjacent. Keeping extra solver data for a zero-hit rule would add
 compiler complexity without improving either cart, so the prototype was
 discarded.
 
-The cleared-cache cart measurements therefore remain 36,892 bytes for the
-iterator cart and 36,850 bytes for the direct-list cart. No ARC change was
-landed from this pilot. Further size work should start from measured whole-cart
-reachability and composition rather than broadening ARC rules without an exact
-ownership proof.
+No ARC change was landed from this pilot. Further size work started from
+measured whole-cart reachability and composition rather than broadening ARC
+rules without an exact ownership proof.
+
+## Broader Cart-Size Audit
+
+The platform now declares `exports: ["start", "update"]` as its complete final
+wasm ABI. Previously, 36 public object symbols became link roots. Making the
+two real host entrypoints explicit removed 28 functions and 5 imports, reducing
+both carts by 1,325 bytes without changing their 42-byte difference.
+
+Non-debug size output also strips the final `target_features` custom section.
+That metadata was 392 bytes in both carts and did not affect executable code or
+data. The two changes reduce each cart by 1,717 bytes in total:
+
+| cart | before broader audit | current | change |
+|---|---:|---:|---:|
+| iterator | 36,892 | 35,175 | -1,717 |
+| direct list | 36,850 | 35,133 | -1,717 |
+
+A minimal application on the same platform measured about 3.1 KB after
+metadata stripping, so the remaining gap is not an unavoidable 26 KB host
+floor. In the named diagnostic cart, every function left after explicit export
+rooting is referenced by an export, a direct call, or the function table; no
+unreachable runtime or standard-library procedure remains to prune.
+
+The large `update` body and other Roc procedures were also tested against the
+available structural controls. Disabling wrapper specialization increased the
+iterator cart by 6,453 bytes and the direct-list cart by 4,434 bytes. Disabling
+ARC procedure specialization produced byte-identical carts. Binaryen's existing
+shrink-level-2 pipeline already performs duplicate and similar-function
+elimination. Together with the exact ARC pilot's zero safe matches, these
+results leave no measured structural candidate with both a correctness proof
+and a cart-size benefit.
 
 ## Current Conclusion
 
 Per-chain minting, explicit forced-dynamic representation, SpecConstr loop
 scalarization, and constant-list static storage jointly deliver the iterator
-goal. The current iterator premium is 42 bytes. Further work toward Rust's total
-cart size belongs to general ARC, runtime, export, standard-library, platform,
-and code-generation size efforts, not to a new iterator representation or
-fusion campaign.
+goal. Explicit final exports and metadata stripping reduce general cart cost
+without changing the current 42-byte iterator premium. Further work toward
+Rust's total cart size belongs to separately justified ARC, runtime,
+standard-library, platform, and code-generation efforts, not to a new iterator
+representation or fusion campaign.
