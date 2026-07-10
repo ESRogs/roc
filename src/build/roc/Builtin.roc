@@ -16378,17 +16378,22 @@ crypto_digest_to_hex = |bytes|
 		}
 	}
 
+## The numeric value of an ASCII hex digit (either case).
+hex_digit_value : U8 -> Try(U8, [NotHex])
+hex_digit_value = |byte|
+	if byte >= '0' and byte <= '9' {
+		Ok(byte - '0')
+	} else if byte >= 'a' and byte <= 'f' {
+		Ok(byte - 'a' + 10)
+	} else if byte >= 'A' and byte <= 'F' {
+		Ok(byte - 'A' + 10)
+	} else {
+		Err(NotHex)
+	}
+
 crypto_hex_nibble : U8, U64 -> Try(U8, Crypto.DigestHexErr)
 crypto_hex_nibble = |byte, index|
-	if byte >= 48 and byte <= 57 {
-		Ok(byte - 48)
-	} else if byte >= 65 and byte <= 70 {
-		Ok(byte - 55)
-	} else if byte >= 97 and byte <= 102 {
-		Ok(byte - 87)
-	} else {
-		Err(InvalidHex({ index, byte }))
-	}
+	hex_digit_value(byte).map_err(|_| InvalidHex({ index, byte }))
 
 crypto_digest_from_hex : Str -> Try(List(U8), Crypto.DigestHexErr)
 crypto_digest_from_hex = |hex| {
