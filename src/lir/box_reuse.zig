@@ -699,6 +699,12 @@ fn testZst(store: *LirStore, target: LocalId, next: CFStmtId) ResourceError!CFSt
     } });
 }
 
+fn testFreshJoinPointId(next_join_point: *u32) LIR.JoinPointId {
+    const id: LIR.JoinPointId = @enumFromInt(next_join_point.*);
+    next_join_point.* += 1;
+    return id;
+}
+
 test "box reuse rewrites the direct unbox call rebox return chain" {
     const allocator = std.testing.allocator;
     var store = LirStore.init(allocator);
@@ -797,7 +803,8 @@ test "box reuse rewrites joined update wrappers" {
     const prelude_zst = try testLocal(&store, .zst);
     const remainder_zst = try testLocal(&store, .zst);
 
-    const join_id: LIR.JoinPointId = @enumFromInt(0);
+    var next_join_point: u32 = 0;
+    const join_id = testFreshJoinPointId(&next_join_point);
 
     const ret = try store.addCFStmt(.{ .ret = .{ .value = result_box } });
     const rebox = try testLowLevel(&store, result_box, .box_box, &.{body_payload_alias}, ret);
@@ -899,7 +906,8 @@ test "box reuse rewrites platform-style join remainder update wrappers" {
     const proc_zst = try testLocal(&store, .zst);
     const remainder_zst = try testLocal(&store, .zst);
 
-    const join_id: LIR.JoinPointId = @enumFromInt(0);
+    var next_join_point: u32 = 0;
+    const join_id = testFreshJoinPointId(&next_join_point);
 
     const ret = try store.addCFStmt(.{ .ret = .{ .value = result_box } });
     const rebox = try testLowLevel(&store, result_box, .box_box, &.{body_payload_alias}, ret);
