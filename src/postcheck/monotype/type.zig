@@ -71,6 +71,7 @@ pub const TypeDef = struct {
     iterator_depth: u8 = 0,
 };
 
+/// Explicit representation tier assigned when an iterator nominal is created.
 pub const IteratorRepresentation = enum(u8) {
     none,
     minted,

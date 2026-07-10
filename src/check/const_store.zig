@@ -79,6 +79,7 @@ pub const TypeDef = struct {
     iterator_depth: u8 = 0,
 };
 
+/// Checked iterator representation tier preserved for post-check consumers.
 pub const IteratorRepresentation = enum(u8) {
     none,
     minted,
