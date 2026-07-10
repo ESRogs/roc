@@ -254,7 +254,7 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     const malformed_src =
         \\main! = |_| {
-        \\    todo = { nam"Call mom", done: False }
+        \\    todo = { name "Call mom", done: False }
         \\    Ok({})
         \\}
     ;
