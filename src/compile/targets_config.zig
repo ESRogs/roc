@@ -102,6 +102,16 @@ pub const TargetLinkSpec = struct {
     output: OutputKind,
     items: []const LinkItem,
     wasm: ?WasmTargetConfig = null,
+
+    fn hasDeclaredTargetFiles(self: TargetLinkSpec) bool {
+        for (self.items) |item| {
+            switch (item) {
+                .file_path => return true,
+                .app, .win_gui => {},
+            }
+        }
+        return false;
+    }
 };
 
 fn freeLinkSpec(allocator: Allocator, spec: TargetLinkSpec) void {
@@ -209,6 +219,7 @@ pub const TargetsConfig = struct {
         allocator: Allocator,
         filesystem: CoreCtx,
         platform_dir: []const u8,
+        target: RocTarget,
     ) Allocator.Error!TargetFileValidation {
         var issues = std.ArrayList(TargetFileValidationIssue).empty;
         errdefer {
@@ -216,9 +227,11 @@ pub const TargetsConfig = struct {
             issues.deinit(allocator);
         }
 
-        if (!self.hasDeclaredTargetFiles()) {
+        const spec = self.getLinkSpec(target) orelse {
             return .{ .issues = try issues.toOwnedSlice(allocator) };
-        }
+        };
+
+        if (!spec.hasDeclaredTargetFiles()) return .{ .issues = try issues.toOwnedSlice(allocator) };
 
         const inputs_dir = self.inputs_dir orelse "targets";
         const inputs_dir_path = try std.fs.path.join(allocator, &.{ platform_dir, inputs_dir });
@@ -236,45 +249,31 @@ pub const TargetsConfig = struct {
             return .{ .issues = try issues.toOwnedSlice(allocator) };
         }
 
-        for (self.targets) |spec| {
-            const target_name = @tagName(spec.target);
-            for (spec.items) |item| {
-                switch (item) {
-                    .file_path => |path| {
-                        const full_path = try std.fs.path.join(allocator, &.{ platform_dir, inputs_dir, target_name, path });
-                        var full_path_owned = true;
-                        defer if (full_path_owned) allocator.free(full_path);
+        const target_name = @tagName(spec.target);
+        for (spec.items) |item| {
+            switch (item) {
+                .file_path => |path| {
+                    const full_path = try std.fs.path.join(allocator, &.{ platform_dir, inputs_dir, target_name, path });
+                    var full_path_owned = true;
+                    defer if (full_path_owned) allocator.free(full_path);
 
-                        if (!filesystem.fileExists(full_path)) {
-                            try issues.append(allocator, .{
-                                .missing_target_file = .{
-                                    .target = spec.target,
-                                    .output = spec.output,
-                                    .file_path = path,
-                                    .expected_full_path = full_path,
-                                },
-                            });
-                            full_path_owned = false;
-                        }
-                    },
-                    .app, .win_gui => {},
-                }
+                    if (!filesystem.fileExists(full_path)) {
+                        try issues.append(allocator, .{
+                            .missing_target_file = .{
+                                .target = spec.target,
+                                .output = spec.output,
+                                .file_path = path,
+                                .expected_full_path = full_path,
+                            },
+                        });
+                        full_path_owned = false;
+                    }
+                },
+                .app, .win_gui => {},
             }
         }
 
         return .{ .issues = try issues.toOwnedSlice(allocator) };
-    }
-
-    fn hasDeclaredTargetFiles(self: TargetsConfig) bool {
-        for (self.targets) |spec| {
-            for (spec.items) |item| {
-                switch (item) {
-                    .file_path => return true,
-                    .app, .win_gui => {},
-                }
-            }
-        }
-        return false;
     }
 
     /// Create a TargetsConfig from a parsed AST.
@@ -999,7 +998,7 @@ test "fromAST captures punned wasm identifier config" {
     try testing.expectEqualStrings("global_base", wasm.global_base_ident.?);
 }
 
-test "validateDeclaredTargetFilesExist checks all declared target files" {
+test "validateDeclaredTargetFilesExist checks selected target files" {
     const allocator = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1025,16 +1024,23 @@ test "validateDeclaredTargetFilesExist checks all declared target files" {
         .targets = specs,
     };
 
-    const validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir);
-    defer validation.deinit(allocator);
+    const x64_validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir, .x64mac);
+    defer x64_validation.deinit(allocator);
 
-    try testing.expectEqual(@as(usize, 1), validation.issues.len);
-    switch (validation.issues[0]) {
+    try testing.expectEqual(@as(usize, 0), x64_validation.issues.len);
+
+    const wasm_validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir, .wasm32);
+    defer wasm_validation.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), wasm_validation.issues.len);
+    switch (wasm_validation.issues[0]) {
         .missing_target_file => |issue| {
             try testing.expectEqual(RocTarget.wasm32, issue.target);
             try testing.expectEqual(OutputKind.shared, issue.output);
             try testing.expectEqualStrings("host.wasm", issue.file_path);
-            try testing.expect(std.mem.endsWith(u8, issue.expected_full_path, "targets/wasm32/host.wasm"));
+            const expected_path = try std.fs.path.join(allocator, &.{ platform_dir, "targets", "wasm32", "host.wasm" });
+            defer allocator.free(expected_path);
+            try testing.expectEqualStrings(expected_path, issue.expected_full_path);
         },
         else => return error.UnexpectedResult,
     }
@@ -1059,7 +1065,7 @@ test "validateDeclaredTargetFilesExist uses default targets directory" {
         .targets = specs,
     };
 
-    const validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir);
+    const validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir, .x64mac);
     defer validation.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 1), validation.issues.len);

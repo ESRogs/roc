@@ -33,7 +33,7 @@ pub const BuildError = Allocator.Error || std.Thread.SpawnError || error{ Expect
 /// Errors that can occur while initializing build inputs.
 pub const InitError = Allocator.Error || BuiltinModules.InitError;
 /// Errors that can occur while compiling discovered modules.
-pub const CompileDiscoveredError = compile_package.PublishError || error{ UnsupportedBuiltinAnnotationOnly, BuiltinLowLevelAnnotationMustBeFunction, LowLevelOperationsNotFound, HasUserErrors };
+pub const CompileDiscoveredError = BuildError || compile_package.PublishError || error{ UnsupportedBuiltinAnnotationOnly, BuiltinLowLevelAnnotationMustBeFunction, LowLevelOperationsNotFound, HasUserErrors };
 /// Errors that can occur while building a root module.
 pub const BuildRootError = BuildError || CompileDiscoveredError;
 /// Errors that can occur while building an app module.
@@ -668,6 +668,8 @@ pub const BuildEnv = struct {
     /// Must be called after discoverDependencies().
     pub fn compileDiscovered(self: *BuildEnv) CompileDiscoveredError!void {
         const pkg_name = self.discovered_pkg_name orelse unreachable; // Must call discoverDependencies() first
+
+        try self.validateDiscoveredPlatformTargetFilesForCurrentTarget();
 
         // Initialize coordinator if not already done
         try self.initCoordinator();
@@ -2028,7 +2030,7 @@ pub const BuildEnv = struct {
         maybe_targets_config: ?targets_config_mod.TargetsConfig,
     ) BuildError!void {
         const targets_config = maybe_targets_config orelse return;
-        const validation = try targets_config.validateDeclaredTargetFilesExist(self.gpa, self.filesystem, platform_dir);
+        const validation = try targets_config.validateDeclaredTargetFilesExist(self.gpa, self.filesystem, platform_dir, self.target);
         defer validation.deinit(self.gpa);
 
         if (!validation.hasErrors()) return;
@@ -2045,6 +2047,15 @@ pub const BuildEnv = struct {
             return error.MissingFilesDirectory;
         }
         return error.MissingTargetFile;
+    }
+
+    fn validateDiscoveredPlatformTargetFilesForCurrentTarget(self: *BuildEnv) BuildError!void {
+        var pkg_it = self.packages.iterator();
+        while (pkg_it.next()) |entry| {
+            const pkg = entry.value_ptr;
+            if (pkg.kind != .platform) continue;
+            try self.validateDiscoveredPlatformTargetFiles(pkg.root_file, pkg.root_dir, pkg.targets_config);
+        }
     }
 
     fn emitMissingTargetInputsDirectoryReport(
@@ -2095,7 +2106,7 @@ pub const BuildEnv = struct {
         try report.document.addAnnotated(info.expected_full_path, .path);
         try report.document.addLineBreak();
         try report.document.addLineBreak();
-        try report.document.addText("Every file listed in the platform `targets` section is checked, regardless of `--target`. Add the file or remove it from the target config before building.");
+        try report.document.addText("The selected target's platform entry lists this file. Add the file or remove it from that target config before building.");
 
         try self.sink.emitReport("workspace", "root", report);
     }
