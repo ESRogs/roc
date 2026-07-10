@@ -757,6 +757,56 @@ const DemandAnalyzer = struct {
     }
 };
 
+/// Whether `def_idx` names a function definition — one whose value is a lambda
+/// (or closure / hosted lambda). A recursive function referencing itself is
+/// legal; a non-function value referencing itself is a manufactured self-cycle.
+fn defIsFunction(cir: *const ModuleEnv, def_idx: CIR.Def.Idx) bool {
+    const def = cir.store.getDef(def_idx);
+    return switch (cir.store.getExpr(def.expr)) {
+        .e_lambda, .e_closure, .e_hosted_lambda => true,
+        else => false,
+    };
+}
+
+/// Whether `def_idx`'s dependency summary lists `def_idx` itself while the
+/// definition is not a function. Canonicalization must exclude the definition
+/// currently being defined from satisfying lookups in its own right-hand side,
+/// so a non-function self-dependency in the output is an invariant violation:
+/// the manufactured self-cycle that drives downstream evaluation into unbounded
+/// recursion. Recursive function definitions are legal and return false.
+fn hasNonFunctionSelfDependency(
+    cir: *const ModuleEnv,
+    def_idx: CIR.Def.Idx,
+    deps: *const std.AutoHashMapUnmanaged(CIR.Def.Idx, void),
+) bool {
+    if (!deps.contains(def_idx)) return false;
+    return !defIsFunction(cir, def_idx);
+}
+
+/// Debug-only guard on canonicalization output: panic, naming the offending
+/// definition, if a non-function definition's dependency summary contains
+/// itself. Compiled out when runtime safety is off, so release builds are
+/// behaviorally identical.
+fn assertNoNonFunctionSelfDependency(
+    cir: *const ModuleEnv,
+    def_idx: CIR.Def.Idx,
+    deps: *const std.AutoHashMapUnmanaged(CIR.Def.Idx, void),
+) void {
+    if (!std.debug.runtime_safety) return;
+    if (!hasNonFunctionSelfDependency(cir, def_idx, deps)) return;
+
+    const def = cir.store.getDef(def_idx);
+    const name = switch (cir.store.getPattern(def.pattern)) {
+        .assign => |assign| cir.getIdent(assign.ident),
+        .as => |as_pattern| cir.getIdent(as_pattern.ident),
+        else => "<anonymous def>",
+    };
+    std.debug.panic(
+        "non-function def '{s}' depends on itself in its canonicalization dependency summary",
+        .{name},
+    );
+}
+
 /// Build a dependency graph for all definitions
 pub fn buildDependencyGraph(
     cir: *const ModuleEnv,
@@ -777,6 +827,8 @@ pub fn buildDependencyGraph(
         defer deps.deinit(allocator);
 
         try analyzer.collectDefDependencies(def_idx, &deps);
+
+        assertNoNonFunctionSelfDependency(cir, def_idx, &deps.deps);
 
         var dep_iter = deps.deps.keyIterator();
         while (dep_iter.next()) |dep_def_idx| {
@@ -1388,3 +1440,77 @@ const TarjanState = struct {
         }
     }
 };
+
+const testing = std.testing;
+
+test "hasNonFunctionSelfDependency flags a non-function def that depends on itself" {
+    const gpa = testing.allocator;
+    var module_env = try ModuleEnv.init(gpa, "x = x");
+    defer module_env.deinit();
+
+    const x_ident = try module_env.insertIdent(base.Ident.for_text("x"));
+    const x_pattern = try module_env.store.addPattern(.{
+        .assign = .{ .ident = x_ident },
+    }, base.Region.zero());
+
+    // A non-function value whose right-hand side looks itself up.
+    const x_expr = try module_env.store.addExpr(.{
+        .e_lookup_local = .{ .pattern_idx = x_pattern },
+    }, base.Region.zero());
+
+    const x_def = try module_env.store.addDef(.{
+        .pattern = x_pattern,
+        .expr = x_expr,
+        .annotation = null,
+        .kind = .let,
+    }, base.Region.zero());
+
+    var deps: std.AutoHashMapUnmanaged(CIR.Def.Idx, void) = .{};
+    defer deps.deinit(gpa);
+    try deps.put(gpa, x_def, {});
+
+    try testing.expect(hasNonFunctionSelfDependency(&module_env, x_def, &deps));
+}
+
+test "hasNonFunctionSelfDependency permits a recursive function def" {
+    const gpa = testing.allocator;
+    var module_env = try ModuleEnv.init(gpa, "f = |x| f(x)");
+    defer module_env.deinit();
+
+    const f_ident = try module_env.insertIdent(base.Ident.for_text("f"));
+    const f_pattern = try module_env.store.addPattern(.{
+        .assign = .{ .ident = f_ident },
+    }, base.Region.zero());
+
+    const x_ident = try module_env.insertIdent(base.Ident.for_text("x"));
+    const x_pattern = try module_env.store.addPattern(.{
+        .assign = .{ .ident = x_ident },
+    }, base.Region.zero());
+
+    // Body `f(...)` looks up the function being defined: legal recursion.
+    const body_expr = try module_env.store.addExpr(.{
+        .e_lookup_local = .{ .pattern_idx = f_pattern },
+    }, base.Region.zero());
+
+    const args_start = module_env.store.scratchPatternTop();
+    try module_env.store.addScratchPattern(x_pattern);
+    const args_span = try module_env.store.patternSpanFrom(args_start);
+
+    const lambda_expr = try module_env.store.addExpr(.{
+        .e_lambda = .{ .args = args_span, .body = body_expr },
+    }, base.Region.zero());
+
+    const f_def = try module_env.store.addDef(.{
+        .pattern = f_pattern,
+        .expr = lambda_expr,
+        .annotation = null,
+        .kind = .let,
+    }, base.Region.zero());
+
+    // Even with a self-edge present, a function def is legal recursion.
+    var deps: std.AutoHashMapUnmanaged(CIR.Def.Idx, void) = .{};
+    defer deps.deinit(gpa);
+    try deps.put(gpa, f_def, {});
+
+    try testing.expect(!hasNonFunctionSelfDependency(&module_env, f_def, &deps));
+}
