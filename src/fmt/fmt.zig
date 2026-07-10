@@ -530,6 +530,7 @@ const Formatter = struct {
                         try fmt.pushAll(" as ");
                     }
                     try fmt.pushTokenText(a);
+                    flushed = false;
                     if (i.exposes.span.len > 0) {
                         flushed = try fmt.flushCommentsAfter(a);
                     }
@@ -1976,8 +1977,8 @@ const Formatter = struct {
                     // Nominal-value destructure renders as `Type.(args)` (the `.`
                     // distinguishes it from an ordinary applied-tag `Tag(args)`).
                     try fmt.push('.');
-                    try fmt.formatCollection(region, .round, AST.Pattern.Idx, fmt.ast.store.patternSlice(t.args), Formatter.formatPattern);
-                } else if (t.args.span.len > 0) {
+                }
+                if (t.backing_value or t.has_args) {
                     try fmt.formatCollection(region, .round, AST.Pattern.Idx, fmt.ast.store.patternSlice(t.args), Formatter.formatPattern);
                 }
             },
@@ -2169,6 +2170,7 @@ const Formatter = struct {
     fn formatSymbolMapSection(fmt: *Formatter, span: AST.SymbolMapEntry.Span, base_indent: u32) (Allocator.Error || error{WriteFailed})!void {
         const entries = fmt.ast.store.symbolMapEntrySlice(span);
         const has_comments = fmt.regionHasInteriorComment(span.region);
+        const multiline = fmt.ast.regionIsMultiline(span.region) or entries.len > 2 or has_comments;
         if (entries.len == 0) {
             if (has_comments) {
                 try fmt.push('{');
@@ -2183,7 +2185,7 @@ const Formatter = struct {
             try fmt.pushAll("{}");
             return;
         }
-        if (entries.len <= 2 and !has_comments) {
+        if (!multiline) {
             try fmt.pushAll("{ ");
             for (entries, 0..) |entry_idx, i| {
                 if (i > 0) {
@@ -2815,6 +2817,7 @@ const Formatter = struct {
         const multiline = fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, anno);
         switch (a) {
             .apply => |app| {
+                region = app.region;
                 const slice = fmt.ast.store.typeAnnoSlice(app.args);
                 const first = slice[0];
                 try fmt.formatTypeAnnoDiscard(first);
@@ -3623,6 +3626,18 @@ test "issue 9785: multiline string followed by tuple access formats to valid sou
     try std.testing.expectEqualStrings("n = \\\\\n\t.0 - ||\n\t0\n", result);
 }
 
+test "parenthesized type application with leading newline is idempotent" {
+    const result = try moduleFmtsStable(std.testing.allocator, "\ne:[(N())()]", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\ne : [(N()), ()]\n", result);
+}
+
+test "import alias after comment stays separated from synthetic exposing clause" {
+    const result = try moduleFmtsStable(std.testing.allocator, "import A .B as#\nX", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("import A\n\t.B as #\nX exposing []\n", result);
+}
+
 test "issue 8894: typed integer literal formats correctly" {
     // Typed integer literals like 0.F or 123.U64 should format without panicking
     const result = try moduleFmtsStable(std.testing.allocator, "x = 0.F", false);
@@ -3740,6 +3755,28 @@ test "issue 9940: comments in platform header sections are preserved" {
         "\thosted {\n" ++
         "\t\t\"hosted_stderr_line\": Stderr.line!,\n" ++
         "\t\t# \"hosted_event_queue_enqueue\": EventQueue.enqueue!\n" ++
+        "\t}\n";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "multiline platform symbol map remains multiline after comments are discarded" {
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\platform"
+        \\requires{[R:r]for a:R->R}exposes[]packages{a:""}provides{"":#
+        \\h,"":r}
+    , false);
+    defer std.testing.allocator.free(result);
+
+    const expected =
+        "platform \"\"\n" ++
+        "\trequires {\n" ++
+        "\t\t[R : r] for a : R -> R\n" ++
+        "\t}\n" ++
+        "\texposes []\n" ++
+        "\tpackages { a: \"\" }\n" ++
+        "\tprovides {\n" ++
+        "\t\t\"\": h,\n" ++
+        "\t\t\"\": r,\n" ++
         "\t}\n";
     try std.testing.expectEqualStrings(expected, result);
 }

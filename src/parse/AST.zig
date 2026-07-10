@@ -52,9 +52,11 @@ pub fn regionIsMultiline(self: *AST, region: TokenizedRegion) bool {
     const source_start = start_region.start.offset;
     const source_end = end_region.end.offset;
 
-    // Look for newlines in the source text
+    // Look for line breaks in the source text. A carriage return is invalid
+    // Roc source, but formatting a comment terminated by one emits a newline,
+    // so it must make the same multiline layout decision on the first pass.
     for (self.env.source[source_start..source_end]) |c| {
-        if (c == '\n') {
+        if (c == '\n' or c == '\r') {
             return true;
         }
     }
@@ -1323,6 +1325,9 @@ pub const Pattern = union(enum) {
         tag_tok: Token.Idx,
         args: Pattern.Span,
         qualifiers: Token.Span,
+        /// True when the tag was written with an argument list, including an
+        /// empty argument list such as `Tag()`.
+        has_args: bool = false,
         /// True when written as `Type.(pattern)` — a nominal-value destructure
         /// (the inverse of `Type.(value)` construction), where `tag_tok` is the
         /// nominal type and `args` is the backing pattern. False for ordinary
