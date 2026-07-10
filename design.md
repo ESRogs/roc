@@ -4413,10 +4413,11 @@ link-only code.
 
 After the final wasm link, size builds run Binaryen at optimize level 2 and
 shrink level 2, validate the resulting module, and remove debug, producer, and
-target-feature custom sections from non-debug output. Target features remain
-encoded in the executable instructions and validated by Binaryen; the removed
-custom section is metadata and is not part of the runtime ABI. Debug builds
-retain debugging and target-feature metadata.
+target-feature custom sections from non-debug output. Removing the
+target-feature custom section does not alter the wasm code section; Binaryen
+validates the module after the metadata is removed. The removed custom section
+is not part of the runtime ABI. Debug builds retain debugging and
+target-feature metadata.
 
 ## Host Symbol ABI
 
