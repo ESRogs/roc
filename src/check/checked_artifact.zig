@@ -18737,6 +18737,7 @@ fn platformAppRelationMergeResultKey(
 ) Allocator.Error!canonical.CanonicalTypeKey {
     var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
+    builder.bind();
     try builder.writeMerge(platform_root, app_root, context);
     return .{ .bytes = builder.hasher.finalResult() };
 }
@@ -18751,6 +18752,7 @@ fn platformAppRelationFinalizeResultKey(
 ) Allocator.Error!canonical.CanonicalTypeKey {
     var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
+    builder.bind();
     try builder.writeFinalize(root, context);
     return .{ .bytes = builder.hasher.finalResult() };
 }
@@ -18766,6 +18768,7 @@ fn platformAppRelationMergeResultIsEmptyRecord(
 ) Allocator.Error!bool {
     var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
+    builder.bind();
     return try builder.mergeIsEmptyRecord(platform_root, app_root, context);
 }
 
@@ -18780,6 +18783,7 @@ fn platformAppRelationMergeResultIsEmptyTagUnion(
 ) Allocator.Error!bool {
     var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
+    builder.bind();
     return try builder.mergeIsEmptyTagUnion(platform_root, app_root, context);
 }
 
@@ -18793,6 +18797,7 @@ fn platformAppRelationFinalizeResultIsEmptyRecord(
 ) Allocator.Error!bool {
     var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
+    builder.bind();
     return try builder.finalizeIsEmptyRecord(root, context);
 }
 
@@ -18806,17 +18811,101 @@ fn platformAppRelationFinalizeResultIsEmptyTagUnion(
 ) Allocator.Error!bool {
     var builder = PlatformAppRelationTypeDigestBuilder.init(allocator, names, store, substitutions);
     defer builder.deinit();
+    builder.bind();
     return try builder.finalizeIsEmptyTagUnion(root, context);
 }
+
+/// Active-path key for the platform/app relation digest byte-walk. Its three
+/// variants together are the digest builder's active path; the sum of their
+/// counts is the de Bruijn back-edge depth assigned to each reserved slot.
+const PlatformAppRelationDigestActiveKey = union(enum) {
+    source: CheckedTypeId,
+    finalize: PlatformAppRelationFinalizeInput,
+    merge: PlatformAppRelationMergeInput,
+};
+
+/// Which emptiness a normalization prescan is proving.
+const PlatformAppRelationDigestEmptyKind = enum { record, tag_union };
+
+/// Input for an emptiness prescan: a finalize or merge subproblem.
+const PlatformAppRelationDigestEmptyInput = union(enum) {
+    finalize: PlatformAppRelationFinalizeInput,
+    merge: PlatformAppRelationMergeInput,
+};
+
+/// Memo key for the emptiness prescans, pairing the finalize/merge subproblem
+/// with the record-versus-tag-union question so both prescans share one memo.
+const PlatformAppRelationDigestEmptyKey = struct {
+    input: PlatformAppRelationDigestEmptyInput,
+    kind: PlatformAppRelationDigestEmptyKind,
+};
+
+/// Byte-walk context: owns the digest emission, back-edge depths, and dispatch.
+const PlatformAppRelationDigestByteWalkContext = struct {
+    builder: *PlatformAppRelationTypeDigestBuilder,
+
+    /// Emit the payload bytes for a freshly reserved active-path slot.
+    pub fn visit(self: *@This(), _: anytype, key: PlatformAppRelationDigestActiveKey) Allocator.Error!void {
+        return self.builder.byteWalkVisit(key);
+    }
+
+    /// De Bruijn depth to assign the slot about to be reserved.
+    pub fn activeDepth(self: *@This()) u32 {
+        return self.builder.byte_walk.activeCount();
+    }
+
+    /// Emit a back-edge marker to a slot already on the active path.
+    pub fn backEdge(self: *@This(), depth: u32) void {
+        self.builder.writeCycle(depth);
+    }
+};
+
+/// Identity-variable scan context over the byte-walk's active-key space.
+const PlatformAppRelationDigestIdentityContext = struct {
+    builder: *PlatformAppRelationTypeDigestBuilder,
+
+    /// Whether the given subproblem contains identity variables.
+    pub fn visit(self: *@This(), traversal: anytype, key: PlatformAppRelationDigestActiveKey) Allocator.Error!bool {
+        return self.builder.identityScanBody(traversal, key);
+    }
+};
+
+/// Empty-normalization prescan context.
+const PlatformAppRelationDigestEmptyContext = struct {
+    builder: *PlatformAppRelationTypeDigestBuilder,
+
+    /// Whether the given subproblem normalizes to the requested empty payload.
+    pub fn visit(self: *@This(), traversal: anytype, key: PlatformAppRelationDigestEmptyKey) Allocator.Error!bool {
+        return self.builder.emptyScanBody(traversal, key);
+    }
+};
+
+const PlatformAppRelationDigestByteWalk = checked_traverse.DigestTraversal(
+    PlatformAppRelationDigestActiveKey,
+    PlatformAppRelationDigestByteWalkContext,
+);
+
+const PlatformAppRelationDigestIdentityScan = checked_traverse.BoolPredicateTraversal(
+    PlatformAppRelationDigestActiveKey,
+    PlatformAppRelationDigestIdentityContext,
+);
+
+const PlatformAppRelationDigestEmptyScan = checked_traverse.BoolPredicateTraversal(
+    PlatformAppRelationDigestEmptyKey,
+    PlatformAppRelationDigestEmptyContext,
+);
 
 const PlatformAppRelationTypeDigestBuilder = struct {
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
     hasher: std.crypto.hash.sha2.Sha256,
-    source_active: std.AutoHashMap(CheckedTypeId, u32),
-    finalizing: std.AutoHashMap(PlatformAppRelationFinalizeInput, u32),
-    merging: std.AutoHashMap(PlatformAppRelationMergeInput, u32),
+    byte_walk: PlatformAppRelationDigestByteWalk,
+    byte_walk_ctx: PlatformAppRelationDigestByteWalkContext,
+    identity_scan: PlatformAppRelationDigestIdentityScan,
+    identity_ctx: PlatformAppRelationDigestIdentityContext,
+    empty_scan: PlatformAppRelationDigestEmptyScan,
+    empty_ctx: PlatformAppRelationDigestEmptyContext,
     identity_variables: std.AutoHashMap(CheckedTypeId, u32),
     substitutions: ?*const std.AutoHashMap(CheckedTypeId, CheckedTypeId),
 
@@ -18854,23 +18943,42 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .names = names,
             .store = store,
             .hasher = std.crypto.hash.sha2.Sha256.init(.{}),
-            .source_active = std.AutoHashMap(CheckedTypeId, u32).init(allocator),
-            .finalizing = std.AutoHashMap(PlatformAppRelationFinalizeInput, u32).init(allocator),
-            .merging = std.AutoHashMap(PlatformAppRelationMergeInput, u32).init(allocator),
+            .byte_walk = PlatformAppRelationDigestByteWalk.init(allocator, undefined),
+            .byte_walk_ctx = .{ .builder = undefined },
+            .identity_scan = PlatformAppRelationDigestIdentityScan.init(allocator, undefined),
+            .identity_ctx = .{ .builder = undefined },
+            .empty_scan = PlatformAppRelationDigestEmptyScan.init(allocator, undefined),
+            .empty_ctx = .{ .builder = undefined },
             .identity_variables = std.AutoHashMap(CheckedTypeId, u32).init(allocator),
             .substitutions = substitutions,
         };
     }
 
-    fn deinit(self: *PlatformAppRelationTypeDigestBuilder) void {
-        self.identity_variables.deinit();
-        self.merging.deinit();
-        self.finalizing.deinit();
-        self.source_active.deinit();
+    /// Point every traversal at this builder's stable address. Called by each
+    /// digest entry point before any traversal runs.
+    fn bind(self: *PlatformAppRelationTypeDigestBuilder) void {
+        self.byte_walk_ctx.builder = self;
+        self.byte_walk.context = &self.byte_walk_ctx;
+        self.identity_ctx.builder = self;
+        self.identity_scan.context = &self.identity_ctx;
+        self.empty_ctx.builder = self;
+        self.empty_scan.context = &self.empty_ctx;
     }
 
-    fn activeDepth(self: *const PlatformAppRelationTypeDigestBuilder) u32 {
-        return @intCast(self.source_active.count() + self.finalizing.count() + self.merging.count());
+    fn deinit(self: *PlatformAppRelationTypeDigestBuilder) void {
+        self.identity_variables.deinit();
+        self.empty_scan.deinit();
+        self.identity_scan.deinit();
+        self.byte_walk.deinit();
+    }
+
+    /// Emit the payload bytes for one reserved active-path slot.
+    fn byteWalkVisit(self: *PlatformAppRelationTypeDigestBuilder, key: PlatformAppRelationDigestActiveKey) Allocator.Error!void {
+        switch (key) {
+            .source => |root| try self.writeSourcePayload(self.payload(root)),
+            .finalize => |fin| try self.writeFinalizePayload(@enumFromInt(fin.root), fin.context),
+            .merge => |mrg| try self.writeMergePayload(@enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+        }
     }
 
     fn payload(self: *const PlatformAppRelationTypeDigestBuilder, root: CheckedTypeId) CheckedTypePayload {
@@ -18956,10 +19064,18 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .app_root = @intFromEnum(app_root),
             .context = context,
         };
-        if (self.merging.get(merge_input)) |slot| return self.writeCycle(slot);
-        try self.merging.put(merge_input, self.activeDepth());
-        defer _ = self.merging.remove(merge_input);
+        try self.byte_walk.visit(.{ .merge = merge_input });
+    }
 
+    fn writeMergePayload(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        platform_root: CheckedTypeId,
+        app_root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!void {
+        _ = context;
+        const platform_payload = self.payload(platform_root);
+        const app_payload = self.payload(app_root);
         return switch (platform_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending platform payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
@@ -19091,10 +19207,16 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .root = @intFromEnum(root),
             .context = context,
         };
-        if (self.finalizing.get(finalize_input)) |slot| return self.writeCycle(slot);
-        try self.finalizing.put(finalize_input, self.activeDepth());
-        defer _ = self.finalizing.remove(finalize_input);
+        try self.byte_walk.visit(.{ .finalize = finalize_input });
+    }
 
+    fn writeFinalizePayload(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!void {
+        _ = context;
+        const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
@@ -19152,10 +19274,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .rigid => |rigid| return try self.writeIdentityVariable(root, "rigid", rigid.name, rigid.constraints),
             else => {},
         }
-        if (self.source_active.get(root)) |slot| return self.writeCycle(slot);
-        try self.source_active.put(root, self.activeDepth());
-        defer _ = self.source_active.remove(root);
-        try self.writeSourcePayload(root_payload);
+        try self.byte_walk.visit(.{ .source = root });
     }
 
     fn writeSourcePayload(self: *PlatformAppRelationTypeDigestBuilder, source_payload: CheckedTypePayload) Allocator.Error!void {
@@ -19290,7 +19409,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         var seen = std.AutoHashMap(CheckedTypeId, void).init(self.allocator);
         defer seen.deinit();
         while (tail) |tail_id| {
-            if (self.source_active.contains(tail_id)) break;
+            if (self.byte_walk.active.contains(.{ .source = tail_id })) break;
             if (seen.contains(tail_id)) break;
             try seen.put(tail_id, {});
             switch (self.payload(tail_id)) {
@@ -19515,7 +19634,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         var seen = std.AutoHashMap(CheckedTypeId, void).init(self.allocator);
         defer seen.deinit();
         while (tail) |tail_id| {
-            if (self.source_active.contains(tail_id)) break;
+            if (self.byte_walk.active.contains(.{ .source = tail_id })) break;
             if (seen.contains(tail_id)) break;
             try seen.put(tail_id, {});
             switch (self.payload(tail_id)) {
@@ -19640,8 +19759,14 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     ) Allocator.Error!bool {
         return switch (ty) {
             .source => |root| try self.sourceTypeContainsIdentityVariables(root),
-            .finalize => |finalize| try self.finalizeContainsIdentityVariables(finalize.root, finalize.context),
-            .merge => |merge| try self.mergeContainsIdentityVariables(merge.platform_root, merge.app_root, merge.context),
+            .finalize => |finalize| blk: {
+                self.identity_scan.resetRetainingCapacity();
+                break :blk try self.finalizeIdentityRec(&self.identity_scan, finalize.root, finalize.context);
+            },
+            .merge => |merge| blk: {
+                self.identity_scan.resetRetainingCapacity();
+                break :blk try self.mergeIdentityRec(&self.identity_scan, merge.platform_root, merge.app_root, merge.context);
+            },
         };
     }
 
@@ -19672,7 +19797,70 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        if (self.substitution(root)) |replacement| return try self.finalizeIsEmptyRecord(replacement, context);
+        self.empty_scan.resetRetainingCapacity();
+        return try self.finalizeEmptyRecordRec(&self.empty_scan, root, context);
+    }
+
+    fn finalizeIsEmptyTagUnion(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        self.empty_scan.resetRetainingCapacity();
+        return try self.finalizeEmptyTagRec(&self.empty_scan, root, context);
+    }
+
+    fn mergeIsEmptyRecord(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        platform_root: CheckedTypeId,
+        app_root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        self.empty_scan.resetRetainingCapacity();
+        return try self.mergeEmptyRecordRec(&self.empty_scan, platform_root, app_root, context);
+    }
+
+    fn mergeIsEmptyTagUnion(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        platform_root: CheckedTypeId,
+        app_root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        self.empty_scan.resetRetainingCapacity();
+        return try self.mergeEmptyTagRec(&self.empty_scan, platform_root, app_root, context);
+    }
+
+    /// Dispatch an emptiness prescan for one reserved memo key, treating any
+    /// byte-walk active slot as non-empty (matching the byte-walk cycle guard).
+    fn emptyScanBody(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        key: PlatformAppRelationDigestEmptyKey,
+    ) Allocator.Error!bool {
+        const active_key: PlatformAppRelationDigestActiveKey = switch (key.input) {
+            .finalize => |fin| .{ .finalize = fin },
+            .merge => |mrg| .{ .merge = mrg },
+        };
+        if (self.byte_walk.active.contains(active_key)) return false;
+        return switch (key.kind) {
+            .record => switch (key.input) {
+                .finalize => |fin| try self.finalizeEmptyRecordPayload(traversal, @enumFromInt(fin.root), fin.context),
+                .merge => |mrg| try self.mergeEmptyRecordPayload(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+            },
+            .tag_union => switch (key.input) {
+                .finalize => |fin| try self.finalizeEmptyTagPayload(traversal, @enumFromInt(fin.root), fin.context),
+                .merge => |mrg| try self.mergeEmptyTagPayload(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+            },
+        };
+    }
+
+    fn finalizeEmptyRecordRec(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        if (self.substitution(root)) |replacement| return try self.finalizeEmptyRecordRec(traversal, replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) return context == .record_tail;
         switch (root_payload) {
@@ -19682,13 +19870,20 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .empty_tag_union => return false,
             else => {},
         }
-        const finalize_input = PlatformAppRelationFinalizeInput{
-            .root = @intFromEnum(root),
-            .context = context,
-        };
-        if (self.finalizing.contains(finalize_input)) return false;
-        try self.finalizing.put(finalize_input, self.activeDepth());
-        defer _ = self.finalizing.remove(finalize_input);
+        return try traversal.visit(.{
+            .input = .{ .finalize = .{ .root = @intFromEnum(root), .context = context } },
+            .kind = .record,
+        });
+    }
+
+    fn finalizeEmptyRecordPayload(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        _ = context;
+        const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => false,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
@@ -19696,7 +19891,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                 const row = try self.flattenRecordRow(record.fields, record.ext);
                 defer row.deinit(self.allocator);
                 if (row.fields.len != 0) break :blk false;
-                if (row.tail) |tail| break :blk try self.finalizeIsEmptyRecord(tail, .record_tail);
+                if (row.tail) |tail| break :blk try self.finalizeEmptyRecordRec(traversal, tail, .record_tail);
                 break :blk true;
             },
             .record_unbound => false,
@@ -19704,12 +19899,13 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         };
     }
 
-    fn finalizeIsEmptyTagUnion(
+    fn finalizeEmptyTagRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        if (self.substitution(root)) |replacement| return try self.finalizeIsEmptyTagUnion(replacement, context);
+        if (self.substitution(root)) |replacement| return try self.finalizeEmptyTagRec(traversal, replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) return context == .tag_tail;
         switch (root_payload) {
@@ -19719,13 +19915,20 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .empty_tag_union => return true,
             else => {},
         }
-        const finalize_input = PlatformAppRelationFinalizeInput{
-            .root = @intFromEnum(root),
-            .context = context,
-        };
-        if (self.finalizing.contains(finalize_input)) return false;
-        try self.finalizing.put(finalize_input, self.activeDepth());
-        defer _ = self.finalizing.remove(finalize_input);
+        return try traversal.visit(.{
+            .input = .{ .finalize = .{ .root = @intFromEnum(root), .context = context } },
+            .kind = .tag_union,
+        });
+    }
+
+    fn finalizeEmptyTagPayload(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        _ = context;
+        const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => false,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
@@ -19733,34 +19936,35 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                 const row = try self.flattenTagRow(tag_union.tags, tag_union.ext);
                 defer row.deinit(self.allocator);
                 if (row.tags.len != 0) break :blk false;
-                if (row.tail) |tail| break :blk try self.finalizeIsEmptyTagUnion(tail, .tag_tail);
+                if (row.tail) |tail| break :blk try self.finalizeEmptyTagRec(traversal, tail, .tag_tail);
                 break :blk true;
             },
             else => false,
         };
     }
 
-    fn mergeIsEmptyRecord(
+    fn mergeEmptyRecordRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        if (self.substitution(platform_root)) |replacement| return try self.mergeIsEmptyRecord(replacement, app_root, context);
-        if (platform_root == app_root) return try self.finalizeIsEmptyRecord(platform_root, context);
+        if (self.substitution(platform_root)) |replacement| return try self.mergeEmptyRecordRec(traversal, replacement, app_root, context);
+        if (platform_root == app_root) return try self.finalizeEmptyRecordRec(traversal, platform_root, context);
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
         if (checkedTypePayloadIsIdentity(platform_payload)) {
             if (checkedTypePayloadIsIdentity(app_payload)) return context == .record_tail;
-            return try self.finalizeIsEmptyRecord(app_root, context);
+            return try self.finalizeEmptyRecordRec(traversal, app_root, context);
         }
         if (checkedTypePayloadIsIdentity(app_payload)) {
-            return try self.finalizeIsEmptyRecord(platform_root, context);
+            return try self.finalizeEmptyRecordRec(traversal, platform_root, context);
         }
         switch (platform_payload) {
             .alias => {},
             else => switch (app_payload) {
-                .alias => |alias| return try self.mergeIsEmptyRecord(platform_root, alias.backing, context),
+                .alias => |alias| return try self.mergeEmptyRecordRec(traversal, platform_root, alias.backing, context),
                 else => {},
             },
         }
@@ -19769,7 +19973,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .flex, .rigid => unreachable,
             .empty_record => return switch (app_payload) {
                 .empty_record => true,
-                .record, .record_unbound => try self.finalizeIsEmptyRecord(app_root, context),
+                .record, .record_unbound => try self.finalizeEmptyRecordRec(traversal, app_root, context),
                 else => false,
             },
             .nominal => |platform_nominal| switch (app_payload) {
@@ -19778,21 +19982,32 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                 else => {
                     if (platform_nominal.is_opaque) return false;
                     const platform_backing = try self.nominalBacking(platform_nominal);
-                    return try self.mergeIsEmptyRecord(platform_backing, app_root, .value);
+                    return try self.mergeEmptyRecordRec(traversal, platform_backing, app_root, .value);
                 },
             },
             .record, .record_unbound => {},
             else => return false,
         }
-        const merge_input = PlatformAppRelationMergeInput{
-            .platform_root = @intFromEnum(platform_root),
-            .app_root = @intFromEnum(app_root),
-            .context = context,
-        };
-        if (self.merging.contains(merge_input)) return false;
-        try self.merging.put(merge_input, self.activeDepth());
-        defer _ = self.merging.remove(merge_input);
+        return try traversal.visit(.{
+            .input = .{ .merge = .{
+                .platform_root = @intFromEnum(platform_root),
+                .app_root = @intFromEnum(app_root),
+                .context = context,
+            } },
+            .kind = .record,
+        });
+    }
 
+    fn mergeEmptyRecordPayload(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        platform_root: CheckedTypeId,
+        app_root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        _ = context;
+        const platform_payload = self.payload(platform_root);
+        const app_payload = self.payload(app_root);
         const platform_parts = recordParts(platform_payload) orelse return false;
         const app_parts = recordParts(app_payload) orelse return false;
         const platform_row = try self.flattenRecordRow(platform_parts.fields, platform_parts.ext);
@@ -19801,34 +20016,35 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         defer app_row.deinit(self.allocator);
         if (platform_row.fields.len != 0 or app_row.fields.len != 0) return false;
         if (platform_row.tail) |left| {
-            if (app_row.tail) |right| return try self.mergeIsEmptyRecord(left, right, .record_tail);
-            return try self.finalizeIsEmptyRecord(left, .record_tail);
+            if (app_row.tail) |right| return try self.mergeEmptyRecordRec(traversal, left, right, .record_tail);
+            return try self.finalizeEmptyRecordRec(traversal, left, .record_tail);
         }
-        if (app_row.tail) |right| return try self.finalizeIsEmptyRecord(right, .record_tail);
+        if (app_row.tail) |right| return try self.finalizeEmptyRecordRec(traversal, right, .record_tail);
         return true;
     }
 
-    fn mergeIsEmptyTagUnion(
+    fn mergeEmptyTagRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        if (self.substitution(platform_root)) |replacement| return try self.mergeIsEmptyTagUnion(replacement, app_root, context);
-        if (platform_root == app_root) return try self.finalizeIsEmptyTagUnion(platform_root, context);
+        if (self.substitution(platform_root)) |replacement| return try self.mergeEmptyTagRec(traversal, replacement, app_root, context);
+        if (platform_root == app_root) return try self.finalizeEmptyTagRec(traversal, platform_root, context);
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
         if (checkedTypePayloadIsIdentity(platform_payload)) {
             if (checkedTypePayloadIsIdentity(app_payload)) return context == .tag_tail;
-            return try self.finalizeIsEmptyTagUnion(app_root, context);
+            return try self.finalizeEmptyTagRec(traversal, app_root, context);
         }
         if (checkedTypePayloadIsIdentity(app_payload)) {
-            return try self.finalizeIsEmptyTagUnion(platform_root, context);
+            return try self.finalizeEmptyTagRec(traversal, platform_root, context);
         }
         switch (platform_payload) {
             .alias => {},
             else => switch (app_payload) {
-                .alias => |alias| return try self.mergeIsEmptyTagUnion(platform_root, alias.backing, context),
+                .alias => |alias| return try self.mergeEmptyTagRec(traversal, platform_root, alias.backing, context),
                 else => {},
             },
         }
@@ -19837,21 +20053,32 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .flex, .rigid => unreachable,
             .empty_tag_union => return switch (app_payload) {
                 .empty_tag_union => true,
-                .tag_union => try self.finalizeIsEmptyTagUnion(app_root, context),
+                .tag_union => try self.finalizeEmptyTagRec(traversal, app_root, context),
                 else => false,
             },
             .tag_union => {},
             else => return false,
         }
-        const merge_input = PlatformAppRelationMergeInput{
-            .platform_root = @intFromEnum(platform_root),
-            .app_root = @intFromEnum(app_root),
-            .context = context,
-        };
-        if (self.merging.contains(merge_input)) return false;
-        try self.merging.put(merge_input, self.activeDepth());
-        defer _ = self.merging.remove(merge_input);
+        return try traversal.visit(.{
+            .input = .{ .merge = .{
+                .platform_root = @intFromEnum(platform_root),
+                .app_root = @intFromEnum(app_root),
+                .context = context,
+            } },
+            .kind = .tag_union,
+        });
+    }
 
+    fn mergeEmptyTagPayload(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        platform_root: CheckedTypeId,
+        app_root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        _ = context;
+        const platform_payload = self.payload(platform_root);
+        const app_payload = self.payload(app_root);
         const platform_union = switch (platform_payload) {
             .tag_union => |tag_union| tag_union,
             else => return false,
@@ -19866,10 +20093,10 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         defer app_row.deinit(self.allocator);
         if (platform_row.tags.len != 0 or app_row.tags.len != 0) return false;
         if (platform_row.tail) |left| {
-            if (app_row.tail) |right| return try self.mergeIsEmptyTagUnion(left, right, .tag_tail);
-            return try self.finalizeIsEmptyTagUnion(left, .tag_tail);
+            if (app_row.tail) |right| return try self.mergeEmptyTagRec(traversal, left, right, .tag_tail);
+            return try self.finalizeEmptyTagRec(traversal, left, .tag_tail);
         }
-        if (app_row.tail) |right| return try self.finalizeIsEmptyTagUnion(right, .tag_tail);
+        if (app_row.tail) |right| return try self.finalizeEmptyTagRec(traversal, right, .tag_tail);
         return true;
     }
 
@@ -19878,7 +20105,8 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         roots: []const CheckedTypeId,
     ) Allocator.Error!bool {
         for (roots) |root| {
-            if (try self.sourceTypeContainsIdentityVariables(root)) return true;
+            self.identity_scan.resetRetainingCapacity();
+            if (try self.sourceIdentityRec(&self.identity_scan, root)) return true;
         }
         return false;
     }
@@ -19887,12 +20115,77 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         self: *PlatformAppRelationTypeDigestBuilder,
         root: CheckedTypeId,
     ) Allocator.Error!bool {
-        const root_payload = self.payload(root);
-        if (checkedTypePayloadIsIdentity(root_payload)) return true;
-        if (self.source_active.contains(root)) return false;
-        try self.source_active.put(root, self.activeDepth());
-        defer _ = self.source_active.remove(root);
-        return switch (root_payload) {
+        self.identity_scan.resetRetainingCapacity();
+        return try self.sourceIdentityRec(&self.identity_scan, root);
+    }
+
+    fn finalizeSliceContainsIdentityVariables(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        roots: []const CheckedTypeId,
+    ) Allocator.Error!bool {
+        for (roots) |root| {
+            self.identity_scan.resetRetainingCapacity();
+            if (try self.finalizeIdentityRec(&self.identity_scan, root, .value)) return true;
+        }
+        return false;
+    }
+
+    fn mergeSliceContainsIdentityVariables(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        platform_roots: []const CheckedTypeId,
+        app_roots: []const CheckedTypeId,
+    ) Allocator.Error!bool {
+        if (platform_roots.len != app_roots.len) {
+            checkedArtifactInvariant("platform/app relation digest identity scan arity mismatch", .{});
+        }
+        for (platform_roots, app_roots) |platform_root, app_root| {
+            self.identity_scan.resetRetainingCapacity();
+            if (try self.mergeIdentityRec(&self.identity_scan, platform_root, app_root, .value)) return true;
+        }
+        return false;
+    }
+
+    /// Dispatch an identity-variable scan for one reserved memo key, treating any
+    /// byte-walk active slot as identity-free (matching the byte-walk cycle guard).
+    fn identityScanBody(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        key: PlatformAppRelationDigestActiveKey,
+    ) Allocator.Error!bool {
+        if (self.byte_walk.active.contains(key)) return false;
+        return switch (key) {
+            .source => |root| try self.sourceIdentityScanBody(traversal, root),
+            .finalize => |fin| try self.finalizeIdentityScanBody(traversal, @enumFromInt(fin.root), fin.context),
+            .merge => |mrg| try self.mergeIdentityScanBody(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+        };
+    }
+
+    fn sourceSliceIdentityRec(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        roots: []const CheckedTypeId,
+    ) Allocator.Error!bool {
+        for (roots) |root| {
+            if (try self.sourceIdentityRec(traversal, root)) return true;
+        }
+        return false;
+    }
+
+    fn sourceIdentityRec(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        root: CheckedTypeId,
+    ) Allocator.Error!bool {
+        if (checkedTypePayloadIsIdentity(self.payload(root))) return true;
+        return try traversal.visit(.{ .source = root });
+    }
+
+    fn sourceIdentityScanBody(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        root: CheckedTypeId,
+    ) Allocator.Error!bool {
+        return switch (self.payload(root)) {
             .pending => true,
             .flex,
             .rigid,
@@ -19901,50 +20194,52 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .empty_tag_union,
             => false,
             .alias => |alias| blk: {
-                if (try self.sourceTypeContainsIdentityVariables(alias.backing)) break :blk true;
-                break :blk try self.sourceSliceContainsIdentityVariables(alias.args);
+                if (try self.sourceIdentityRec(traversal, alias.backing)) break :blk true;
+                break :blk try self.sourceSliceIdentityRec(traversal, alias.args);
             },
             .record => |record| blk: {
                 for (record.fields) |field| {
-                    if (try self.sourceTypeContainsIdentityVariables(field.ty)) break :blk true;
+                    if (try self.sourceIdentityRec(traversal, field.ty)) break :blk true;
                 }
-                break :blk try self.sourceTypeContainsIdentityVariables(record.ext);
+                break :blk try self.sourceIdentityRec(traversal, record.ext);
             },
             .record_unbound => |fields| blk: {
                 for (fields) |field| {
-                    if (try self.sourceTypeContainsIdentityVariables(field.ty)) break :blk true;
+                    if (try self.sourceIdentityRec(traversal, field.ty)) break :blk true;
                 }
                 break :blk false;
             },
-            .tuple => |items| try self.sourceSliceContainsIdentityVariables(items),
-            .nominal => |nominal| try self.sourceSliceContainsIdentityVariables(nominal.args),
-            .function => |function| try self.sourceSliceContainsIdentityVariables(function.args) or
-                try self.sourceTypeContainsIdentityVariables(function.ret),
+            .tuple => |items| try self.sourceSliceIdentityRec(traversal, items),
+            .nominal => |nominal| try self.sourceSliceIdentityRec(traversal, nominal.args),
+            .function => |function| try self.sourceSliceIdentityRec(traversal, function.args) or
+                try self.sourceIdentityRec(traversal, function.ret),
             .tag_union => |tag_union| blk: {
                 for (tag_union.tags) |tag| {
-                    if (try self.sourceSliceContainsIdentityVariables(tag.argsSlice(self.store))) break :blk true;
+                    if (try self.sourceSliceIdentityRec(traversal, tag.argsSlice(self.store))) break :blk true;
                 }
-                break :blk try self.sourceTypeContainsIdentityVariables(tag_union.ext);
+                break :blk try self.sourceIdentityRec(traversal, tag_union.ext);
             },
         };
     }
 
-    fn finalizeSliceContainsIdentityVariables(
+    fn finalizeSliceIdentityRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         roots: []const CheckedTypeId,
     ) Allocator.Error!bool {
         for (roots) |root| {
-            if (try self.finalizeContainsIdentityVariables(root, .value)) return true;
+            if (try self.finalizeIdentityRec(traversal, root, .value)) return true;
         }
         return false;
     }
 
-    fn finalizeContainsIdentityVariables(
+    fn finalizeIdentityRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        if (self.substitution(root)) |replacement| return try self.finalizeContainsIdentityVariables(replacement, context);
+        if (self.substitution(root)) |replacement| return try self.finalizeIdentityRec(traversal, replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) {
             return context == .value;
@@ -19957,35 +20252,38 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             => return false,
             else => {},
         }
-        const finalize_input = PlatformAppRelationFinalizeInput{
-            .root = @intFromEnum(root),
-            .context = context,
-        };
-        if (self.finalizing.contains(finalize_input)) return false;
-        try self.finalizing.put(finalize_input, self.activeDepth());
-        defer _ = self.finalizing.remove(finalize_input);
-        return switch (root_payload) {
+        return try traversal.visit(.{ .finalize = .{ .root = @intFromEnum(root), .context = context } });
+    }
+
+    fn finalizeIdentityScanBody(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        _ = context;
+        return switch (self.payload(root)) {
             .pending => true,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
-            .tuple => |items| try self.finalizeSliceContainsIdentityVariables(items),
-            .function => |function| try self.finalizeSliceContainsIdentityVariables(function.args) or
-                try self.finalizeContainsIdentityVariables(function.ret, .value),
+            .tuple => |items| try self.finalizeSliceIdentityRec(traversal, items),
+            .function => |function| try self.finalizeSliceIdentityRec(traversal, function.args) or
+                try self.finalizeIdentityRec(traversal, function.ret, .value),
             .alias => |alias| blk: {
-                if (try self.finalizeContainsIdentityVariables(alias.backing, .value)) break :blk true;
-                break :blk try self.finalizeSliceContainsIdentityVariables(alias.args);
+                if (try self.finalizeIdentityRec(traversal, alias.backing, .value)) break :blk true;
+                break :blk try self.finalizeSliceIdentityRec(traversal, alias.args);
             },
             .record => |record| blk: {
                 const row = try self.flattenRecordRow(record.fields, record.ext);
                 defer row.deinit(self.allocator);
                 for (row.fields) |field| {
-                    if (try self.finalizeContainsIdentityVariables(field.ty, .value)) break :blk true;
+                    if (try self.finalizeIdentityRec(traversal, field.ty, .value)) break :blk true;
                 }
-                if (row.tail) |tail| break :blk try self.finalizeContainsIdentityVariables(tail, .record_tail);
+                if (row.tail) |tail| break :blk try self.finalizeIdentityRec(traversal, tail, .record_tail);
                 break :blk false;
             },
             .record_unbound => |fields| blk: {
                 for (fields) |field| {
-                    if (try self.finalizeContainsIdentityVariables(field.ty, .value)) break :blk true;
+                    if (try self.finalizeIdentityRec(traversal, field.ty, .value)) break :blk true;
                 }
                 break :blk false;
             },
@@ -19994,18 +20292,19 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                 defer row.deinit(self.allocator);
                 for (row.tags) |tag| {
                     for (tag.argsSlice(self.store)) |arg| {
-                        if (try self.finalizeContainsIdentityVariables(arg, .value)) break :blk true;
+                        if (try self.finalizeIdentityRec(traversal, arg, .value)) break :blk true;
                     }
                 }
-                if (row.tail) |tail| break :blk try self.finalizeContainsIdentityVariables(tail, .tag_tail);
+                if (row.tail) |tail| break :blk try self.finalizeIdentityRec(traversal, tail, .tag_tail);
                 break :blk false;
             },
-            .nominal => |nominal| try self.finalizeSliceContainsIdentityVariables(nominal.args),
+            .nominal => |nominal| try self.finalizeSliceIdentityRec(traversal, nominal.args),
         };
     }
 
-    fn mergeSliceContainsIdentityVariables(
+    fn mergeSliceIdentityRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         platform_roots: []const CheckedTypeId,
         app_roots: []const CheckedTypeId,
     ) Allocator.Error!bool {
@@ -20013,32 +20312,33 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             checkedArtifactInvariant("platform/app relation digest identity scan arity mismatch", .{});
         }
         for (platform_roots, app_roots) |platform_root, app_root| {
-            if (try self.mergeContainsIdentityVariables(platform_root, app_root, .value)) return true;
+            if (try self.mergeIdentityRec(traversal, platform_root, app_root, .value)) return true;
         }
         return false;
     }
 
-    fn mergeContainsIdentityVariables(
+    fn mergeIdentityRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        if (self.substitution(platform_root)) |replacement| return try self.mergeContainsIdentityVariables(replacement, app_root, context);
-        if (platform_root == app_root) return try self.finalizeContainsIdentityVariables(platform_root, context);
+        if (self.substitution(platform_root)) |replacement| return try self.mergeIdentityRec(traversal, replacement, app_root, context);
+        if (platform_root == app_root) return try self.finalizeIdentityRec(traversal, platform_root, context);
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
         if (checkedTypePayloadIsIdentity(platform_payload)) {
             if (checkedTypePayloadIsIdentity(app_payload)) return context == .value;
-            return try self.finalizeContainsIdentityVariables(app_root, context);
+            return try self.finalizeIdentityRec(traversal, app_root, context);
         }
         if (checkedTypePayloadIsIdentity(app_payload)) {
-            return try self.finalizeContainsIdentityVariables(platform_root, context);
+            return try self.finalizeIdentityRec(traversal, platform_root, context);
         }
         switch (platform_payload) {
             .alias => {},
             else => switch (app_payload) {
-                .alias => |alias| return try self.mergeContainsIdentityVariables(platform_root, alias.backing, context),
+                .alias => |alias| return try self.mergeIdentityRec(traversal, platform_root, alias.backing, context),
                 else => {},
             },
         }
@@ -20047,12 +20347,12 @@ const PlatformAppRelationTypeDigestBuilder = struct {
             .flex, .rigid => unreachable,
             .empty_record => return switch (app_payload) {
                 .empty_record => false,
-                .record, .record_unbound => try self.finalizeContainsIdentityVariables(app_root, context),
+                .record, .record_unbound => try self.finalizeIdentityRec(traversal, app_root, context),
                 else => checkedArtifactInvariant("platform/app relation digest identity scan expected record-compatible app payload", .{}),
             },
             .empty_tag_union => return switch (app_payload) {
                 .empty_tag_union => false,
-                .tag_union => try self.finalizeContainsIdentityVariables(app_root, context),
+                .tag_union => try self.finalizeIdentityRec(traversal, app_root, context),
                 else => checkedArtifactInvariant("platform/app relation digest identity scan expected tag-compatible app payload", .{}),
             },
             .nominal => |platform_nominal| switch (app_payload) {
@@ -20063,59 +20363,69 @@ const PlatformAppRelationTypeDigestBuilder = struct {
                         checkedArtifactInvariant("platform/app relation digest identity scan expected nominal-compatible app payload", .{});
                     }
                     const platform_backing = try self.nominalBacking(platform_nominal);
-                    return try self.mergeContainsIdentityVariables(platform_backing, app_root, .value);
+                    return try self.mergeIdentityRec(traversal, platform_backing, app_root, .value);
                 },
             },
             else => {},
         }
-        const merge_input = PlatformAppRelationMergeInput{
+        return try traversal.visit(.{ .merge = .{
             .platform_root = @intFromEnum(platform_root),
             .app_root = @intFromEnum(app_root),
             .context = context,
-        };
-        if (self.merging.contains(merge_input)) return false;
-        try self.merging.put(merge_input, self.activeDepth());
-        defer _ = self.merging.remove(merge_input);
+        } });
+    }
+
+    fn mergeIdentityScanBody(
+        self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
+        platform_root: CheckedTypeId,
+        app_root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!bool {
+        _ = context;
+        const platform_payload = self.payload(platform_root);
+        const app_payload = self.payload(app_root);
         return switch (platform_payload) {
             .pending => true,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
-            .record, .record_unbound => try self.mergeRecordContainsIdentityVariables(platform_root, app_root),
-            .tag_union => try self.mergeTagContainsIdentityVariables(platform_root, app_root),
+            .record, .record_unbound => try self.mergeRecordIdentityRec(traversal, platform_root, app_root),
+            .tag_union => try self.mergeTagIdentityRec(traversal, platform_root, app_root),
             .tuple => |platform_items| blk: {
                 const app_items = switch (app_payload) {
                     .tuple => |items| items,
                     else => checkedArtifactInvariant("platform/app relation digest identity scan expected tuple-compatible app payload", .{}),
                 };
-                break :blk try self.mergeSliceContainsIdentityVariables(platform_items, app_items);
+                break :blk try self.mergeSliceIdentityRec(traversal, platform_items, app_items);
             },
             .function => |platform_fn| blk: {
                 const app_fn = switch (app_payload) {
                     .function => |function| function,
                     else => checkedArtifactInvariant("platform/app relation digest identity scan expected function-compatible app payload", .{}),
                 };
-                if (try self.mergeSliceContainsIdentityVariables(platform_fn.args, app_fn.args)) break :blk true;
-                break :blk try self.mergeContainsIdentityVariables(platform_fn.ret, app_fn.ret, .value);
+                if (try self.mergeSliceIdentityRec(traversal, platform_fn.args, app_fn.args)) break :blk true;
+                break :blk try self.mergeIdentityRec(traversal, platform_fn.ret, app_fn.ret, .value);
             },
             .alias => |platform_alias| blk: {
                 const app_backing = switch (app_payload) {
                     .alias => |alias| alias.backing,
                     else => app_root,
                 };
-                if (try self.mergeContainsIdentityVariables(platform_alias.backing, app_backing, .value)) break :blk true;
-                break :blk try self.finalizeSliceContainsIdentityVariables(platform_alias.args);
+                if (try self.mergeIdentityRec(traversal, platform_alias.backing, app_backing, .value)) break :blk true;
+                break :blk try self.finalizeSliceIdentityRec(traversal, platform_alias.args);
             },
             .nominal => |platform_nominal| blk: {
                 const app_nominal = switch (app_payload) {
                     .nominal => |nominal| nominal,
                     else => checkedArtifactInvariant("platform/app relation digest identity scan expected nominal-compatible app payload", .{}),
                 };
-                break :blk try self.mergeSliceContainsIdentityVariables(platform_nominal.args, app_nominal.args);
+                break :blk try self.mergeSliceIdentityRec(traversal, platform_nominal.args, app_nominal.args);
             },
         };
     }
 
-    fn mergeRecordContainsIdentityVariables(
+    fn mergeRecordIdentityRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
     ) Allocator.Error!bool {
@@ -20124,7 +20434,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         };
         const app_payload = self.payload(app_root);
         const app_parts = recordParts(app_payload) orelse switch (app_payload) {
-            .alias => |alias| return try self.mergeRecordContainsIdentityVariables(platform_root, alias.backing),
+            .alias => |alias| return try self.mergeRecordIdentityRec(traversal, platform_root, alias.backing),
             else => checkedArtifactInvariant("platform/app relation digest identity scan expected app record payload", .{}),
         };
         const platform_row = try self.flattenRecordRow(platform_parts.fields, platform_parts.ext);
@@ -20133,23 +20443,24 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         defer app_row.deinit(self.allocator);
         for (platform_row.fields) |platform_field| {
             if (findRecordField(self.names, app_row.fields, platform_field.name)) |app_field| {
-                if (try self.mergeContainsIdentityVariables(platform_field.ty, app_field.ty, .value)) return true;
-            } else if (try self.finalizeContainsIdentityVariables(platform_field.ty, .value)) return true;
+                if (try self.mergeIdentityRec(traversal, platform_field.ty, app_field.ty, .value)) return true;
+            } else if (try self.finalizeIdentityRec(traversal, platform_field.ty, .value)) return true;
         }
         for (app_row.fields) |app_field| {
             if (findRecordField(self.names, platform_row.fields, app_field.name) != null) continue;
-            if (try self.finalizeContainsIdentityVariables(app_field.ty, .value)) return true;
+            if (try self.finalizeIdentityRec(traversal, app_field.ty, .value)) return true;
         }
         if (platform_row.tail) |left| {
-            if (app_row.tail) |right| return try self.mergeContainsIdentityVariables(left, right, .record_tail);
-            return try self.finalizeContainsIdentityVariables(left, .record_tail);
+            if (app_row.tail) |right| return try self.mergeIdentityRec(traversal, left, right, .record_tail);
+            return try self.finalizeIdentityRec(traversal, left, .record_tail);
         }
-        if (app_row.tail) |right| return try self.finalizeContainsIdentityVariables(right, .record_tail);
+        if (app_row.tail) |right| return try self.finalizeIdentityRec(traversal, right, .record_tail);
         return false;
     }
 
-    fn mergeTagContainsIdentityVariables(
+    fn mergeTagIdentityRec(
         self: *PlatformAppRelationTypeDigestBuilder,
+        traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
     ) Allocator.Error!bool {
@@ -20162,25 +20473,25 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         defer platform_row.deinit(self.allocator);
         const app_row = switch (app_payload) {
             .tag_union => |tag_union| try self.flattenTagRow(tag_union.tags, tag_union.ext),
-            .alias => |alias| return try self.mergeTagContainsIdentityVariables(platform_root, alias.backing),
+            .alias => |alias| return try self.mergeTagIdentityRec(traversal, platform_root, alias.backing),
             .empty_tag_union => FlattenedTagRow{ .tags = &.{}, .tail = null },
             else => checkedArtifactInvariant("platform/app relation digest identity scan expected app tag union payload", .{}),
         };
         defer app_row.deinit(self.allocator);
         for (platform_row.tags) |platform_tag| {
             if (findTag(self.names, app_row.tags, platform_tag.name)) |app_tag| {
-                if (try self.mergeSliceContainsIdentityVariables(platform_tag.argsSlice(self.store), app_tag.argsSlice(self.store))) return true;
-            } else if (try self.finalizeSliceContainsIdentityVariables(platform_tag.argsSlice(self.store))) return true;
+                if (try self.mergeSliceIdentityRec(traversal, platform_tag.argsSlice(self.store), app_tag.argsSlice(self.store))) return true;
+            } else if (try self.finalizeSliceIdentityRec(traversal, platform_tag.argsSlice(self.store))) return true;
         }
         for (app_row.tags) |app_tag| {
             if (findTag(self.names, platform_row.tags, app_tag.name) != null) continue;
-            if (try self.finalizeSliceContainsIdentityVariables(app_tag.argsSlice(self.store))) return true;
+            if (try self.finalizeSliceIdentityRec(traversal, app_tag.argsSlice(self.store))) return true;
         }
         if (platform_row.tail) |left| {
-            if (app_row.tail) |right| return try self.mergeContainsIdentityVariables(left, right, .tag_tail);
-            return try self.finalizeContainsIdentityVariables(left, .tag_tail);
+            if (app_row.tail) |right| return try self.mergeIdentityRec(traversal, left, right, .tag_tail);
+            return try self.finalizeIdentityRec(traversal, left, .tag_tail);
         }
-        if (app_row.tail) |right| return try self.finalizeContainsIdentityVariables(right, .tag_tail);
+        if (app_row.tail) |right| return try self.finalizeIdentityRec(traversal, right, .tag_tail);
         return false;
     }
 
