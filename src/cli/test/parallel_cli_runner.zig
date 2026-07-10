@@ -6388,12 +6388,63 @@ fn compileGlueRuntimeCHost(
         host_o_path,
     }, project_root_path, .{ .args = &.{} })) |failure| return failure;
 
+    // `zig cc -c` emits only the host translation unit; unlike the Zig host
+    // (`zig build-obj -fcompiler-rt`) and the Rust host (`rustc --crate-type
+    // staticlib`, which bundles compiler-builtins), it carries no compiler_rt.
+    // roc's final static link (`-nostdlib -static`, adding no compiler_rt) then
+    // leaves the soft-float libcalls that musl's `libc.a` references undefined.
+    // On aarch64 `long double` is IEEE-128, so `vfprintf` pulls in `__addtf3`,
+    // `__extenddftf2`, `__netf2`, ... and the link fails. (On x86_64 `long
+    // double` is 80-bit x87, so those f128 libcalls are never referenced, which
+    // is why this only breaks on arm64.) Merge a compiler_rt object into the
+    // host object so `libhost.a` is self-contained, exactly like the Zig host.
+    // A separate archive member would not suffice: `libhost.a` is linked before
+    // `libc.a` (and lazily for symbol-ABI hosts), so its compiler_rt member
+    // would never be pulled to satisfy `libc.a`'s later references.
+    const target_dir = std.fs.path.dirname(host_o_path) orelse project_root_path;
+    const compiler_rt_root_path = std.fs.path.join(allocator, &.{ target_dir, "compiler_rt_root.zig" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime compiler_rt root path: {}", .{err});
+    const compiler_rt_o_path = std.fs.path.join(allocator, &.{ target_dir, "compiler_rt.o" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime compiler_rt object path: {}", .{err});
+    const host_combined_o_path = std.fs.path.join(allocator, &.{ target_dir, "host_combined.o" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime combined host object path: {}", .{err});
+
+    // An empty root module is enough: `-fcompiler-rt` emits the full compiler_rt
+    // (as weak symbols) regardless of what the module itself references.
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = compiler_rt_root_path, .data = "" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to write glue runtime compiler_rt root: {}", .{err});
+    const compiler_rt_emit_flag = std.fmt.allocPrint(allocator, "-femit-bin={s}", .{compiler_rt_o_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime compiler_rt emit flag: {}", .{err});
+    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        target.zig_target,
+        "-fcompiler-rt",
+        compiler_rt_root_path,
+        compiler_rt_emit_flag,
+    }, project_root_path, .{ .args = &.{} })) |failure| return failure;
+
+    // Relocatable-link the host object and compiler_rt into a single object so
+    // one `libhost.a` member carries both.
+    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
+        "zig",
+        "cc",
+        "-target",
+        target.zig_target,
+        "-r",
+        host_o_path,
+        compiler_rt_o_path,
+        "-o",
+        host_combined_o_path,
+    }, project_root_path, .{ .args = &.{} })) |failure| return failure;
+
     if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
         "zig",
         "ar",
         "rcs",
         host_lib_path,
-        host_o_path,
+        host_combined_o_path,
     }, project_root_path, .{ .args = &.{} })) |failure| return failure;
 
     return null;
