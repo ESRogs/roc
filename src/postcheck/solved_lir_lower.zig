@@ -1695,9 +1695,11 @@ const Lowerer = struct {
 
     fn erasedFnsForType(self: *Lowerer, ty: Type.TypeId, erased: anytype) Common.LowerError!LirProgram.ErasedFnsId {
         const members = self.types.fnVariantSpan(erased.members);
-        if (members.len == 0) {
-            Common.invariant("erased function ConstStore output requires explicit erased function entries");
-        }
+
+        // A const plan covers every tag payload, including payload types for
+        // tags no value flow reached. Keep an explicit empty entry set for an
+        // erased callable in such a payload. The ConstStore writer still
+        // rejects the plan if runtime data ever selects that callable.
 
         const entries = try self.allocator.alloc(LirProgram.ErasedFn, members.len);
         var initialized: usize = 0;
