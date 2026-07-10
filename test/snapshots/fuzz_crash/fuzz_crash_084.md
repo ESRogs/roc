@@ -2,10 +2,11 @@
 ~~~ini
 description=fuzz regression: parser formatter output instability
 type=snippet
+source_escapes=true
 ~~~
 # SOURCE
 ~~~roc
-t=|(0|(#))|0
+t=|(0|(#\r))|0
 ~~~
 # EXPECTED
 MISPLACED CARRIAGE RETURN - :0:0:0:0
@@ -22,7 +23,7 @@ Carriage return characters (\r) are not allowed in Roc source code.
 │ NOT IMPLEMENTED ├─ This feature is not yet implemented: alternatives ───────┐
 └┬────────────────┘  pattern outside match expression.                        │
  │                                                                            │
- │  t=|(0|(#))|0                                                             │
+ │  t=|(0|(#\r))|0                                                             │
  │      ‾‾‾‾‾‾                                                                │
  └───────────────────────────────────────────────────── fuzz_crash_084.md:1:5 ┘
 
@@ -51,8 +52,13 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-t = |(0 | ( #
-))| 0
+t = |
+	(
+		0
+		| ( #
+		),
+	),
+| 0
 ~~~
 # CANONICALIZE
 ~~~clojure
