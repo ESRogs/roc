@@ -105,6 +105,19 @@ const CommandResult = struct {
     heartbeat_printed: bool = false,
 };
 
+const Progress = struct {
+    current: usize,
+    total: usize,
+};
+
+const SummaryCounts = struct {
+    passed: usize = 0,
+    failed: usize = 0,
+    crashed: usize = 0,
+    skipped: usize = 0,
+    not_run: usize = 0,
+};
+
 fn nowNs(io: std.Io) u64 {
     return @intCast(@max(0, std.Io.Timestamp.now(io, .awake).nanoseconds));
 }
@@ -119,6 +132,49 @@ fn unixMs(io: std.Io) u64 {
 
 fn seconds(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
+}
+
+fn decimalDigits(value: usize) usize {
+    var digits: usize = 1;
+    var remaining = value;
+    while (remaining >= 10) : (remaining /= 10) {
+        digits += 1;
+    }
+    return digits;
+}
+
+fn appendProgressPrefix(out: *std.ArrayList(u8), allocator: std.mem.Allocator, progress: Progress) !void {
+    try out.appendSlice(allocator, "MiniCI ");
+    const width = decimalDigits(progress.total);
+    const current_width = decimalDigits(progress.current);
+    var padding = width -| current_width;
+    while (padding > 0) : (padding -= 1) {
+        try out.append(allocator, ' ');
+    }
+    const text = try std.fmt.allocPrint(allocator, "{d}/{d}: ", .{ progress.current, progress.total });
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn printProgressPrefix(progress: Progress) void {
+    std.debug.print("MiniCI ", .{});
+    const width = decimalDigits(progress.total);
+    const current_width = decimalDigits(progress.current);
+    var padding = width -| current_width;
+    while (padding > 0) : (padding -= 1) {
+        std.debug.print(" ", .{});
+    }
+    std.debug.print("{d}/{d}: ", .{ progress.current, progress.total });
+}
+
+fn printBuildStart(progress: Progress) void {
+    printProgressPrefix(progress);
+    std.debug.print("Building CI steps ... ", .{});
+}
+
+fn printRunStart(progress: Progress, name: []const u8) void {
+    printProgressPrefix(progress);
+    std.debug.print("Running `{s}` ... ", .{name});
 }
 
 fn isPass(result: CommandResult) bool {
@@ -340,11 +396,75 @@ fn commandStepName(argv: []const []const u8) []const u8 {
     return if (argv.len > 2) argv[2] else argv[0];
 }
 
+fn addResultToSummary(counts: *SummaryCounts, result: CommandResult) void {
+    if (isPass(result)) {
+        counts.passed += 1;
+    } else if (std.mem.eql(u8, result.status, "skip")) {
+        counts.skipped += 1;
+    } else if (std.mem.eql(u8, result.status, "crash")) {
+        counts.crashed += 1;
+    } else {
+        counts.failed += 1;
+    }
+}
+
+fn summaryCounts(total_phases: usize, build_result: CommandResult, results: []const CommandResult) SummaryCounts {
+    var counts = SummaryCounts{};
+    addResultToSummary(&counts, build_result);
+    for (results) |result| {
+        addResultToSummary(&counts, result);
+    }
+    const ran = 1 + results.len;
+    counts.not_run = total_phases -| ran;
+    return counts;
+}
+
+fn appendSummaryLine(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    total_phases: usize,
+    build_result: CommandResult,
+    results: []const CommandResult,
+    wall_ns: u64,
+) !void {
+    const counts = summaryCounts(total_phases, build_result, results);
+    const ran = total_phases - counts.not_run;
+    const base = try std.fmt.allocPrint(
+        allocator,
+        "MiniCI summary: {d}/{d} phases ran; {d} passed, {d} failed, {d} crashed, {d} skipped",
+        .{ ran, total_phases, counts.passed, counts.failed, counts.crashed, counts.skipped },
+    );
+    defer allocator.free(base);
+    try out.appendSlice(allocator, base);
+    if (counts.not_run != 0) {
+        const not_run = try std.fmt.allocPrint(allocator, ", {d} not run", .{counts.not_run});
+        defer allocator.free(not_run);
+        try out.appendSlice(allocator, not_run);
+    }
+    const suffix = try std.fmt.allocPrint(allocator, "; wall {d:.3}s\n", .{seconds(wall_ns)});
+    defer allocator.free(suffix);
+    try out.appendSlice(allocator, suffix);
+}
+
+fn printSummary(
+    allocator: std.mem.Allocator,
+    total_phases: usize,
+    build_result: CommandResult,
+    results: []const CommandResult,
+    wall_ns: u64,
+) !void {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try appendSummaryLine(&out, allocator, total_phases, build_result, results, wall_ns);
+    std.debug.print("{s}", .{out.items});
+}
+
 const Heartbeat = struct {
     io: std.Io,
     argv: []const []const u8,
     started: u64,
     interval_ms: u64,
+    progress: Progress,
     done: std.atomic.Value(bool),
     printed: std.atomic.Value(bool),
 
@@ -361,7 +481,8 @@ const Heartbeat = struct {
 
             const already_printed = self.printed.swap(true, .acq_rel);
             if (!already_printed) std.debug.print("\n", .{});
-            std.debug.print("  still running `{s}` after {d:.1}s\n", .{
+            printProgressPrefix(self.progress);
+            std.debug.print("still running `{s}` after {d:.1}s\n", .{
                 commandStepName(self.argv),
                 seconds(elapsed_ms * std.time.ns_per_ms),
             });
@@ -415,6 +536,7 @@ fn runCommand(
     log_path: []const u8,
     heartbeat_interval_ms: u64,
     run_started_ns: u64,
+    progress: Progress,
 ) !CommandResult {
     const started = nowNs(io);
     var heartbeat = Heartbeat{
@@ -422,6 +544,7 @@ fn runCommand(
         .argv = argv,
         .started = started,
         .interval_ms = heartbeat_interval_ms,
+        .progress = progress,
         .done = std.atomic.Value(bool).init(false),
         .printed = std.atomic.Value(bool).init(false),
     };
@@ -956,12 +1079,14 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("=== MINICI ORCHESTRATOR ===\n", .{});
     const run_started_ns = nowNs(io);
     const run_started_unix_ms = unixMs(io);
+    const total_phases = jobs.len + 1;
 
     const build_argv = try buildCommand(allocator, zig_exe, build_args, "build-ci", null, &.{});
     const build_log = logs_dir ++ "/build-ci.txt";
-    std.debug.print("Building CI steps ... ", .{});
-    const build_result = try runCommand(allocator, io, build_argv, build_log, heartbeat_interval_ms, run_started_ns);
-    if (build_result.heartbeat_printed) std.debug.print("Building CI steps ... ", .{});
+    const build_progress = Progress{ .current = 1, .total = total_phases };
+    printBuildStart(build_progress);
+    const build_result = try runCommand(allocator, io, build_argv, build_log, heartbeat_interval_ms, run_started_ns, build_progress);
+    if (build_result.heartbeat_printed) printBuildStart(build_progress);
     std.debug.print("{s} in {d:.3}s\n", .{ buildStatusText(build_result), seconds(build_result.duration_ns) });
 
     var results = std.ArrayList(CommandResult).empty;
@@ -972,24 +1097,26 @@ pub fn main(init: std.process.Init) !void {
         printRerunHint(build_result);
         try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
         try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
+        try printSummary(allocator, total_phases, build_result, results.items, durationSince(io, run_started_ns));
         std.process.exit(1);
     }
 
-    for (jobs) |job| {
+    for (jobs, 0..) |job, job_index| {
         const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.txt", .{ logs_dir, job.name });
         const stats_path: ?[]const u8 = if (job.kind == .harness)
             try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ raw_dir, job.name })
         else
             null;
         const argv = try buildCommand(allocator, zig_exe, build_args, job.name, stats_path, job.args);
-        std.debug.print("Running `{s}` ... ", .{job.name});
+        const progress = Progress{ .current = job_index + 2, .total = total_phases };
+        printRunStart(progress, job.name);
         var result = if (job.skip_reason) |reason|
             try skipCommand(io, argv, log_path, reason, run_started_ns)
         else
-            try runCommand(allocator, io, argv, log_path, heartbeat_interval_ms, run_started_ns);
+            try runCommand(allocator, io, argv, log_path, heartbeat_interval_ms, run_started_ns, progress);
         result.stats_path = if (job.skip_reason == null) stats_path else null;
         try results.append(allocator, result);
-        if (result.heartbeat_printed) std.debug.print("Running `{s}` ... ", .{job.name});
+        if (result.heartbeat_printed) printRunStart(progress, job.name);
         std.debug.print("{s} in {d:.3}s\n", .{ runStatusText(result), seconds(result.duration_ns) });
 
         if (!isSuccessful(result)) {
@@ -1000,16 +1127,95 @@ pub fn main(init: std.process.Init) !void {
         if (isCheckJob(job.name) and !isSuccessful(result)) {
             try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
             try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
+            try printSummary(allocator, total_phases, build_result, results.items, durationSince(io, run_started_ns));
             std.process.exit(1);
         }
     }
 
     try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
     try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
+    try printSummary(allocator, total_phases, build_result, results.items, durationSince(io, run_started_ns));
 
     for (results.items) |result| {
         if (!isSuccessful(result)) std.process.exit(1);
     }
+}
+
+test "appendProgressPrefix aligns current phase to total width" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendProgressPrefix(&out, std.testing.allocator, .{ .current = 1, .total = 61 });
+    try std.testing.expectEqualStrings("MiniCI  1/61: ", out.items);
+
+    out.clearRetainingCapacity();
+    try appendProgressPrefix(&out, std.testing.allocator, .{ .current = 20, .total = 61 });
+    try std.testing.expectEqualStrings("MiniCI 20/61: ", out.items);
+
+    out.clearRetainingCapacity();
+    try appendProgressPrefix(&out, std.testing.allocator, .{ .current = 7, .total = 123 });
+    try std.testing.expectEqualStrings("MiniCI   7/123: ", out.items);
+}
+
+fn testResult(status: []const u8, duration_ns: u64) CommandResult {
+    return .{
+        .status = status,
+        .start_ns = 0,
+        .end_ns = duration_ns,
+        .duration_ns = duration_ns,
+        .log_path = "log.txt",
+        .command = &.{ "zig", "build", "step" },
+    };
+}
+
+test "appendSummaryLine reports all phases passed" {
+    const build_result = testResult("pass", 1);
+    const results = [_]CommandResult{
+        testResult("pass", 2),
+        testResult("pass", 3),
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try appendSummaryLine(&out, std.testing.allocator, 3, build_result, &results, 1_500_000_000);
+
+    try std.testing.expectEqualStrings(
+        "MiniCI summary: 3/3 phases ran; 3 passed, 0 failed, 0 crashed, 0 skipped; wall 1.500s\n",
+        out.items,
+    );
+}
+
+test "appendSummaryLine reports skipped phases" {
+    const build_result = testResult("pass", 1);
+    const results = [_]CommandResult{
+        testResult("skip", 2),
+        testResult("pass", 3),
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try appendSummaryLine(&out, std.testing.allocator, 3, build_result, &results, 2_000_000_000);
+
+    try std.testing.expectEqualStrings(
+        "MiniCI summary: 3/3 phases ran; 2 passed, 0 failed, 0 crashed, 1 skipped; wall 2.000s\n",
+        out.items,
+    );
+}
+
+test "appendSummaryLine reports early failure with not-run phases" {
+    const build_result = testResult("pass", 1);
+    const results = [_]CommandResult{
+        testResult("fail", 2),
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try appendSummaryLine(&out, std.testing.allocator, 4, build_result, &results, 3_250_000_000);
+
+    try std.testing.expectEqualStrings(
+        "MiniCI summary: 2/4 phases ran; 1 passed, 1 failed, 0 crashed, 0 skipped, 2 not run; wall 3.250s\n",
+        out.items,
+    );
 }
 
 test "findCoreError extracts a Zig compile error region" {
