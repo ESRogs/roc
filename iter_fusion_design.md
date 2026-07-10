@@ -249,6 +249,39 @@ The durable focused gates are:
 Focused implementation work must run the smallest relevant subsets first.
 Whole-tree CI is a final integration gate, not the inner edit/test loop.
 
+## ARC Size Pilot
+
+A scoped post-ARC scan of both Rocci Bird carts found no safe non-adjacent
+retain/release pair to elide. In particular:
+
+- no retain had a matching same-local release within the next 16 straight-line
+  statements;
+- allowing pure reference assignments between a retain and release did not
+  expose a same-value pair;
+- the repeated superficially promising sequence retained a value produced by
+  `list_get_unsafe` and later released a different aggregate local.
+
+The last sequence is not an ownership transfer. Retaining a borrowed list
+element cannot be canceled against releasing a containing or otherwise nearby
+aggregate: its release does not necessarily remove the ownership unit added to
+that element. Layout equality and a one-child deep-release plan are insufficient
+proof of value identity.
+
+An exact struct-field move-out rule was also prototyped. Its proof required a
+single-definition parent, the exact projected field and offset, a parent deep
+release with that field as its sole RC child, equal atomicity, and only pure
+unrelated reference reads between the operations. The carts had no such
+non-adjacent occurrence; the focused fixture naturally emitted the retain and
+parent release adjacent. Keeping extra solver data for a zero-hit rule would add
+compiler complexity without improving either cart, so the prototype was
+discarded.
+
+The cleared-cache cart measurements therefore remain 36,892 bytes for the
+iterator cart and 36,850 bytes for the direct-list cart. No ARC change was
+landed from this pilot. Further size work should start from measured whole-cart
+reachability and composition rather than broadening ARC rules without an exact
+ownership proof.
+
 ## Current Conclusion
 
 Per-chain minting, explicit forced-dynamic representation, SpecConstr loop
