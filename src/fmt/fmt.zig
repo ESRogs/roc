@@ -2169,6 +2169,7 @@ const Formatter = struct {
     fn formatSymbolMapSection(fmt: *Formatter, span: AST.SymbolMapEntry.Span, base_indent: u32) (Allocator.Error || error{WriteFailed})!void {
         const entries = fmt.ast.store.symbolMapEntrySlice(span);
         const has_comments = fmt.regionHasInteriorComment(span.region);
+        const multiline = fmt.ast.regionIsMultiline(span.region) or entries.len > 2 or has_comments;
         if (entries.len == 0) {
             if (has_comments) {
                 try fmt.push('{');
@@ -2183,7 +2184,7 @@ const Formatter = struct {
             try fmt.pushAll("{}");
             return;
         }
-        if (entries.len <= 2 and !has_comments) {
+        if (!multiline) {
             try fmt.pushAll("{ ");
             for (entries, 0..) |entry_idx, i| {
                 if (i > 0) {
@@ -3747,6 +3748,28 @@ test "issue 9940: comments in platform header sections are preserved" {
         "\thosted {\n" ++
         "\t\t\"hosted_stderr_line\": Stderr.line!,\n" ++
         "\t\t# \"hosted_event_queue_enqueue\": EventQueue.enqueue!\n" ++
+        "\t}\n";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "multiline platform symbol map remains multiline after comments are discarded" {
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\platform"
+        \\requires{[R:r]for a:R->R}exposes[]packages{a:""}provides{"":#
+        \\h,"":r}
+    , false);
+    defer std.testing.allocator.free(result);
+
+    const expected =
+        "platform \"\"\n" ++
+        "\trequires {\n" ++
+        "\t\t[R : r] for a : R -> R\n" ++
+        "\t}\n" ++
+        "\texposes []\n" ++
+        "\tpackages { a: \"\" }\n" ++
+        "\tprovides {\n" ++
+        "\t\t\"\": h,\n" ++
+        "\t\t\"\": r,\n" ++
         "\t}\n";
     try std.testing.expectEqualStrings(expected, result);
 }
