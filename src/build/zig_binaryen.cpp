@@ -15,6 +15,7 @@ typedef struct RocBinaryenOptimizeConfig {
     uint8_t debug_info;
     uint8_t strip_debug;
     uint8_t strip_producers;
+    uint8_t strip_target_features;
     uint8_t validate;
 } RocBinaryenOptimizeConfig;
 
@@ -91,7 +92,7 @@ extern "C" int RocBinaryenOptimizeWasm(
 
     BinaryenModuleOptimize(module);
 
-    const char* strip_passes[3];
+    const char* strip_passes[4];
     BinaryenIndex strip_count = 0;
     if (config.strip_debug != 0 && config.debug_info == 0) {
         strip_passes[strip_count++] = "strip-debug";
@@ -99,6 +100,9 @@ extern "C" int RocBinaryenOptimizeWasm(
     }
     if (config.strip_producers != 0) {
         strip_passes[strip_count++] = "strip-producers";
+    }
+    if (config.strip_target_features != 0) {
+        strip_passes[strip_count++] = "strip-target-features";
     }
     if (strip_count != 0) {
         BinaryenModuleRunPasses(module, strip_passes, strip_count);

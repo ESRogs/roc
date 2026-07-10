@@ -36,6 +36,7 @@ const RocBinaryenOptimizeConfig = extern struct {
     debug_info: u8,
     strip_debug: u8,
     strip_producers: u8,
+    strip_target_features: u8,
     validate: u8,
 };
 
@@ -938,6 +939,7 @@ fn binaryenConfig(config: LinkConfig) RocBinaryenOptimizeConfig {
         .debug_info = @intFromBool(config.wasm_debug_info),
         .strip_debug = @intFromBool(!config.wasm_debug_info),
         .strip_producers = 1,
+        .strip_target_features = @intFromBool(config.wasm_optimize == .size and !config.wasm_debug_info),
         .validate = 1,
     };
 }
@@ -1152,6 +1154,17 @@ test "link config creation" {
     try std.testing.expectEqual(@as(usize, 2), config.object_files.len);
     try std.testing.expectEqual(@as(usize, 0), config.platform_files_pre.len);
     try std.testing.expectEqual(@as(usize, 0), config.platform_files_post.len);
+}
+
+test "size wasm strips final target feature metadata" {
+    const size = binaryenConfig(.{ .output_path = "out.wasm", .object_files = &.{}, .wasm_optimize = .size });
+    try std.testing.expectEqual(@as(u8, 1), size.strip_target_features);
+
+    const size_debug = binaryenConfig(.{ .output_path = "out.wasm", .object_files = &.{}, .wasm_optimize = .size, .wasm_debug_info = true });
+    try std.testing.expectEqual(@as(u8, 0), size_debug.strip_target_features);
+
+    const speed = binaryenConfig(.{ .output_path = "out.wasm", .object_files = &.{}, .wasm_optimize = .speed });
+    try std.testing.expectEqual(@as(u8, 0), speed.strip_target_features);
 }
 
 test "target format detection" {
