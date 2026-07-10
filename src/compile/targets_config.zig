@@ -57,6 +57,10 @@ pub const WasmImportMemory = enum {
 
 /// Optional wasm-specific settings from a target record in a platform header.
 pub const WasmTargetConfig = struct {
+    /// Final host-visible function exports. `null` preserves the legacy
+    /// contract where public symbols are read from the platform object; a
+    /// present slice, including an empty one, is the complete export set.
+    exports: ?[]const []const u8 = null,
     import_memory: WasmImportMemory = .no,
     minimum_memory: ?usize = null,
     maximum_memory: ?usize = null,
@@ -69,6 +73,10 @@ pub const WasmTargetConfig = struct {
     global_base_ident: ?[]const u8 = null,
 
     fn deinit(self: WasmTargetConfig, allocator: Allocator) void {
+        if (self.exports) |exports| {
+            for (exports) |name| allocator.free(name);
+            allocator.free(exports);
+        }
         if (self.import_memory_ident) |ident| allocator.free(ident);
         if (self.minimum_memory_ident) |ident| allocator.free(ident);
         if (self.maximum_memory_ident) |ident| allocator.free(ident);
@@ -303,6 +311,34 @@ pub const TargetsConfig = struct {
         link_items.clearRetainingCapacity();
     }
 
+    fn replaceWasmExports(
+        allocator: Allocator,
+        store: *const parse.NodeStore,
+        ast: anytype,
+        values: parse.AST.TargetConfigValue.Span,
+        wasm: *WasmTargetConfig,
+    ) Allocator.Error!void {
+        if (wasm.exports) |old_exports| {
+            for (old_exports) |name| allocator.free(name);
+            allocator.free(old_exports);
+            wasm.exports = null;
+        }
+
+        var exports = std.array_list.Managed([]const u8).init(allocator);
+        errdefer {
+            for (exports.items) |name| allocator.free(name);
+            exports.deinit();
+        }
+
+        for (store.targetConfigValueSlice(values)) |value_idx| {
+            switch (store.getTargetConfigValue(value_idx)) {
+                .string_literal => |tok| try exports.append(try allocator.dupe(u8, ast.resolve(tok))),
+                else => {},
+            }
+        }
+        wasm.exports = try exports.toOwnedSlice();
+    }
+
     fn storeIdent(
         allocator: Allocator,
         ast: anytype,
@@ -376,6 +412,14 @@ pub const TargetsConfig = struct {
                     .files => |files| {
                         clearTargetFiles(allocator, link_items);
                         try appendTargetFiles(allocator, store, ast, files, link_items);
+                    },
+                    else => {},
+                }
+            } else if (std.mem.eql(u8, name, "exports")) {
+                switch (value) {
+                    .list => |values| {
+                        try replaceWasmExports(allocator, store, ast, values, &wasm);
+                        has_wasm_config = true;
                     },
                     else => {},
                 }
@@ -825,6 +869,50 @@ test "fromAST accepts explicit hostless targets section" {
 
     try testing.expect(config.inputs_dir == null);
     try testing.expectEqual(@as(usize, 0), config.targets.len);
+}
+
+test "fromAST captures explicit wasm exports" {
+    const allocator = testing.allocator;
+
+    const source =
+        \\platform ""
+        \\    requires { main : {} }
+        \\    exposes []
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host }
+        \\    targets: {
+        \\        inputs_dir: "targets/",
+        \\        wasm32: {
+        \\            inputs: ["host.wasm", app],
+        \\            output: Shared,
+        \\            exports: ["start", "update"],
+        \\        },
+        \\    }
+        \\
+    ;
+
+    const source_copy = try allocator.dupe(u8, source);
+    defer allocator.free(source_copy);
+
+    var env = try base.CommonEnv.init(allocator, source_copy);
+    defer env.deinit(allocator);
+
+    const ast = try parse.file(allocator, &env);
+    defer ast.deinit();
+
+    try testing.expectEqual(@as(usize, 0), ast.parse_diagnostics.items.len);
+
+    const maybe_config = try TargetsConfig.fromAST(allocator, ast);
+    try testing.expect(maybe_config != null);
+
+    const config = maybe_config.?;
+    defer config.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), config.targets.len);
+    const exports = config.targets[0].wasm.?.exports.?;
+    try testing.expectEqual(@as(usize, 2), exports.len);
+    try testing.expectEqualStrings("start", exports[0]);
+    try testing.expectEqualStrings("update", exports[1]);
 }
 
 test "fromAST captures punned wasm identifier config" {

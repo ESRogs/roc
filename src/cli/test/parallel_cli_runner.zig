@@ -26,6 +26,7 @@ const harness = @import("test_harness");
 const platform_config = @import("platform_config.zig");
 const util = @import("util.zig");
 const collections = @import("collections");
+const roc_backend = @import("backend");
 
 const child_command_timeout_reserve_ms: u64 = 1_000;
 const timeout_result_grace_ms: u64 = 5_000;
@@ -4188,6 +4189,31 @@ fn customRocciDevWasmStaticDataBuild(
         return customInfraFailure(allocator, timer, "failed to read Rocci dev wasm magic: {}", .{err});
     if (bytes_read != magic.len or !std.mem.eql(u8, magic[0..], &.{ 0, 'a', 's', 'm' })) {
         return customFailure(allocator, timer, "Rocci dev wasm output had invalid wasm magic", .{});
+    }
+
+    const wasm_bytes = std.Io.Dir.cwd().readFileAlloc(io, output_path, allocator, .limited(64 * 1024 * 1024)) catch |err|
+        return customInfraFailure(allocator, timer, "failed to read Rocci dev wasm output: {}", .{err});
+    defer allocator.free(wasm_bytes);
+    var module = roc_backend.wasm.WasmModule.preload(allocator, wasm_bytes, false) catch |err|
+        return customInfraFailure(allocator, timer, "failed to parse Rocci dev wasm output: {}", .{err});
+    defer module.deinit();
+
+    var has_start = false;
+    var has_update = false;
+    var has_other = false;
+    for (module.exports.items) |exported| {
+        if (exported.kind != .func) {
+            has_other = true;
+        } else if (std.mem.eql(u8, exported.name, "start")) {
+            has_start = true;
+        } else if (std.mem.eql(u8, exported.name, "update")) {
+            has_update = true;
+        } else {
+            has_other = true;
+        }
+    }
+    if (module.exports.items.len != 2 or !has_start or !has_update or has_other) {
+        return customFailure(allocator, timer, "Rocci dev wasm did not contain exactly the configured update/start function exports", .{});
     }
 
     return null;

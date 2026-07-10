@@ -7377,6 +7377,10 @@ fn collectWasmPlatformExports(
     link_inputs: PlatformLinkInputs,
     owned_inputs: *std.ArrayList([]u8),
 ) CliMainError![]const []const u8 {
+    if (link_inputs.wasm) |wasm| {
+        if (wasm.exports) |exports| return exports;
+    }
+
     var exports = std.array_list.Managed([]const u8).init(ctx.arena);
 
     for (link_inputs.platform_files_pre) |path| {
