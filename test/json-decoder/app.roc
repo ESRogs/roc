@@ -74,6 +74,12 @@ main! = |json| {
 	invalid_missing_tag_payload_result : Try([Active, Paused], Json.ParseErr)
 	invalid_missing_tag_payload_result = Json.parse("{\"Active\":}")
 
+	# The known field's value contains \n, \", and \uXXXX escapes. The other
+	# fields are unknown, so the decoder skips them; their values contain
+	# escaped quotes, escaped backslashes, and a surrogate pair.
+	escaped_string_result : Try({ note : Str }, Json.ParseErr)
+	escaped_string_result = Json.parse("{\"note\":\"roc\\nsays \\\"kree\\\" caf\\u00e9\",\"keeper\":{\"bio\":\"tends the \\\"Roc\\\" egg\",\"links\":[\"https:\\/\\/roc.example\\/1\",\"wing\\tspan\"]},\"bird\":\"\\ud83e\\udd85\"}")
+
 	match decoded_result {
 		Ok(decoded) => {
 			explicit_optional_length = match decoded.explicit_optional {
@@ -135,6 +141,7 @@ main! = |json| {
 				+ invalid_u64_plus_score(invalid_u64_plus_result)
 				+ invalid_u64_leading_zero_score(invalid_u64_leading_zero_result)
 				+ invalid_missing_tag_payload_score(invalid_missing_tag_payload_result)
+				+ escaped_string_score(escaped_string_result)
 				+ explicit_optional_length
 				+ wildcard_optional_length
 				+ question_optional_length
@@ -197,6 +204,18 @@ invalid_string_score = |string_result|
 	match string_result {
 		Ok(_) => 999999
 		Err(InvalidJson(_)) => 43
+		Err(_) => 999999
+	}
+
+escaped_string_score : Try({ note : Str }, Json.ParseErr) -> U64
+escaped_string_score = |escaped_result|
+	match escaped_result {
+		Ok(decoded) =>
+			if Str.is_eq(decoded.note, "roc\nsays \"kree\" café") {
+				107
+			} else {
+				999999
+			}
 		Err(_) => 999999
 	}
 
