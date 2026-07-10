@@ -2501,10 +2501,14 @@ const Builder = struct {
     /// Builds the declared-field-order span for a nominal/opaque record backing
     /// from its source declaration (the declaration backing preserves source
     /// order, unlike the lexicographically-sorted lowered row). Returns the empty
-    /// span for non-record backings or when no declaration is available. The
-    /// span feeds layout selection only; the lowered row stays lexicographic.
+    /// span for non-record backings or encodings that intentionally have no
+    /// declaration backing. The span feeds layout selection only; the lowered
+    /// row stays lexicographic.
     fn declaredOrderForNominal(self: *Builder, view: ModuleView, nominal: checked.CheckedNominalType) Allocator.Error!Type.Span {
-        const lookup = self.nominalDeclarationFor(view, nominal) orelse return Type.Span.empty();
+        const lookup = self.nominalDeclarationFor(view, nominal) orelse {
+            if (!nominalHasDeclarationBacking(nominal)) return Type.Span.empty();
+            Common.invariant("declaration-backed nominal reached Monotype lowering without declaration data");
+        };
         const fields = lookup.declaration.declaredRecordFields(lookup.view.types);
         if (fields.len == 0) return Type.Span.empty();
         // Unnamed fields are layout padding; their resolved checked types ride on
@@ -3170,7 +3174,7 @@ const Builder = struct {
         for (fn_value.captures) |capture| {
             if (!capture.id.isCanonical()) continue;
             const binder = capture.id.binder();
-            const lowered_ty = try fn_ctx.lowerTypeView(checkedBinderType(fn_view, binder));
+            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
             const local = try fn_ctx.addLocalWithBinder(self.symbols.fresh(), lowered_ty, binder);
             try fn_ctx.bindLocalName(local, binder);
             const previous = fn_ctx.binders.get(binder);
@@ -3739,7 +3743,7 @@ const Builder = struct {
 
         for (fn_value.captures, 0..) |capture, index| {
             const binder = constCaptureBinder(capture.id);
-            const lowered_ty = try fn_ctx.lowerTypeView(checkedBinderType(fn_view, binder));
+            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
             const capture_cell = try fn_ctx.draftTypeCell(lowered_ty);
             const local = try fn_ctx.addLocalWithBinderCell(self.symbols.fresh(), capture_cell, binder);
             try fn_ctx.bindLocalName(local, binder);
@@ -6471,6 +6475,10 @@ const BodyContext = struct {
     /// restored from the constant lower their bodies against this chain
     /// (their plans' `constraint(k)` refs index the constant's scheme).
     restore_evidence: EvidenceChain = .{},
+    /// While recursively restoring a stored constant, the concrete type of the
+    /// whole restored value. Nested stored closures use this to instantiate the
+    /// owner callable's return when synthesizing the constant scheme's evidence.
+    restore_const_result_ty: ?Type.TypeId = null,
 
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
@@ -7277,6 +7285,7 @@ const BodyContext = struct {
         child.generated_encoder_lambda_index = self.generated_encoder_lambda_index;
         child.source_region_override = self.source_region_override;
         child.current_entry_root = self.current_entry_root;
+        child.restore_const_result_ty = self.restore_const_result_ty;
 
         var binder_iter = self.binders.iterator();
         while (binder_iter.next()) |entry| {
@@ -8138,7 +8147,10 @@ const BodyContext = struct {
         self: *BodyContext,
         nominal: checked.CheckedNominalType,
     ) Allocator.Error![]const InstDeclaredField {
-        const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse return &.{};
+        const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse {
+            if (!nominalHasDeclarationBacking(nominal)) return &.{};
+            Common.invariant("declaration-backed nominal reached Monotype instantiation without declaration data");
+        };
         const fields = lookup.declaration.declaredRecordFields(lookup.view.types);
         if (fields.len == 0) return &.{};
 
@@ -15183,6 +15195,10 @@ const BodyContext = struct {
         node: checked.ConstNodeId,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        const previous_restore_const_result_ty = self.restore_const_result_ty;
+        if (previous_restore_const_result_ty == null) self.restore_const_result_ty = ty;
+        defer self.restore_const_result_ty = previous_restore_const_result_ty;
+
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
@@ -15336,6 +15352,177 @@ const BodyContext = struct {
         };
     }
 
+    fn lowerConstCaptureType(
+        self: *BodyContext,
+        store_view: ModuleView,
+        ty: check.ConstStore.ConstTypeId,
+    ) Allocator.Error!Type.TypeId {
+        var map = std.AutoHashMap(check.ConstStore.ConstTypeId, Type.TypeId).init(self.allocator);
+        defer map.deinit();
+        return try self.lowerConstCaptureTypeInner(store_view, ty, &map);
+    }
+
+    fn lowerConstCaptureTypeInner(
+        self: *BodyContext,
+        store_view: ModuleView,
+        ty: check.ConstStore.ConstTypeId,
+        map: *std.AutoHashMap(check.ConstStore.ConstTypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        if (map.get(ty)) |existing| return existing;
+        const context = ConstTypeLowerContext{
+            .body = self,
+            .store_view = store_view,
+            .ty = ty,
+            .map = map,
+        };
+        return self.builder.program.types.addRecursive(context, ConstTypeLowerContext.fill) catch |err| {
+            _ = map.remove(ty);
+            return err;
+        };
+    }
+
+    const ConstTypeLowerContext = struct {
+        body: *BodyContext,
+        store_view: ModuleView,
+        ty: check.ConstStore.ConstTypeId,
+        map: *std.AutoHashMap(check.ConstStore.ConstTypeId, Type.TypeId),
+
+        fn fill(self: ConstTypeLowerContext, reserved: Type.TypeId) Allocator.Error!Type.Content {
+            try self.map.put(self.ty, reserved);
+            return try self.body.lowerConstCaptureTypeContent(self.store_view, self.ty, self.map);
+        }
+    };
+
+    fn lowerConstCaptureTypeContent(
+        self: *BodyContext,
+        store_view: ModuleView,
+        ty: check.ConstStore.ConstTypeId,
+        map: *std.AutoHashMap(check.ConstStore.ConstTypeId, Type.TypeId),
+    ) Allocator.Error!Type.Content {
+        const type_store = &store_view.const_store.type_store;
+        return switch (type_store.get(ty)) {
+            .primitive => |primitive| .{ .primitive = monotypePrimitive(primitive) },
+            .zst => .zst,
+            .erased => |erased| .{ .erased = erased },
+            .list => |elem| .{ .list = try self.lowerConstCaptureTypeInner(store_view, elem, map) },
+            .box => |elem| .{ .box = try self.lowerConstCaptureTypeInner(store_view, elem, map) },
+            .tuple => |items| blk: {
+                const source = type_store.typeSpan(items);
+                const out = try self.allocator.alloc(Type.TypeId, source.len);
+                defer self.allocator.free(out);
+                for (source, 0..) |item, index| {
+                    out[index] = try self.lowerConstCaptureTypeInner(store_view, item, map);
+                }
+                break :blk .{ .tuple = try self.builder.program.types.addSpan(out) };
+            },
+            .func => |func| blk: {
+                const source = type_store.typeSpan(func.args);
+                const out = try self.allocator.alloc(Type.TypeId, source.len);
+                defer self.allocator.free(out);
+                for (source, 0..) |arg, index| {
+                    out[index] = try self.lowerConstCaptureTypeInner(store_view, arg, map);
+                }
+                break :blk .{ .func = .{
+                    .args = try self.builder.program.types.addSpan(out),
+                    .ret = try self.lowerConstCaptureTypeInner(store_view, func.ret, map),
+                } };
+            },
+            .record => |fields| blk: {
+                const source = type_store.fieldSpan(fields);
+                const out = try self.allocator.alloc(Type.Field, source.len);
+                defer self.allocator.free(out);
+                for (source, 0..) |field, index| {
+                    out[index] = .{
+                        .name = try self.constRecordFieldName(store_view, field.name),
+                        .ty = try self.lowerConstCaptureTypeInner(store_view, field.ty, map),
+                    };
+                }
+                break :blk .{ .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, out) };
+            },
+            .tag_union => |tags| blk: {
+                const source = type_store.tagSpan(tags);
+                const out = try self.allocator.alloc(Type.Tag, source.len);
+                defer self.allocator.free(out);
+                for (source, 0..) |tag, index| {
+                    const payloads = type_store.typeSpan(tag.payloads);
+                    const out_payloads = try self.allocator.alloc(Type.TypeId, payloads.len);
+                    defer self.allocator.free(out_payloads);
+                    for (payloads, 0..) |payload, payload_index| {
+                        out_payloads[payload_index] = try self.lowerConstCaptureTypeInner(store_view, payload, map);
+                    }
+                    out[index] = .{
+                        .name = try self.constTagName(store_view, tag.name),
+                        .checked_name = try self.constTagName(store_view, tag.checked_name),
+                        .payloads = try self.builder.program.types.addSpan(out_payloads),
+                    };
+                }
+                break :blk .{ .tag_union = try self.builder.program.types.addTagVariants(&self.builder.program.names, out) };
+            },
+            .named => |named| blk: {
+                const args = type_store.typeSpan(named.args);
+                const out_args = try self.allocator.alloc(Type.TypeId, args.len);
+                defer self.allocator.free(out_args);
+                for (args, 0..) |arg, index| {
+                    out_args[index] = try self.lowerConstCaptureTypeInner(store_view, arg, map);
+                }
+
+                const declared = type_store.declaredFieldSpan(named.declared_order);
+                const out_declared = try self.allocator.alloc(Type.DeclaredField, declared.len);
+                defer self.allocator.free(out_declared);
+                for (declared, 0..) |entry, index| {
+                    out_declared[index] = switch (entry) {
+                        .named => |name| .{ .named = try self.constRecordFieldName(store_view, name) },
+                        .padding => |padding| .{ .padding = try self.lowerConstCaptureTypeInner(store_view, padding, map) },
+                    };
+                }
+
+                break :blk .{ .named = .{
+                    .named_type = .{
+                        .module = named.named_type.module,
+                        .ty = named.named_type.ty,
+                    },
+                    .def = try self.constTypeDef(store_view, named.def),
+                    .kind = monotypeNamedKind(named.kind),
+                    .builtin_owner = named.builtin_owner,
+                    .args = try self.builder.program.types.addSpan(out_args),
+                    .backing = if (named.backing) |backing| .{
+                        .ty = try self.lowerConstCaptureTypeInner(store_view, backing.ty, map),
+                        .use = monotypeBackingUse(backing.use),
+                    } else null,
+                    .declared_order = try self.builder.program.types.addDeclaredFields(out_declared),
+                } };
+            },
+        };
+    }
+
+    fn constRecordFieldName(
+        self: *BodyContext,
+        store_view: ModuleView,
+        name: names.RecordFieldNameId,
+    ) Allocator.Error!names.RecordFieldNameId {
+        return try self.builder.program.names.internRecordFieldLabel(store_view.names.recordFieldLabelText(name));
+    }
+
+    fn constTagName(
+        self: *BodyContext,
+        store_view: ModuleView,
+        name: names.TagNameId,
+    ) Allocator.Error!names.TagNameId {
+        return try self.builder.program.names.internTagLabel(store_view.names.tagLabelText(name));
+    }
+
+    fn constTypeDef(
+        self: *BodyContext,
+        store_view: ModuleView,
+        def: check.ConstStore.TypeDef,
+    ) Allocator.Error!Type.TypeDef {
+        return .{
+            .module = try self.builder.program.names.internModuleIdentity(store_view.names.moduleIdentityBytes(def.module)),
+            .type_name = try self.builder.program.names.internTypeName(store_view.names.typeNameText(def.type_name)),
+            .source_decl = def.source_decl,
+        };
+    }
+
     fn constRecordFields(self: *BodyContext, ty: Type.TypeId) Type.StoreSpanBorrow(Type.Field, "fields") {
         return self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(ty));
     }
@@ -15429,7 +15616,7 @@ const BodyContext = struct {
 
         for (fn_value.captures, 0..) |capture, index| {
             const binder = constCaptureBinder(capture.id);
-            const lowered_ty = try fn_ctx.lowerTypeView(checkedBinderType(fn_view, binder));
+            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
             const capture_cell = try fn_ctx.draftTypeCell(lowered_ty);
             const local = try fn_ctx.addLocalWithBinderCell(self.builder.symbols.fresh(), capture_cell, binder);
             try fn_ctx.bindLocalName(local, binder);
@@ -15467,7 +15654,8 @@ const BodyContext = struct {
                 // compiler-generated-edge evidence construction, so the nested
                 // body's constraint refs at depth 0 resolve.
                 if (self.restore_evidence.vector.len == 0) {
-                    if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty)) |synthesized| {
+                    const result_ty = self.restore_const_result_ty orelse ty;
+                    if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty, result_ty)) |synthesized| {
                         fn_ctx.evidence = .{ .vector = synthesized };
                     }
                 }
@@ -17663,16 +17851,19 @@ const BodyContext = struct {
     /// checked dispatcher paths over the closure's concrete restored callable.
     ///
     /// The owner scheme's evidence-param paths run over the owner's whole
-    /// callable, whose return is the restored closure (a `constraint(0, k)` in
-    /// the closure body forwards to the owner's `k`th param). Instantiate the
-    /// owner root, pin its return to the concrete restored `ty`, and synthesize
-    /// each param's target over the resulting concrete owner callable. Null when
-    /// the owner scheme has no evidence params.
+    /// callable (a `constraint(0, k)` in the closure body forwards to the
+    /// owner's `k`th param). Instantiate the owner root, pin its return to the
+    /// result value that created this stored closure, and synthesize each param's
+    /// target over the resulting concrete owner callable. When the owner returns
+    /// the closure directly, that result is the restored closure type itself; an
+    /// ambient restored constant result only applies when the owner returns an
+    /// aggregate that contains this closure.
     fn synthesizeRestoredClosureEvidence(
         self: *BodyContext,
         owner_view: ModuleView,
         owner_ref: names.ProcTemplate,
         ty: Type.TypeId,
+        owner_result_ty: Type.TypeId,
     ) Allocator.Error!?[]const SpecEvidence {
         const owner_template = owner_view.templates.get(owner_ref.template);
         if (owner_template.evidence_params.len == 0) return null;
@@ -17680,7 +17871,15 @@ const BodyContext = struct {
         const owner_node = try self.instNode(owner_template.checked_fn_root);
         const owner_mono_ty = try self.activeTypeFromNode(owner_node);
         const owner_ret = self.functionReturnType(owner_mono_ty);
-        try self.graph.unify(try self.graph.importMono(owner_ret), try self.graph.importMono(ty));
+        switch (self.builder.shapeContent(ty)) {
+            .func => {},
+            else => Common.invariant("stored capturing function had a non-function restored type"),
+        }
+        const restored_owner_result_ty = switch (self.builder.shapeContent(owner_ret)) {
+            .func => ty,
+            else => owner_result_ty,
+        };
+        try self.graph.unify(try self.graph.importMono(owner_ret), try self.graph.importMono(restored_owner_result_ty));
         try self.graph.drainDirty();
         const owner_callable_ty = try self.activeTypeFromNode(owner_node);
         return try self.synthesizeParamsEvidence(owner_view, owner_template, owner_callable_ty);
@@ -25021,6 +25220,26 @@ fn constGeneratedCaptureNode(fn_value: check.ConstStore.ConstFn, capture_id: u32
     return null;
 }
 
+fn monotypePrimitive(primitive: check.ConstStore.Primitive) Type.Primitive {
+    return std.meta.stringToEnum(Type.Primitive, @tagName(primitive)) orelse
+        Common.invariant("ConstStore primitive had no Monotype primitive equivalent");
+}
+
+fn monotypeNamedKind(kind: check.ConstStore.TypeNamedKind) Type.NamedKind {
+    return switch (kind) {
+        .nominal => .nominal,
+        .@"opaque" => .@"opaque",
+        .alias => .alias,
+    };
+}
+
+fn monotypeBackingUse(use: check.ConstStore.TypeBackingUse) Type.BackingUse {
+    return switch (use) {
+        .inspectable => .inspectable,
+        .runtime_layout_only => .runtime_layout_only,
+    };
+}
+
 fn constStrNodeByteLen(view: ModuleView, node: checked.ConstNodeId) u32 {
     return switch (view.const_store.get(node)) {
         .str => |str| str.len,
@@ -25076,6 +25295,34 @@ fn methodOwnerFromType(types: *const Type.Store, ty: Type.TypeId) ?static_dispat
             .type_name = def.type_name,
             .source_decl = def.source_decl,
         } },
+    };
+}
+
+fn nominalHasDeclarationBacking(nominal: checked.CheckedNominalType) bool {
+    return switch (nominal.representation) {
+        .opaque_without_backing => false,
+        .builtin => |builtin| switch (checked.builtinRuntimeEncoding(builtin)) {
+            .primitive,
+            .list,
+            .box,
+            .dict,
+            .set,
+            .parse_tag_union_spec,
+            .fields,
+            .field,
+            => false,
+            .bool_tag_union,
+            .crypto_sha256_digest,
+            .crypto_sha256_hasher,
+            .crypto_blake3_digest,
+            .crypto_blake3_hasher,
+            => true,
+        },
+        .local_declaration,
+        .imported_declaration,
+        .local_box_payload_capability,
+        .imported_box_payload_capability,
+        => true,
     };
 }
 

@@ -53,8 +53,6 @@ const NominalDecl = types.NominalDecl;
 const StaticDispatchConstraint = types.StaticDispatchConstraint;
 const SourceDecl = types.SourceDecl;
 
-const SERIALIZATION_ALIGNMENT = collections.SERIALIZATION_ALIGNMENT;
-
 /// A variable & its descriptor info
 pub const ResolvedVarDesc = struct {
     var_: Var,
@@ -1465,116 +1463,6 @@ pub const Store = struct {
         self.static_dispatch_constraints.relocate(offset);
         self.nominal_decls.relocate(offset);
         self.nominal_decl_index.relocate(offset);
-    }
-
-    /// Calculate the size needed to serialize this Store
-    pub fn serializedSize(self: *const Self) usize {
-        const slots_size = self.slots.serializedSize();
-        const descs_size = self.descs.serializedSize();
-        const record_fields_size = self.record_fields.serializedSize();
-        const tags_size = self.tags.serializedSize();
-        const vars_size = self.vars.serializedSize();
-        const static_dispatch_constraints_size = self.static_dispatch_constraints.serializedSize();
-        const nominal_decls_size = self.nominal_decls.serializedSize();
-        const nominal_decl_index_size = self.nominal_decl_index.serializedSize();
-
-        // Add alignment padding for each component
-        var total_size: usize = @sizeOf(u32) * 8; // size headers
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT);
-
-        total_size += slots_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-
-        total_size += descs_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-
-        total_size += record_fields_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-
-        total_size += tags_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-
-        total_size += vars_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-
-        total_size += static_dispatch_constraints_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-
-        total_size += nominal_decls_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-
-        total_size += nominal_decl_index_size;
-        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT);
-
-        // Align to SERIALIZATION_ALIGNMENT to maintain alignment for subsequent data
-        return std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
-    }
-
-    /// Deserialize a Store from the provided buffer
-    pub fn deserializeFrom(buffer: []const u8, allocator: Allocator) Allocator.Error!Self {
-        if (buffer.len < @sizeOf(u32) * 6) return error.BufferTooSmall;
-
-        var offset: usize = 0;
-
-        // Read sizes
-        const slots_size = @as(*const u32, @ptrCast(@alignCast(buffer.ptr + offset))).*;
-        offset += @sizeOf(u32);
-
-        const descs_size = @as(*const u32, @ptrCast(@alignCast(buffer.ptr + offset))).*;
-        offset += @sizeOf(u32);
-
-        const record_fields_size = @as(*const u32, @ptrCast(@alignCast(buffer.ptr + offset))).*;
-        offset += @sizeOf(u32);
-
-        const tags_size = @as(*const u32, @ptrCast(@alignCast(buffer.ptr + offset))).*;
-        offset += @sizeOf(u32);
-
-        const vars_size = @as(*const u32, @ptrCast(@alignCast(buffer.ptr + offset))).*;
-        offset += @sizeOf(u32);
-
-        const static_dispatch_constraints_size = @as(*const u32, @ptrCast(@alignCast(buffer.ptr + offset))).*;
-        offset += @sizeOf(u32);
-
-        // Deserialize data
-        offset = std.mem.alignForward(usize, offset, SERIALIZATION_ALIGNMENT.toByteUnits());
-        const slots_buffer = @as([]align(SERIALIZATION_ALIGNMENT.toByteUnits()) const u8, @alignCast(buffer[offset .. offset + slots_size]));
-        const slots = try SlotStore.deserializeFrom(slots_buffer, allocator);
-        offset += slots_size;
-
-        offset = std.mem.alignForward(usize, offset, SERIALIZATION_ALIGNMENT.toByteUnits());
-        const descs_buffer = @as([]align(@alignOf(Desc)) const u8, @alignCast(buffer[offset .. offset + descs_size]));
-        const descs = try DescStore.deserializeFrom(descs_buffer, allocator);
-        offset += descs_size;
-
-        offset = std.mem.alignForward(usize, offset, SERIALIZATION_ALIGNMENT.toByteUnits());
-        const record_fields_buffer = @as([]align(SERIALIZATION_ALIGNMENT.toByteUnits()) const u8, @alignCast(buffer[offset .. offset + record_fields_size]));
-        const record_fields = try RecordFieldSafeMultiList.deserializeFrom(record_fields_buffer, allocator);
-        offset += record_fields_size;
-
-        offset = std.mem.alignForward(usize, offset, SERIALIZATION_ALIGNMENT.toByteUnits());
-        const tags_buffer = @as([]align(SERIALIZATION_ALIGNMENT.toByteUnits()) const u8, @alignCast(buffer[offset .. offset + tags_size]));
-        const tags = try TagSafeMultiList.deserializeFrom(tags_buffer, allocator);
-        offset += tags_size;
-
-        offset = std.mem.alignForward(usize, offset, SERIALIZATION_ALIGNMENT.toByteUnits());
-        const vars_buffer = @as([]align(SERIALIZATION_ALIGNMENT.toByteUnits()) const u8, @alignCast(buffer[offset .. offset + vars_size]));
-        const vars = try VarSafeList.deserializeFrom(vars_buffer, allocator);
-        offset += vars_size;
-
-        offset = std.mem.alignForward(usize, offset, SERIALIZATION_ALIGNMENT.toByteUnits());
-        const static_dispatch_constraints_buffer = @as([]align(SERIALIZATION_ALIGNMENT.toByteUnits()) const u8, @alignCast(buffer[offset .. offset + static_dispatch_constraints_size]));
-        const static_dispatch_constraints = try StaticDispatchConstraint.SafeList.deserializeFrom(static_dispatch_constraints_buffer, allocator);
-        offset += static_dispatch_constraints_size;
-
-        return Self{
-            .gpa = allocator,
-            .slots = slots,
-            .descs = descs,
-            .record_fields = record_fields,
-            .tags = tags,
-            .vars = vars,
-            .static_dispatch_constraints = static_dispatch_constraints,
-        };
     }
 };
 

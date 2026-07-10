@@ -1336,6 +1336,7 @@ const CompileTimeRequestScheduler = struct {
         self: *CompileTimeRequestScheduler,
         dependency_root: ComptimeRootId,
     ) Allocator.Error!void {
+        if (dependency_root == self.current_root_id) return;
         const raw = @intFromEnum(dependency_root);
         if (raw >= self.root_to_request_index.len) {
             checkedArtifactInvariant("compile-time root dependency was outside the root table", .{});
@@ -2058,8 +2059,13 @@ const PlatformRelationSubstitutionCollector = struct {
         {
             checkedArtifactInvariant("platform relation substitution alias mismatch", .{});
         }
+        const platform_args = try self.allocator.dupe(CheckedTypeId, platform_alias.args);
+        defer self.allocator.free(platform_args);
+        const resolved_args = try self.allocator.dupe(CheckedTypeId, resolved_alias.args);
+        defer self.allocator.free(resolved_args);
+
         try self.collect(platform_alias.backing, resolved_alias.backing, .value);
-        return try self.collectSlices(platform_alias.args, resolved_alias.args);
+        return try self.collectSlices(platform_args, resolved_args);
     }
 
     fn collectNominal(
@@ -2092,11 +2098,27 @@ const PlatformRelationSubstitutionCollector = struct {
         {
             checkedArtifactInvariant("platform relation substitution nominal mismatch", .{});
         }
-        try self.collectSlices(platform_nominal.args, resolved_nominal.args);
-        try self.collectSlices(platform_nominal.padding_field_types, resolved_nominal.padding_field_types);
+        const platform_args = try self.allocator.dupe(CheckedTypeId, platform_nominal.args);
+        defer self.allocator.free(platform_args);
+        const resolved_args = try self.allocator.dupe(CheckedTypeId, resolved_nominal.args);
+        defer self.allocator.free(resolved_args);
+        const platform_padding = try self.allocator.dupe(CheckedTypeId, platform_nominal.padding_field_types);
+        defer self.allocator.free(platform_padding);
+        const resolved_padding = try self.allocator.dupe(CheckedTypeId, resolved_nominal.padding_field_types);
+        defer self.allocator.free(resolved_padding);
+
+        var platform_nominal_copy = platform_nominal;
+        platform_nominal_copy.args = platform_args;
+        platform_nominal_copy.padding_field_types = platform_padding;
+        var resolved_nominal_copy = resolved_nominal;
+        resolved_nominal_copy.args = resolved_args;
+        resolved_nominal_copy.padding_field_types = resolved_padding;
+
+        try self.collectSlices(platform_args, resolved_args);
+        try self.collectSlices(platform_padding, resolved_padding);
         if (platform_nominal.is_opaque) return;
-        const platform_backing = (try self.nominalBacking(platform_nominal)) orelse return;
-        const resolved_backing = (try self.nominalBacking(resolved_nominal)) orelse {
+        const platform_backing = (try self.nominalBacking(platform_nominal_copy)) orelse return;
+        const resolved_backing = (try self.nominalBacking(resolved_nominal_copy)) orelse {
             checkedArtifactInvariant("platform relation substitution resolved nominal missing declaration backing", .{});
         };
         return try self.collect(platform_backing, resolved_backing, .value);
@@ -2199,7 +2221,11 @@ const PlatformRelationSubstitutionCollector = struct {
         if (platform_roots.len != resolved_roots.len) {
             checkedArtifactInvariant("platform relation substitution arity mismatch", .{});
         }
-        for (platform_roots, resolved_roots) |platform_root, resolved_root| {
+        const platform_copy = try self.allocator.dupe(CheckedTypeId, platform_roots);
+        defer self.allocator.free(platform_copy);
+        const resolved_copy = try self.allocator.dupe(CheckedTypeId, resolved_roots);
+        defer self.allocator.free(resolved_copy);
+        for (platform_copy, resolved_copy) |platform_root, resolved_root| {
             try self.collect(platform_root, resolved_root, .value);
         }
     }
@@ -4155,12 +4181,14 @@ pub const CheckedTypeStore = struct {
             return out;
         }
 
-        // paddingFieldTypes/formalArgs alias type_id_pool, which cloning may
+        // paddingFieldTypes/formalArgs/actualArgs may alias type_id_pool, which cloning may
         // grow/reallocate; copy before the substitution loop.
         const padding_copy = try allocator.dupe(CheckedTypeId, padding_field_types);
         defer allocator.free(padding_copy);
         const formals_copy = try allocator.dupe(CheckedTypeId, formal_args);
         defer allocator.free(formals_copy);
+        const actuals_copy = try allocator.dupe(CheckedTypeId, actual_args);
+        defer allocator.free(actuals_copy);
 
         var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
         defer active.deinit();
@@ -4170,7 +4198,7 @@ pub const CheckedTypeStore = struct {
                 names,
                 padding_ty,
                 formals_copy,
-                actual_args,
+                actuals_copy,
                 &active,
             );
         }
@@ -5646,33 +5674,54 @@ const OwnerNominalDecl = struct {
     decl: CheckedNominalDeclaration,
 };
 
-/// Find the imported artifact view + declaration for a nominal by stable
-/// content identity (origin module hash) and declared type-name text. This is
-/// the same identity-directed resolution `importedNominalDeclarationRefForSourceNominal`
-/// uses; returns null when no owner view carries the declaration (a local
-/// declaration, or an owner not present at publication).
-fn ownerViewAndDeclForNominal(
-    imports: CheckedImportViews,
-    origin_hash: *const [32]u8,
-    type_text: []const u8,
-) ?OwnerNominalDecl {
+fn importedViewForKey(imports: CheckedImportViews, key: CheckedModuleArtifactKey) ?ImportedModuleView {
     for (imports.direct) |import| {
-        if (!importedViewIdentityMatches(import.view, origin_hash)) continue;
-        for (import.view.checked_types.nominal_declarations) |decl| {
-            if (Ident.textEql(import.view.canonical_names.typeNameText(decl.nominal.type_name), type_text)) {
-                return .{ .view = import.view, .decl = decl };
-            }
-        }
+        if (checkedArtifactKeyEql(import.key, key)) return import.view;
     }
     for (imports.available) |view| {
-        if (!importedViewIdentityMatches(view, origin_hash)) continue;
-        for (view.checked_types.nominal_declarations) |decl| {
-            if (Ident.textEql(view.canonical_names.typeNameText(decl.nominal.type_name), type_text)) {
-                return .{ .view = view, .decl = decl };
-            }
-        }
+        if (checkedArtifactKeyEql(view.key, key)) return view;
+    }
+    for (imports.relations) |view| {
+        if (checkedArtifactKeyEql(view.key, key)) return view;
     }
     return null;
+}
+
+/// Find the imported artifact view + declaration for a nominal using the
+/// explicit representation carried by the payload. Missing declaration-backed
+/// owners are producer bugs: a published artifact must be self-contained.
+fn ownerViewAndDeclForImportedNominal(
+    imports: CheckedImportViews,
+    owner_module: ModuleId,
+    source_decl: ?u32,
+    representation: CheckedNominalRepresentationRef,
+) ?OwnerNominalDecl {
+    return switch (representation) {
+        .builtin => blk: {
+            const view = importedViewForKey(imports, owner_module) orelse return null;
+            const source_statement = source_decl orelse return null;
+            for (view.checked_types.nominal_declarations) |declaration| {
+                if (declaration.source_statement != source_statement) continue;
+                break :blk .{ .view = view, .decl = declaration };
+            }
+            break :blk null;
+        },
+        .imported_declaration => |imported| blk: {
+            const view = importedViewForKey(imports, imported.artifact) orelse return null;
+            break :blk .{ .view = view, .decl = view.checked_types.nominalDeclarationById(imported.declaration) };
+        },
+        .imported_box_payload_capability => |capability_ref| blk: {
+            const view = importedViewForKey(imports, capability_ref.artifact) orelse return null;
+            const capability = view.interface_capabilities.boxPayloadCapability(capability_ref.capability);
+            const decl = view.checked_types.nominalDeclaration(capability.nominal) orelse
+                checkedArtifactInvariant("imported box payload capability referenced missing nominal declaration", .{});
+            break :blk .{ .view = view, .decl = decl };
+        },
+        .local_declaration,
+        .local_box_payload_capability,
+        .opaque_without_backing,
+        => null,
+    };
 }
 
 /// Project one imported nominal declaration (its declaration-root nominal
@@ -5726,8 +5775,8 @@ fn embedReachableImportedNominalDecls(
     while (i < store.payloads.items.len) : (i += 1) {
         // Read only scalar identity fields: the payload's slice fields alias
         // pools that projection below can reallocate.
-        const origin_module, const type_name, const source_decl = switch (store.payloads.items[i]) {
-            .nominal => |nominal| .{ nominal.origin_module, nominal.name, nominal.source_decl },
+        const origin_module, const owner_module, const type_name, const source_decl, const builtin_nominal, const representation = switch (store.payloads.items[i]) {
+            .nominal => |nominal| .{ nominal.origin_module, nominal.owner_module, nominal.name, nominal.source_decl, nominal.builtin, nominal.representation },
             else => continue,
         };
 
@@ -5740,9 +5789,22 @@ fn embedReachableImportedNominalDecls(
         // embedded on an earlier iteration.
         if (store.nominalDeclaration(key) != null) continue;
 
-        const origin_hash = names.moduleIdentityBytes(origin_module);
-        const type_text = names.typeNameText(type_name);
-        const owner = ownerViewAndDeclForNominal(imports, origin_hash, type_text) orelse continue;
+        const owner = ownerViewAndDeclForImportedNominal(imports, owner_module, source_decl, representation) orelse
+            switch (representation) {
+                .opaque_without_backing => continue,
+                .builtin => {
+                    if (builtin_nominal) |builtin_decl| {
+                        if (!builtinNominalHasDeclarationBacking(builtin_decl)) continue;
+                    }
+                    checkedArtifactInvariant("checked type publication could not embed reachable builtin nominal declaration", .{});
+                },
+                .local_declaration,
+                .local_box_payload_capability,
+                => checkedArtifactInvariant("checked type publication had local nominal payload without local declaration", .{}),
+                .imported_declaration,
+                .imported_box_payload_capability,
+                => checkedArtifactInvariant("checked type publication could not embed reachable imported nominal declaration", .{}),
+            };
 
         try embedOneImportedNominalDecl(allocator, store, names, owner.view, owner.decl);
     }
@@ -6923,6 +6985,7 @@ const ExpectSingleNominalBackingPayloadError = Allocator.Error || error{
     ExpectedNominalStatement,
     ExpectedNominalRoot,
     ExpectedNominalPayload,
+    ExpectedNominalBacking,
 };
 
 fn expectSingleNominalBackingPayload(allocator: Allocator, module_name: []const u8, source: []const u8, expected: CheckedTypePayload) ExpectSingleNominalBackingPayloadError!void {
@@ -6985,7 +7048,8 @@ fn expectSingleNominalBackingPayload(allocator: Allocator, module_name: []const 
         .nominal => |payload| payload,
         else => return error.ExpectedNominalPayload,
     };
-    try testing.expectEqual(expected, publication.store.payload(nominal.backing));
+    const backing = publication.store.nominalBackingTemplateForPayload(nominal) orelse return error.ExpectedNominalBacking;
+    try testing.expectEqual(expected, publication.store.payload(backing));
 }
 
 test "checked type publication normalizes closed empty tag union backing" {
@@ -7131,17 +7195,19 @@ fn checkedNominalRepresentationForSourceNominal(
         imports,
         origin_hash,
         type_name,
+        source_decl orelse checkedArtifactInvariant("checked imported nominal representation had no source declaration", .{}),
     ) };
 }
 
 /// Resolve the artifact + declaration that owns an imported nominal type:
 /// the declaring module by 32-byte content identity, the declaration by its
-/// declared (module-relative) type name.
+/// full nominal key.
 fn importedNominalDeclarationRefForSourceNominal(
     names: *const canonical.CanonicalNameStore,
     imports: CheckedImportViews,
     origin_hash: *const [32]u8,
     type_name: canonical.TypeNameId,
+    source_decl: u32,
 ) ImportedNominalDeclarationRef {
     const type_text = names.typeNameText(type_name);
     var found: ?ImportedNominalDeclarationRef = null;
@@ -7150,6 +7216,7 @@ fn importedNominalDeclarationRefForSourceNominal(
         if (!importedViewIdentityMatches(import.view, origin_hash)) continue;
         for (import.view.checked_types.nominal_declarations) |declaration| {
             if (!Ident.textEql(import.view.canonical_names.typeNameText(declaration.nominal.type_name), type_text)) continue;
+            if (declaration.source_statement != source_decl) continue;
             const next = ImportedNominalDeclarationRef{
                 .artifact = import.key,
                 .declaration = declaration.id,
@@ -7167,6 +7234,7 @@ fn importedNominalDeclarationRefForSourceNominal(
         if (!importedViewIdentityMatches(view, origin_hash)) continue;
         for (view.checked_types.nominal_declarations) |declaration| {
             if (!Ident.textEql(view.canonical_names.typeNameText(declaration.nominal.type_name), type_text)) continue;
+            if (declaration.source_statement != source_decl) continue;
             const next = ImportedNominalDeclarationRef{
                 .artifact = view.key,
                 .declaration = declaration.id,
@@ -7182,8 +7250,8 @@ fn importedNominalDeclarationRefForSourceNominal(
     }
 
     return found orelse checkedArtifactInvariant(
-        "checked nominal representation referenced a missing imported nominal declaration for owner identity {any} type {s}",
-        .{ origin_hash.*, type_text },
+        "checked nominal representation referenced a missing imported nominal declaration for owner identity {any} type {s} statement {d}",
+        .{ origin_hash.*, type_text, source_decl },
     );
 }
 
@@ -17264,20 +17332,28 @@ const PlatformRequirementTypeCompatibilityChecker = struct {
         if (expected_nominal.source_decl != actual_nominal.source_decl) return false;
         if (expected_nominal.builtin != actual_nominal.builtin) return false;
         if (expected_nominal.is_opaque != actual_nominal.is_opaque) return false;
-        if (expected_nominal.args.len != actual_nominal.args.len) return false;
-        for (expected_nominal.args, actual_nominal.args) |expected_arg, actual_arg| {
+        const expected_args = try self.allocator.dupe(CheckedTypeId, expected_nominal.args);
+        defer self.allocator.free(expected_args);
+        const actual_args = try self.allocator.dupe(CheckedTypeId, actual_nominal.args);
+        defer self.allocator.free(actual_args);
+        if (expected_args.len != actual_args.len) return false;
+        for (expected_args, actual_args) |expected_arg, actual_arg| {
             if (!try self.compatible(expected_arg, actual_arg)) return false;
         }
         if (expected_nominal.is_opaque) return true;
+        var expected_nominal_copy = expected_nominal;
+        expected_nominal_copy.args = expected_args;
+        var actual_nominal_copy = actual_nominal;
+        actual_nominal_copy.args = actual_args;
         const expected_backing = (try self.store.ensureInstantiatedNominalBackingRootForPayload(
             self.allocator,
             self.names,
-            expected_nominal,
+            expected_nominal_copy,
         )) orelse return true;
         const actual_backing = (try self.store.ensureInstantiatedNominalBackingRootForPayload(
             self.allocator,
             self.names,
-            actual_nominal,
+            actual_nominal_copy,
         )) orelse return true;
         if (try self.compatible(expected_backing, actual_backing)) return true;
         return canonicalTypeKeyEql(
@@ -20590,7 +20666,7 @@ pub const ModuleInterfaceCapabilities = struct {
                 allocator,
                 names,
                 declaration,
-                nominal.args,
+                nominal_args,
             );
             defer allocator.free(padding_field_tys);
             const padding_start: u32 = @intCast(padding_pool.items.len);
@@ -30566,8 +30642,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x17, 0x49, 0xD3, 0xE8, 0xB4, 0x14, 0xB4, 0x4E, 0xBA, 0x3F, 0x83, 0x56, 0x1A, 0xCB, 0x56, 0x6F,
-        0xBB, 0xC4, 0xD2, 0x20, 0x0F, 0x37, 0x13, 0xA3, 0x68, 0xE2, 0xE4, 0x43, 0x75, 0x6C, 0xB0, 0xDD,
+        0x9B, 0x46, 0x4A, 0x21, 0x89, 0x52, 0xF5, 0xCB, 0x5B, 0xC0, 0xE7, 0xF8, 0x71, 0x0A, 0xCA, 0x52,
+        0x93, 0xBA, 0xD1, 0x02, 0xEB, 0xEC, 0xA0, 0x63, 0x67, 0xE0, 0xAB, 0x25, 0x0B, 0x7D, 0xA7, 0x89,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

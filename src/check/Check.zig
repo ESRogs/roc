@@ -5615,13 +5615,25 @@ fn varIsConcreteHoistedConstType(self: *Self, var_: Var) Allocator.Error!bool {
 }
 
 /// Resolve a nominal application's declaration backing TEMPLATE for read-only
-/// structural queries, or null when the declaration is unresolvable or
-/// invalid. In the template, the declaration's formals (rigid vars) stand at
-/// exactly the positions where the application's args are substituted, so a
-/// query that checks the args separately can walk the template as long as its
-/// rigid handling is neutral (or explicitly template-aware).
+/// structural queries, or null when the declaration is invalid or source-less.
+/// A source-backed nominal missing from the declaration table is a checker
+/// invariant violation. In the template, the declaration's formals (rigid vars)
+/// stand at exactly the positions where the application's args are substituted,
+/// so a query that checks the args separately can walk the template as long as
+/// its rigid handling is neutral (or explicitly template-aware).
 fn nominalDeclBackingTemplate(self: *const Self, nominal: types_mod.NominalType) ?Var {
-    const decl_idx = self.types.lookupNominalDecl(nominal) orelse return null;
+    const decl_idx = self.types.lookupNominalDecl(nominal) orelse {
+        if (nominal.sourceDecl().present) {
+            if (builtin.mode == .Debug) {
+                std.debug.panic(
+                    "type checker invariant violated: nominal application '{s}' has a source declaration but no declaration table entry",
+                    .{self.cir.getIdentStoreConst().getText(nominal.ident.ident_idx)},
+                );
+            }
+            unreachable;
+        }
+        return null;
+    };
     const decl = self.types.getNominalDecl(decl_idx);
     if (!decl.isValid()) return null;
     return decl.backing;
@@ -8658,7 +8670,7 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     // recursive, neither of which is covered by the per-def checks above.
     const expr_var = ModuleEnv.varFrom(expr_idx);
     try self.checkFlexVarConstraintCompatibility(expr_var, &env, true);
-    try self.validateResolvedOpenNumeralLiterals(&env, true);
+    try self.validateResolvedOpenNumeralLiterals(&env);
     try self.resolvePendingTupleAccesses(&env, true);
     try self.checkAllConstraints(&env);
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);

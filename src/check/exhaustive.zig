@@ -26,6 +26,7 @@
 //! - Original Rust implementation in `crates/compiler/exhaustive/`
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const base = @import("base");
 const builtins = @import("builtins");
@@ -39,6 +40,13 @@ const Region = base.Region;
 const StringLiteral = base.StringLiteral;
 const TypeStore = types.Store;
 const Var = types.Var;
+
+fn exhaustiveInvariant(comptime message: []const u8, args: anytype) noreturn {
+    if (builtin.mode == .Debug) {
+        std.debug.panic(message, args);
+    }
+    unreachable;
+}
 
 /// Builtin type identifiers needed for special-casing in exhaustiveness checking.
 /// These types have special backing representations that would incorrectly appear uninhabited.
@@ -869,14 +877,14 @@ const UnionResult = union(enum) {
 /// template with its actual args substituted for the declaration's formals.
 /// The instantiated copy is analysis-only scratch in the type store (the
 /// checker backfills regions for it after each exhaustiveness entry point).
-/// Returns null when the declaration is unresolvable or invalid; callers
-/// treat such a nominal as opaque.
+/// Returns null only for invalid declarations whose error was already reported.
 fn openNominalBacking(
     type_store: *TypeStore,
     builtin_idents: BuiltinIdents,
     nominal: types.NominalType,
 ) error{OutOfMemory}!?Var {
-    const decl_idx = type_store.lookupNominalDecl(nominal) orelse return null;
+    const decl_idx = type_store.lookupNominalDecl(nominal) orelse
+        exhaustiveInvariant("exhaustiveness nominal opening referenced a missing declaration", .{});
     const decl = type_store.getNominalDecl(decl_idx);
     if (!decl.isValid()) return null;
 

@@ -623,14 +623,14 @@ pub const Resolver = struct {
     }
 
     fn nominalDeclarationFor(
-        self: *Resolver,
+        _: *Resolver,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         nominal: CheckedArtifact.CheckedNominalType,
     ) ?NominalDeclarationLookup {
         // Self-contained artifacts embed a copy of every imported/builtin
         // nominal declaration they use, keyed by content identity. Resolve
-        // from the LOCAL table first so no owner artifact must be loaded; the
-        // representation-directed arms below remain as a fallback.
+        // from the LOCAL table only; falling back to the owner artifact would
+        // mask a broken checked-artifact publication.
         const local_key = NominalTypeKey{
             .module = nominal.origin_module,
             .type_name = nominal.name,
@@ -639,44 +639,7 @@ pub const Resolver = struct {
         if (artifact.checked_types.nominalDeclaration(local_key)) |declaration| {
             return .{ .artifact = artifact, .declaration = declaration };
         }
-        return switch (nominal.representation) {
-            .local_declaration => |declaration_id| .{
-                .artifact = artifact,
-                .declaration = artifact.checked_types.nominalDeclarationById(declaration_id),
-            },
-            .imported_declaration => |imported| blk: {
-                const owner = self.artifactByKey(CheckedArtifact.importedNominalDeclarationModuleId(imported)) orelse return null;
-                break :blk .{
-                    .artifact = owner,
-                    .declaration = owner.checked_types.nominalDeclarationById(imported.declaration),
-                };
-            },
-            .local_box_payload_capability => |capability_ref| blk: {
-                const capability = artifact.interface_capabilities.boxPayloadCapability(capability_ref.capability);
-                break :blk .{
-                    .artifact = artifact,
-                    .declaration = artifact.checked_types.nominalDeclaration(capability.nominal) orelse unreachable,
-                };
-            },
-            .imported_box_payload_capability => |capability_ref| blk: {
-                const owner = self.artifactByKey(CheckedArtifact.importedBoxPayloadCapabilityModuleId(capability_ref)) orelse return null;
-                const capability = owner.interface_capabilities.boxPayloadCapability(capability_ref.capability);
-                break :blk .{
-                    .artifact = owner,
-                    .declaration = owner.checked_types.nominalDeclaration(capability.nominal) orelse unreachable,
-                };
-            },
-            .builtin,
-            .opaque_without_backing,
-            => null,
-        };
-    }
-
-    fn artifactByKey(
-        self: *Resolver,
-        key: CheckedArtifact.CheckedModuleArtifactKey,
-    ) ?*const CheckedArtifact.CheckedModuleArtifact {
-        return self.artifacts_by_key.get(key);
+        return null;
     }
 
     fn checkedTypePayload(

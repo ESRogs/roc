@@ -12,6 +12,7 @@
 //! chains. This is reset between runs. The check does not mutate the `Store`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const base = @import("base");
 const collections = @import("collections");
 const types = @import("types");
@@ -193,6 +194,14 @@ const CheckOccurs = struct {
                                                 if (self.types_store.lookupNominalDecl(nominal_type)) |decl_idx| {
                                                     const decl = self.types_store.getNominalDecl(decl_idx);
                                                     try self.pushVarToProcess(decl.backing, Edge.nominal);
+                                                } else if (nominal_type.sourceDecl().present) {
+                                                    if (builtin.mode == .Debug) {
+                                                        std.debug.panic(
+                                                            "occurs invariant violated: nominal application with source declaration has no declaration table entry",
+                                                            .{},
+                                                        );
+                                                    }
+                                                    unreachable;
                                                 }
                                             },
                                         }
