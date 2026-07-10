@@ -17114,6 +17114,65 @@ range_inclusive_with_len = |start, end, len_if_known|
 			},
 	)
 
+## Parse one JSON escape sequence. `rest` is expected to hold the bytes after a backslash.
+## Every JSON escape denotes exactly one code point (surrogate pairs combine into one), so
+## this returns that code point plus the number of bytes consumed from `rest`.
+parse_json_escape_sequence : List(U8) -> Try({ code_point : U64, consumed : U64 }, Json.ParseErr)
+parse_json_escape_sequence = |rest| match rest {
+	['"', ..] => Ok({ code_point: '"', consumed: 1 })
+	['\\', ..] => Ok({ code_point: '\\', consumed: 1 })
+	['/', ..] => Ok({ code_point: '/', consumed: 1 })
+	# backspace
+	['b', ..] => Ok({ code_point: 8, consumed: 1 })
+	# form feed
+	['f', ..] => Ok({ code_point: 12, consumed: 1 })
+	# newline
+	['n', ..] => Ok({ code_point: 10, consumed: 1 })
+	# carriage return
+	['r', ..] => Ok({ code_point: 13, consumed: 1 })
+	# tab
+	['t', ..] => Ok({ code_point: 9, consumed: 1 })
+	# \uXXXX names a UTF-16 code unit, not a code point, so surrogates may need pairing
+	['u', h0, h1, h2, h3, .. as tail] => {
+		unit = decode_json_hex4(h0, h1, h2, h3)?
+		if unit >= 55296 and unit <= 56319 {
+			# high surrogate (U+D800..U+DBFF): a \uDC00..\uDFFF escape must follow
+			match tail {
+				['\\', 'u', h4, h5, h6, h7, ..] => {
+					low = decode_json_hex4(h4, h5, h6, h7)?
+					if low >= 56320 and low <= 57343 {
+						Ok({ code_point: 65536 + (unit - 55296) * 1024 + (low - 56320), consumed: 11 })
+					} else {
+						Err(Json.invalid_json)
+					}
+				}
+				_ => Err(Json.invalid_json)
+			}
+		} else if unit >= 56320 and unit <= 57343 {
+			# unpaired low surrogate (U+DC00..U+DFFF)
+			Err(Json.invalid_json)
+		} else {
+			Ok({ code_point: unit, consumed: 5 })
+		}
+	}
+	# truncated or unknown escape
+	_ => Err(Json.invalid_json)
+}
+
+## Combine 4 hex-digit bytes (as in \uXXXX) into their numeric value.
+decode_json_hex4 : U8, U8, U8, U8 -> Try(U64, Json.ParseErr)
+decode_json_hex4 = |b0, b1, b2, b3| {
+	d0 = decode_json_hex_digit(b0)?
+	d1 = decode_json_hex_digit(b1)?
+	d2 = decode_json_hex_digit(b2)?
+	d3 = decode_json_hex_digit(b3)?
+	Ok(((d0 * 16 + d1) * 16 + d2) * 16 + d3)
+}
+
+decode_json_hex_digit : U8 -> Try(U64, Json.ParseErr)
+decode_json_hex_digit = |byte|
+	hex_digit_value(byte).map_ok(|value| value.to_u64()).map_err(|_| Json.invalid_json)
+
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item
 
