@@ -2667,14 +2667,14 @@ Builtin :: [].{
 
 		## Iterator over `num` values from `start` up to but not including `end`.
 		## Returns an empty iterator if `start >= end`. This is what `start..<end` desugars to.
-		exclusive_range : num, num -> Iter(num)
+		range_exclusive : num, num -> Iter(num)
 			where [
 				num.is_lt : num, num -> Bool,
 				num.add_try : num, num -> Try(num, [Overflow]),
 				num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
 				num.steps_between : num, num -> [Known(U64), Unknown],
 			]
-		exclusive_range = |start, end| {
+		range_exclusive = |start, end| {
 			len_if_known: start.steps_between(end),
 			step: ||
 				if start < end {
@@ -2683,7 +2683,7 @@ Builtin :: [].{
 							item: start,
 							rest: match start.add_try(1) {
 								Ok(next) => if next < end {
-									Iter.exclusive_range(next, end)
+									Iter.range_exclusive(next, end)
 								} else {
 									range_done()
 								}
@@ -2698,14 +2698,14 @@ Builtin :: [].{
 
 		## Iterator over `num` values from `start` up to and including `end`.
 		## Returns an empty iterator if `start > end`. This is what `start..=end` desugars to.
-		inclusive_range : num, num -> Iter(num)
+		range_inclusive : num, num -> Iter(num)
 			where [
 				num.is_lte : num, num -> Bool,
 				num.add_try : num, num -> Try(num, [Overflow]),
 				num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
 				num.steps_between : num, num -> [Known(U64), Unknown],
 			]
-		inclusive_range = |start, end| {
+		range_inclusive = |start, end| {
 			len_if_known: if start <= end {
 				match start.steps_between(end) {
 					Known(n) => match n.add_try(1) {
@@ -2724,7 +2724,7 @@ Builtin :: [].{
 							item: start,
 							rest: match start.add_try(1) {
 								Ok(next) => if next <= end {
-									Iter.inclusive_range(next, end)
+									Iter.range_inclusive(next, end)
 								} else {
 									range_done()
 								}
@@ -5400,6 +5400,18 @@ Builtin :: [].{
 				else
 					Known(0)
 
+			## Iterator over [U8] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U8] values.
+			range_exclusive : U8, U8 -> Iter(U8)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [U8] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U8] values.
+			range_inclusive : U8, U8 -> Iter(U8)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
+
 			## Add two [U8] values, saturating at [U8.highest] on overflow rather than wrapping around.
 			## ```roc
 			## expect U8.plus_saturated(U8.highest, 1) == U8.highest
@@ -6038,6 +6050,18 @@ Builtin :: [].{
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+			## Iterator over [I8] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I8] values.
+			range_exclusive : I8, I8 -> Iter(I8)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [I8] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I8] values.
+			range_inclusive : I8, I8 -> Iter(I8)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [I8] values, saturating at [I8.highest] or [I8.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -6737,6 +6761,18 @@ Builtin :: [].{
 				else
 					Known(0)
 
+			## Iterator over [U16] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U16] values.
+			range_exclusive : U16, U16 -> Iter(U16)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [U16] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U16] values.
+			range_inclusive : U16, U16 -> Iter(U16)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
+
 			## Add two [U16] values, saturating at [U16.highest] on overflow rather than wrapping around.
 			## ```roc
 			## expect U16.plus_saturated(U16.highest, 1) == U16.highest
@@ -7408,6 +7444,18 @@ Builtin :: [].{
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+			## Iterator over [I16] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I16] values.
+			range_exclusive : I16, I16 -> Iter(I16)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [I16] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I16] values.
+			range_inclusive : I16, I16 -> Iter(I16)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [I16] values, saturating at [I16.highest] or [I16.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -8122,6 +8170,18 @@ Builtin :: [].{
 				else
 					Known(0)
 
+			## Iterator over [U32] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U32] values.
+			range_exclusive : U32, U32 -> Iter(U32)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [U32] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U32] values.
+			range_inclusive : U32, U32 -> Iter(U32)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
+
 			## Add two [U32] values, saturating at [U32.highest] on overflow rather than wrapping around.
 			## ```roc
 			## expect U32.plus_saturated(U32.highest, 1) == U32.highest
@@ -8825,6 +8885,18 @@ Builtin :: [].{
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+			## Iterator over [I32] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I32] values.
+			range_exclusive : I32, I32 -> Iter(I32)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [I32] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I32] values.
+			range_inclusive : I32, I32 -> Iter(I32)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [I32] values, saturating at [I32.highest] or [I32.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -9555,6 +9627,18 @@ Builtin :: [].{
 					Known(start.abs_diff(end))
 				else
 					Known(0)
+
+			## Iterator over [U64] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U64] values.
+			range_exclusive : U64, U64 -> Iter(U64)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [U64] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U64] values.
+			range_inclusive : U64, U64 -> Iter(U64)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [U64] values, saturating at [U64.highest] on overflow rather than wrapping around.
 			## ```roc
@@ -10298,6 +10382,18 @@ Builtin :: [].{
 					Known(start.abs_diff(end))
 				else
 					Known(0)
+
+			## Iterator over [I64] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I64] values.
+			range_exclusive : I64, I64 -> Iter(I64)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [I64] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I64] values.
+			range_inclusive : I64, I64 -> Iter(I64)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [I64] values, saturating at [I64.highest] or [I64.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -11053,6 +11149,18 @@ Builtin :: [].{
 					}
 				else
 					Known(0)
+
+			## Iterator over [U128] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U128] values.
+			range_exclusive : U128, U128 -> Iter(U128)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [U128] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U128] values.
+			range_inclusive : U128, U128 -> Iter(U128)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [U128] values, saturating at [U128.highest] on overflow rather than wrapping around.
 			## ```roc
@@ -11837,6 +11945,18 @@ Builtin :: [].{
 					}
 				else
 					Known(0)
+
+			## Iterator over [I128] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I128] values.
+			range_exclusive : I128, I128 -> Iter(I128)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [I128] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I128] values.
+			range_inclusive : I128, I128 -> Iter(I128)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [I128] values, saturating at [I128.highest] or [I128.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -12644,6 +12764,18 @@ Builtin :: [].{
 			## correct (if imprecise) length hint.
 			steps_between : Dec, Dec -> [Known(U64), Unknown]
 			steps_between = |_start, _end| Unknown
+
+			## Iterator over [Dec] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [Dec] values.
+			range_exclusive : Dec, Dec -> Iter(Dec)
+			range_exclusive = |start, end| Iter.range_exclusive(start, end)
+
+			## Iterator over [Dec] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [Dec] values.
+			range_inclusive : Dec, Dec -> Iter(Dec)
+			range_inclusive = |start, end| Iter.range_inclusive(start, end)
 
 			## Add two [Dec] values, saturating at [Dec.highest] or [Dec.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -14031,6 +14163,42 @@ Builtin :: [].{
 			from_numeral : Numeral -> Try(F32, [InvalidNumeral(Str)])
 			from_numeral = |numeral| from_numeral_with(numeral, |str| f32_from_str(str))
 
+			## Iterator over [F32] values from `start` up to but not including `end`,
+			## incrementing by 1. Returns an empty iterator if `start >= end`.
+			## This is what `start..<end` desugars to when the bounds are [F32] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_exclusive : F32, F32 -> Iter(F32)
+			range_exclusive = |start, end|
+				Iter.custom((start, False), Unknown, |(cur, done)|
+					if done or cur >= end {
+						Err(NoMore)
+					} else {
+						next = cur + 1
+						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+					})
+
+			## Iterator over [F32] values from `start` up to and including `end`,
+			## incrementing by 1. Returns an empty iterator if `start > end`.
+			## This is what `start..=end` desugars to when the bounds are [F32] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_inclusive : F32, F32 -> Iter(F32)
+			range_inclusive = |start, end|
+				Iter.custom((start, False), Unknown, |(cur, done)|
+					if done {
+						Err(NoMore)
+					} else if cur < end {
+						next = cur + 1
+						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+					} else if cur == end {
+						Ok((cur, (cur, True)))
+					} else {
+						Err(NoMore)
+					})
+
 			## Parse an [F32] from a [Str]. Returns `Err(BadNumStr)` if the
 			## string is not a valid decimal number, or if the parsed value does
 			## not fit in an [F32].
@@ -14922,6 +15090,42 @@ Builtin :: [].{
 			## parse user text with [F64.from_str] instead.
 			from_numeral : Numeral -> Try(F64, [InvalidNumeral(Str)])
 			from_numeral = |numeral| from_numeral_with(numeral, |str| f64_from_str(str))
+
+			## Iterator over [F64] values from `start` up to but not including `end`,
+			## incrementing by 1. Returns an empty iterator if `start >= end`.
+			## This is what `start..<end` desugars to when the bounds are [F64] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_exclusive : F64, F64 -> Iter(F64)
+			range_exclusive = |start, end|
+				Iter.custom((start, False), Unknown, |(cur, done)|
+					if done or cur >= end {
+						Err(NoMore)
+					} else {
+						next = cur + 1
+						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+					})
+
+			## Iterator over [F64] values from `start` up to and including `end`,
+			## incrementing by 1. Returns an empty iterator if `start > end`.
+			## This is what `start..=end` desugars to when the bounds are [F64] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_inclusive : F64, F64 -> Iter(F64)
+			range_inclusive = |start, end|
+				Iter.custom((start, False), Unknown, |(cur, done)|
+					if done {
+						Err(NoMore)
+					} else if cur < end {
+						next = cur + 1
+						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+					} else if cur == end {
+						Ok((cur, (cur, True)))
+					} else {
+						Err(NoMore)
+					})
 
 			## Parse an [F64] from a [Str]. Returns `Err(BadNumStr)` if the
 			## string is not a valid decimal number, or if the parsed value does

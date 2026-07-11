@@ -786,6 +786,8 @@ fn binopOpToToken(op: Expr.Binop.Op) parse.tokenize.Token.Tag {
         .div_trunc => .OpDoubleSlash,
         .@"and" => .OpAnd,
         .@"or" => .OpOr,
+        .range_exclusive => .OpDoubleDotLessThan,
+        .range_inclusive => .OpDoubleDotEquals,
     };
 }
 
@@ -984,6 +986,8 @@ fn binopToStr(op: Expr.Binop.Op) []const u8 {
         .ne => "!=",
         .@"and" => "and",
         .@"or" => "or",
+        .range_exclusive => "..<",
+        .range_inclusive => "..=",
     };
 }
 
