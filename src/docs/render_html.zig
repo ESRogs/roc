@@ -1262,8 +1262,9 @@ fn renderSidebarEntries(
     try renderSidebarTree(w, module_name, module_link_prefix, entry_tree.root, 0);
 }
 
-/// Render one module's sidebar entry: a `sidebar-entry` whose `sidebar-module-link`
-/// names the module and toggles a `sidebar-sub-entries` list of its members.
+/// Render one module's sidebar entry with sibling navigation and disclosure
+/// controls. The anchor navigates to the module page, while the native
+/// `details`/`summary` toggles the member list without JavaScript.
 fn renderSidebarModuleEntry(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []const u8, mod: DocModel.ModuleDocs) (Allocator.Error || error{WriteFailed})!void {
     const is_active = if (ctx.current_module) |cur|
         std.mem.eql(u8, cur, mod.name)
@@ -1295,16 +1296,21 @@ fn renderSidebarModuleEntry(w: Writer, ctx: *const RenderContext, gpa: Allocator
     } else {
         try w.writeAll(module_link_prefix.items);
     }
-    try w.writeAll("\">");
-    try w.writeAll("<button class=\"entry-toggle\"></button>");
-    try w.writeAll("<span>");
+    try w.writeAll("\"><span>");
     try writeHtmlEscaped(w, mod.name);
     try w.writeAll("</span></a>\n");
+    try w.writeAll("                    <details");
+    if (is_active) try w.writeAll(" open");
+    try w.writeAll(">\n");
+    try w.writeAll("                        <summary class=\"sidebar-module-summary\" aria-label=\"");
+    try writeHtmlEscaped(w, mod.name);
+    try w.writeAll(" entries\"><span class=\"entry-toggle\" aria-hidden=\"true\"></span></summary>\n");
 
     // Sub-entries - grouped hierarchically
-    try w.writeAll("                    <ul class=\"sidebar-sub-entries\">\n");
+    try w.writeAll("                        <ul class=\"sidebar-sub-entries\">\n");
     try renderSidebarEntries(w, gpa, mod.name, module_link_prefix.items, mod.entries, mod.builtin_derived, 0);
-    try w.writeAll("                    </ul>\n");
+    try w.writeAll("                        </ul>\n");
+    try w.writeAll("                    </details>\n");
     try w.writeAll("                </li>\n");
 }
 
@@ -1352,14 +1358,15 @@ fn renderSidebar(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []c
             try w.writeAll("                <li class=\"sidebar-entry\">\n");
             try w.writeAll("                    <a class=\"sidebar-module-link active prose-label\" data-module-name=\"__builtin_types__\" href=\"");
             try writeHtmlEscaped(w, base);
-            try w.writeAll("\">");
-            try w.writeAll("<button class=\"entry-toggle\"></button>");
-            try w.writeAll("<span>Builtin Types</span></a>\n");
-            try w.writeAll("                    <ul class=\"sidebar-sub-entries\">\n");
+            try w.writeAll("\"><span>Builtin Types</span></a>\n");
+            try w.writeAll("                    <details open>\n");
+            try w.writeAll("                        <summary class=\"sidebar-module-summary\" aria-label=\"Builtin Types entries\"><span class=\"entry-toggle\" aria-hidden=\"true\"></span></summary>\n");
+            try w.writeAll("                        <ul class=\"sidebar-sub-entries\">\n");
             for (ctx.package_docs.modules) |inner| {
                 if (inner.builtin_derived) try renderSidebarModuleEntry(w, ctx, gpa, base, inner);
             }
-            try w.writeAll("                    </ul>\n");
+            try w.writeAll("                        </ul>\n");
+            try w.writeAll("                    </details>\n");
             try w.writeAll("                </li>\n");
         } else if (!mod.builtin_derived) {
             try renderSidebarModuleEntry(w, ctx, gpa, base, mod);
@@ -1392,11 +1399,11 @@ fn renderLangRefSidebar(
     try w.writeAll(langref_sidebar_id);
     try w.writeAll("\" href=\"");
     try writeHtmlEscaped(w, base);
-    try w.writeAll("langref/\">");
-    try w.writeAll("<button class=\"entry-toggle\"></button>");
-    try w.writeAll("<span>Language Reference</span></a>\n");
+    try w.writeAll("langref/\"><span>Language Reference</span></a>\n");
+    try w.writeAll("                    <details open>\n");
+    try w.writeAll("                        <summary class=\"sidebar-module-summary\" aria-label=\"Language Reference entries\"><span class=\"entry-toggle\" aria-hidden=\"true\"></span></summary>\n");
 
-    try w.writeAll("                    <ul class=\"sidebar-sub-entries langref-articles\">\n");
+    try w.writeAll("                        <ul class=\"sidebar-sub-entries langref-articles\">\n");
     for (langref.articles) |*article| {
         if (article.is_index) continue; // the README is the section landing page
 
@@ -1412,7 +1419,8 @@ fn renderLangRefSidebar(
         try render_markdown.renderTitleInline(w, gpa, langref.articles, article);
         try w.writeAll("</a></li>\n");
     }
-    try w.writeAll("                    </ul>\n");
+    try w.writeAll("                        </ul>\n");
+    try w.writeAll("                    </details>\n");
     try w.writeAll("                </li>\n");
 }
 
