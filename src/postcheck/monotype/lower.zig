@@ -15571,12 +15571,38 @@ const BodyContext = struct {
             .nested => {
                 const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
                 var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
-                fn_ctx.evidence = self.restore_evidence;
                 defer fn_ctx.deinit();
+                try self.prepareRestoredFnEvidence(&fn_ctx, fn_view, fn_value, template);
                 return try self.builder.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def), template, null);
             },
             else => try self.builder.lowerFnTemplateDefFromContext(self, template, self.restore_evidence.vector),
         };
+    }
+
+    fn prepareRestoredFnEvidence(
+        self: *BodyContext,
+        fn_ctx: *BodyContext,
+        fn_view: ModuleView,
+        fn_value: check.ConstStore.ConstFn,
+        template: Ast.FnTemplate,
+    ) Allocator.Error!void {
+        fn_ctx.evidence = self.restore_evidence;
+        try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, template.mono_fn_ty);
+
+        if (self.restore_evidence.vector.len == 0) {
+            const nested = switch (template.fn_def) {
+                .nested => |nested| nested,
+                else => Common.invariant("stored function evidence preparation requires a nested function identity"),
+            };
+            if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, template.mono_fn_ty, null)) |synthesized| {
+                fn_ctx.evidence = .{ .vector = synthesized };
+            }
+        }
+
+        // Captured ConstStore values belong to the same restored constant.
+        // Propagate the explicit use-edge or synthesized owner evidence before
+        // recursively restoring them.
+        fn_ctx.restore_evidence = fn_ctx.evidence;
     }
 
     fn restoreCapturingConstFn(
@@ -15590,6 +15616,7 @@ const BodyContext = struct {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
         fn_ctx.evidence = self.restore_evidence;
+        fn_ctx.restore_evidence = self.restore_evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, ty);
@@ -15655,19 +15682,16 @@ const BodyContext = struct {
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
                 } };
                 // A compile-time-evaluated closure keeps its dispatch evidence
-                // params even when the outer scheme is concrete (a concrete
-                // captured `n` still selects `plus`), but a concrete use site
-                // carries no checked site evidence to fill them. Resolve the
-                // owner scheme's evidence params from its checked dispatcher
-                // paths over the closure's concrete callable, mirroring the
-                // compiler-generated-edge evidence construction, so the nested
-                // body's constraint refs at depth 0 resolve.
+                // params even when the outer scheme is concrete. Capture types
+                // and the enclosing constant result together instantiate the
+                // owner callable before its checked evidence paths are read.
                 if (self.restore_evidence.vector.len == 0) {
                     const result_ty = self.restore_const_result_ty orelse ty;
                     if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty, result_ty)) |synthesized| {
                         fn_ctx.evidence = .{ .vector = synthesized };
                     }
                 }
+                fn_ctx.restore_evidence = fn_ctx.evidence;
             },
             else => Common.invariant("capturing stored function had no nested function identity"),
         }
@@ -17872,7 +17896,7 @@ const BodyContext = struct {
         owner_view: ModuleView,
         owner_ref: names.ProcTemplate,
         ty: Type.TypeId,
-        owner_result_ty: Type.TypeId,
+        owner_result_ty: ?Type.TypeId,
     ) Allocator.Error!?[]const SpecEvidence {
         const owner_template = owner_view.templates.get(owner_ref.template);
         if (owner_template.evidence_params.len == 0) return null;
@@ -17886,7 +17910,7 @@ const BodyContext = struct {
         }
         const restored_owner_result_ty = switch (self.builder.shapeContent(owner_ret)) {
             .func => ty,
-            else => owner_result_ty,
+            else => owner_result_ty orelse owner_ret,
         };
         try self.graph.unify(try self.graph.importMono(owner_ret), try self.graph.importMono(restored_owner_result_ty));
         try self.graph.drainDirty();
