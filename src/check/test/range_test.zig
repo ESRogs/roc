@@ -42,7 +42,7 @@ test "Iter.range_exclusive over generic operands carries its where-constraints" 
     ;
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
-    try test_env.assertLastDefTypeContains("is_lt");
+    try test_env.assertLastDefTypeContains("range_exclusive");
 }
 
 test "Iter.range_inclusive over generic operands carries its where-constraints" {
@@ -51,7 +51,7 @@ test "Iter.range_inclusive over generic operands carries its where-constraints" 
     ;
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
-    try test_env.assertLastDefTypeContains("is_lte");
+    try test_env.assertLastDefTypeContains("range_inclusive");
 }
 
 test "exclusive range of unannotated literals defaults like a numeral" {
