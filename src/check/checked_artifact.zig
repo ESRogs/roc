@@ -18976,8 +18976,8 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     fn byteWalkVisit(self: *PlatformAppRelationTypeDigestBuilder, key: PlatformAppRelationDigestActiveKey) Allocator.Error!void {
         switch (key) {
             .source => |root| try self.writeSourcePayload(self.payload(root)),
-            .finalize => |fin| try self.writeFinalizePayload(@enumFromInt(fin.root), fin.context),
-            .merge => |mrg| try self.writeMergePayload(@enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+            .finalize => |fin| try self.writeFinalizePayload(@enumFromInt(fin.root)),
+            .merge => |mrg| try self.writeMergePayload(@enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root)),
         }
     }
 
@@ -19071,9 +19071,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         self: *PlatformAppRelationTypeDigestBuilder,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!void {
-        _ = context;
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
         return switch (platform_payload) {
@@ -19213,9 +19211,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     fn writeFinalizePayload(
         self: *PlatformAppRelationTypeDigestBuilder,
         root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!void {
-        _ = context;
         const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending payload", .{}),
@@ -19844,12 +19840,12 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         if (self.byte_walk.active.contains(active_key)) return false;
         return switch (key.kind) {
             .record => switch (key.input) {
-                .finalize => |fin| try self.finalizeEmptyRecordPayload(traversal, @enumFromInt(fin.root), fin.context),
-                .merge => |mrg| try self.mergeEmptyRecordPayload(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+                .finalize => |fin| try self.finalizeEmptyRecordPayload(traversal, @enumFromInt(fin.root)),
+                .merge => |mrg| try self.mergeEmptyRecordPayload(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root)),
             },
             .tag_union => switch (key.input) {
-                .finalize => |fin| try self.finalizeEmptyTagPayload(traversal, @enumFromInt(fin.root), fin.context),
-                .merge => |mrg| try self.mergeEmptyTagPayload(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+                .finalize => |fin| try self.finalizeEmptyTagPayload(traversal, @enumFromInt(fin.root)),
+                .merge => |mrg| try self.mergeEmptyTagPayload(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root)),
             },
         };
     }
@@ -19880,9 +19876,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         self: *PlatformAppRelationTypeDigestBuilder,
         traversal: anytype,
         root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        _ = context;
         const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => false,
@@ -19925,9 +19919,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         self: *PlatformAppRelationTypeDigestBuilder,
         traversal: anytype,
         root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        _ = context;
         const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => false,
@@ -20003,9 +19995,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        _ = context;
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
         const platform_parts = recordParts(platform_payload) orelse return false;
@@ -20074,9 +20064,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        _ = context;
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
         const platform_union = switch (platform_payload) {
@@ -20155,8 +20143,8 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         if (self.byte_walk.active.contains(key)) return false;
         return switch (key) {
             .source => |root| try self.sourceIdentityScanBody(traversal, root),
-            .finalize => |fin| try self.finalizeIdentityScanBody(traversal, @enumFromInt(fin.root), fin.context),
-            .merge => |mrg| try self.mergeIdentityScanBody(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root), mrg.context),
+            .finalize => |fin| try self.finalizeIdentityScanBody(traversal, @enumFromInt(fin.root)),
+            .merge => |mrg| try self.mergeIdentityScanBody(traversal, @enumFromInt(mrg.platform_root), @enumFromInt(mrg.app_root)),
         };
     }
 
@@ -20259,9 +20247,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         self: *PlatformAppRelationTypeDigestBuilder,
         traversal: anytype,
         root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        _ = context;
         return switch (self.payload(root)) {
             .pending => true,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
@@ -20380,9 +20366,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         traversal: anytype,
         platform_root: CheckedTypeId,
         app_root: CheckedTypeId,
-        context: PlatformAppRelationMergeContext,
     ) Allocator.Error!bool {
-        _ = context;
         const platform_payload = self.payload(platform_root);
         const app_payload = self.payload(app_root);
         return switch (platform_payload) {
