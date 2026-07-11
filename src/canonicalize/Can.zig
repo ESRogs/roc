@@ -22,6 +22,7 @@ const CIR = @import("CIR.zig");
 const Scope = @import("Scope.zig");
 
 const tokenize = parse.tokenize;
+const escape = parse.escape;
 const RocDec = builtins.dec.RocDec;
 const AST = parse.AST;
 const Token = tokenize.Token;
@@ -6776,8 +6777,13 @@ fn parseSingleQuoteCodepoint(
 
     if (escaped) {
         const c = inner_text[1];
-        switch (c) {
-            'u' => {
+        // The tokenizer validated this escape against the shared alphabet, so
+        // every byte here is in the table's domain.
+        switch (escape.lookup(c) orelse unreachable) {
+            .byte => |b| {
+                return b;
+            },
+            .unicode => {
                 const hex_code = inner_text[3 .. inner_text.len - 1];
                 const codepoint = std.fmt.parseInt(u21, hex_code, 16) catch unreachable;
 
@@ -6785,19 +6791,6 @@ fn parseSingleQuoteCodepoint(
 
                 return codepoint;
             },
-            '\\', '"', '\'', '$' => {
-                return c;
-            },
-            'n' => {
-                return '\n';
-            },
-            'r' => {
-                return '\r';
-            },
-            't' => {
-                return '\t';
-            },
-            else => unreachable,
         }
     } else {
         const view = std.unicode.Utf8View.init(inner_text) catch unreachable;
@@ -14395,36 +14388,18 @@ fn processEscapeSequences(allocator: std.mem.Allocator, input: []const u8) std.m
     while (i < input.len) {
         if (input[i] == '\\' and i + 1 < input.len) {
             const next = input[i + 1];
-            switch (next) {
-                'n' => {
-                    try result.append(allocator, '\n');
+            const interpretation = escape.lookup(next) orelse {
+                // Unknown escape, keep as-is
+                try result.append(allocator, input[i]);
+                i += 1;
+                continue;
+            };
+            switch (interpretation) {
+                .byte => |b| {
+                    try result.append(allocator, b);
                     i += 2;
                 },
-                'r' => {
-                    try result.append(allocator, '\r');
-                    i += 2;
-                },
-                't' => {
-                    try result.append(allocator, '\t');
-                    i += 2;
-                },
-                '\\' => {
-                    try result.append(allocator, '\\');
-                    i += 2;
-                },
-                '"' => {
-                    try result.append(allocator, '"');
-                    i += 2;
-                },
-                '\'' => {
-                    try result.append(allocator, '\'');
-                    i += 2;
-                },
-                '$' => {
-                    try result.append(allocator, '$');
-                    i += 2;
-                },
-                'u' => {
+                .unicode => {
                     // Unicode escape: \u(XXXX)
                     if (i + 2 < input.len and input[i + 2] == '(') {
                         // Find the closing paren
@@ -14450,11 +14425,6 @@ fn processEscapeSequences(allocator: std.mem.Allocator, input: []const u8) std.m
                         }
                     }
                     // Invalid unicode escape, keep original
-                    try result.append(allocator, input[i]);
-                    i += 1;
-                },
-                else => {
-                    // Unknown escape, keep as-is
                     try result.append(allocator, input[i]);
                     i += 1;
                 },

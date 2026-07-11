@@ -5568,6 +5568,14 @@ pub const MonoLlvmCodeGen = struct {
         // should become a handful of word-size mask operations, not a helper
         // call and not a byte loop. Exact-equal lanes are accepted for any byte;
         // lanes that differ must differ by ASCII's case bit and must be letters.
+        //
+        // The two implementations must agree byte-for-byte. The builtin side is
+        // pinned exhaustively by `builtins.str.swar_caseless_word_vectors`; this
+        // emitted routine is pinned end-to-end through caseless record-field
+        // dispatch by `src/cli/test/http_header_decoder_platform_test.zig`,
+        // which builds an LLVM executable and dispatches on case-varying header
+        // names. There is no isolated JIT harness for a single emitted helper,
+        // so full-pipeline execution is the only way to run this routine.
         const zero = builder.intValue(.i64, 0) catch return error.OutOfMemory;
         const highs = try self.llvmI64Value(0x8080808080808080);
         const ascii_case = try self.llvmI64Value(0x2020202020202020);

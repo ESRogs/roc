@@ -200,6 +200,32 @@ pub const RocList = extern struct {
         self.increfWithAtomicity(amount, elements_refcounted, .atomic, roc_ops);
     }
 
+    /// Walk every element in the list's backing allocation and apply `dec` to
+    /// each. This is the single definition of the "a dying unique refcounted
+    /// list decrefs its children first" traversal: the compiled `decref` path
+    /// and the interpreter's list teardown both route through it, so they
+    /// cannot disagree about which elements are visited. For seamless slices,
+    /// `getAllocationElementCount` reads the heap-stored whole-allocation
+    /// element count, so teardown visits elements outside the visible slice
+    /// window too. Callers own the uniqueness gate before invoking this.
+    pub fn decrefElements(
+        self: RocList,
+        element_width: usize,
+        dec_context: ?*anyopaque,
+        dec: Dec,
+        roc_ops: *RocOps,
+    ) void {
+        if (self.getAllocationDataPtr(roc_ops)) |source| {
+            const count = self.getAllocationElementCount(true, roc_ops);
+
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const element = source + i * element_width;
+                dec(dec_context, element);
+            }
+        }
+    }
+
     /// Always uses atomic count updates: this entry serves primitive-internal
     /// RC inside runtime-checked list ops, which serve both modes and make no
     /// thread-confinement claim. Single-thread statement teardown instead goes
@@ -216,19 +242,8 @@ pub const RocList = extern struct {
         roc_ops: *RocOps,
     ) void {
         // If unique, decref will free the list. Before that happens, all elements must be decremented.
-        // For seamless slices, getAllocationElementCount reads the heap-stored
-        // whole-allocation element count, so full teardown visits elements
-        // outside the visible slice window too.
         if (elements_refcounted and self.isUnique(roc_ops)) {
-            if (self.getAllocationDataPtr(roc_ops)) |source| {
-                const count = self.getAllocationElementCount(elements_refcounted, roc_ops);
-
-                var i: usize = 0;
-                while (i < count) : (i += 1) {
-                    const element = source + i * element_width;
-                    dec(dec_context, element);
-                }
-            }
+            self.decrefElements(element_width, dec_context, dec, roc_ops);
         }
 
         // We use the raw capacity to ensure we always decrement the refcount of seamless slices.

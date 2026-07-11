@@ -9,6 +9,9 @@ const tracy = @import("tracy");
 
 pub const tokenize = @import("tokenize.zig");
 
+/// Single source of truth for the string/char escape alphabet.
+pub const escape = @import("escape.zig");
+
 const Allocator = std.mem.Allocator;
 const CommonEnv = base.CommonEnv;
 const Diagnostic = AST.Diagnostic;
@@ -146,6 +149,7 @@ test "parser tests" {
     std.testing.refAllDecls(@import("NumericLiteral.zig"));
     std.testing.refAllDecls(@import("Parser.zig"));
     std.testing.refAllDecls(@import("tokenize.zig"));
+    std.testing.refAllDecls(@import("escape.zig"));
     std.testing.refAllDecls(@import("test/ast_node_store_test.zig"));
 }
 
