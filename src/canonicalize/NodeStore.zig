@@ -4121,12 +4121,14 @@ fn sliceWhereClauseIndices(store: *const NodeStore, span: CIR.WhereClause.IdxSpa
     return store.sliceFromSpan(CIR.WhereClause.Idx, span.span);
 }
 
+/// Returns the canonical rigid-owner groups for one where-clause scope.
 pub fn sliceWhereClauseOwners(store: *const NodeStore, span: CIR.WhereClause.Span) []const WhereClauseOwnerData {
     const start: usize = span.owners.span.start;
     const end = start + span.owners.span.len;
     return store.where_clause_owners.items.items[start..end];
 }
 
+/// Returns the method clauses canonically assigned to one rigid owner.
 pub fn sliceWhereClausesForOwner(store: *const NodeStore, owner: WhereClauseOwnerData) []CIR.WhereClause.Idx {
     return store.sliceFromSpan(CIR.WhereClause.Idx, .{
         .start = owner.clauses_start,
