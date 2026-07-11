@@ -13004,7 +13004,7 @@ fn sealCheckedProcedureTemplateRefs(
 /// canonical evidence-param list. Concrete dispatchers resolve through the
 /// checked registry; where-var dispatchers resolve to their param index;
 /// evidence for call edges comes from the checker's persisted
-/// `SchemeInstantiationRecord`s, whose fresh vars are resolved against the
+/// `SchemeUseRecord`s, whose fresh vars are resolved against the
 /// settled type store.
 const EvidencePass = struct {
     allocator: Allocator,
@@ -13302,8 +13302,8 @@ const EvidencePass = struct {
 
     fn buildIndexes(self: *EvidencePass) Allocator.Error!void {
         const module_env = self.module.moduleEnvConst();
-        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
-            switch (@as(ModuleEnv.SchemeInstantiationRecord.Slot, @enumFromInt(record.slot_kind))) {
+        for (module_env.scheme_uses.items.items, 0..) |record, i| {
+            switch (@as(ModuleEnv.SchemeUseRecord.Slot, @enumFromInt(record.slot_kind))) {
                 .value_use, .shared_value_use => {
                     // Re-checks can record the same instantiation twice; keep
                     // the first.
@@ -13332,8 +13332,8 @@ const EvidencePass = struct {
 
         // Generalized local VALUE decls and one representative use record per
         // looked-up pattern (see `local_value_scheme_by_var`).
-        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
-            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.value_use)) continue;
+        for (module_env.scheme_uses.items.items, 0..) |record, i| {
+            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.value_use)) continue;
             if (self.module.nodeTag(@enumFromInt(record.node_idx)) != .expr_var) continue;
             const lookup = self.module.expr(@enumFromInt(record.node_idx)).data.e_lookup_local;
             const entry = try self.value_use_record_by_pattern.getOrPut(@intFromEnum(lookup.pattern_idx));
@@ -13555,8 +13555,8 @@ const EvidencePass = struct {
         if (self.local_value_scheme_by_var.get(@intFromEnum(resolved.var_))) |pattern_raw| {
             if (self.value_use_record_by_pattern.get(pattern_raw)) |record_idx| {
                 const module_env = self.module.moduleEnvConst();
-                const record = module_env.scheme_instantiations.items.items[record_idx];
-                const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+                const record = module_env.scheme_uses.items.items[record_idx];
+                const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
                 if (self.pairForResolved(pairs, resolved.var_)) |fresh| {
                     if (self.types.resolveVar(fresh).var_ != resolved.var_) {
                         const fresh_fn: ?Var = if (constraint_fn_var) |fn_var| self.pairForResolved(pairs, self.types.resolveVar(fn_var).var_) else null;
@@ -13728,12 +13728,12 @@ const EvidencePass = struct {
         return node_id;
     }
 
-    /// Resolve one instantiation record's obligations (in the scheme's
-    /// canonical order) into a contiguous `evidence_refs` range.
+    /// Resolve one scheme-use record's obligations (in the scheme's canonical
+    /// order) into a contiguous `evidence_refs` range.
     fn evidenceRefsForRecord(self: *EvidencePass, record_idx: u32, commit_unpinned: bool) Allocator.Error!?artifact_serialize.Span {
         const module_env = self.module.moduleEnvConst();
-        const record = module_env.scheme_instantiations.items.items[record_idx];
-        const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+        const record = module_env.scheme_uses.items.items[record_idx];
+        const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
 
         var params = std.ArrayListUnmanaged(EvidenceParam).empty;
         defer params.deinit(self.allocator);
@@ -13753,7 +13753,7 @@ const EvidencePass = struct {
 
     fn evidenceForRecordParam(
         self: *EvidencePass,
-        pairs: []const ModuleEnv.SchemeInstantiationPair,
+        pairs: []const ModuleEnv.SchemeUsePair,
         param: EvidenceParam,
         commit_unpinned: bool,
     ) Allocator.Error!?static_dispatch.CheckedEvidence {
@@ -13834,8 +13834,8 @@ const EvidencePass = struct {
         defer self.current_chain = &.{};
 
         if (self.value_use_by_node.get(source_node)) |record_idx| {
-            const record = self.module.moduleEnvConst().scheme_instantiations.items.items[record_idx];
-            const shared = record.slot_kind == @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.shared_value_use);
+            const record = self.module.moduleEnvConst().scheme_uses.items.items[record_idx];
+            const shared = record.slot_kind == @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.shared_value_use);
             const span = (try self.evidenceRefsForRecord(record_idx, !shared)) orelse {
                 try self.deferred_use_sites.append(self.allocator, .{ .record_idx = record_idx, .site_key = site_key });
                 return;
@@ -13854,7 +13854,7 @@ const EvidencePass = struct {
 
     /// `pairFor`, but comparing RESOLVED roots on both sides: finalization
     /// after record time can move the pristine var's root.
-    fn pairForResolved(self: *EvidencePass, pairs: []const ModuleEnv.SchemeInstantiationPair, old_root: Var) ?Var {
+    fn pairForResolved(self: *EvidencePass, pairs: []const ModuleEnv.SchemeUsePair, old_root: Var) ?Var {
         for (pairs) |pair| {
             if (self.types.resolveVar(@enumFromInt(pair.old_var)).var_ == old_root) return @enumFromInt(pair.fresh_var);
         }

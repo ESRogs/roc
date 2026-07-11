@@ -424,11 +424,11 @@ instantiation_source_expr: ?CIR.Expr.Idx = null,
 /// While discharging a static-dispatch constraint, the site that constraint
 /// originated at. Scheme instantiations that copy constrained vars are then
 /// recorded against that node's `dispatch_target` evidence slot (see
-/// `recordSchemeInstantiationEvidence`).
+/// `recordSchemeUse`).
 evidence_target_site: ?EvidenceTargetSite = null,
 /// Scratch buffer for the (scheme var → fresh var) pairs of one constrained
-/// scheme instantiation, flushed into `cir.scheme_instantiations`.
-scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeInstantiationPair) = .empty,
+/// scheme instantiation, flushed into `cir.scheme_uses`.
+scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeUsePair) = .empty,
 /// Worklist of flex vars created by literal conversions (`from_numeral`,
 /// `from_quote`, or `from_interpolation`) — open literals that may still need
 /// defaulting. Checker bookkeeping, not type data:
@@ -3973,7 +3973,7 @@ fn instantiateVarHelp(
     // decide how each of the scheme's dispatch constraints was satisfied here.
     if (self.scratch_evidence_pairs.items.len > 0) {
         if (self.evidence_target_site) |target| {
-            try self.cir.recordSchemeInstantiation(
+            try self.cir.recordSchemeUse(
                 target.node_idx,
                 .dispatch_target,
                 @intFromEnum(target.constraint_fn_var),
@@ -3990,7 +3990,7 @@ fn instantiateVarHelp(
                 .expr_external_lookup,
                 .expr_required_lookup,
                 .expr_field_access,
-                => try self.cir.recordSchemeInstantiation(
+                => try self.cir.recordSchemeUse(
                     @intFromEnum(source_expr),
                     .value_use,
                     0,
@@ -4016,11 +4016,11 @@ fn instantiateVarHelp(
 fn recordSharedSchemeUse(
     self: *Self,
     node_idx: u32,
-    slot: ModuleEnv.SchemeInstantiationRecord.Slot,
+    slot: ModuleEnv.SchemeUseRecord.Slot,
     slot_data: u32,
     scheme_root: Var,
 ) std.mem.Allocator.Error!void {
-    try self.cir.recordSchemeInstantiation(node_idx, slot, slot_data, scheme_root, &.{});
+    try self.cir.recordSchemeUse(node_idx, slot, slot_data, scheme_root, &.{});
 }
 
 // regions //
@@ -16796,8 +16796,8 @@ const Probe = struct {
     open_literal_vars_len: usize,
     open_numeral_literals_len: usize,
     pending_tuple_accesses_len: usize,
-    scheme_instantiations_len: usize,
-    scheme_instantiation_pairs_len: usize,
+    scheme_uses_len: usize,
+    scheme_use_pairs_len: usize,
 
     fn rollback(self: *Probe) void {
         self.check.types.rollbackToSavepoint(&self.savepoint);
@@ -16810,10 +16810,10 @@ const Probe = struct {
         self.check.open_literal_vars.shrinkRetainingCapacity(self.open_literal_vars_len);
         self.check.open_numeral_literals.shrinkRetainingCapacity(self.open_numeral_literals_len);
         self.check.pending_tuple_accesses.shrinkRetainingCapacity(self.pending_tuple_accesses_len);
-        // Scheme-instantiation evidence recorded during the probe references
-        // fresh vars the savepoint rollback just discarded.
-        self.check.cir.scheme_instantiations.items.shrinkRetainingCapacity(self.scheme_instantiations_len);
-        self.check.cir.scheme_instantiation_pairs.items.shrinkRetainingCapacity(self.scheme_instantiation_pairs_len);
+        // Scheme-use evidence recorded during the probe can reference fresh
+        // vars the savepoint rollback just discarded.
+        self.check.cir.scheme_uses.items.shrinkRetainingCapacity(self.scheme_uses_len);
+        self.check.cir.scheme_use_pairs.items.shrinkRetainingCapacity(self.scheme_use_pairs_len);
     }
 
     /// Close the probe scope KEEPING everything it did: the type-store
@@ -16831,8 +16831,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
     const open_literal_vars_len = self.open_literal_vars.items.len;
     const open_numeral_literals_len = self.open_numeral_literals.items.len;
     const pending_tuple_accesses_len = self.pending_tuple_accesses.items.len;
-    const scheme_instantiations_len = self.cir.scheme_instantiations.items.items.len;
-    const scheme_instantiation_pairs_len = self.cir.scheme_instantiation_pairs.items.items.len;
+    const scheme_uses_len = self.cir.scheme_uses.items.items.len;
+    const scheme_use_pairs_len = self.cir.scheme_use_pairs.items.items.len;
     return .{
         .check = self,
         .regions_len = regions_len,
@@ -16840,8 +16840,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
         .open_literal_vars_len = open_literal_vars_len,
         .open_numeral_literals_len = open_numeral_literals_len,
         .pending_tuple_accesses_len = pending_tuple_accesses_len,
-        .scheme_instantiations_len = scheme_instantiations_len,
-        .scheme_instantiation_pairs_len = scheme_instantiation_pairs_len,
+        .scheme_uses_len = scheme_uses_len,
+        .scheme_use_pairs_len = scheme_use_pairs_len,
         .savepoint = try self.types.createSavepoint(),
     };
 }
