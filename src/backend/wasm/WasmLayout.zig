@@ -138,7 +138,7 @@ pub fn tagUnionLayoutWithStore(tu_idx: layout.TagUnionIdx, ls: *const layout.Sto
         if (payload.alignment > max_payload_align) max_payload_align = payload.alignment;
     }
 
-    const discriminant_size: u8 = tagUnionDiscriminantSize(variants.len);
+    const discriminant_size: u8 = layout.TagUnionData.discriminantSize(variants.len);
     const disc_align = layout.TagUnionData.alignmentForDiscriminantSize(discriminant_size);
     const disc_align_bytes: u32 = @intCast(disc_align.toByteUnits());
     const discriminant_offset: u32 = alignUp(max_payload_size, disc_align_bytes);
@@ -266,7 +266,7 @@ fn wasmSizeAlign(root_idx: layout.Idx, ls: *const layout.Store) Error!SizeAlign 
                 if (payload.size > max_payload_size) max_payload_size = payload.size;
                 if (payload.alignment > max_payload_align) max_payload_align = payload.alignment;
             }
-            const discriminant_size: u8 = tagUnionDiscriminantSize(variant_count);
+            const discriminant_size: u8 = layout.TagUnionData.discriminantSize(variant_count);
             const disc_align = layout.TagUnionData.alignmentForDiscriminantSize(discriminant_size);
             const disc_align_bytes: u32 = @intCast(disc_align.toByteUnits());
             const discriminant_offset: u32 = alignUp(max_payload_size, disc_align_bytes);
@@ -278,19 +278,6 @@ fn wasmSizeAlign(root_idx: layout.Idx, ls: *const layout.Store) Error!SizeAlign 
     };
 
     return results.items[0];
-}
-
-fn tagUnionDiscriminantSize(variant_count: usize) u8 {
-    return if (variant_count <= 1)
-        0
-    else if (variant_count <= 256)
-        1
-    else if (variant_count <= 65536)
-        2
-    else if (variant_count <= (1 << 32))
-        4
-    else
-        8;
 }
 
 fn alignUp(value: u32, alignment: u32) u32 {
