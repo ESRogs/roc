@@ -331,6 +331,9 @@ list_eq_import: ?u32 = null,
 i128_div_s_import: ?u32 = null,
 /// Wasm function index for imported roc_i128_mod_s host function.
 i128_mod_s_import: ?u32 = null,
+/// Wasm function index for imported roc_builtins_num_mod_i128 host function
+/// (signed i128 modulo whose result carries the sign of the divisor).
+num_mod_i128_import: ?u32 = null,
 /// Wasm function index for imported roc_builtins_num_mul_with_overflow_i128 host function.
 num_mul_with_overflow_i128_import: ?u32 = null,
 /// Wasm function index for imported roc_builtins_num_mul_with_overflow_u128 host function.
@@ -1428,6 +1431,14 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
     );
     self.num_mul_with_overflow_i128_import = try self.module.addImport("env", "roc_builtins_num_mul_with_overflow_i128", i128_mul_overflow_type);
     self.num_mul_with_overflow_u128_import = try self.module.addImport("env", "roc_builtins_num_mul_with_overflow_u128", i128_mul_overflow_type);
+
+    // Signed i128 modulo (decomposed wrapper ABI):
+    // (out_low_ptr, out_high_ptr, a_low, a_high, b_low, b_high, roc_ops) -> void
+    const i128_mod_type = try self.module.addFuncType(
+        &.{ .i32, .i32, .i64, .i64, .i64, .i64, .i32 },
+        &.{},
+    );
+    self.num_mod_i128_import = try self.module.addImport("env", "roc_builtins_num_mod_i128", i128_mod_type);
 
     const dec_unary_type = try self.module.addFuncType(
         &.{ .i32, .i32 },
@@ -4482,8 +4493,12 @@ fn emitCompositeNumericOp(self: *Self, op: anytype, args: anytype, ret_layout: l
             },
             .num_mod_by => {
                 const is_signed = operand_layout == .i128 or operand_layout == .dec;
-                const import_idx = if (is_signed) self.i128_mod_s_import else self.u128_mod_import;
-                try self.emitI128HostBinOp(lhs_local, rhs_local, import_idx orelse unreachable);
+                if (is_signed) {
+                    try self.emitI128ModBuiltin(lhs_local, rhs_local);
+                } else {
+                    // Unsigned modulo equals the truncated remainder.
+                    try self.emitI128HostBinOp(lhs_local, rhs_local, self.u128_mod_import orelse unreachable);
+                }
             },
             .num_is_gt => {
                 const is_signed = operand_layout == .i128 or operand_layout == .dec;
@@ -4549,6 +4564,33 @@ fn emitI128HostBinOp(self: *Self, lhs_local: u32, rhs_local: u32, import_idx: u3
     try self.emitCall(import_idx);
 
     // Push result pointer
+    try self.emitLocalGet(result_local);
+}
+
+/// Signed i128/Dec modulo via the decomposed `roc_builtins_num_mod_i128`
+/// wrapper: the result carries the sign of the divisor (truncated remainder
+/// plus the divisor when the remainder is non-zero and its sign differs).
+/// Dec shares this call because the adjustment operates on its raw scaled
+/// i128 representation. Leaves the result pointer on the wasm stack.
+fn emitI128ModBuiltin(self: *Self, lhs_local: u32, rhs_local: u32) Allocator.Error!void {
+    const result_offset = try self.allocStackMemory(16, 8);
+    const result_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+    try self.emitFpOffset(result_offset);
+    try self.emitLocalSet(result_local);
+
+    try self.emitLocalGet(result_local);
+    try self.emitI32PtrOffset(result_local, 8);
+    try self.emitLocalGet(lhs_local);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitLocalGet(lhs_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitLocalGet(rhs_local);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitLocalGet(rhs_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitLocalGet(self.roc_ops_local);
+    try self.emitBuiltinCall(.num_mod_i128, self.num_mod_i128_import);
+
     try self.emitLocalGet(result_local);
 }
 
@@ -4741,7 +4783,11 @@ fn emitCheckedCompositeNumericOp(self: *Self, checked_op: LIR.LowLevel, plain_op
                 self.currentCode().append(self.allocator, @intFromEnum(BlockType.i32)) catch return error.OutOfMemory;
                 try self.emitZeroI128ResultPtr();
                 self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
-                try self.emitI128HostBinOp(lhs_local, rhs_local, self.i128_mod_s_import orelse unreachable);
+                if (plain_op == .num_mod_by) {
+                    try self.emitI128ModBuiltin(lhs_local, rhs_local);
+                } else {
+                    try self.emitI128HostBinOp(lhs_local, rhs_local, self.i128_mod_s_import orelse unreachable);
+                }
                 self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
             } else {
                 try self.emitI128HostBinOp(lhs_local, rhs_local, self.u128_mod_import orelse unreachable);
@@ -4791,13 +4837,7 @@ fn checkedScalarBinaryWasmOp(plain_op: LIR.LowLevel, vt: ValType) u8 {
 }
 
 fn signedMinForScalar(layout_idx: layout.Idx) i64 {
-    return switch (layout_idx) {
-        .i8 => std.math.minInt(i8),
-        .i16 => std.math.minInt(i16),
-        .i32 => std.math.minInt(i32),
-        .i64 => std.math.minInt(i64),
-        else => unreachable,
-    };
+    return @intCast(CheckedArithmetic.signedLowestValue(layout_idx) orelse unreachable);
 }
 
 fn signedMaxForScalar(layout_idx: layout.Idx) i64 {

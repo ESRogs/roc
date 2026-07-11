@@ -198,6 +198,7 @@ pub fn runWasmStrWithStats(
         env_imports.addHostFunction("roc_i128_mod_s", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostI128ModS, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_u128_div", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostU128Div, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_u128_mod", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostU128Mod, null) catch return error.WasmExecFailed;
+        env_imports.addHostFunction("roc_builtins_num_mod_i128", &[_]bytebox.ValType{ .I32, .I32, .I64, .I64, .I64, .I64, .I32 }, &[_]bytebox.ValType{}, hostI128Mod, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_builtins_num_mul_with_overflow_i128", &[_]bytebox.ValType{ .I32, .I32, .I64, .I64, .I64, .I64 }, &[_]bytebox.ValType{.I32}, hostI128MulWithOverflow, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_builtins_num_mul_with_overflow_u128", &[_]bytebox.ValType{ .I32, .I32, .I64, .I64, .I64, .I64 }, &[_]bytebox.ValType{.I32}, hostU128MulWithOverflow, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_dec_div", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostDecDiv, null) catch return error.WasmExecFailed;
@@ -671,6 +672,22 @@ fn hostI128DivS(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]cons
 fn hostI128ModS(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
     const buffer = module.store.getMemory(0).buffer();
     writeI128ToMem(buffer, @intCast(params[2].I32), @rem(readI128FromMem(buffer, @intCast(params[0].I32)), readI128FromMem(buffer, @intCast(params[1].I32))));
+}
+
+fn hostI128Mod(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
+    const buffer = module.store.getMemory(0).buffer();
+    const out_low: usize = @intCast(params[0].I32);
+    const out_high: usize = @intCast(params[1].I32);
+    const a_low: u64 = @bitCast(params[2].I64);
+    const a_high: u64 = @bitCast(params[3].I64);
+    const b_low: u64 = @bitCast(params[4].I64);
+    const b_high: u64 = @bitCast(params[5].I64);
+    const a: i128 = @bitCast(@as(u128, a_high) << 64 | @as(u128, a_low));
+    const b: i128 = @bitCast(@as(u128, b_high) << 64 | @as(u128, b_low));
+    // Modulo carries the sign of the divisor, matching roc_builtins_num_mod_i128.
+    const result: u128 = @bitCast(@mod(a, b));
+    writeIntLittle(u64, buffer, out_low, @truncate(result));
+    writeIntLittle(u64, buffer, out_high, @truncate(result >> 64));
 }
 
 fn hostU128Div(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
