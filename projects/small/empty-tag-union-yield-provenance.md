@@ -16,7 +16,7 @@ The reasoning is sound **for defaulted slots**. But the hatch keys on the
 *shape* `[]`, not on the *fact* "this slot was defaulted" — it re-derives
 provenance from structure, which is the codebase's recurring disease shape.
 Any upstream bug that leaves an empty tag union somewhere it should not be
-(a genuine mis-unification, a wrongly-sealed row, a future refactor of
+(a genuinely wrong unification, a wrongly-sealed row, a future refactor of
 Monotype defaulting) is silently absorbed here instead of tripping the
 exact-match invariant: the wrong peer wins, the slot is silently retyped,
 and the divergence surfaces — if at all — stages later as a layout or
@@ -112,7 +112,7 @@ follow-up.
 - The yield at `solve.zig:1264` is conditioned on (route A) or verified
   against (route B) the *fact* "defaulted at materialization" — never on
   shape alone.
-- An artificially mis-sealed `[]` (test-injected) trips the exact-match
+- An artificially wrongly-sealed `[]` (test-injected) trips the exact-match
   invariant in Debug instead of silently linking.
 - The motivating phantom case (a function value rendered as `<function>`
   whose phantom argument type seals as `[]` at the reference site) still

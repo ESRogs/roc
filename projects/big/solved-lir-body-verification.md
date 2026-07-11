@@ -22,7 +22,7 @@ faithful body-level port of cor's `ir/lower.ml` (`postcheck/lir_lower.zig`)
 was dead code and was deleted in the duplication-audit cleanup
 (PR roc-lang/roc#10079) — correctly, since an unexercised oracle is drift,
 not protection. But its deletion makes the gap permanent by default: a
-body-lowering bug in `solved_lir_lower.zig` (a mis-ordered capture field,
+body-lowering bug in `solved_lir_lower.zig` (a misordered capture field,
 a wrong variant index, a swapped branch target) is caught today only if an
 end-to-end test happens to execute the affected construct with a
 discriminating input.
