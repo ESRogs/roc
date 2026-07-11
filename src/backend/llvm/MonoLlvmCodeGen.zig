@@ -1836,7 +1836,7 @@ pub const MonoLlvmCodeGen = struct {
             wip.debug_location = resume_debug_location;
         }
 
-        const entry_block: @TypeOf(resume_cursor.block) = @enumFromInt(0);
+        const entry_block: LlvmBuilder.Function.Block.Index = .entry;
         wip.cursor = .{ .block = entry_block };
         wip.debug_location = .no_location;
         const allocated = wip.alloca(
