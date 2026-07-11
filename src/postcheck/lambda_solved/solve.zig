@@ -889,9 +889,45 @@ const Solver = struct {
                 try self.bindPattern(let_.bind, value_ty);
                 try self.expectExprAtTypeEvenIfDone(let_.rest, expected);
             },
+            .match_ => |match| {
+                // The match slot was solved at the minted nominal type during
+                // the first walk. Its branch bodies still need the backing
+                // type, without unifying the match node with that backing.
+                const scrutinee_ty = try self.inferExpr(match.scrutinee);
+                for (self.lifted.branchSpan(match.branches)) |branch| {
+                    try self.bindPattern(branch.pat, scrutinee_ty);
+                    if (branch.guard) |guard| _ = try self.inferExpr(guard);
+                    try self.expectExprAtTypeEvenIfDone(branch.body, expected);
+                }
+            },
+            .if_ => |if_| {
+                for (self.lifted.ifBranchSpan(if_.branches)) |branch| {
+                    _ = try self.inferExpr(branch.cond);
+                    try self.expectExprAtTypeEvenIfDone(branch.body, expected);
+                }
+                try self.expectExprAtTypeEvenIfDone(if_.final_else, expected);
+            },
+            .block => |block| try self.expectExprAtTypeEvenIfDone(block.final_expr, expected),
+            .comptime_branch_taken => |taken| try self.expectExprAtTypeEvenIfDone(taken.body, expected),
+            .if_initialized_payload => |payload_switch| {
+                _ = try self.inferExpr(payload_switch.cond);
+                _ = self.localTy(payload_switch.payload);
+                try self.expectExprAtTypeEvenIfDone(payload_switch.initialized, expected);
+                try self.expectExprAtTypeEvenIfDone(payload_switch.uninitialized, expected);
+            },
+            .try_sequence => |sequence| try self.expectExprAtTypeEvenIfDone(sequence.ok_body, expected),
+            .try_record_sequence => |sequence| try self.expectExprAtTypeEvenIfDone(sequence.ok_body, expected),
             else => {
-                const slot = try self.expectExprSlot(expr_id, expected);
                 const inferred = try self.inferExpr(expr_id);
+                // An opaque leaf that already carries the generated nominal
+                // has no backing expression to revisit. Its construction site
+                // was traversed separately; keep this use at the nominal type.
+                if (self.generatedIteratorBacking(inferred) != null and
+                    self.generatedIteratorBacking(expected) == null)
+                {
+                    return;
+                }
+                const slot = try self.expectExprSlot(expr_id, expected);
                 try self.unify(slot, inferred);
             },
         }

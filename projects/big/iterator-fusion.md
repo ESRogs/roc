@@ -147,7 +147,7 @@ unproven piece, the construction-site channel.
    backing shape matches an ancestor, collapse to the declaration backing, which
    re-creates the `Iter` self-edge → `insertBox` (`store.zig:1086`) → the one
    sanctioned box, and terminates as a fixed point. Ship a **hard depth backstop
-   first** so a mis-tuned cap degrades to the box (safe), never hangs; then tighten
+   first** so a poorly tuned cap degrades to the box (safe), never hangs; then tighten
    the shape predicate. Gate: `wrap`/`leaves` box once per dynamic level and
    terminate; a finite-but-deep static chain does not trip the cap.
 6. **Slice 6 — escaping gate.** The escaping static gates (`lir_inline_test.zig`,
