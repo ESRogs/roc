@@ -4013,6 +4013,16 @@ fn instantiateVarHelp(
     return instantiated_var;
 }
 
+fn recordSharedSchemeUse(
+    self: *Self,
+    node_idx: u32,
+    slot: ModuleEnv.SchemeInstantiationRecord.Slot,
+    slot_data: u32,
+    scheme_root: Var,
+) std.mem.Allocator.Error!void {
+    try self.cir.recordSchemeInstantiation(node_idx, slot, slot_data, scheme_root, &.{});
+}
+
 // regions //
 
 /// Fill slots in the regions array up to and including the target var
@@ -12225,6 +12235,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                 // type, so facts discovered at the call site
                                 // flow into the inferred scheme.
                                 _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
+                                try self.recordSharedSchemeUse(
+                                    @intFromEnum(expr_idx),
+                                    .shared_value_use,
+                                    0,
+                                    ModuleEnv.varFrom(processing_def.def_idx),
+                                );
                             }
                             break :blk;
                         }
@@ -12262,6 +12278,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                         // whole merged group out of generalization instead of
                         // generalizing with the suspended group's boundary.
                         _ = try self.unifyInContext(expr_var, ModuleEnv.varFrom(referenced_def.expr), env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
+                        try self.recordSharedSchemeUse(
+                            @intFromEnum(expr_idx),
+                            .shared_value_use,
+                            0,
+                            ModuleEnv.varFrom(processing_def.def_idx),
+                        );
                         break :blk;
                     },
                     .processed => {},
@@ -12295,6 +12317,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 std.debug.assert(self.types.resolveVar(pat_var).desc.rank != .generalized);
 
                 _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = local_def.def_name } });
+                try self.recordSharedSchemeUse(
+                    @intFromEnum(expr_idx),
+                    .shared_value_use,
+                    0,
+                    pat_var,
+                );
                 break :blk;
             }
 
@@ -12331,6 +12359,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 _ = try self.unify(expr_var, instantiated, env);
             } else {
                 _ = try self.unify(expr_var, pat_var, env);
+                if (mb_processing_def) |processing_def| {
+                    try self.recordSharedSchemeUse(
+                        @intFromEnum(expr_idx),
+                        .shared_value_use,
+                        0,
+                        ModuleEnv.varFrom(processing_def.def_idx),
+                    );
+                }
             }
         },
         .e_lookup_external => |ext| {
@@ -18863,12 +18899,24 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
                         // Cycle participant or recursive self-dispatch: use the
                         // fresh flex var instead of def_var to avoid rank lowering.
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            expr_var_for_method,
+                        );
                         break :blk expr_var_for_method;
                     } else if (method_is_this_module) blk: {
                         const local_method_type_var = predeclared_scheme_for_method orelse method_type_var;
                         if (self.types.resolveVar(local_method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(local_method_type_var, env, .use_last_var);
                         }
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            local_method_type_var,
+                        );
                         break :blk local_method_type_var;
                     } else blk: {
                         // Copy the method from the other module's type store
@@ -19139,12 +19187,24 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         .constraint_fn_var = constraint.fn_var,
                     };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            expr_var_for_method,
+                        );
                         break :blk expr_var_for_method;
                     } else if (method_is_this_module) blk: {
                         const local_method_type_var = predeclared_scheme_for_method orelse method_type_var;
                         if (self.types.resolveVar(local_method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(local_method_type_var, env, .use_last_var);
                         }
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            local_method_type_var,
+                        );
                         break :blk local_method_type_var;
                     } else blk: {
                         const copied_var = try self.copyVar(method_type_var, method_env, region);

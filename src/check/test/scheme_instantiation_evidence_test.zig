@@ -85,8 +85,8 @@ test "discharging a dispatch constraint onto a constrained method target records
     var found_resolved_pair = false;
     for (env.scheme_instantiations.items.items) |record| {
         if (record.slot_kind != @intFromEnum(Slot.dispatch_target)) continue;
+        if (record.pairs_len == 0) continue;
         try std.testing.expect(record.slot_data != 0);
-        try std.testing.expect(record.pairs_len >= 1);
         const pairs = env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
         for (pairs) |pair| {
             const resolved = env.types.resolveVar(@enumFromInt(pair.fresh_var));
@@ -94,4 +94,46 @@ test "discharging a dispatch constraint onto a constrained method target records
         }
     }
     try std.testing.expect(found_resolved_pair);
+}
+
+test "phantom recursive dispatch records a shared target use" {
+    const source =
+        \\Counter := [Mk(U64)].{
+        \\    step = |c, k| match c {
+        \\        Counter.Mk(n) => if k == 0 { n } else { ping(c, k - 1) }
+        \\    }
+        \\}
+        \\
+        \\ping = |c, k| c.step(k)
+        \\
+        \\main = ping(Counter.Mk(7), 3)
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+    try test_env.assertDefType("main", "U64");
+
+    const env = test_env.module_env;
+    var found_shared_target = false;
+    for (env.scheme_instantiations.items.items) |record| {
+        if (record.slot_kind != @intFromEnum(Slot.dispatch_target)) continue;
+        if (record.pairs_len == 0) found_shared_target = true;
+    }
+    try std.testing.expect(found_shared_target);
+}
+
+test "constrained self recursion records a shared value use" {
+    const source =
+        \\Thing := [Val(U64)].{
+        \\    step = |Thing.Val(n)| n
+        \\}
+        \\
+        \\loop = |x, n| if n == 0 { x.step() } else { loop(x, n - 1) }
+        \\
+        \\main = loop(Thing.Val(7), 3)
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+    try test_env.assertDefType("main", "U64");
+
+    try std.testing.expect(recordsWithSlot(test_env.module_env, .shared_value_use) >= 1);
 }

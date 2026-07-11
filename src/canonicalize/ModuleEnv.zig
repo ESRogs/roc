@@ -604,13 +604,12 @@ pub const NumeralDispatchPlan = extern struct {
     pub const SafeList = collections.SafeList(@This());
 };
 
-/// One constrained-scheme instantiation recorded by checking for static-dispatch
-/// evidence. It names the source node whose checking instantiated the scheme, the
-/// pristine (never-unified) scheme root that was copied, and — via
-/// `scheme_instantiation_pairs` — the fresh var each constrained scheme var was
-/// copied to. Publication resolves the fresh vars after checking settles to
-/// decide how each of the callee's dispatch constraints was satisfied at this
-/// site.
+/// One constrained-scheme use recorded by checking for static-dispatch
+/// evidence. It names the source node, the scheme root used at that edge, and
+/// — for an instantiation — the fresh var each constrained scheme var was
+/// copied to. Shared monomorphic edges have no copy pairs. Publication resolves
+/// the recorded vars after checking settles to decide how each of the callee's
+/// dispatch constraints was satisfied at this site.
 pub const SchemeInstantiationRecord = extern struct {
     node_idx: u32,
     /// `Slot` — distinguishes several schemes instantiated at one node (a value
@@ -621,8 +620,8 @@ pub const SchemeInstantiationRecord = extern struct {
     /// instantiation, so nested evidence chains resolve without ambiguity.
     /// 0 for `value_use` slots (keyed by `node_idx` instead).
     slot_data: u32,
-    /// The pristine scheme root `Var` that was instantiated. For imported
-    /// schemes this is the local copy, which stays structurally intact.
+    /// The scheme root `Var` used at this edge. For imported schemes this is
+    /// the pristine local copy; for shared uses it is the in-flight local root.
     scheme_root: u32,
     /// Range into `scheme_instantiation_pairs`.
     pairs_start: u32,
@@ -637,6 +636,10 @@ pub const SchemeInstantiationRecord = extern struct {
         /// The scheme of the method target chosen while discharging a static
         /// dispatch constraint originating at this node.
         dispatch_target,
+        /// A monomorphic reference to an in-flight unannotated definition.
+        /// The edge shares the definition's vars, so its record has no copy
+        /// pairs but still names the exact scheme root used by checking.
+        shared_value_use,
     };
 };
 
@@ -3743,9 +3746,9 @@ pub fn recordQuoteDispatchPlan(
     });
 }
 
-/// Record a constrained-scheme instantiation for static-dispatch evidence.
+/// Record a constrained-scheme use for static-dispatch evidence.
 /// `slot_data` is the raw fn `Var` of the discharged constraint for
-/// `dispatch_target` slots and 0 for `value_use` slots.
+/// `dispatch_target` slots and 0 for value-use slots.
 pub fn recordSchemeInstantiation(
     self: *Self,
     node_idx: u32,
