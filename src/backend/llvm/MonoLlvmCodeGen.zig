@@ -6483,7 +6483,7 @@ pub const MonoLlvmCodeGen = struct {
 
     /// ptr_alloca: () -> Ptr(T). Reserve a zeroed slot for T and store its
     /// address into the target. TRMC emits this once per proc entry (pre-loop),
-    /// so a .normal alloca at the op site executes once per call.
+    /// and allocEntryBlockSlot keeps the physical slot in the entry frame.
     fn emitPtrAlloca(self: *MonoLlvmCodeGen, target: LocalId) Error!void {
         const elem_idx = self.layoutValue(self.localLayout(target)).getIdx();
         const sa = self.sizeAlignOf(elem_idx);
