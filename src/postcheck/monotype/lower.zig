@@ -14501,27 +14501,6 @@ const BodyContext = struct {
         return try self.activeTypeFromNode(fn_node);
     }
 
-    fn instantiateTargetFromPlan(
-        self: *BodyContext,
-        source_fn_ty: checked.CheckedTypeId,
-        plan_ctx: *BodyContext,
-        plan_fn_ty: checked.CheckedTypeId,
-        expected_ret_ty: ?Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
-        const function = self.checkedFunctionType(source_fn_ty);
-        const plan_function = plan_ctx.checkedFunctionType(plan_fn_ty);
-        if (function.args.len != plan_function.args.len) {
-            Common.invariant("checked dispatch target arity differed from its dispatch plan");
-        }
-        const fn_node = try self.instNode(source_fn_ty);
-        try self.graph.unify(fn_node, try plan_ctx.instNode(plan_fn_ty));
-        if (expected_ret_ty) |expected| {
-            try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
-        }
-        try self.graph.drainDirty();
-        return try self.activeTypeFromNode(fn_node);
-    }
-
     fn instantiateTargetCallTypePreservingSourceArgsAndRet(
         self: *BodyContext,
         source_fn_ty: checked.CheckedTypeId,
@@ -16820,7 +16799,7 @@ const BodyContext = struct {
                 .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
             };
         }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, expected_ret_ty);
+        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
         const refreshed_target_mono_ty = try self.activeTypeFromType(target_mono_ty);
         if (!self.sameType(callable_mono_ty, refreshed_target_mono_ty)) {
@@ -17502,7 +17481,7 @@ const BodyContext = struct {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, null);
+        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
         if (!self.sameType(callable_mono_ty, target_mono_ty)) {
             Common.invariant("checked dispatch target callable type differed from dispatch plan callable type");
@@ -17774,13 +17753,15 @@ const BodyContext = struct {
     fn methodTargetMonoTypeFromPlan(
         self: *BodyContext,
         lookup: MethodLookup,
-        plan_ctx: *BodyContext,
-        plan_callable_ty: checked.CheckedTypeId,
-        expected_ret_ty: ?Type.TypeId,
+        plan_callable_mono_ty: Type.TypeId,
     ) Allocator.Error!Type.TypeId {
+        const plan_fn = self.builder.functionShape(plan_callable_mono_ty, "checked dispatch plan had a non-function type");
+        const plan_args = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn.args));
+        defer self.allocator.free(plan_args);
+
         var target_ctx = try self.methodTargetContext(lookup);
         defer target_ctx.deinit();
-        return try target_ctx.instantiateTargetFromPlan(lookup.target.callable_ty, plan_ctx, plan_callable_ty, expected_ret_ty);
+        return try target_ctx.instantiateTargetCallTypeFromMonoArgs(lookup.target.callable_ty, plan_args, plan_fn.ret);
     }
 
     fn methodTargetMonoTypePreservingSourceArgsAndRet(
@@ -23318,7 +23299,7 @@ const BodyContext = struct {
                 Common.invariant("checked iterator dispatch method registry is missing resolved target");
         };
 
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, &call_ctx, plan.callable_ty, expected_ret_ty);
+        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, callable_mono_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
         if (!self.sameType(callable_mono_ty, target_mono_ty)) {
             Common.invariant("checked iterator dispatch target callable type differed from dispatch plan callable type");
