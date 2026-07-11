@@ -14205,13 +14205,17 @@ Builtin :: [].{
 			## bigger float, the iterator yields that value once and then ends.
 			range_exclusive : F32, F32 -> Iter(F32)
 			range_exclusive = |start, end|
-				Iter.custom((start, False), Unknown, |(cur, done)|
-					if done or cur >= end {
-						Err(NoMore)
-					} else {
-						next = cur + 1
-						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
-					})
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done or cur >= end {
+							Err(NoMore)
+						} else {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						},
+				)
 
 			## Iterator over [F32] values from `start` up to and including `end`,
 			## incrementing by 1. Returns an empty iterator if `start > end`.
@@ -14221,17 +14225,21 @@ Builtin :: [].{
 			## bigger float, the iterator yields that value once and then ends.
 			range_inclusive : F32, F32 -> Iter(F32)
 			range_inclusive = |start, end|
-				Iter.custom((start, False), Unknown, |(cur, done)|
-					if done {
-						Err(NoMore)
-					} else if cur < end {
-						next = cur + 1
-						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
-					} else if cur == end {
-						Ok((cur, (cur, True)))
-					} else {
-						Err(NoMore)
-					})
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done {
+							Err(NoMore)
+						} else if cur < end {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						} else if cur == end {
+							Ok((cur, (cur, True)))
+						} else {
+							Err(NoMore)
+						},
+				)
 
 			## Parse an [F32] from a [Str]. Returns `Err(BadNumStr)` if the
 			## string is not a valid decimal number, or if the parsed value does
@@ -15133,13 +15141,17 @@ Builtin :: [].{
 			## bigger float, the iterator yields that value once and then ends.
 			range_exclusive : F64, F64 -> Iter(F64)
 			range_exclusive = |start, end|
-				Iter.custom((start, False), Unknown, |(cur, done)|
-					if done or cur >= end {
-						Err(NoMore)
-					} else {
-						next = cur + 1
-						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
-					})
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done or cur >= end {
+							Err(NoMore)
+						} else {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						},
+				)
 
 			## Iterator over [F64] values from `start` up to and including `end`,
 			## incrementing by 1. Returns an empty iterator if `start > end`.
@@ -15149,17 +15161,21 @@ Builtin :: [].{
 			## bigger float, the iterator yields that value once and then ends.
 			range_inclusive : F64, F64 -> Iter(F64)
 			range_inclusive = |start, end|
-				Iter.custom((start, False), Unknown, |(cur, done)|
-					if done {
-						Err(NoMore)
-					} else if cur < end {
-						next = cur + 1
-						if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
-					} else if cur == end {
-						Ok((cur, (cur, True)))
-					} else {
-						Err(NoMore)
-					})
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done {
+							Err(NoMore)
+						} else if cur < end {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						} else if cur == end {
+							Ok((cur, (cur, True)))
+						} else {
+							Err(NoMore)
+						},
+				)
 
 			## Parse an [F64] from a [Str]. Returns `Err(BadNumStr)` if the
 			## string is not a valid decimal number, or if the parsed value does
@@ -16784,19 +16800,23 @@ range_exclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
 		num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
 	]
 range_exclusive_with_len = |start, end, len_if_known|
-	Iter.custom(start, len_if_known, |cur|
-		if cur < end {
-			match cur.add_try(1) {
-				Ok(next) => if next < end {
-					Ok((cur, next))
-				} else {
-					Ok((cur, end))
+	Iter.custom(
+		start,
+		len_if_known,
+		|cur|
+			if cur < end {
+				match cur.add_try(1) {
+					Ok(next) => if next < end {
+						Ok((cur, next))
+					} else {
+						Ok((cur, end))
+					}
+					Err(Overflow) => Ok((cur, end))
 				}
-				Err(Overflow) => Ok((cur, end))
-			}
-		} else {
-			Err(NoMore)
-		})
+			} else {
+				Err(NoMore)
+			},
+	)
 
 # Shared step loop behind the numeric types' `range_inclusive` methods; same
 # `len_if_known` contract as `range_exclusive_with_len`. The seed carries a
@@ -16809,21 +16829,25 @@ range_inclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
 		num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
 	]
 range_inclusive_with_len = |start, end, len_if_known|
-	Iter.custom((start, False), len_if_known, |(cur, done)|
-		if done {
-			Err(NoMore)
-		} else if cur <= end {
-			match cur.add_try(1) {
-				Ok(next) => if next <= end {
-					Ok((cur, (next, False)))
-				} else {
-					Ok((cur, (cur, True)))
+	Iter.custom(
+		(start, False),
+		len_if_known,
+		|(cur, done)|
+			if done {
+				Err(NoMore)
+			} else if cur <= end {
+				match cur.add_try(1) {
+					Ok(next) => if next <= end {
+						Ok((cur, (next, False)))
+					} else {
+						Ok((cur, (cur, True)))
+					}
+					Err(Overflow) => Ok((cur, (cur, True)))
 				}
-				Err(Overflow) => Ok((cur, (cur, True)))
-			}
-		} else {
-			Err(NoMore)
-		})
+			} else {
+				Err(NoMore)
+			},
+	)
 
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item
