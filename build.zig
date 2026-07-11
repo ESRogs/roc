@@ -2457,7 +2457,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const roc_modules = modules.RocModules.create(b, build_options, zstd, valgrind_support);
+    const roc_modules = modules.RocModules.create(b, build_options, zstd);
 
     // Build-time compiler for builtin .roc modules
     //

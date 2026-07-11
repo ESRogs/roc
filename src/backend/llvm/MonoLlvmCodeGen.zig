@@ -1376,7 +1376,12 @@ pub const MonoLlvmCodeGen = struct {
         } else {
             self.roc_ops_arg = wip.arg(0);
             if (proc.abi == .erased_callable) {
-                self.test_context_arg = null;
+                // Test expectations report their region through the host-side
+                // wrapper, so erased-callable code has no hidden invocation
+                // context to reconstruct. Keep the legacy normal-proc ABI
+                // parameter explicitly null; it is not read by generated code.
+                const ptr_ty = builder.ptrType(.default) catch return error.OutOfMemory;
+                self.test_context_arg = builder.nullValue(ptr_ty) catch return error.OutOfMemory;
                 self.ret_ptr_arg = wip.arg(1);
                 self.args_ptr_arg = wip.arg(2);
                 self.capture_ptr_arg = wip.arg(3);
@@ -2300,13 +2305,6 @@ pub const MonoLlvmCodeGen = struct {
                 const builder = self.builder orelse return error.CompilationFailed;
                 const region_start = builder.intValue(.i32, expect_err_stmt.region.start.offset) catch return error.OutOfMemory;
                 const region_end = builder.intValue(.i32, expect_err_stmt.region.end.offset) catch return error.OutOfMemory;
-
-                const context = self.testInvocationContext();
-                const flag = builder.intValue(.i32, 1) catch return error.OutOfMemory;
-                const align4 = LlvmBuilder.Alignment.fromByteUnits(4);
-                _ = wip.store(.normal, flag, context, align4) catch return error.OutOfMemory;
-                _ = wip.store(.normal, region_start, try self.offsetPtr(context, 4), align4) catch return error.OutOfMemory;
-                _ = wip.store(.normal, region_end, try self.offsetPtr(context, 8), align4) catch return error.OutOfMemory;
 
                 try self.callBuiltinVoid(
                     "roc_builtins_expect_err_str",
