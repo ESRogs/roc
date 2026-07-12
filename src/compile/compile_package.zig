@@ -1953,15 +1953,14 @@ pub const PackageEnv = struct {
             };
         }
 
-        // The platform root of an app build checks cleanly here and normally does
-        // not publish: finalization publishes the relation-bearing platform root
-        // once, so a check-time publish would be immediately superseded. Deferral
-        // is only sound when no requires signature references a platform-root-
-        // declared named type (e.g. a for-clause identity alias used by name):
-        // requirement unification copies such a self-origin type into the app's
-        // store, and the app's publication then needs this module's artifact as
-        // the type's owner — those shapes keep the check-time publish.
-        if (defer_publication and !(try requiresSignaturesReferenceLocalNamedTypes(check_alloc, env))) {
+        // The platform root of an app build does not publish here: finalization
+        // publishes the relation-bearing platform root once, so a check-time
+        // publish would be immediately superseded. The one exception is a
+        // requires signature that still carries erroneous type content — the
+        // env-derived requirement context a deferred root needs is a canonical
+        // key digest, and erroneous content has no canonical key, so those
+        // shapes keep the check-time publish and its diagnostics.
+        if (defer_publication and !(try checker.requiresTypesContainError())) {
             return .{
                 .checker = checker,
                 .checked_artifact = null,
@@ -2003,24 +2002,6 @@ pub const PackageEnv = struct {
             .checked_artifact = checked_artifact,
             .user_errors_allow_lowering = user_errors_allow_lowering,
         };
-    }
-
-    /// True when any of `env`'s requires-clause signature types references a
-    /// named type declared by `env`'s own module. See the deferral decision in
-    /// `typeCheckModule`.
-    fn requiresSignaturesReferenceLocalNamedTypes(
-        allocator: Allocator,
-        env: *const ModuleEnv,
-    ) Allocator.Error!bool {
-        for (env.requires_types.items.items) |required_type| {
-            if (try check.CanonicalTypeKeys.varReferencesModuleLocalNamedType(
-                allocator,
-                &env.types,
-                env,
-                ModuleEnv.varFrom(required_type.type_anno),
-            )) return true;
-        }
-        return false;
     }
 
     pub fn publishCheckedArtifactFromCheckedModule(

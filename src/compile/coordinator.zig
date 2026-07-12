@@ -2915,10 +2915,11 @@ pub const Coordinator = struct {
 
     /// True when `mod` is the app build's platform root, which MAY defer its
     /// check-time publication to finalization. The final decision belongs to
-    /// `typeCheckModule` (deferral is skipped when a requires signature
-    /// references a platform-root-declared named type); an `env_only` cache
-    /// entry only ever exists for a shape whose check actually deferred, so
-    /// admitting one under this may-defer condition is sound.
+    /// `typeCheckModule` (deferral is skipped while a requires signature still
+    /// carries erroneous type content, which has no canonical key for the
+    /// env-derived requirement context); an `env_only` cache entry only ever
+    /// exists for a shape whose check actually deferred, so admitting one
+    /// under this may-defer condition is sound.
     fn moduleDefersPublication(self: *Coordinator, mod: *ModuleState) bool {
         if (self.app_package_name == null) return false;
         return self.moduleIsPlatformRoot(mod);
@@ -3681,7 +3682,8 @@ pub const Coordinator = struct {
             try self.registerCheckedArtifact(pkg, mod);
 
             // A non-deferred platform root publishes its runnable artifact here (a
-            // platform-as-workspace-root build with no app pairing).
+            // platform-as-workspace-root build with no app pairing, or a requires
+            // signature still carrying erroneous type content).
             if (self.moduleIsPlatformRoot(mod)) {
                 self.platform_root_publish_count += 1;
                 // The artifact-derived and env-derived requirement contexts must
@@ -5280,6 +5282,96 @@ test "platform requirement relation specializes identity reached through app ali
     const relation = relations[0];
     const payload = platform_artifact.checked_types.payload(relation.requested_source_ty_payload);
     try std.testing.expect(payload != .pending);
+}
+
+fn writeAliasByNameRequirementFixture(tmp_dir: *std.testing.TmpDir) (std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError)!void {
+    try tmp_dir.dir.createDirPath(std.testing.io, "app/.roc_state_platform");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/main.roc",
+        .data =
+        \\app [prog] { pf: platform "./.roc_state_platform/main.roc" }
+        \\
+        \\Model : { count : U64 }
+        \\
+        \\prog : { init : {} -> Model, tick : Model -> Model }
+        \\prog = { init: |_| { count: 0 }, tick: |m| m }
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/.roc_state_platform/main.roc",
+        .data =
+        \\platform ""
+        \\    requires { [Model : model] for prog : { init : {} -> Model, tick : Model -> Model } }
+        \\    exposes []
+        \\    packages {}
+        \\    provides { "roc_entry": entry }
+        \\
+        \\entry : {} -> Model
+        \\entry = |_| (prog.init)({})
+        ,
+    });
+}
+
+test "requires signature naming a for-clause alias resolves to the app declaration and publishes once" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try writeAliasByNameRequirementFixture(&tmp_dir);
+    const app_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "app/main.roc", allocator);
+    defer allocator.free(app_path);
+
+    const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
+    var builtin_modules = try eval.BuiltinModules.init(allocator);
+    defer builtin_modules.deinit();
+
+    var coord = try Coordinator.init(
+        allocator,
+        .single_threaded,
+        1,
+        roc_target.RocTarget.detectNative(),
+        &builtin_modules,
+        build_options.compiler_version,
+        null,
+        roc_ctx,
+    );
+    defer coord.deinit();
+    coord.enable_hosted_transform = true;
+
+    var arena_impl = base.SingleThreadArena.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    try coord.start();
+    try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
+    try coord.coordinatorLoop();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    // The requirement signature uses the for-clause alias `Model` by name.
+    // Instantiation resolves those occurrences to the app's own declaration,
+    // so the app's recorded solution references app-owned types only and the
+    // platform root defers its publication like any other app build.
+    const app_artifact = coord.appRootCheckedArtifact();
+    const table = &app_artifact.platform_requirement_solutions;
+    try std.testing.expectEqual(@as(usize, 1), table.solutions.len);
+    const solution = table.solutions[0];
+    try std.testing.expectEqual(@as(u32, 1), solution.identity_len);
+    const identity_payload = app_artifact.checked_types.payload(table.identitySlice(solution)[0]);
+    try std.testing.expect(identity_payload == .alias);
+    try std.testing.expectEqualStrings(
+        "Model",
+        app_artifact.canonical_names.typeNameText(identity_payload.alias.name),
+    );
+    try std.testing.expect(Coordinator.checkedArtifactKeyEql(identity_payload.alias.owner_module, app_artifact.key));
+
+    try coord.finalizeExecutableArtifacts();
+    try std.testing.expect(!coord.hasUserErrors());
+    try std.testing.expectEqual(@as(u32, 1), coord.platform_root_publish_count);
+
+    const platform_artifact = coord.executableRootCheckedArtifact();
+    const relations = platform_artifact.platform_requirement_relations.relations;
+    try std.testing.expectEqual(@as(usize, 1), relations.len);
+    try std.testing.expect(platform_artifact.checked_types.payload(relations[0].requested_source_ty_payload) != .pending);
 }
 
 fn writeHostedDistinctnessFixture(tmp_dir: *std.testing.TmpDir) (std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError)!void {
