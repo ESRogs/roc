@@ -219,6 +219,30 @@ const names = @import("check").CheckedNames;
 const Allocator = std.mem.Allocator;
 const GuardedList = collections.GuardedList;
 
+/// The error set of a span-walk visitor: `visit`'s own error set merged with
+/// the allocation failure raised while copying the span.
+fn WalkSpanError(comptime visit: anytype) type {
+    const ret = @typeInfo(@TypeOf(visit)).@"fn".return_type.?;
+    return Allocator.Error || @typeInfo(ret).error_union.error_set;
+}
+
+/// Copy `slice` into scratch memory, then invoke `visit` for every element.
+/// The copy is a mutation-during-iteration guard: element callbacks append to the
+/// span stores they walk, so the traversal must iterate a snapshot taken before
+/// any element is visited rather than the live span. `context` carries whatever
+/// state the callback needs (visitor `self`, owner ids, done markers).
+fn walkSpanCloned(
+    allocator: Allocator,
+    comptime T: type,
+    slice: anytype,
+    context: anytype,
+    comptime visit: anytype,
+) WalkSpanError(visit)!void {
+    const source = try GuardedList.dupe(allocator, T, slice);
+    defer allocator.free(source);
+    for (source) |item| try visit(context, item);
+}
+
 /// Specialize recursive direct calls whose arguments are known constructor shapes.
 pub fn run(allocator: Allocator, program: *Ast.Program) Common.LowerError!void {
     var pass = try Pass.init(allocator, program);
@@ -975,45 +999,53 @@ const Pass = struct {
     }
 
     fn collectCallPatternsInExprSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.ExprId)) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.ExprId, self.program.exprSpan(span));
-        defer self.allocator.free(source);
-        for (source) |expr| try self.collectCallPatternsInExpr(owner, expr);
+        try walkSpanCloned(self.allocator, Ast.ExprId, self.program.exprSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, expr: Ast.ExprId) Allocator.Error!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, expr);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInCaptureOperandSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.CaptureOperand)) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.CaptureOperand, self.program.captureOperandSpan(span));
-        defer self.allocator.free(source);
-        for (source) |operand| try self.collectCallPatternsInExpr(owner, operand.value);
+        try walkSpanCloned(self.allocator, Ast.CaptureOperand, self.program.captureOperandSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, operand: Ast.CaptureOperand) Allocator.Error!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, operand.value);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInFieldExprSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.FieldExpr)) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.FieldExpr, self.program.fieldExprSpan(span));
-        defer self.allocator.free(source);
-        for (source) |field| try self.collectCallPatternsInExpr(owner, field.value);
+        try walkSpanCloned(self.allocator, Ast.FieldExpr, self.program.fieldExprSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, field: Ast.FieldExpr) Allocator.Error!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, field.value);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInBranchSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.Branch)) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.Branch, self.program.branchSpan(span));
-        defer self.allocator.free(source);
-        for (source) |branch| {
-            if (branch.guard) |guard| try self.collectCallPatternsInExpr(owner, guard);
-            try self.collectCallPatternsInExpr(owner, branch.body);
-        }
+        try walkSpanCloned(self.allocator, Ast.Branch, self.program.branchSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, branch: Ast.Branch) Allocator.Error!void {
+                if (branch.guard) |guard| try ctx.self.collectCallPatternsInExpr(ctx.owner, guard);
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, branch.body);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInIfBranchSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.IfBranch)) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.IfBranch, self.program.ifBranchSpan(span));
-        defer self.allocator.free(source);
-        for (source) |branch| {
-            try self.collectCallPatternsInExpr(owner, branch.cond);
-            try self.collectCallPatternsInExpr(owner, branch.body);
-        }
+        try walkSpanCloned(self.allocator, Ast.IfBranch, self.program.ifBranchSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, branch: Ast.IfBranch) Allocator.Error!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, branch.cond);
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, branch.body);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInStmtSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.StmtId)) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.StmtId, self.program.stmtSpan(span));
-        defer self.allocator.free(source);
-        for (source) |stmt| try self.collectCallPatternsInStmt(owner, stmt);
+        try walkSpanCloned(self.allocator, Ast.StmtId, self.program.stmtSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, stmt: Ast.StmtId) Allocator.Error!void {
+                try ctx.self.collectCallPatternsInStmt(ctx.owner, stmt);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInStmt(self: *Pass, owner: Ast.FnId, stmt_id: Ast.StmtId) Allocator.Error!void {
@@ -2892,45 +2924,53 @@ const Pass = struct {
     }
 
     fn rewriteCallsInExprSpan(self: *Pass, span: Ast.Span(Ast.ExprId), done: []bool) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.ExprId, self.program.exprSpan(span));
-        defer self.allocator.free(source);
-        for (source) |expr| try self.rewriteCallsInExpr(expr, done);
+        try walkSpanCloned(self.allocator, Ast.ExprId, self.program.exprSpan(span), .{ .self = self, .done = done }, struct {
+            fn visit(ctx: anytype, expr: Ast.ExprId) Allocator.Error!void {
+                try ctx.self.rewriteCallsInExpr(expr, ctx.done);
+            }
+        }.visit);
     }
 
     fn rewriteCallsInCaptureOperandSpan(self: *Pass, span: Ast.Span(Ast.CaptureOperand), done: []bool) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.CaptureOperand, self.program.captureOperandSpan(span));
-        defer self.allocator.free(source);
-        for (source) |operand| try self.rewriteCallsInExpr(operand.value, done);
+        try walkSpanCloned(self.allocator, Ast.CaptureOperand, self.program.captureOperandSpan(span), .{ .self = self, .done = done }, struct {
+            fn visit(ctx: anytype, operand: Ast.CaptureOperand) Allocator.Error!void {
+                try ctx.self.rewriteCallsInExpr(operand.value, ctx.done);
+            }
+        }.visit);
     }
 
     fn rewriteCallsInFieldExprSpan(self: *Pass, span: Ast.Span(Ast.FieldExpr), done: []bool) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.FieldExpr, self.program.fieldExprSpan(span));
-        defer self.allocator.free(source);
-        for (source) |field| try self.rewriteCallsInExpr(field.value, done);
+        try walkSpanCloned(self.allocator, Ast.FieldExpr, self.program.fieldExprSpan(span), .{ .self = self, .done = done }, struct {
+            fn visit(ctx: anytype, field: Ast.FieldExpr) Allocator.Error!void {
+                try ctx.self.rewriteCallsInExpr(field.value, ctx.done);
+            }
+        }.visit);
     }
 
     fn rewriteCallsInBranchSpan(self: *Pass, span: Ast.Span(Ast.Branch), done: []bool) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.Branch, self.program.branchSpan(span));
-        defer self.allocator.free(source);
-        for (source) |branch| {
-            if (branch.guard) |guard| try self.rewriteCallsInExpr(guard, done);
-            try self.rewriteCallsInExpr(branch.body, done);
-        }
+        try walkSpanCloned(self.allocator, Ast.Branch, self.program.branchSpan(span), .{ .self = self, .done = done }, struct {
+            fn visit(ctx: anytype, branch: Ast.Branch) Allocator.Error!void {
+                if (branch.guard) |guard| try ctx.self.rewriteCallsInExpr(guard, ctx.done);
+                try ctx.self.rewriteCallsInExpr(branch.body, ctx.done);
+            }
+        }.visit);
     }
 
     fn rewriteCallsInIfBranchSpan(self: *Pass, span: Ast.Span(Ast.IfBranch), done: []bool) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.IfBranch, self.program.ifBranchSpan(span));
-        defer self.allocator.free(source);
-        for (source) |branch| {
-            try self.rewriteCallsInExpr(branch.cond, done);
-            try self.rewriteCallsInExpr(branch.body, done);
-        }
+        try walkSpanCloned(self.allocator, Ast.IfBranch, self.program.ifBranchSpan(span), .{ .self = self, .done = done }, struct {
+            fn visit(ctx: anytype, branch: Ast.IfBranch) Allocator.Error!void {
+                try ctx.self.rewriteCallsInExpr(branch.cond, ctx.done);
+                try ctx.self.rewriteCallsInExpr(branch.body, ctx.done);
+            }
+        }.visit);
     }
 
     fn rewriteCallsInStmtSpan(self: *Pass, span: Ast.Span(Ast.StmtId), done: []bool) Allocator.Error!void {
-        const source = try GuardedList.dupe(self.allocator, Ast.StmtId, self.program.stmtSpan(span));
-        defer self.allocator.free(source);
-        for (source) |stmt| try self.rewriteCallsInStmt(stmt, done);
+        try walkSpanCloned(self.allocator, Ast.StmtId, self.program.stmtSpan(span), .{ .self = self, .done = done }, struct {
+            fn visit(ctx: anytype, stmt: Ast.StmtId) Allocator.Error!void {
+                try ctx.self.rewriteCallsInStmt(stmt, ctx.done);
+            }
+        }.visit);
     }
 
     fn rewriteCallsInStmt(self: *Pass, stmt_id: Ast.StmtId, done: []bool) Allocator.Error!void {
@@ -3476,48 +3516,56 @@ const Cloner = struct {
     }
 
     fn collectCallPatternsInExprSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.ExprId)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |expr| try self.collectCallPatternsInExpr(owner, expr);
+        try walkSpanCloned(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, expr: Ast.ExprId) Common.LowerError!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, expr);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInCaptureOperandSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.CaptureOperand)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.CaptureOperand, self.pass.program.captureOperandSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |operand| try self.collectCallPatternsInExpr(owner, operand.value);
+        try walkSpanCloned(self.pass.allocator, Ast.CaptureOperand, self.pass.program.captureOperandSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, operand: Ast.CaptureOperand) Common.LowerError!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, operand.value);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInFieldExprSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.FieldExpr)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.FieldExpr, self.pass.program.fieldExprSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |field| try self.collectCallPatternsInExpr(owner, field.value);
+        try walkSpanCloned(self.pass.allocator, Ast.FieldExpr, self.pass.program.fieldExprSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, field: Ast.FieldExpr) Common.LowerError!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, field.value);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInBranchSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.Branch)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |branch| {
-            const change_start = self.changes.items.len;
-            defer self.restore(change_start);
-            try self.shadowPatLocals(branch.pat);
-            if (branch.guard) |guard| try self.collectCallPatternsInExpr(owner, guard);
-            try self.collectCallPatternsInExpr(owner, branch.body);
-        }
+        try walkSpanCloned(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, branch: Ast.Branch) Common.LowerError!void {
+                const change_start = ctx.self.changes.items.len;
+                defer ctx.self.restore(change_start);
+                try ctx.self.shadowPatLocals(branch.pat);
+                if (branch.guard) |guard| try ctx.self.collectCallPatternsInExpr(ctx.owner, guard);
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, branch.body);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInIfBranchSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.IfBranch)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |branch| {
-            try self.collectCallPatternsInExpr(owner, branch.cond);
-            try self.collectCallPatternsInExpr(owner, branch.body);
-        }
+        try walkSpanCloned(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, branch: Ast.IfBranch) Common.LowerError!void {
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, branch.cond);
+                try ctx.self.collectCallPatternsInExpr(ctx.owner, branch.body);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInStmtSpan(self: *Cloner, owner: Ast.FnId, span: Ast.Span(Ast.StmtId)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |stmt| try self.collectCallPatternsInStmt(owner, stmt);
+        try walkSpanCloned(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(span), .{ .self = self, .owner = owner }, struct {
+            fn visit(ctx: anytype, stmt: Ast.StmtId) Common.LowerError!void {
+                try ctx.self.collectCallPatternsInStmt(ctx.owner, stmt);
+            }
+        }.visit);
     }
 
     fn collectCallPatternsInStmt(self: *Cloner, owner: Ast.FnId, stmt_id: Ast.StmtId) Common.LowerError!void {
@@ -3634,7 +3682,10 @@ const Cloner = struct {
                 try self.rewriteCallsWithValuesInExpr(eq.lhs);
                 try self.rewriteCallsWithValuesInExpr(eq.rhs);
             },
-            .structural_hash => |h| try self.rewriteCallsWithValuesInExpr(h.value),
+            .structural_hash => |h| {
+                try self.rewriteCallsWithValuesInExpr(h.value);
+                try self.rewriteCallsWithValuesInExpr(h.hasher);
+            },
             .match_ => |match| {
                 try self.rewriteCallsWithValuesInExpr(match.scrutinee);
                 try self.rewriteCallsWithValuesInBranchSpan(match.branches);
@@ -3747,48 +3798,56 @@ const Cloner = struct {
     }
 
     fn rewriteCallsWithValuesInExprSpan(self: *Cloner, span: Ast.Span(Ast.ExprId)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |expr| try self.rewriteCallsWithValuesInExpr(expr);
+        try walkSpanCloned(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(span), self, struct {
+            fn visit(cloner: *Cloner, expr: Ast.ExprId) Common.LowerError!void {
+                try cloner.rewriteCallsWithValuesInExpr(expr);
+            }
+        }.visit);
     }
 
     fn rewriteCallsWithValuesInCaptureOperandSpan(self: *Cloner, span: Ast.Span(Ast.CaptureOperand)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.CaptureOperand, self.pass.program.captureOperandSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |operand| try self.rewriteCallsWithValuesInExpr(operand.value);
+        try walkSpanCloned(self.pass.allocator, Ast.CaptureOperand, self.pass.program.captureOperandSpan(span), self, struct {
+            fn visit(cloner: *Cloner, operand: Ast.CaptureOperand) Common.LowerError!void {
+                try cloner.rewriteCallsWithValuesInExpr(operand.value);
+            }
+        }.visit);
     }
 
     fn rewriteCallsWithValuesInFieldExprSpan(self: *Cloner, span: Ast.Span(Ast.FieldExpr)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.FieldExpr, self.pass.program.fieldExprSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |field| try self.rewriteCallsWithValuesInExpr(field.value);
+        try walkSpanCloned(self.pass.allocator, Ast.FieldExpr, self.pass.program.fieldExprSpan(span), self, struct {
+            fn visit(cloner: *Cloner, field: Ast.FieldExpr) Common.LowerError!void {
+                try cloner.rewriteCallsWithValuesInExpr(field.value);
+            }
+        }.visit);
     }
 
     fn rewriteCallsWithValuesInBranchSpan(self: *Cloner, span: Ast.Span(Ast.Branch)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |branch| {
-            const change_start = self.changes.items.len;
-            defer self.restore(change_start);
-            try self.shadowPatLocals(branch.pat);
-            if (branch.guard) |guard| try self.rewriteCallsWithValuesInExpr(guard);
-            try self.rewriteCallsWithValuesInExpr(branch.body);
-        }
+        try walkSpanCloned(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(span), self, struct {
+            fn visit(cloner: *Cloner, branch: Ast.Branch) Common.LowerError!void {
+                const change_start = cloner.changes.items.len;
+                defer cloner.restore(change_start);
+                try cloner.shadowPatLocals(branch.pat);
+                if (branch.guard) |guard| try cloner.rewriteCallsWithValuesInExpr(guard);
+                try cloner.rewriteCallsWithValuesInExpr(branch.body);
+            }
+        }.visit);
     }
 
     fn rewriteCallsWithValuesInIfBranchSpan(self: *Cloner, span: Ast.Span(Ast.IfBranch)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |branch| {
-            try self.rewriteCallsWithValuesInExpr(branch.cond);
-            try self.rewriteCallsWithValuesInExpr(branch.body);
-        }
+        try walkSpanCloned(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(span), self, struct {
+            fn visit(cloner: *Cloner, branch: Ast.IfBranch) Common.LowerError!void {
+                try cloner.rewriteCallsWithValuesInExpr(branch.cond);
+                try cloner.rewriteCallsWithValuesInExpr(branch.body);
+            }
+        }.visit);
     }
 
     fn rewriteCallsWithValuesInStmtSpan(self: *Cloner, span: Ast.Span(Ast.StmtId)) Common.LowerError!void {
-        const source = try GuardedList.dupe(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(span));
-        defer self.pass.allocator.free(source);
-        for (source) |stmt| try self.rewriteCallsWithValuesInStmt(stmt);
+        try walkSpanCloned(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(span), self, struct {
+            fn visit(cloner: *Cloner, stmt: Ast.StmtId) Common.LowerError!void {
+                try cloner.rewriteCallsWithValuesInStmt(stmt);
+            }
+        }.visit);
     }
 
     fn rewriteCallsWithValuesInStmt(self: *Cloner, stmt_id: Ast.StmtId) Common.LowerError!void {
@@ -6980,13 +7039,6 @@ const Cloner = struct {
             }
         }
 
-        const result = try self.materializeCallableWithCaptures(
-            callable.ty,
-            fn_id,
-            captures_span,
-            callable.captures,
-        );
-
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
@@ -7006,18 +7058,53 @@ const Cloner = struct {
         }
 
         // Build the body before writing the final function slot. The clone can
-        // re-enter callable materialization for this active specialization.
+        // re-enter callable materialization for this active specialization,
+        // reading the reserved slot's declared captures.
         const cloned_body = try self.cloneExpr(source_body);
+
+        // The arg-specializing clone above can dissolve a captured value's only
+        // use, so the specialized body may reference fewer captures than the
+        // source declared. `recomputeCaptures` shrinks the function's capture
+        // slots to exactly what the body reads; pin the slots to that same set
+        // now and build the reference operands to match. A callable reference
+        // left dangling by a speculative caller keeps the operand span produced
+        // here, and `verifyCaptureInvariants` checks every expression, so the
+        // span must already agree with the settled capture set rather than the
+        // source's larger one. A capture the recompute keeps is one whose local
+        // is read by the body (directly or as a residual call's capture
+        // operand), which is exactly what a use count over the body detects.
+        var used_captures = std.ArrayList(Ast.TypedLocal).empty;
+        defer used_captures.deinit(self.pass.allocator);
+        var used_values = std.ArrayList(CaptureValue).empty;
+        defer used_values.deinit(self.pass.allocator);
+        for (captures) |capture| {
+            if (localUseCountInExpr(self.pass.program, capture.local, cloned_body) == 0) continue;
+            try used_captures.append(self.pass.allocator, capture);
+            const id = self.pass.program.captureIdOfLocal(capture.local);
+            const value = callableCaptureValueForId(callable.captures, id) orelse
+                Common.invariant("specialized callable had no value for a used capture slot");
+            try used_values.append(self.pass.allocator, .{ .id = id, .value = value });
+        }
+
+        const used_span = if (used_captures.items.len == captures.len)
+            captures_span
+        else
+            try self.pass.program.addTypedLocalSpan(used_captures.items);
         self.pass.program.setFn(fn_id, .{
             .symbol = symbol,
             .source = source_fn.source,
             .args = args_span,
-            .captures = captures_span,
+            .captures = used_span,
             .body = .{ .roc = cloned_body },
             .ret = source_fn.ret,
         });
 
-        return result;
+        return try self.materializeCallableWithCaptures(
+            callable.ty,
+            fn_id,
+            used_span,
+            used_values.items,
+        );
     }
 
     fn materializeCallableWithCaptures(
@@ -8377,6 +8464,35 @@ test "call-pattern scans direct call and function reference capture operands" {
     try std.testing.expect(exprContainsReturn(&program, call_proc));
     try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, local, call_proc));
     try std.testing.expect(localUseBeforeEffect(&program, local, call_proc));
+}
+
+test "expression traversal visits both operands of structural_hash" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const unit_ty = try program.types.add(.zst);
+    const value_local = try program.addLocal(@enumFromInt(1), unit_ty);
+    const hasher_local = try program.addLocal(@enumFromInt(2), unit_ty);
+
+    const value_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .local = value_local } });
+    const hasher_local_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .local = hasher_local } });
+    const hasher_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .return_ = .{
+        .value = hasher_local_expr,
+        .target = unit_ty,
+    } } });
+    const hash_expr = try program.addExpr(.{ .ty = unit_ty, .data = .{ .structural_hash = .{
+        .value = value_expr,
+        .hasher = hasher_expr,
+    } } });
+
+    // The `hasher` operand is an unrestricted expression, so every traversal
+    // must descend into it as well as into `value`. A `return_` reachable only
+    // through `hasher` proves the hasher side is walked; counting each local
+    // proves both sides are walked exactly once.
+    try std.testing.expect(exprContainsReturn(&program, hash_expr));
+    try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, value_local, hash_expr));
+    try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, hasher_local, hash_expr));
 }
 
 test "call-pattern specialization preserves imported direct calls" {
