@@ -13068,8 +13068,7 @@ const EvidencePass = struct {
         var params = std.ArrayListUnmanaged(EvidenceParam).empty;
         defer params.deinit(self.allocator);
 
-        // by_def maps source defs to templates; entry wrappers and intrinsic
-        // wrappers have no scheme of their own (empty params).
+        // by_def maps source defs to templates.
         var template_defs = std.AutoHashMap(u32, CIR.Def.Idx).init(self.allocator);
         defer template_defs.deinit();
         for (self.templates.by_def) |entry| {
@@ -13078,7 +13077,13 @@ const EvidencePass = struct {
 
         for (self.templates.templates, 0..) |*template, template_index| {
             params.clearRetainingCapacity();
-            if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
+            if (template.body == .intrinsic_wrapper) {
+                // Intrinsic wrappers have no scheme of their own: their
+                // published evidence params are empty by construction, even
+                // though their annotation defs appear in `by_def`. Monotype
+                // lowering relies on this — an under-supplied intrinsic
+                // wrapper request is a consumer invariant.
+            } else if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
                 try self.enumerateParams(ModuleEnv.varFrom(def_idx), &params);
             } else switch (template.body) {
                 // An entry wrapper evaluates a compile-time root; plans inside
