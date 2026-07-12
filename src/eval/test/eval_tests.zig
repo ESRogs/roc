@@ -4472,28 +4472,31 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "(1, 1, 1, 1, 1, 1, 1, 1, 1, 1)" },
     },
     .{
-        // Directly exercises the steps_between length primitive: ascending ->
-        // Known(count); descending and equal -> Known(0) (the lower guard
-        // branch the range boundary tests never hit); and the U128/I128
-        // over-U64-width + Dec cases -> Unknown (the fallback that feeds the
-        // from_iter grow path).
-        .name = "inspect: steps_between reports Known counts, Known(0) descending, Unknown on overflow",
+        // Directly exercises the range length computation via size_hint:
+        // ascending -> Known(count); descending and empty -> Known(0) (the
+        // lower guard branch the range boundary tests never hit); inclusive
+        // singleton -> Known(1); the U128/I128 over-U64-width, the inclusive
+        // full-width count that exceeds U64, and Dec -> Unknown (which feeds
+        // the from_iter grow path).
+        .name = "inspect: range size_hint reports Known counts, Known(0) descending, Unknown on overflow",
         .source =
         \\{
         \\    (
-        \\        U8.steps_between(5, 10),
-        \\        U8.steps_between(10, 5),
-        \\        U8.steps_between(5, 5),
-        \\        I8.steps_between(-3, 2),
-        \\        I8.steps_between(2, -3),
-        \\        U128.steps_between(0, 100),
-        \\        U128.steps_between(0, U128.highest),
-        \\        I128.steps_between(0, I128.highest),
-        \\        Dec.steps_between(1.0, 5.0),
+        \\        Iter.size_hint(U8.range_exclusive(5, 10)),
+        \\        Iter.size_hint(U8.range_exclusive(10, 5)),
+        \\        Iter.size_hint(U8.range_exclusive(5, 5)),
+        \\        Iter.size_hint(U8.range_inclusive(5, 5)),
+        \\        Iter.size_hint(I8.range_exclusive(-3, 2)),
+        \\        Iter.size_hint(I8.range_exclusive(2, -3)),
+        \\        Iter.size_hint(U128.range_exclusive(0, 100)),
+        \\        Iter.size_hint(U128.range_exclusive(0, U128.highest)),
+        \\        Iter.size_hint(I128.range_exclusive(0, I128.highest)),
+        \\        Iter.size_hint(U64.range_inclusive(0, U64.highest)),
+        \\        Iter.size_hint(Dec.range_exclusive(1.0, 5.0)),
         \\    )
         \\}
         ,
-        .expected = .{ .inspect_str = "(Known(5), Known(0), Known(0), Known(5), Known(0), Known(100), Unknown, Unknown, Unknown)" },
+        .expected = .{ .inspect_str = "(Known(5), Known(0), Known(0), Known(1), Known(5), Known(0), Known(100), Unknown, Unknown, Unknown, Unknown)" },
     },
     .{
         // Collecting a range whose length is Unknown (Dec ranges always report

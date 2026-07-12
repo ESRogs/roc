@@ -12527,7 +12527,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         // function calling //
         .e_call => |call| {
             switch (call.called_via) {
-                .apply, .record_builder, .range => blk: {
+                .apply, .record_builder => blk: {
                     // First, check the function being called
                     // It could be effectful, e.g. `(mk_fn!())(arg)`
                     self.checking_call_arg = true;
@@ -15506,6 +15506,49 @@ fn checkBinopExpr(
             const arg_var = rhs_var;
 
             // Create the binop constraint with unified arg type
+            try self.mkBinopConstraint(
+                arg_var,
+                arg_var,
+                ret_var,
+                method_name,
+                false,
+                env,
+                expr_region,
+                expr_idx,
+            );
+
+            // Set the expression to redirect to the return type
+            _ = try self.unify(expr_var, ret_var, env);
+        },
+        .range_exclusive, .range_inclusive => {
+            const method_name = switch (binop.op) {
+                .range_exclusive => self.cir.idents.range_exclusive,
+                .range_inclusive => self.cir.idents.range_inclusive,
+                else => unreachable,
+            };
+
+            if (try self.reportMissingNominalMethodForBinop(lhs_var, rhs_var, expr_var, method_name, env, expr_region)) {
+                return does_fx;
+            }
+
+            // For range binops, both bounds must have the same type.
+            const arg_unify_result = try self.unify(lhs_var, rhs_var, env);
+
+            if (!arg_unify_result.isOk()) {
+                try self.unifyWith(expr_var, .err, env);
+                return does_fx;
+            }
+
+            const arg_var = rhs_var;
+
+            // Range binops carry the contract `ret = Iter(bound)`: the
+            // operator exists to produce an iterator over the bound type, and
+            // pinning that shape here lets context at the iterator (a `for`
+            // loop's item type, an `Iter(U8)` annotation) flow back into
+            // still-open numeral bounds before they default.
+            const ret_var = try self.mkIterVar(arg_var, env, expr_region);
+
+            // Create the binop static dispatch function: bound.method(bound) -> Iter(bound)
             try self.mkBinopConstraint(
                 arg_var,
                 arg_var,
