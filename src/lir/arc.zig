@@ -81,6 +81,11 @@ pub var migration_counters: MigrationCounters = .{};
 
 const count_migration = builtin.mode == .Debug;
 
+/// Debug-only check that the liveness table and the forward scans agree at
+/// every query; removed once the scans are deleted at the end of the
+/// join-summary migration.
+const differential_liveness = builtin.mode == .Debug and builtin.os.tag != .freestanding;
+
 fn migrationCountersRequested() bool {
     if (comptime !builtin.link_libc) return false;
     const value = std.c.getenv("ROC_ARC_COUNTERS") orelse return false;
@@ -115,6 +120,47 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     var solution = try arc_solve.solve(store.allocator, store, local_contains_refcounted, options.roots);
     defer solution.deinit();
     inserter.solution = &solution;
+
+    // Liveness-table bit layout: [0, localCount) raw locals with
+    // read-before-rebind semantics, then one bit per multi-member borrow
+    // group (group-use semantics: any member read, no kills), then one bit
+    // per borrowed call-result local (value-use semantics: RC statements are
+    // not uses, string-match captures kill on the match edge).
+    const no_liveness_bit = std.math.maxInt(u32);
+    var group_bit_index = try store.allocator.alloc(u32, store.localCount());
+    defer store.allocator.free(group_bit_index);
+    @memset(group_bit_index, no_liveness_bit);
+    var group_leaders = std.ArrayList(LIR.LocalId).empty;
+    defer group_leaders.deinit(store.allocator);
+    for (0..store.localCount()) |local_index| {
+        const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(local_index)));
+        const leader = solution.leaderOf(local);
+        if (leader != local) continue;
+        if (solution.groupMembers(leader).len <= 1) continue;
+        group_bit_index[local_index] = @intCast(group_leaders.items.len);
+        try group_leaders.append(store.allocator, leader);
+    }
+    var value_use_bit_index = try store.allocator.alloc(u32, store.localCount());
+    defer store.allocator.free(value_use_bit_index);
+    @memset(value_use_bit_index, no_liveness_bit);
+    var value_use_locals = std.ArrayList(LIR.LocalId).empty;
+    defer value_use_locals.deinit(store.allocator);
+    for (0..store.cfStmtCount()) |stmt_index| {
+        const target = switch (store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))))) {
+            .assign_call => |assign| assign.target,
+            .assign_call_erased => |assign| assign.target,
+            else => continue,
+        };
+        if (!solution.isBorrowed(target)) continue;
+        if (value_use_bit_index[@intFromEnum(target)] != no_liveness_bit) continue;
+        value_use_bit_index[@intFromEnum(target)] = @intCast(value_use_locals.items.len);
+        try value_use_locals.append(store.allocator, target);
+    }
+    inserter.group_bit_index = group_bit_index;
+    inserter.group_leaders = group_leaders.items;
+    inserter.value_use_bit_index = value_use_bit_index;
+    inserter.value_use_locals = value_use_locals.items;
+    inserter.liveness_bit_len = store.localCount() + group_leaders.items.len + value_use_locals.items.len;
 
     var scan_needles = try OwnedSet.init(store.allocator, store.localCount());
     defer scan_needles.deinit();
@@ -490,6 +536,21 @@ const Inserter = struct {
     reads_before_rebind_cache: *std.AutoHashMap(ReadBeforeRebindKey, std.bit_set.DynamicBitSetUnmanaged) = undefined,
     read_cache_arena: *std.heap.ArenaAllocator = undefined,
     read_cache_allocator: Allocator = undefined,
+    /// Group-bit index per local: leaders of multi-member borrow groups map
+    /// to a dense index (others hold maxInt). Group bits live at
+    /// `localCount() + index` in the liveness table.
+    group_bit_index: []const u32 = &.{},
+    /// Leader local per dense group-bit index.
+    group_leaders: []const LIR.LocalId = &.{},
+    /// Value-use bit index per local: borrowed call-result locals map to a
+    /// dense index (others hold maxInt). Value-use bits live at
+    /// `localCount() + group_leaders.len + index` in the liveness table.
+    value_use_bit_index: []const u32 = &.{},
+    /// Local per dense value-use bit index.
+    value_use_locals: []const LIR.LocalId = &.{},
+    /// Total liveness-table bit width: raw locals, then group bits, then
+    /// value-use bits.
+    liveness_bit_len: usize = 0,
     /// Live mapping from an OwnedSet address used as a loop keep-set to its
     /// explicit cache identity. IDs are never reused within one proc emission,
     /// and the map entry is removed before the keep-set storage is destroyed.
@@ -3031,7 +3092,7 @@ const Inserter = struct {
     ) ResourceError!void {
         if (!owned.contains(local)) return;
         if (self.solution.isJoinParam(local)) return;
-        if (try self.localValueUsedInPath(next, local, loop_keep)) return;
+        if (try self.valueUsedInPath(next, local, loop_keep)) return;
         owned.unset(local);
         if (collected) |list| {
             try list.append(self.store.allocator, local);
@@ -3663,6 +3724,14 @@ const Inserter = struct {
         }
     }
 
+    /// Kill applied to one successor edge only: value-use bits of string
+    /// match captures die on the match edge (the capture is rebound there),
+    /// while the miss edge still exposes earlier bindings' uses.
+    const ReadBeforeRebindEdgeKill = struct {
+        successor_offset: u32,
+        bit: u32,
+    };
+
     const ReadBeforeRebindNode = struct {
         stmt: LIR.CFStmtId,
         reads: std.bit_set.DynamicBitSetUnmanaged,
@@ -3670,6 +3739,7 @@ const Inserter = struct {
         successor_start: usize,
         successor_len: u32,
         def: ?LIR.LocalId,
+        edge_kills: []const ReadBeforeRebindEdgeKill = &.{},
     };
 
     const ReadBeforeRebindGraph = struct {
@@ -3701,9 +3771,9 @@ const Inserter = struct {
     ) ResourceError!void {
         if (graph.indices.contains(stmt)) return;
 
-        var reads = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.localCount());
+        var reads = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.liveness_bit_len);
         errdefer reads.deinit(graph.allocator);
-        var exposed = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.localCount());
+        var exposed = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.liveness_bit_len);
         errdefer exposed.deinit(graph.allocator);
 
         const index = graph.nodes.items.len;
@@ -3741,16 +3811,65 @@ const Inserter = struct {
         reads.set(@intFromEnum(local));
     }
 
-    fn noteReadBeforeRebindSpan(self: *Inserter, reads: *std.bit_set.DynamicBitSetUnmanaged, span: LIR.LocalSpan) void {
+    /// Group-bit position of a local's multi-member borrow group, if any.
+    fn groupBitOf(self: *const Inserter, local: LIR.LocalId) ?usize {
+        const leader = self.solution.leaderOf(local);
+        const index = self.group_bit_index[@intFromEnum(leader)];
+        if (index == std.math.maxInt(u32)) return null;
+        return self.store.localCount() + index;
+    }
+
+    /// Value-use bit position of a borrowed call-result local, if any.
+    fn valueUseBitOf(self: *const Inserter, local: LIR.LocalId) ?usize {
+        const index = self.value_use_bit_index[@intFromEnum(local)];
+        if (index == std.math.maxInt(u32)) return null;
+        return self.store.localCount() + self.group_leaders.len + index;
+    }
+
+    /// Records a value use: the raw read-before-rebind bit, the local's
+    /// group bit, and its value-use bit. Reference-count statements record
+    /// only the raw bit through `noteReadBeforeRebindLocal`: they must not
+    /// extend group or call-result liveness.
+    fn noteLivenessUseLocal(self: *const Inserter, reads: *std.bit_set.DynamicBitSetUnmanaged, local: LIR.LocalId) void {
+        reads.set(@intFromEnum(local));
+        if (self.groupBitOf(local)) |bit| reads.set(bit);
+        if (self.valueUseBitOf(local)) |bit| reads.set(bit);
+    }
+
+    fn noteLivenessUseSpan(self: *const Inserter, reads: *std.bit_set.DynamicBitSetUnmanaged, span: LIR.LocalSpan) void {
         const locals = self.store.getLocalSpan(span);
         for (0..GuardedList.borrowLen(locals)) |index| {
             const local = GuardedList.at(locals, index);
-            noteReadBeforeRebindLocal(reads, local);
+            self.noteLivenessUseLocal(reads, local);
         }
     }
 
-    fn noteReadBeforeRebindRefOp(reads: *std.bit_set.DynamicBitSetUnmanaged, op: LIR.RefOp) void {
-        noteReadBeforeRebindLocal(reads, refOpSource(op));
+    fn noteLivenessUseRefOp(self: *const Inserter, reads: *std.bit_set.DynamicBitSetUnmanaged, op: LIR.RefOp) void {
+        self.noteLivenessUseLocal(reads, refOpSource(op));
+    }
+
+    /// Records the loop keep-set as reads at a `loop_continue`/`loop_break`:
+    /// kept units, groups with any kept member, and kept call-result locals
+    /// all stay live across the loop edge.
+    fn noteLivenessLoopKeep(self: *const Inserter, reads: *std.bit_set.DynamicBitSetUnmanaged, keep: *const OwnedSet) void {
+        // The keep-set is local-count wide while the table rows carry the
+        // extra group and value-use bits, so the raw bits copy one by one.
+        var keep_iter = keep.bits.iterator(.{});
+        while (keep_iter.next()) |kept| reads.set(kept);
+        for (self.group_leaders, 0..) |leader, group_index| {
+            const members = self.solution.groupMembers(leader);
+            for (members) |member| {
+                if (keep.bits.isSet(member)) {
+                    reads.set(self.store.localCount() + group_index);
+                    break;
+                }
+            }
+        }
+        for (self.value_use_locals, 0..) |local, value_index| {
+            if (keep.contains(local)) {
+                reads.set(self.store.localCount() + self.group_leaders.len + value_index);
+            }
+        }
     }
 
     fn setReadBeforeRebindDef(
@@ -3759,6 +3878,38 @@ const Inserter = struct {
         local: LIR.LocalId,
     ) void {
         graph.nodes.items[node_index].def = local;
+    }
+
+    /// Records value-use kills for one string-match arm: a capture view is
+    /// rebound on that arm's match edge, so the previous binding's value-use
+    /// liveness does not flow back through it.
+    fn attachStrMatchEdgeKills(
+        self: *Inserter,
+        graph: *ReadBeforeRebindGraph,
+        node_index: usize,
+        steps_span: LIR.StrMatchStepSpan,
+        successor_offset: u32,
+    ) ResourceError!void {
+        var kills = std.ArrayList(ReadBeforeRebindEdgeKill).empty;
+        const steps = self.store.getStrMatchSteps(steps_span);
+        for (0..GuardedList.borrowLen(steps)) |step_index| {
+            const step = GuardedList.at(steps, step_index);
+            switch (step.capture) {
+                .discard => {},
+                .view => |local| if (self.valueUseBitOf(local)) |bit| {
+                    try kills.append(graph.allocator, .{
+                        .successor_offset = successor_offset,
+                        .bit = @intCast(bit),
+                    });
+                },
+            }
+        }
+        if (kills.items.len == 0) return;
+        const existing = graph.nodes.items[node_index].edge_kills;
+        const merged = try graph.allocator.alloc(ReadBeforeRebindEdgeKill, existing.len + kills.items.len);
+        @memcpy(merged[0..existing.len], existing);
+        @memcpy(merged[existing.len..], kills.items);
+        graph.nodes.items[node_index].edge_kills = merged;
     }
 
     fn computeReadsBeforeRebind(
@@ -3796,7 +3947,7 @@ const Inserter = struct {
 
             switch (self.store.getCFStmt(stmt)) {
                 .assign_ref => |assign| {
-                    noteReadBeforeRebindRefOp(&graph.nodes.items[node_index].reads, assign.op);
+                    self.noteLivenessUseRefOp(&graph.nodes.items[node_index].reads, assign.op);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
@@ -3809,56 +3960,56 @@ const Inserter = struct {
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, init.next);
                 },
                 .assign_call => |assign| {
-                    self.noteReadBeforeRebindSpan(&graph.nodes.items[node_index].reads, assign.args);
+                    self.noteLivenessUseSpan(&graph.nodes.items[node_index].reads, assign.args);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .assign_call_erased => |assign| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, assign.closure);
-                    self.noteReadBeforeRebindSpan(&graph.nodes.items[node_index].reads, assign.args);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, assign.closure);
+                    self.noteLivenessUseSpan(&graph.nodes.items[node_index].reads, assign.args);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .assign_packed_erased_fn => |assign| {
-                    if (assign.capture) |capture| noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, capture);
+                    if (assign.capture) |capture| self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, capture);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .assign_low_level => |assign| {
-                    self.noteReadBeforeRebindSpan(&graph.nodes.items[node_index].reads, assign.args);
+                    self.noteLivenessUseSpan(&graph.nodes.items[node_index].reads, assign.args);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .assign_list => |assign| {
-                    self.noteReadBeforeRebindSpan(&graph.nodes.items[node_index].reads, assign.elems);
+                    self.noteLivenessUseSpan(&graph.nodes.items[node_index].reads, assign.elems);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .assign_struct => |assign| {
-                    self.noteReadBeforeRebindSpan(&graph.nodes.items[node_index].reads, assign.fields);
+                    self.noteLivenessUseSpan(&graph.nodes.items[node_index].reads, assign.fields);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .assign_tag => |assign| {
-                    if (assign.payload) |payload| noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, payload);
+                    if (assign.payload) |payload| self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, payload);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .set_local => |assign| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, assign.value);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, assign.value);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
                 .debug => |debug_stmt| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, debug_stmt.message);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, debug_stmt.message);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, debug_stmt.next);
                 },
                 .expect => |expect_stmt| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, expect_stmt.condition);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, expect_stmt.condition);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, expect_stmt.next);
                 },
                 .expect_err => |expect_err_stmt| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, expect_err_stmt.message);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, expect_err_stmt.message);
                 },
                 .incref => |rc| {
                     noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, rc.value);
@@ -3869,8 +4020,8 @@ const Inserter = struct {
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, rc.next);
                 },
                 .decref_if_initialized => |rc| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, rc.cond);
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, rc.value);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, rc.cond);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, rc.value);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, rc.next);
                 },
                 .free => |rc| {
@@ -3878,7 +4029,7 @@ const Inserter = struct {
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, rc.next);
                 },
                 .switch_stmt => |switch_stmt| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, switch_stmt.cond);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, switch_stmt.cond);
                     if (switch_stmt.continuation) |continuation| {
                         try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, continuation);
                     }
@@ -3890,24 +4041,29 @@ const Inserter = struct {
                     }
                 },
                 .switch_initialized_payload => |switch_stmt| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, switch_stmt.cond);
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, switch_stmt.payload);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, switch_stmt.cond);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, switch_stmt.payload);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, switch_stmt.initialized_branch);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, switch_stmt.uninitialized_branch);
                 },
                 .str_match => |str_match| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, str_match.source);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, str_match.source);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, str_match.on_match);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, str_match.on_miss);
+                    try self.attachStrMatchEdgeKills(&graph, node_index, str_match.steps, 0);
                 },
                 .str_match_set => |str_match_set| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, str_match_set.source);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, str_match_set.source);
                     const arms = self.store.getStrMatchArms(str_match_set.arms);
                     for (0..GuardedList.borrowLen(arms)) |arm_index| {
                         const arm = GuardedList.at(arms, arm_index);
                         try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, arm.on_match);
                     }
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, str_match_set.on_miss);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
+                        try self.attachStrMatchEdgeKills(&graph, node_index, arm.steps, @intCast(arm_index));
+                    }
                 },
                 .join => |join_stmt| {
                     // Entering a join statement itself continues with the
@@ -3925,12 +4081,12 @@ const Inserter = struct {
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, target_body);
                 },
                 .ret => |ret_stmt| {
-                    noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, ret_stmt.value);
+                    self.noteLivenessUseLocal(&graph.nodes.items[node_index].reads, ret_stmt.value);
                 },
                 .loop_continue,
                 .loop_break,
                 => if (loop_keep) |keep| {
-                    graph.nodes.items[node_index].reads.setUnion(keep.bits);
+                    self.noteLivenessLoopKeep(&graph.nodes.items[node_index].reads, keep);
                 },
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
@@ -3972,7 +4128,8 @@ const Inserter = struct {
             }
         }
 
-        var scratch = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, self.store.localCount());
+        var scratch = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, self.liveness_bit_len);
+        var edge_scratch = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, self.liveness_bit_len);
         var in_work = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, node_count);
         var node_work = std.ArrayList(usize).empty;
         try node_work.ensureTotalCapacity(graph_allocator, node_count);
@@ -3988,12 +4145,27 @@ const Inserter = struct {
             scratch.unsetAll();
             const successor_start = node.successor_start;
             const successor_end = successor_start + @as(usize, node.successor_len);
-            for (graph.successors.items[successor_start..successor_end]) |successor| {
+            for (graph.successors.items[successor_start..successor_end], 0..) |successor, successor_offset| {
                 const successor_index = graph.indices.get(successor) orelse unreachable;
-                scratch.setUnion(graph.nodes.items[successor_index].exposed);
+                var edge_killed = false;
+                for (node.edge_kills) |kill| {
+                    if (kill.successor_offset != successor_offset) continue;
+                    if (!edge_killed) {
+                        edge_scratch.unsetAll();
+                        edge_scratch.setUnion(graph.nodes.items[successor_index].exposed);
+                        edge_killed = true;
+                    }
+                    edge_scratch.unset(kill.bit);
+                }
+                if (edge_killed) {
+                    scratch.setUnion(edge_scratch);
+                } else {
+                    scratch.setUnion(graph.nodes.items[successor_index].exposed);
+                }
             }
             if (node.def) |local| {
                 scratch.unset(@intFromEnum(local));
+                if (self.valueUseBitOf(local)) |bit| scratch.unset(bit);
             }
             scratch.setUnion(node.reads);
 
@@ -4023,6 +4195,36 @@ const Inserter = struct {
 
         return self.reads_before_rebind_cache.getPtr(key) orelse
             arcInvariant("ARC read-before-rebind cache did not include requested start");
+    }
+
+    /// Value liveness for one raw local (no group extension): answered by
+    /// the value-use bit of the liveness table when the local carries one,
+    /// with the forward scan retained during migration for the differential
+    /// check and for loop keep-sets that carry no table identity.
+    fn valueUsedInPath(
+        self: *Inserter,
+        start: LIR.CFStmtId,
+        needle: LIR.LocalId,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!bool {
+        const loop_keep_id: ?u32 = if (loop_keep) |keep|
+            self.active_loop_keep_ids.get(@intFromPtr(keep))
+        else
+            0;
+        if (loop_keep_id) |keep_id| {
+            if (self.valueUseBitOf(needle)) |bit| {
+                const reads = try self.computeReadsBeforeRebind(start, loop_keep, keep_id);
+                const table_used = reads.isSet(bit);
+                if (comptime differential_liveness) {
+                    const scanned = try self.localValueUsedInPath(start, needle, loop_keep);
+                    if (scanned != table_used) {
+                        arcInvariant("ARC liveness table disagreed with the value-use scan");
+                    }
+                }
+                return table_used;
+            }
+        }
+        return self.localValueUsedInPath(start, needle, loop_keep);
     }
 
     fn localValueUsedInPath(
@@ -4216,18 +4418,67 @@ const Inserter = struct {
         local: LIR.LocalId,
         loop_keep: ?*const OwnedSet,
     ) ResourceError!bool {
-        const members = self.solution.groupMembers(self.solution.leaderOf(local));
+        const leader = self.solution.leaderOf(local);
+        const members = self.solution.groupMembers(leader);
+        const loop_keep_id: ?u32 = if (loop_keep) |keep|
+            self.active_loop_keep_ids.get(@intFromPtr(keep))
+        else
+            0;
         if (members.len <= 1) {
-            const loop_keep_id: ?u32 = if (loop_keep) |keep|
-                self.active_loop_keep_ids.get(@intFromPtr(keep))
-            else
-                0;
             if (loop_keep_id) |keep_id| {
                 const reads = try self.computeReadsBeforeRebind(start, loop_keep, keep_id);
                 return reads.isSet(@intFromEnum(local));
             }
             return self.localValueUsedInPath(start, local, loop_keep);
         }
+        if (loop_keep_id) |keep_id| {
+            const group_bit = self.groupBitOf(leader) orelse
+                arcInvariant("ARC multi-member borrow group missing its liveness group bit");
+            const reads = try self.computeReadsBeforeRebind(start, loop_keep, keep_id);
+            const table_used = reads.isSet(group_bit);
+            if (comptime differential_liveness) {
+                const scanned = try self.groupUsedInPathByScan(start, members, loop_keep);
+                if (scanned != table_used) {
+                    std.debug.print(
+                        "arc-liveness-mismatch: local={d} leader={d} members={any} start={d} keep_id={d} table={} scan={}\n",
+                        .{ @intFromEnum(local), @intFromEnum(leader), members, @intFromEnum(start), keep_id, table_used, scanned },
+                    );
+                    for (members) |member| {
+                        const member_local: LIR.LocalId = @enumFromInt(member);
+                        const member_scan = try self.localValueUsedInPath(start, member_local, loop_keep);
+                        std.debug.print(
+                            "  member={d} raw_bit={} value_scan={} start_tag={s} member_leader={d} member_group_bit={?d}\n",
+                            .{
+                                member,
+                                reads.isSet(member),
+                                member_scan,
+                                @tagName(self.store.getCFStmt(start)),
+                                @intFromEnum(self.solution.leaderOf(member_local)),
+                                self.groupBitOf(member_local),
+                            },
+                        );
+                    }
+                    std.debug.print(
+                        "  group_bit={d} local_count={d} bit_len={d} reads_len={d}\n",
+                        .{ group_bit, self.store.localCount(), self.liveness_bit_len, reads.bit_length },
+                    );
+                    arcInvariant("ARC liveness table disagreed with the group-use scan");
+                }
+            }
+            return table_used;
+        }
+        return self.groupUsedInPathByScan(start, members, loop_keep);
+    }
+
+    /// Forward-scan variant of the multi-member group query; retained during
+    /// the liveness-table migration for the differential check and for loop
+    /// keep-sets that carry no table identity.
+    fn groupUsedInPathByScan(
+        self: *Inserter,
+        start: LIR.CFStmtId,
+        members: []const u32,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!bool {
         for (members) |member| {
             self.scan_needles.set(@enumFromInt(member));
         }
