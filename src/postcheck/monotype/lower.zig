@@ -116,7 +116,6 @@ pub fn run(
         verifyMonotypeTypeStore(&program);
         verifyMonotypeCompletedTypeIds(&program);
         verifyMonotypeCallTargets(&program);
-        builder.countBy("evidence_missing", builder.evidence_missing_count);
         builder.spec_store.validateLookupIntegrity();
         verifyMonotypeSpecsReady(&program);
     }
@@ -190,9 +189,6 @@ const SpecEvidence = union(enum) {
     /// Checking rejected the edge's requirement (a reported missing method);
     /// the dispatch lowers to an explicit crash.
     checked_error,
-    /// Checking left the requirement unresolved (migration gap). Consuming
-    /// it falls back to owner derivation until the migration completes.
-    unavailable,
 };
 
 const SpecEvidenceTarget = struct {
@@ -267,7 +263,6 @@ fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
         },
         .unreachable_value => b == .unreachable_value,
         .checked_error => b == .checked_error,
-        .unavailable => b == .unavailable,
     };
 }
 
@@ -277,18 +272,6 @@ fn specEvidenceVectorEql(a: []const SpecEvidence, b: []const SpecEvidence) bool 
         if (!specEvidenceEql(a_entry, b_entry)) return false;
     }
     return true;
-}
-
-/// True when either vector contains an `unavailable` migration gap (agreement
-/// can only be asserted between fully-resolved vectors).
-fn evidenceVectorsHaveGaps(a: []const SpecEvidence, b: []const SpecEvidence) bool {
-    for (a) |entry| {
-        if (entry == .unavailable) return true;
-    }
-    for (b) |entry| {
-        if (entry == .unavailable) return true;
-    }
-    return false;
 }
 
 const MethodDispatch = struct {
@@ -584,10 +567,6 @@ const Builder = struct {
     /// Owns every materialized `SpecEvidence` tree; freed wholesale with the
     /// builder.
     evidence_arena: std.heap.ArenaAllocator,
-    /// Dispatch requirements whose checked evidence could not resolve
-    /// (migration gaps still covered by owner derivation); audited by the
-    /// total-dispatch migration before the derivation path is deleted.
-    evidence_missing_count: usize = 0,
 
     fn init(allocator: Allocator, modules: Common.CheckedModules, program: *Ast.Program, options: Options) Builder {
         var spec_store = specialize.SpecBuilder.init(allocator, &program.names, &program.types, &program.specs);
@@ -663,16 +642,6 @@ const Builder = struct {
     fn countBy(self: *Builder, comptime field: []const u8, amount: usize) void {
         if (self.counters) |counters| {
             @field(counters, field) += @intCast(amount);
-        }
-    }
-
-    /// Record one dispatch requirement the checked evidence could not cover
-    /// (owner derivation resolves it during the migration). The tagged debug
-    /// log drives the audit that must reach zero before derivation is deleted.
-    fn evidenceGap(self: *Builder, comptime reason: []const u8, context: []const u8) void {
-        self.evidence_missing_count += 1;
-        if (@import("builtin").mode == .Debug) {
-            std.log.scoped(.monotype).debug("evidence gap [" ++ reason ++ "]: {s}", .{context});
         }
     }
 
@@ -1448,45 +1417,16 @@ const Builder = struct {
             // checking resolved that edge's evidence (chain-free: concrete
             // targets, mono-default owners, structural, vacuous) as site
             // evidence keyed by the root's body expression.
-            var filled = false;
             if (try body_ctx.rootEdgeEvidence(view, template)) |root_evidence| {
                 body_ctx.evidence = .{ .vector = root_evidence };
-                filled = true;
             } else if (template.body != .intrinsic_wrapper) {
                 // Root-edge request scheduled after checking output was sealed (eval/REPL
                 // entries): resolve the requirements from the template's own
                 // dispatcher paths over the requested callable — the sealed
                 // mono type carries the checker's defaults.
-                const synthesized = try body_ctx.synthesizeParamsEvidence(view, template, lower_fn_ty);
-                var complete = synthesized.len == template.evidence_params.len;
-                for (synthesized) |entry| {
-                    if (entry == .unavailable) complete = false;
-                }
-                if (complete) {
-                    body_ctx.evidence = .{ .vector = synthesized };
-                    filled = true;
-                }
-            }
-            if (!filled) {
-                // Requesting edges that predate full evidence threading (or
-                // counted gaps from checking) leave the vector short; owner
-                // derivation still resolves those requirements during the
-                // migration.
-                const proc_base = view.names.procBase(template_ref.proc_base);
-                const template_name = if (proc_base.export_name) |export_name| view.names.exportNameText(export_name) else "<unnamed>";
-                var short = template.evidence_params.len - spec_evidence.len;
-                while (short > 0) : (short -= 1) {
-                    self.evidenceGap("spec-vector-short", template_name);
-                    if (@import("builtin").mode == .Debug) {
-                        const params = view.templates.evidenceParams(&template);
-                        const missing = params[spec_evidence.len + short - 1];
-                        std.log.scoped(.monotype).debug("  in module: {s} missing param {d}: {s}", .{
-                            view.module_env.module_name,
-                            spec_evidence.len + short - 1,
-                            view.names.methodNameText(missing.method),
-                        });
-                    }
-                }
+                body_ctx.evidence = .{ .vector = try body_ctx.synthesizeParamsEvidence(view, template, lower_fn_ty) };
+            } else {
+                Common.invariant("intrinsic wrapper specialization request supplied fewer evidence entries than its scheme's params");
             }
         }
         body_ctx.source_region_override = source_region_override;
@@ -1586,7 +1526,6 @@ const Builder = struct {
                         const existing = self.lowered_templates.get(hit.fn_id) orelse
                             Common.invariant("Monotype specialization index found a local template missing from lowering state");
                         if (existing.evidence.len == evidence.len and
-                            !evidenceVectorsHaveGaps(existing.evidence, evidence) and
                             !specEvidenceVectorEql(existing.evidence, evidence))
                         {
                             Common.invariant("specialization edges disagreed on dispatch evidence");
@@ -16766,15 +16705,13 @@ const BodyContext = struct {
                 .type_only => {},
             }
         }
-        // `dispatchTarget` raises the "dispatch plan had no method owner" invariant
-        // when the receiver never grounded to a concrete owner and the result mode
-        // is not a structural dispatch. That is only reachable inside a bare
-        // polymorphic function value never called at a concrete type — e.g.
-        // evaluating `run` itself for `run : a -> a where [a.go : a -> a]`.
-        // Checking classified such dispatches (`unreachable_dispatch`, or a
-        // `checked_error` for reported missing methods); both lower to an
-        // explicit crash. A genuinely reachable ownerless dispatch was
-        // rejected at check time.
+        // A dispatch whose receiver never grounds to a concrete owner is only
+        // reachable inside a bare polymorphic function value never called at
+        // a concrete type — e.g. evaluating `run` itself for
+        // `run : a -> a where [a.go : a -> a]`. Checking classified such
+        // dispatches (`unreachable_dispatch`, or a `checked_error` for
+        // reported missing methods); both lower to an explicit crash. A
+        // genuinely reachable ownerless dispatch was rejected at check time.
         if (self.planUnexecutable(plan)) |reason| {
             const crash_ty = expected_ret_ty orelse plan_ret_ty;
             try self.constrainTypeToMono(checked_ret_ty, crash_ty);
@@ -16787,7 +16724,7 @@ const BodyContext = struct {
                 .checked_error => "method dispatch failed to check",
             });
         }
-        const lookup = self.dispatchTarget(plan, dispatcher_ty);
+        const lookup = self.dispatchTarget(plan);
         if (lookup == null) {
             return switch (plan.result_mode) {
                 // `.equality` and `.hash` are both handled by lowerStructuralEquality,
@@ -16885,12 +16822,9 @@ const BodyContext = struct {
 
         const callable_mono_ty = try call_ctx.instantiateNumeralPlanCallType(plan.callable_ty, self, checked_ret_ty, target_ty, plan_args);
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked from_numeral plan had a non-function type");
-        const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
-        defer self.allocator.free(plan_arg_tys);
         const try_ty = plan_fn_data.ret;
 
-        const dispatcher_ty = try self.dispatcherMonoType(plan, plan_arg_tys);
-        const resolved = self.dispatchTarget(plan, dispatcher_ty) orelse
+        const resolved = self.dispatchTarget(plan) orelse
             Common.invariant("checked from_numeral dispatch unexpectedly resolved to structural equality");
 
         const target_mono_ty = try self.methodTargetMonoTypePreservingSourceArgsAndRet(resolved, try_ty);
@@ -17483,7 +17417,7 @@ const BodyContext = struct {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
-        const resolved = self.dispatchTarget(plan, dispatcher_ty) orelse {
+        const resolved = self.dispatchTarget(plan) orelse {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         };
@@ -17535,11 +17469,8 @@ const BodyContext = struct {
                 return .{ .target = try self.materializeEvidenceTarget(node) };
             },
             .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse {
-                    self.builder.evidenceGap("materialize-chain-miss", "");
-                    return .unavailable;
-                };
-                return entry;
+                return self.evidence.at(constraint_ref) orelse
+                    Common.invariant("checked evidence constraint ref was outside the edge's evidence chain");
             },
             .structural => |kind| return .{ .structural = kind },
             .checked_error => return .checked_error,
@@ -17576,13 +17507,14 @@ const BodyContext = struct {
                 return .{ .resolved = try self.materializeEvidence(self.view.static_dispatch_plans.nestedEvidence(node)) };
             },
             .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse return .{ .resolved = &.{} };
+                const entry = self.evidence.at(constraint_ref) orelse
+                    Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain");
                 return switch (entry) {
                     .target => |target| switch (target.nested) {
                         .resolved => |nested| .{ .resolved = nested },
                         .synthesize => .synthesize,
                     },
-                    .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
+                    .structural, .unreachable_value, .checked_error => .{ .resolved = &.{} },
                 };
             },
             .structural, .checked_error, .unreachable_dispatch => return .{ .resolved = &.{} },
@@ -17598,13 +17530,14 @@ const BodyContext = struct {
                 return .{ .resolved = try self.materializeEvidence(self.view.static_dispatch_plans.nestedEvidence(node)) };
             },
             .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse return .{ .resolved = &.{} };
+                const entry = self.evidence.at(constraint_ref) orelse
+                    Common.invariant("iterator dispatch plan's constraint ref was outside the edge's evidence chain");
                 return switch (entry) {
                     .target => |target| switch (target.nested) {
                         .resolved => |nested| .{ .resolved = nested },
                         .synthesize => .synthesize,
                     },
-                    .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
+                    .structural, .unreachable_value, .checked_error => .{ .resolved = &.{} },
                 };
             },
             .structural, .checked_error, .unreachable_dispatch => return .{ .resolved = &.{} },
@@ -17618,27 +17551,21 @@ const BodyContext = struct {
         structural,
     };
 
-    /// The plan's checked (or edge-supplied) resolution, if the migration
-    /// has one for it. Null means owner derivation still decides
-    /// (unresolved plans, unavailable edge evidence, checked errors).
-    fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, count_gaps: bool) ?EvidenceResolved {
+    /// The plan's checked (or edge-supplied) resolution. Null only for
+    /// dispatches that never resolve a target: unreachable and checked-error
+    /// dispatches, which `planUnexecutable` lowers to explicit crashes first.
+    fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?EvidenceResolved {
         switch (plan.resolution) {
             .direct => |node_id| return .{ .target = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target) },
             .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse {
-                    if (count_gaps) self.builder.evidenceGap("dispatch-chain-miss", self.view.names.methodNameText(plan.method));
-                    return null;
-                };
+                const entry = self.evidence.at(constraint_ref) orelse
+                    Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain");
                 return switch (entry) {
                     .target => |target| .{ .target = .{ .view = target.view, .target = target.target } },
                     .structural => .structural,
                     // Unreachable and checked-error dispatches crash before
                     // target resolution.
                     .unreachable_value, .checked_error => null,
-                    .unavailable => blk: {
-                        if (count_gaps) self.builder.evidenceGap("dispatch-entry-unavailable", self.view.names.methodNameText(plan.method));
-                        break :blk null;
-                    },
                 };
             },
             .structural => return .structural,
@@ -17656,55 +17583,26 @@ const BodyContext = struct {
         return switch (plan.resolution) {
             .unreachable_dispatch => .unreachable_value,
             .checked_error => .checked_error,
-            .constraint => |constraint_ref| if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
+            .constraint => |constraint_ref| switch (self.evidence.at(constraint_ref) orelse
+                Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain")) {
                 .unreachable_value => .unreachable_value,
                 .checked_error => .checked_error,
-                .target, .structural, .unavailable => null,
-            } else null,
+                .target, .structural => null,
+            },
             .direct, .structural => null,
         };
-    }
-
-    /// Iterator-call twin of `debugCompareDerivation`.
-    fn debugCompareIteratorDerivation(self: *BodyContext, dispatcher_ty: Type.TypeId, method: names.MethodNameId, consumed: MethodLookup) void {
-        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse return;
-        const derived = self.builder.lookupMethodTarget(owner, self.view, method) orelse return;
-        if (!std.meta.eql(consumed.target, derived.target)) {
-            Common.invariant("iterator dispatch evidence target disagreed with the owner-derivation target");
-        }
     }
 
     fn dispatchTarget(
         self: *BodyContext,
         plan: static_dispatch.StaticDispatchCallPlan,
-        dispatcher_ty: Type.TypeId,
     ) ?MethodLookup {
-        const resolution = self.evidenceResolution(plan, true) orelse
+        const resolution = self.evidenceResolution(plan) orelse
             Common.invariant("dispatch plan reached monotype lowering without a resolution");
-        // Debug audit: where owner derivation can still resolve the dispatch,
-        // it must agree with the consumed evidence.
-        if (@import("builtin").mode == .Debug) self.debugCompareDerivation(plan, dispatcher_ty, resolution);
         return switch (resolution) {
             .target => |lookup| lookup,
             .structural => null,
         };
-    }
-
-    /// Migration audit: where owner derivation can still resolve the dispatch,
-    /// it must agree with the consumed evidence. Derivation being blind (no
-    /// owner, or registry miss) while evidence resolves is the migration's
-    /// point, not a bug.
-    fn debugCompareDerivation(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, dispatcher_ty: Type.TypeId, resolution: EvidenceResolved) void {
-        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse return;
-        const derived = self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse return;
-        switch (resolution) {
-            .target => |lookup| {
-                if (!std.meta.eql(lookup.target, derived.target)) {
-                    Common.invariant("dispatch evidence target disagreed with the owner-derivation target");
-                }
-            },
-            .structural => Common.invariant("dispatch evidence chose structural but owner derivation found a target"),
-        }
     }
 
     fn structuralKindForMethodText(method_text: []const u8) ?static_dispatch.StructuralKind {
@@ -17925,15 +17823,10 @@ const BodyContext = struct {
         for (params, 0..) |param, i| {
             const path = view.templates.evidenceParamPath(param);
             if (path.len == 0) {
-                self.builder.evidenceGap("synthesize-pathless", view.names.methodNameText(param.method));
-                out[i] = .unavailable;
-                continue;
+                Common.invariant("synthesized evidence param's dispatcher has no path over the scheme's callable");
             }
-            const component_ty = try self.walkEvidencePath(view, callable_mono_ty, path) orelse {
-                self.builder.evidenceGap("synthesize-path-miss", view.names.methodNameText(param.method));
-                out[i] = .unavailable;
-                continue;
-            };
+            const component_ty = try self.walkEvidencePath(view, callable_mono_ty, path) orelse
+                Common.invariant("synthesized evidence param's dispatcher path diverged from the concrete callable");
             out[i] = try self.synthesizeComponentEvidence(view, param.method, component_ty);
         }
         return out;
@@ -17964,8 +17857,8 @@ const BodyContext = struct {
     }
 
     /// Walk a checked dispatcher path over a concrete monomorphic type.
-    /// Null when the mono shape diverges from the checked scheme's (e.g. an
-    /// erased row) — the requirement then stays a counted gap.
+    /// Null when the mono shape diverges from the checked scheme's; the
+    /// caller treats that divergence as a compiler invariant violation.
     fn walkEvidencePath(
         self: *BodyContext,
         view: ModuleView,
@@ -23272,35 +23165,16 @@ const BodyContext = struct {
         if (!self.sameType(dispatcher_ty, actual_dispatcher_ty)) {
             Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
         }
-        const lookup: MethodLookup = blk: {
-            // Consume the checked (or edge-supplied) resolution; owner
-            // owner derivation still covers migration leftovers and its comparison
-            // audit.
-            switch (plan.resolution) {
-                .direct => |node_id| {
-                    const consumed = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target);
-                    if (@import("builtin").mode == .Debug) self.debugCompareIteratorDerivation(dispatcher_ty, plan.method, consumed);
-                    break :blk consumed;
-                },
-                .constraint => |constraint_ref| {
-                    if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
-                        .target => |target| {
-                            const consumed: MethodLookup = .{ .view = target.view, .target = target.target };
-                            if (@import("builtin").mode == .Debug) self.debugCompareIteratorDerivation(dispatcher_ty, plan.method, consumed);
-                            break :blk consumed;
-                        },
-                        .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
-                        .unavailable => self.builder.evidenceGap("iterator-entry-unavailable", self.view.names.methodNameText(plan.method)),
-                    } else {
-                        self.builder.evidenceGap("iterator-chain-miss", self.view.names.methodNameText(plan.method));
-                    }
-                },
-                .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
-            }
-            const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse
-                Common.invariant("iterator dispatch plan had no method owner");
-            break :blk self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse
-                Common.invariant("checked iterator dispatch method registry is missing resolved target");
+        // Consume the checked (or edge-supplied) resolution; iterator
+        // dispatches always resolve to a callable target.
+        const lookup: MethodLookup = switch (plan.resolution) {
+            .direct => |node_id| self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target),
+            .constraint => |constraint_ref| switch (self.evidence.at(constraint_ref) orelse
+                Common.invariant("iterator dispatch plan's constraint ref was outside the edge's evidence chain")) {
+                .target => |target| .{ .view = target.view, .target = target.target },
+                .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
+            },
+            .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
         };
 
         const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, callable_mono_ty);
