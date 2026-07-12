@@ -2663,74 +2663,18 @@ Builtin :: [].{
 			)
 
 		## Iterator over `num` values from `start` up to but not including `end`.
-		## Returns an empty iterator if `start >= end`. This is what `start..<end` desugars to.
-		exclusive_range : num, num -> Iter(num)
-			where [
-				num.is_lt : num, num -> Bool,
-				num.add_try : num, num -> Try(num, [Overflow]),
-				num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
-				num.steps_between : num, num -> [Known(U64), Unknown],
-			]
-		exclusive_range = |start, end|
-			iter_from_step(
-				start.steps_between(end),
-				||
-					if start < end {
-						One({
-							item: start,
-							rest: match start.add_try(1) {
-								Ok(next) => if next < end {
-									Iter.exclusive_range(next, end)
-								} else {
-									range_done()
-								}
-								Err(Overflow) => range_done()
-							},
-						})
-					} else {
-						Done
-					},
-			)
+		## Returns an empty iterator if `start >= end`. Generic sugar for the
+		## `range_exclusive` method that `start..<end` dispatches on the bound type.
+		range_exclusive : num, num -> Iter(num)
+			where [num.range_exclusive : num, num -> Iter(num)]
+		range_exclusive = |start, end| start.range_exclusive(end)
 
 		## Iterator over `num` values from `start` up to and including `end`.
-		## Returns an empty iterator if `start > end`. This is what `start..=end` desugars to.
-		inclusive_range : num, num -> Iter(num)
-			where [
-				num.is_lte : num, num -> Bool,
-				num.add_try : num, num -> Try(num, [Overflow]),
-				num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
-				num.steps_between : num, num -> [Known(U64), Unknown],
-			]
-		inclusive_range = |start, end|
-			iter_from_step(
-				if start <= end {
-					match start.steps_between(end) {
-						Known(n) => match n.add_try(1) {
-							Ok(len) => Known(len)
-							Err(Overflow) => Unknown
-						}
-						Unknown => Unknown
-					}
-				} else {
-					Known(0)
-				},
-				||
-					if start <= end {
-						One({
-							item: start,
-							rest: match start.add_try(1) {
-								Ok(next) => if next <= end {
-									Iter.inclusive_range(next, end)
-								} else {
-									range_done()
-								}
-								Err(Overflow) => range_done()
-							},
-						})
-					} else {
-						Done
-					},
-			)
+		## Returns an empty iterator if `start > end`. Generic sugar for the
+		## `range_inclusive` method that `start..=end` dispatches on the bound type.
+		range_inclusive : num, num -> Iter(num)
+			where [num.range_inclusive : num, num -> Iter(num)]
+		range_inclusive = |start, end| start.range_inclusive(end)
 
 		iter : Iter(item) -> Iter(item)
 		iter = |self| self
@@ -4498,6 +4442,39 @@ Builtin :: [].{
 	].{
 		DictBucket : { dist_and_fingerprint : U32, entry_index : U32 }
 
+		# INTERNAL SEED-DOMAIN REPRESENTATION INVARIANT
+		#
+		# The high bit of `shifts` records which seed was used to build the current
+		# bucket table; the low seven bits store the actual shift count:
+		#
+		#   0 means the buckets use the deterministic compile-time seed 0.
+		#   1 means the buckets use the randomized process runtime seed.
+		#
+		# This bit and the two seed domains are compiler/host implementation data.
+		# They are not part of Dict's userspace API and must never be exposed as a
+		# source-level option or observable Dict property. Trusted host code may
+		# deliberately construct seed-0 constants when that is correct, but normal
+		# runtime Dict construction always uses the runtime seed.
+		#
+		# Lookup expands the bit to an all-zero or all-one U64 mask and bitwise-ANDs
+		# that mask with the runtime seed. This selects seed 0 or the runtime seed
+		# without a branch, a larger Dict value, a different hash algorithm, or any
+		# startup initialization. Compile-time evaluation must produce seed 0
+		# directly; it must never derive constant data from an address or any other
+		# process-specific state, so identical compiler inputs remain deterministic.
+		#
+		# The bit describes the seed used by the buckets, not when or where the
+		# surrounding value was allocated. Operations that preserve a bucket table
+		# preserve its bit. However, whenever an ordinary runtime operation rehashes
+		# a seed-0 Dict, it must rebuild every bucket with the runtime seed and set
+		# the bit to 1. This is required even when uniqueness permits the buckets to
+		# be updated in place: in-place mutation does not permit seed 0 to survive a
+		# runtime rehash. In particular, runtime-controlled keys must never be added
+		# to a seed-0 bucket table; convert it to the runtime seed first. This rule is
+		# what preserves hash-flooding protection for malicious runtime input.
+		#
+		# Hosts and generated glue that inspect or mutate Dict values must follow the
+		# same rules and use the same authoritative process runtime seed as Roc.
 		DictData(k, v) : {
 			entries : List((k, v)),
 			buckets : List(DictBucket),
@@ -4511,8 +4488,8 @@ Builtin :: [].{
 			shifts : U8,
 		}
 
-		## Returns `Bool.True` if the two dictionaries contain the same key-value
-		## pairs, and `Bool.False` otherwise.
+		## Returns [True] if the two dictionaries contain the same key-value
+		## pairs, and [False] otherwise.
 		is_eq : Dict(k, v), Dict(k, v) -> Bool
 			where [
 				k.is_eq : k, k -> Bool,
@@ -4558,7 +4535,7 @@ Builtin :: [].{
 				var $entry_hashes = 0
 
 				for (key, value) in data.entries {
-					entry_hash = hasher_finish(Value.to_hash(value, Key.to_hash(key, hasher_start(dict_seed()))))
+					entry_hash = hasher_finish(Value.to_hash(value, Key.to_hash(key, hasher)))
 					$entry_hashes = dict_combine_entry_hashes($entry_hashes, entry_hash)
 				}
 
@@ -4571,7 +4548,7 @@ Builtin :: [].{
 		## empty_dict = Dict.empty()
 		## ```
 		empty : () -> Dict(_k, _v)
-		empty = || HashMap({ entries: [], buckets: [], max_entries_before_grow: 0, shifts: dict_initial_shifts })
+		empty = || HashMap({ entries: [], buckets: [], max_entries_before_grow: 0, shifts: dict_shifts_for_current_seed(dict_initial_shifts) })
 
 		## Returns an empty `Dict` with room for at least the requested number of entries.
 		with_capacity : U64 -> Dict(_k, _v)
@@ -4708,17 +4685,7 @@ Builtin :: [].{
 						HashMap({ entries, buckets: data.buckets, max_entries_before_grow: data.max_entries_before_grow, shifts: data.shifts })
 					}
 					Missing(missing) => {
-						if List.len(data.entries) < data.max_entries_before_grow {
-							HashMap(dict_insert_new_data(data, missing.bucket_index, missing.dist_and_fingerprint, key, value))
-						} else {
-							prepared = dict_ensure_capacity(data, dict_add_capacity(List.len(data.entries), 1))
-							match dict_find(prepared, key) {
-								Found(_) => {
-									crash "Dict invariant violated: found duplicate after growth"
-								}
-								Missing(grown_missing) => HashMap(dict_insert_new_data(prepared, grown_missing.bucket_index, grown_missing.dist_and_fingerprint, key, value))
-							}
-						}
+						HashMap(dict_insert_absent_data(data, missing, key, value))
 					}
 				}
 			}
@@ -4839,8 +4806,9 @@ Builtin :: [].{
 					}
 				}
 				empty_buckets = List.map(data.buckets, |_| dict_empty_bucket)
-				buckets = dict_fill_buckets_from_entries(empty_buckets, $entries, data.shifts)
-				HashMap({ entries: $entries, buckets, max_entries_before_grow: data.max_entries_before_grow, shifts: data.shifts })
+				shifts = dict_shifts_for_current_seed(data.shifts)
+				buckets = dict_fill_buckets_from_entries(empty_buckets, $entries, shifts)
+				HashMap({ entries: $entries, buckets, max_entries_before_grow: data.max_entries_before_grow, shifts })
 			}
 		}
 
@@ -5009,12 +4977,7 @@ Builtin :: [].{
 					}
 				Missing(missing) =>
 					match alter(Try.Err(Missing)) {
-						Try.Ok(new_value) =>
-							if List.len(data.entries) < data.max_entries_before_grow {
-								HashMap(dict_insert_new_data(data, missing.bucket_index, missing.dist_and_fingerprint, key, new_value))
-							} else {
-								Dict.insert(dict, key, new_value)
-							}
+						Try.Ok(new_value) => HashMap(dict_insert_absent_data(data, missing, key, new_value))
 						Try.Err(Missing) => dict
 					}
 				}
@@ -5448,12 +5411,31 @@ Builtin :: [].{
 			add_try : U8, U8 -> Try(U8, [Overflow, ..])
 			add_try = |a, b| unsigned_add_try(U8.highest, a, b)
 
-			steps_between : U8, U8 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [U8] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U8] values.
+			range_exclusive : U8, U8 -> Iter(U8)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [U8] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U8] values.
+			range_inclusive : U8, U8 -> Iter(U8)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					Known(start.abs_diff(end).to_u64() + 1)
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [U8] values, saturating at [U8.highest] on overflow rather than wrapping around.
 			## ```roc
@@ -5572,6 +5554,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U8, U8 -> Try(U8, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U8] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U8.div_by].
+			## ```roc
+			## expect U8.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U8, U8 -> U8
+			div_floor_by = |a, b| U8.div_by(a, b)
 
 			## Divide the first [U8] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U8.div_by].
@@ -6085,12 +6075,31 @@ Builtin :: [].{
 			add_try : I8, I8 -> Try(I8, [Overflow, ..])
 			add_try = |a, b| signed_add_try(I8.lowest, I8.highest, 0, a, b)
 
-			steps_between : I8, I8 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [I8] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I8] values.
+			range_exclusive : I8, I8 -> Iter(I8)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [I8] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I8] values.
+			range_inclusive : I8, I8 -> Iter(I8)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					Known(start.abs_diff(end).to_u64() + 1)
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [I8] values, saturating at [I8.highest] or [I8.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -6233,6 +6242,27 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : I8, I8 -> Try(I8, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I8.lowest, I8.highest, 0, 1, -1, a, b)
+
+			## Divide the first [I8] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I8.div_floor_by(7, 2) == 3
+			##
+			## expect I8.div_floor_by(-7, 2) == -4
+			##
+			## expect I8.div_floor_by(7, -2) == -4
+			##
+			## expect I8.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I8, I8 -> I8
+			div_floor_by = |a, b| {
+				quotient = I8.div_trunc_by(a, b)
+				remainder = I8.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
 
 			## Divide the first [I8] by the second, truncating toward zero.
 			## ```roc
@@ -6781,12 +6811,31 @@ Builtin :: [].{
 			add_try : U16, U16 -> Try(U16, [Overflow, ..])
 			add_try = |a, b| unsigned_add_try(U16.highest, a, b)
 
-			steps_between : U16, U16 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [U16] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U16] values.
+			range_exclusive : U16, U16 -> Iter(U16)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [U16] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U16] values.
+			range_inclusive : U16, U16 -> Iter(U16)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					Known(start.abs_diff(end).to_u64() + 1)
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [U16] values, saturating at [U16.highest] on overflow rather than wrapping around.
 			## ```roc
@@ -6905,6 +6954,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U16, U16 -> Try(U16, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U16] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U16.div_by].
+			## ```roc
+			## expect U16.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U16, U16 -> U16
+			div_floor_by = |a, b| U16.div_by(a, b)
 
 			## Divide the first [U16] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U16.div_by].
@@ -7451,12 +7508,31 @@ Builtin :: [].{
 			add_try : I16, I16 -> Try(I16, [Overflow, ..])
 			add_try = |a, b| signed_add_try(I16.lowest, I16.highest, 0, a, b)
 
-			steps_between : I16, I16 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [I16] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I16] values.
+			range_exclusive : I16, I16 -> Iter(I16)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [I16] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I16] values.
+			range_inclusive : I16, I16 -> Iter(I16)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					Known(start.abs_diff(end).to_u64() + 1)
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [I16] values, saturating at [I16.highest] or [I16.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -7599,6 +7675,27 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : I16, I16 -> Try(I16, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I16.lowest, I16.highest, 0, 1, -1, a, b)
+
+			## Divide the first [I16] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I16.div_floor_by(7, 2) == 3
+			##
+			## expect I16.div_floor_by(-7, 2) == -4
+			##
+			## expect I16.div_floor_by(7, -2) == -4
+			##
+			## expect I16.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I16, I16 -> I16
+			div_floor_by = |a, b| {
+				quotient = I16.div_trunc_by(a, b)
+				remainder = I16.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
 
 			## Divide the first [I16] by the second, truncating toward zero.
 			## ```roc
@@ -8162,12 +8259,31 @@ Builtin :: [].{
 			add_try : U32, U32 -> Try(U32, [Overflow, ..])
 			add_try = |a, b| unsigned_add_try(U32.highest, a, b)
 
-			steps_between : U32, U32 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [U32] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U32] values.
+			range_exclusive : U32, U32 -> Iter(U32)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [U32] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U32] values.
+			range_inclusive : U32, U32 -> Iter(U32)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					Known(start.abs_diff(end).to_u64() + 1)
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [U32] values, saturating at [U32.highest] on overflow rather than wrapping around.
 			## ```roc
@@ -8286,6 +8402,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U32, U32 -> Try(U32, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U32] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U32.div_by].
+			## ```roc
+			## expect U32.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U32, U32 -> U32
+			div_floor_by = |a, b| U32.div_by(a, b)
 
 			## Divide the first [U32] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U32.div_by].
@@ -8864,12 +8988,31 @@ Builtin :: [].{
 			add_try : I32, I32 -> Try(I32, [Overflow, ..])
 			add_try = |a, b| signed_add_try(I32.lowest, I32.highest, 0, a, b)
 
-			steps_between : I32, I32 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [I32] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I32] values.
+			range_exclusive : I32, I32 -> Iter(I32)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end).to_u64())
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [I32] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I32] values.
+			range_inclusive : I32, I32 -> Iter(I32)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					Known(start.abs_diff(end).to_u64() + 1)
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [I32] values, saturating at [I32.highest] or [I32.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -9012,6 +9155,27 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : I32, I32 -> Try(I32, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I32.lowest, I32.highest, 0, 1, -1, a, b)
+
+			## Divide the first [I32] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I32.div_floor_by(7, 2) == 3
+			##
+			## expect I32.div_floor_by(-7, 2) == -4
+			##
+			## expect I32.div_floor_by(7, -2) == -4
+			##
+			## expect I32.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I32, I32 -> I32
+			div_floor_by = |a, b| {
+				quotient = I32.div_trunc_by(a, b)
+				remainder = I32.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
 
 			## Divide the first [I32] by the second, truncating toward zero.
 			## ```roc
@@ -9592,12 +9756,34 @@ Builtin :: [].{
 			add_try : U64, U64 -> Try(U64, [Overflow, ..])
 			add_try = |a, b| unsigned_add_try(U64.highest, a, b)
 
-			steps_between : U64, U64 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [U64] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U64] values.
+			range_exclusive : U64, U64 -> Iter(U64)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end))
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [U64] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U64] values.
+			range_inclusive : U64, U64 -> Iter(U64)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					match start.abs_diff(end).add_try(1) {
+						Ok(len) => Known(len)
+						Err(Overflow) => Unknown
+					}
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [U64] values, saturating at [U64.highest] on overflow rather than wrapping around.
 			## ```roc
@@ -9716,6 +9902,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U64, U64 -> Try(U64, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U64] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U64.div_by].
+			## ```roc
+			## expect U64.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U64, U64 -> U64
+			div_floor_by = |a, b| U64.div_by(a, b)
 
 			## Divide the first [U64] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U64.div_by].
@@ -10333,12 +10527,34 @@ Builtin :: [].{
 			add_try : I64, I64 -> Try(I64, [Overflow, ..])
 			add_try = |a, b| signed_add_try(I64.lowest, I64.highest, 0, a, b)
 
-			steps_between : I64, I64 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [I64] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I64] values.
+			range_exclusive : I64, I64 -> Iter(I64)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					Known(start.abs_diff(end))
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [I64] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I64] values.
+			range_inclusive : I64, I64 -> Iter(I64)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					match start.abs_diff(end).add_try(1) {
+						Ok(len) => Known(len)
+						Err(Overflow) => Unknown
+					}
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [I64] values, saturating at [I64.highest] or [I64.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -10481,6 +10697,27 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : I64, I64 -> Try(I64, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I64.lowest, I64.highest, 0, 1, -1, a, b)
+
+			## Divide the first [I64] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I64.div_floor_by(7, 2) == 3
+			##
+			## expect I64.div_floor_by(-7, 2) == -4
+			##
+			## expect I64.div_floor_by(7, -2) == -4
+			##
+			## expect I64.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I64, I64 -> I64
+			div_floor_by = |a, b| {
+				quotient = I64.div_trunc_by(a, b)
+				remainder = I64.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
 
 			## Divide the first [I64] by the second, truncating toward zero.
 			## ```roc
@@ -11083,15 +11320,40 @@ Builtin :: [].{
 			add_try : U128, U128 -> Try(U128, [Overflow, ..])
 			add_try = |a, b| unsigned_add_try(U128.highest, a, b)
 
-			steps_between : U128, U128 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [U128] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [U128] values.
+			range_exclusive : U128, U128 -> Iter(U128)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					match start.abs_diff(end).to_u64_try() {
-						Ok(n) => Known(n)
+						Ok(steps) => Known(steps)
 						Err(OutOfRange) => Unknown
 					}
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [U128] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [U128] values.
+			range_inclusive : U128, U128 -> Iter(U128)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					match start.abs_diff(end).to_u64_try() {
+						Ok(steps) => match steps.add_try(1) {
+							Ok(len) => Known(len)
+							Err(Overflow) => Unknown
+						}
+						Err(OutOfRange) => Unknown
+					}
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [U128] values, saturating at [U128.highest] on overflow rather than wrapping around.
 			## ```roc
@@ -11210,6 +11472,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U128, U128 -> Try(U128, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U128] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U128.div_by].
+			## ```roc
+			## expect U128.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U128, U128 -> U128
+			div_floor_by = |a, b| U128.div_by(a, b)
 
 			## Divide the first [U128] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U128.div_by].
@@ -11865,15 +12135,40 @@ Builtin :: [].{
 			add_try : I128, I128 -> Try(I128, [Overflow, ..])
 			add_try = |a, b| signed_add_try(I128.lowest, I128.highest, 0, a, b)
 
-			steps_between : I128, I128 -> [Known(U64), Unknown]
-			steps_between = |start, end|
-				if start < end
+			## Iterator over [I128] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [I128] values.
+			range_exclusive : I128, I128 -> Iter(I128)
+			range_exclusive = |start, end| {
+				len_if_known = if start < end
 					match start.abs_diff(end).to_u64_try() {
-						Ok(n) => Known(n)
+						Ok(steps) => Known(steps)
 						Err(OutOfRange) => Unknown
 					}
 				else
 					Known(0)
+
+				range_exclusive_with_len(start, end, len_if_known)
+			}
+
+			## Iterator over [I128] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [I128] values.
+			range_inclusive : I128, I128 -> Iter(I128)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					match start.abs_diff(end).to_u64_try() {
+						Ok(steps) => match steps.add_try(1) {
+							Ok(len) => Known(len)
+							Err(Overflow) => Unknown
+						}
+						Err(OutOfRange) => Unknown
+					}
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [I128] values, saturating at [I128.highest] or [I128.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -12016,6 +12311,27 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : I128, I128 -> Try(I128, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I128.lowest, I128.highest, 0, 1, -1, a, b)
+
+			## Divide the first [I128] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I128.div_floor_by(7, 2) == 3
+			##
+			## expect I128.div_floor_by(-7, 2) == -4
+			##
+			## expect I128.div_floor_by(7, -2) == -4
+			##
+			## expect I128.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I128, I128 -> I128
+			div_floor_by = |a, b| {
+				quotient = I128.div_trunc_by(a, b)
+				remainder = I128.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
 
 			## Divide the first [I128] by the second, truncating toward zero.
 			## ```roc
@@ -12677,8 +12993,24 @@ Builtin :: [].{
 			## in a fractional `[start, end)` range advancing by `1` would require
 			## `ceil(end - start)`; until that is implemented, `Unknown` is always a
 			## correct (if imprecise) length hint.
-			steps_between : Dec, Dec -> [Known(U64), Unknown]
-			steps_between = |_start, _end| Unknown
+			## Iterator over [Dec] values from `start` up to but not including `end`.
+			## Returns an empty iterator if `start >= end`. This is what `start..<end`
+			## desugars to when the bounds are [Dec] values.
+			range_exclusive : Dec, Dec -> Iter(Dec)
+			range_exclusive = |start, end| range_exclusive_with_len(start, end, Unknown)
+
+			## Iterator over [Dec] values from `start` up to and including `end`.
+			## Returns an empty iterator if `start > end`. This is what `start..=end`
+			## desugars to when the bounds are [Dec] values.
+			range_inclusive : Dec, Dec -> Iter(Dec)
+			range_inclusive = |start, end| {
+				len_if_known = if start <= end
+					Unknown
+				else
+					Known(0)
+
+				range_inclusive_with_len(start, end, len_if_known)
+			}
 
 			## Add two [Dec] values, saturating at [Dec.highest] or [Dec.lowest] on overflow rather than wrapping around.
 			## ```roc
@@ -12816,6 +13148,15 @@ Builtin :: [].{
 			## expect Dec.div_trunc_by(-7.5, 2.0) == -3.0
 			## ```
 			div_trunc_by : Dec, Dec -> Dec
+
+			## Divide the first [Dec] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect Dec.div_floor_by(7.5, 2.0) == 3.0
+			##
+			## expect Dec.div_floor_by(-7.5, 2.0) == -4.0
+			## ```
+			div_floor_by : Dec, Dec -> Dec
+			div_floor_by = |a, b| dec_floor_to_whole(Dec.div_by(a, b))
 
 			## Return the remainder of dividing the first [Dec] by the second.
 			## The sign of the result matches the sign of the dividend.
@@ -13806,6 +14147,15 @@ Builtin :: [].{
 			## ```
 			div_trunc_by : F32, F32 -> F32
 
+			## Divide the first [F32] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect F32.div_floor_by(7.5, 2.0).to_str() == "3"
+			##
+			## expect F32.div_floor_by(-7.5, 2.0).to_str() == "-4"
+			## ```
+			div_floor_by : F32, F32 -> F32
+			div_floor_by = |a, b| f32_floor_unsafe(F32.div_by(a, b))
+
 			## Return the remainder of dividing the first [F32] by the second.
 			## The sign of the result matches the sign of the dividend.
 			## ```roc
@@ -14063,6 +14413,50 @@ Builtin :: [].{
 			## parse user text with [F32.from_str] instead.
 			from_numeral : Numeral -> Try(F32, [InvalidNumeral(Str)])
 			from_numeral = |numeral| from_numeral_with(numeral, |str| f32_from_str(str))
+
+			## Iterator over [F32] values from `start` up to but not including `end`,
+			## incrementing by 1. Returns an empty iterator if `start >= end`.
+			## This is what `start..<end` desugars to when the bounds are [F32] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_exclusive : F32, F32 -> Iter(F32)
+			range_exclusive = |start, end|
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done or cur >= end {
+							Err(NoMore)
+						} else {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						},
+				)
+
+			## Iterator over [F32] values from `start` up to and including `end`,
+			## incrementing by 1. Returns an empty iterator if `start > end`.
+			## This is what `start..=end` desugars to when the bounds are [F32] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_inclusive : F32, F32 -> Iter(F32)
+			range_inclusive = |start, end|
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done {
+							Err(NoMore)
+						} else if cur < end {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						} else if cur == end {
+							Ok((cur, (cur, True)))
+						} else {
+							Err(NoMore)
+						},
+				)
 
 			## Parse an [F32] from a [Str]. Returns `Err(BadNumStr)` if the
 			## string is not a valid decimal number, or if the parsed value does
@@ -14698,6 +15092,15 @@ Builtin :: [].{
 			## ```
 			div_trunc_by : F64, F64 -> F64
 
+			## Divide the first [F64] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect F64.div_floor_by(7.5, 2.0).to_str() == "3"
+			##
+			## expect F64.div_floor_by(-7.5, 2.0).to_str() == "-4"
+			## ```
+			div_floor_by : F64, F64 -> F64
+			div_floor_by = |a, b| f64_floor_unsafe(F64.div_by(a, b))
+
 			## Return the remainder of dividing the first [F64] by the second.
 			## The sign of the result matches the sign of the dividend.
 			## ```roc
@@ -14955,6 +15358,50 @@ Builtin :: [].{
 			## parse user text with [F64.from_str] instead.
 			from_numeral : Numeral -> Try(F64, [InvalidNumeral(Str)])
 			from_numeral = |numeral| from_numeral_with(numeral, |str| f64_from_str(str))
+
+			## Iterator over [F64] values from `start` up to but not including `end`,
+			## incrementing by 1. Returns an empty iterator if `start >= end`.
+			## This is what `start..<end` desugars to when the bounds are [F64] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_exclusive : F64, F64 -> Iter(F64)
+			range_exclusive = |start, end|
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done or cur >= end {
+							Err(NoMore)
+						} else {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						},
+				)
+
+			## Iterator over [F64] values from `start` up to and including `end`,
+			## incrementing by 1. Returns an empty iterator if `start > end`.
+			## This is what `start..=end` desugars to when the bounds are [F64] values.
+			##
+			## Once the values are large enough that adding 1 can no longer produce a
+			## bigger float, the iterator yields that value once and then ends.
+			range_inclusive : F64, F64 -> Iter(F64)
+			range_inclusive = |start, end|
+				Iter.custom(
+					(start, False),
+					Unknown,
+					|(cur, done)|
+						if done {
+							Err(NoMore)
+						} else if cur < end {
+							next = cur + 1
+							if next > cur Ok((cur, (next, False))) else Ok((cur, (cur, True)))
+						} else if cur == end {
+							Ok((cur, (cur, True)))
+						} else {
+							Err(NoMore)
+						},
+				)
 
 			## Parse an [F64] from a [Str]. Returns `Err(BadNumStr)` if the
 			## string is not a valid decimal number, or if the parsed value does
@@ -15260,6 +15707,12 @@ dict_fingerprint_mask = dict_dist_inc - 1
 dict_initial_shifts : U8
 dict_initial_shifts = 61
 
+dict_runtime_seed_bit : U8
+dict_runtime_seed_bit = 128
+
+dict_shifts_mask : U8
+dict_shifts_mask = 127
+
 dict_min_shifts : U8
 dict_min_shifts = 32
 
@@ -15269,8 +15722,26 @@ dict_max_bucket_count = 4294967296
 dict_max_entry_count : U64
 dict_max_entry_count = 4294967296
 
+dict_actual_shifts : U8 -> U8
+dict_actual_shifts = |shifts| U8.bitwise_and(shifts, dict_shifts_mask)
+
+dict_shifts_for_current_seed : U8 -> U8
+dict_shifts_for_current_seed = |shifts| {
+	actual = dict_actual_shifts(shifts)
+	seed_high_byte = U64.to_u8_wrap(U64.shift_right_zf_by(dict_seed(), 56))
+	runtime_bit = U8.bitwise_and(seed_high_byte, dict_runtime_seed_bit)
+	U8.bitwise_or(actual, runtime_bit)
+}
+
+dict_seed_for_shifts : U8 -> U64
+dict_seed_for_shifts = |shifts| {
+	seed_mask_i8 = I8.shift_right_by(U8.to_i8_wrap(shifts), 7)
+	seed_mask = I8.to_u64_wrap(seed_mask_i8)
+	U64.bitwise_and(dict_seed(), seed_mask)
+}
+
 dict_bucket_count_for_shifts : U8 -> U64
-dict_bucket_count_for_shifts = |shifts| U64.shift_left_by(1, 64 - shifts)
+dict_bucket_count_for_shifts = |shifts| U64.shift_left_by(1, 64 - dict_actual_shifts(shifts))
 
 dict_max_entries_for_bucket_count : U64 -> U64
 dict_max_entries_for_bucket_count = |bucket_count|
@@ -15299,9 +15770,9 @@ dict_shifts_for_capacity = |requested| {
 dict_allocate_buckets_for_capacity : U64 -> Dict.DictMetadata
 dict_allocate_buckets_for_capacity = |requested| {
 	if requested == 0 {
-		{ buckets: [], max_entries_before_grow: 0, shifts: dict_initial_shifts }
+		{ buckets: [], max_entries_before_grow: 0, shifts: dict_shifts_for_current_seed(dict_initial_shifts) }
 	} else {
-		shifts = dict_shifts_for_capacity(requested)
+		shifts = dict_shifts_for_current_seed(dict_shifts_for_capacity(requested))
 		bucket_count = dict_bucket_count_for_shifts(shifts)
 		{
 			buckets: List.repeat(dict_empty_bucket, bucket_count),
@@ -15319,9 +15790,9 @@ dict_add_capacity = |a, b|
 		a + b
 	}
 
-dict_hash_key : k -> U64
+dict_hash_key : k, U8 -> U64
 	where [k.to_hash : k, Hasher -> Hasher]
-dict_hash_key = |key| hasher_finish(key.to_hash(hasher_start(dict_seed())))
+dict_hash_key = |key, shifts| hasher_finish(key.to_hash(hasher_start(dict_seed_for_shifts(shifts))))
 
 dict_entry_index_from_u64 : U64 -> U32
 dict_entry_index_from_u64 = |index|
@@ -15332,7 +15803,7 @@ dict_entry_index_from_u64 = |index|
 	}
 
 dict_bucket_index_from_hash : U64, U8 -> U64
-dict_bucket_index_from_hash = |hash, shifts| U64.shift_right_zf_by(hash, shifts)
+dict_bucket_index_from_hash = |hash, shifts| U64.shift_right_zf_by(hash, dict_actual_shifts(shifts))
 
 dict_dist_and_fingerprint_from_hash : U64 -> U32
 dict_dist_and_fingerprint_from_hash = |hash| {
@@ -15367,6 +15838,51 @@ dict_ensure_capacity = |data, desired| {
 	}
 }
 
+dict_prepare_for_insert : Dict.DictData(k, v) -> Dict.DictData(k, v)
+	where [k.to_hash : k, Hasher -> Hasher]
+dict_prepare_for_insert = |data| {
+	shifts = dict_shifts_for_current_seed(data.shifts)
+	if shifts == data.shifts {
+		data
+	} else {
+		empty_buckets = List.map(data.buckets, |_| dict_empty_bucket)
+		buckets = dict_fill_buckets_from_entries(empty_buckets, data.entries, shifts)
+		{ entries: data.entries, buckets, max_entries_before_grow: data.max_entries_before_grow, shifts }
+	}
+}
+
+dict_insert_missing_data : Dict.DictData(k, v), { bucket_index : U64, dist_and_fingerprint : U32 }, k, v -> Dict.DictData(k, v)
+	where [k.is_eq : k, k -> Bool, k.to_hash : k, Hasher -> Hasher]
+dict_insert_missing_data = |data, missing, key, value| {
+	if List.len(data.entries) < data.max_entries_before_grow {
+		dict_insert_new_data(data, missing.bucket_index, missing.dist_and_fingerprint, key, value)
+	} else {
+		prepared = dict_ensure_capacity(data, dict_add_capacity(List.len(data.entries), 1))
+		match dict_find(prepared, key) {
+			Found(_) => {
+				crash "Dict invariant violated: found duplicate after growth"
+			}
+			Missing(grown_missing) => dict_insert_new_data(prepared, grown_missing.bucket_index, grown_missing.dist_and_fingerprint, key, value)
+		}
+	}
+}
+
+dict_insert_absent_data : Dict.DictData(k, v), { bucket_index : U64, dist_and_fingerprint : U32 }, k, v -> Dict.DictData(k, v)
+	where [k.is_eq : k, k -> Bool, k.to_hash : k, Hasher -> Hasher]
+dict_insert_absent_data = |data, missing, key, value| {
+	prepared = dict_prepare_for_insert(data)
+	if prepared.shifts == data.shifts {
+		dict_insert_missing_data(prepared, missing, key, value)
+	} else {
+		match dict_find(prepared, key) {
+			Found(_) => {
+				crash "Dict invariant violated: found duplicate after seed change"
+			}
+			Missing(reseeded_missing) => dict_insert_missing_data(prepared, reseeded_missing, key, value)
+		}
+	}
+}
+
 dict_find : Dict.DictData(k, v), k -> [Found({ bucket_index : U64, entry_index : U64, value : v }), Missing({ bucket_index : U64, dist_and_fingerprint : U32 })]
 	where [k.is_eq : k, k -> Bool, k.to_hash : k, Hasher -> Hasher]
 dict_find = |data, key| {
@@ -15374,7 +15890,7 @@ dict_find = |data, key| {
 		if List.is_empty(data.buckets) {
 			Missing({ bucket_index: 0, dist_and_fingerprint: 0 })
 		} else {
-			hash = dict_hash_key(key)
+			hash = dict_hash_key(key, data.shifts)
 			Missing({
 				bucket_index: dict_bucket_index_from_hash(hash, data.shifts),
 				dist_and_fingerprint: dict_dist_and_fingerprint_from_hash(hash),
@@ -15383,7 +15899,7 @@ dict_find = |data, key| {
 	} else if List.is_empty(data.buckets) {
 		crash "Dict invariant violated: entries without buckets"
 	} else {
-		hash = dict_hash_key(key)
+		hash = dict_hash_key(key, data.shifts)
 		dict_find_from(
 			data.buckets,
 			data.entries,
@@ -15447,7 +15963,7 @@ dict_remove_bucket_data = |data, bucket_index| {
 	} else {
 		entries_swapped = list_swap_unsafe(data.entries, removed_entry_index_u64, last_entry_index)
 		(moved_key, _) = list_get_unsafe(entries_swapped, removed_entry_index_u64)
-		moved_hash = dict_hash_key(moved_key)
+		moved_hash = dict_hash_key(moved_key, data.shifts)
 		moved_base_bucket_index = dict_bucket_index_from_hash(moved_hash, data.shifts)
 		moved_entry_index = dict_entry_index_from_u64(last_entry_index)
 		moved_bucket_index = dict_scan_for_entry_index(buckets_without_removed, moved_base_bucket_index, moved_entry_index)
@@ -15511,7 +16027,7 @@ dict_fill_buckets_from_entries = |buckets, entries, shifts| {
 dict_next_while_less : List(Dict.DictBucket), k, U8 -> (U64, U32)
 	where [k.to_hash : k, Hasher -> Hasher]
 dict_next_while_less = |buckets, key, shifts| {
-	hash = dict_hash_key(key)
+	hash = dict_hash_key(key, shifts)
 	dict_next_while_less_from(buckets, dict_bucket_index_from_hash(hash, shifts), dict_dist_and_fingerprint_from_hash(hash))
 }
 
@@ -16578,6 +17094,66 @@ range_done = || iter_from_step(
 	Known(0),
 	|| Done,
 )
+
+# Shared step loop behind the numeric types' `range_exclusive` methods. Each
+# caller supplies `len_if_known` computed from its own representation; when it
+# is `Known`, it must be the exact yield count (`Iter.take_last`/`drop_last`
+# rely on that, and `Iter.custom` keeps it exact by decrementing per yield).
+range_exclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
+	where [
+		num.is_lt : num, num -> Bool,
+		num.add_try : num, num -> Try(num, [Overflow]),
+		num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
+	]
+range_exclusive_with_len = |start, end, len_if_known|
+	Iter.custom(
+		start,
+		len_if_known,
+		|cur|
+			if cur < end {
+				match cur.add_try(1) {
+					Ok(next) => if next < end {
+						Ok((cur, next))
+					} else {
+						Ok((cur, end))
+					}
+					Err(Overflow) => Ok((cur, end))
+				}
+			} else {
+				Err(NoMore)
+			},
+	)
+
+# Shared step loop behind the numeric types' `range_inclusive` methods; same
+# `len_if_known` contract as `range_exclusive_with_len`. The seed carries a
+# done flag because the final value must be yielded before the iterator ends,
+# including when stepping past it would overflow.
+range_inclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
+	where [
+		num.is_lte : num, num -> Bool,
+		num.add_try : num, num -> Try(num, [Overflow]),
+		num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
+	]
+range_inclusive_with_len = |start, end, len_if_known|
+	Iter.custom(
+		(start, False),
+		len_if_known,
+		|(cur, done)|
+			if done {
+				Err(NoMore)
+			} else if cur <= end {
+				match cur.add_try(1) {
+					Ok(next) => if next <= end {
+						Ok((cur, (next, False)))
+					} else {
+						Ok((cur, (cur, True)))
+					}
+					Err(Overflow) => Ok((cur, (cur, True)))
+				}
+			} else {
+				Err(NoMore)
+			},
+	)
 
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item

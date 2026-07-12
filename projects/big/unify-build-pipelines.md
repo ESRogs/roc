@@ -120,7 +120,48 @@ pass-through (`if (args.no_cache) null else build_env.cache_manager`) into
   the shape the whole CLI should have.
 - PRs (roc-lang/roc): 9811, 9459, 9698, 9627, 9759, 9720, 9768. Issues:
   9788 (run never cached, filed as slowness), 9694 (`--opt` ignored),
-  9509 (transitive package failure on run, fixed by PR 9627).
+  9509 (compiler output printed twice on run, fixed by PR 9759).
+- A July 2026 audit diffed the two Coordinator-driving sequences line by
+  line. Two divergences were live bugs and have since been aligned
+  (platform root module name — run hardcoded `"main"` where build derives
+  it from the package's root file via `base.module_path.getModuleName` —
+  and platform discovery scope, where run special-cased the root's one
+  direct `is_platform` dep instead of scanning resolved packages by
+  `.platform` kind). Two more turned out to be structural, and are the
+  kind of asymmetry the unified core must make explicit rather than
+  implicit:
+  - `explicit_root_ident_names`: the BuildEnv path parses each platform
+    package's header for `targets_config` and sets these idents (the wasm
+    `import_memory` / `minimum_memory` family, emitted as compile-time
+    requests); the run path never parses platform headers at all, and no
+    run-path consumer reads those requests today because run is
+    native-interpreter-only. A unified core should parse platform headers
+    once, unconditionally, so a future run-path consumer cannot be
+    silently starved.
+  - `markNoAppPackage` exists only in the BuildEnv path; the run path is
+    app-only by construction (`parseAppHeader` rejects non-app roots), so
+    the hosted-transform tri-state is only ever exercised via BuildEnv.
+  - Verified intentional (not drift): run selects platform roots via
+    `selectPlatformEntrypointRoots` (provided exports plus
+    platform-required bindings — the interpreter needs bindings as
+    entrypoints) while linked builds use `selectPlatformExportRoots`
+    (provided exports only).
+  - The package resolution + materialization sequence (resolver
+    construction, `buildPackageKeys`, per-package registration and
+    shorthand wiring, URL-vs-local watch state) is duplicated between
+    `resolvePackages` + the inline registration loop in `cli/main.zig` and
+    `resolveAndMaterialize` / `materializeResolved` in
+    `compile_build.zig` — including a version-bump-notes loop copy-pasted
+    essentially verbatim, identical comments and all.
+  - Downstream of orchestration, the "checked artifacts → LIR" adapter
+    (`executableRootCheckedArtifact` → `collectImportedArtifactViews` →
+    `collectRelationArtifactViews` → platform-roots selection →
+    `lowerCheckedModulesToLir` with per-opt options) is hand-copied five
+    times inside `cli/main.zig` (run, build-LLVM, build-native, embedded,
+    hot-reload), each spelling out its own lowering-option list; the run
+    copy selects entrypoint roots where the build copies select export
+    roots.
+
 
 ## Solution design
 
@@ -160,9 +201,18 @@ only (`roc check`), docs extraction, glue extraction.
    `setupSharedMemoryWithCoordinator` either gains the core's cache wiring
    or is deleted if truly dead. Glue, the LSP, and the playground consume
    the core — no new entry path may construct a Coordinator directly.
-6. **Enumerate the known divergences as the acceptance checklist**:
+6. **Collapse the five "checked artifacts → LIR" adapter copies.** One
+   helper (roughly `lowerCheckedRootToLir(source, roots_kind, opt,
+   target)`) owns the artifact-view collection, platform-roots selection
+   (parameterized entrypoint-vs-export), and the opt-derived lowering
+   options, so a new lowering option cannot be added to four of five
+   backends.
+7. **Enumerate the known divergences as the acceptance checklist**:
    caching parity, `--opt` parity, transitive package registration parity,
-   diagnostic single-render, warning exit codes, and package-identity parity.
+   diagnostic single-render, warning exit codes, package-identity parity,
+   platform root-module naming parity, `explicit_root_ident_names` parity,
+   platform-discovery-scope parity, and app-less-root (`markNoAppPackage`)
+   parity.
 
 ## What success looks like
 
@@ -209,14 +259,17 @@ work, it deduplicates it.
   (including warning exit 2), identical package resolution, and identical
   cache behavior (second invocation hits the checked-module cache on every
   path — assert via cache stats).
-- Issue 9788 repro: default app, `roc run` twice, second run must load
-  checked modules from cache.
+- Issue 9788 repro, strengthened: the runner case
+  `customDefaultAppAllSyntaxCheckedCache`
+  (`src/cli/test/parallel_cli_runner.zig`) runs a default app twice and
+  asserts the checked-module cache-file count is nonzero and unchanged.
+  Equal counts cannot distinguish a cache hit from a same-key rewrite;
+  the second run must additionally assert actual cache loads (cache
+  stats).
 - Issue 9694 repro: `roc file.roc --opt=speed` produces and executes a
   compiled binary (not the interpreter).
-- Issue 9509 repro: app → package → transitive URL package, `roc run`
-  succeeds exactly when `roc build` does.
-- Single-render test: a program with N diagnostics renders exactly N
-  reports on the run path (PR 9759 regression test).
+- Transitive-package repro: app → package → transitive URL package,
+  `roc run` succeeds exactly when `roc build` does.
 
 ## Related projects
 

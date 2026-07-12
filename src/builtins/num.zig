@@ -637,6 +637,14 @@ pub fn remTruncU128(a: u128, b: u128, roc_ops: *RocOps) callconv(.c) u128 {
     return i128h.rem_u128(a, b);
 }
 
+/// i128 modulo (result carries the sign of the divisor) - callable from generated code.
+pub fn modI128(a: i128, b: i128, roc_ops: *RocOps) callconv(.c) i128 {
+    if (b == 0) {
+        roc_ops.crash("Integer modulo by 0!");
+    }
+    return i128h.mod_i128(a, b);
+}
+
 /// Result type for checked integer conversions.
 pub fn ToIntCheckedResult(comptime T: type) type {
     // On the Roc side we sort by alignment; putting the errorcode last

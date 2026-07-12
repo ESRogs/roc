@@ -300,9 +300,7 @@ pub const ModuleType = enum {
     ctx,
     build_options,
     layout,
-    interpreter_layout,
     values,
-    interpreter_values,
     eval,
     ipc,
     fmt,
@@ -341,10 +339,8 @@ pub const ModuleType = enum {
             .can => &.{ .tracy, .builtins, .collections, .types, .base, .parse, .reporting, .build_options, .ctx },
             .check => &.{ .tracy, .builtins, .collections, .base, .parse, .types, .can, .reporting, .build_options },
             .layout => &.{ .tracy, .collections, .base, .types, .builtins, .can },
-            .interpreter_layout => &.{ .tracy, .collections, .base, .types, .builtins, .can, .layout },
             .values => &.{ .collections, .base, .builtins, .layout },
-            .interpreter_values => &.{ .collections, .base, .builtins, .interpreter_layout },
-            .eval => &.{ .tracy, .ctx, .collections, .base, .types, .builtins, .parse, .can, .check, .layout, .interpreter_layout, .values, .interpreter_values, .build_options, .reporting, .backend, .lir, .symbol, .roc_target, .sljmp, .ipc },
+            .eval => &.{ .tracy, .ctx, .collections, .base, .types, .builtins, .parse, .can, .check, .layout, .values, .build_options, .reporting, .backend, .lir, .symbol, .roc_target, .sljmp, .ipc },
             .compile => &.{ .tracy, .build_options, .ctx, .builtins, .collections, .base, .types, .parse, .can, .check, .reporting, .layout, .eval, .unbundle, .roc_target, .backend, .lir, .symbol, .sljmp },
             .ipc => &.{},
 
@@ -358,7 +354,7 @@ pub const ModuleType = enum {
             .backend => &.{ .base, .layout, .builtins, .can, .lir, .roc_target, .ctx },
             .lir_core => &.{ .base, .collections, .layout, .types, .can, .check },
             .postcheck => &.{ .base, .builtins, .can, .check, .collections, .layout, .lir_core },
-            .lir => &.{ .base, .collections, .layout, .types, .can, .check, .build_options, .lir_core, .postcheck },
+            .lir => &.{ .base, .collections, .layout, .types, .can, .check, .build_options, .lir_core, .postcheck, .builtins },
             .symbol => &.{.base},
             .roc_target => &.{.base},
             .sljmp => &.{},
@@ -386,9 +382,7 @@ pub const RocModules = struct {
     ctx: *Module,
     build_options: *Module,
     layout: *Module,
-    interpreter_layout: *Module,
     values: *Module,
-    interpreter_values: *Module,
     eval: *Module,
     ipc: *Module,
     fmt: *Module,
@@ -411,6 +405,13 @@ pub const RocModules = struct {
     bump: *Module,
     glue: *Module,
     embedded_lld: *Module,
+
+    // The default-platform runtimes (`src/default_platform/*_runtime.zig`) are
+    // compiled as standalone freestanding objects without the `builtins` module,
+    // so they read the host-boundary `RocStr` encoding through this single-file
+    // module instead of restating it. It is wired into the `builtins` module too
+    // so a `builtins` test can assert the view matches the canonical `RocStr`.
+    roc_str_view: *Module,
 
     // Vendored-from-Zig modules. Kept out of the `ModuleType` dependency graph
     // (like `embedded_lld`) and wired into their specific consumers via
@@ -445,9 +446,7 @@ pub const RocModules = struct {
                 .{ .root_source_file = build_options_step.getOutput() },
             ),
             .layout = b.addModule("layout", .{ .root_source_file = b.path("src/layout/mod.zig") }),
-            .interpreter_layout = b.addModule("interpreter_layout", .{ .root_source_file = b.path("src/interpreter_layout/mod.zig") }),
             .values = b.addModule("values", .{ .root_source_file = b.path("src/values/mod.zig") }),
-            .interpreter_values = b.addModule("interpreter_values", .{ .root_source_file = b.path("src/eval/interpreter_values.zig") }),
             .eval = b.addModule("eval", .{ .root_source_file = b.path("src/eval/mod.zig") }),
             .ipc = b.addModule("ipc", .{ .root_source_file = b.path("src/ipc/mod.zig") }),
             .fmt = b.addModule("fmt", .{ .root_source_file = b.path("src/fmt/mod.zig") }),
@@ -470,6 +469,7 @@ pub const RocModules = struct {
             .bump = b.addModule("bump", .{ .root_source_file = b.path("src/bump/mod.zig") }),
             .glue = b.addModule("glue", .{ .root_source_file = b.path("src/glue/mod.zig") }),
             .embedded_lld = b.addModule("embedded_lld", .{ .root_source_file = b.path("src/build/embedded_lld.zig") }),
+            .roc_str_view = b.addModule("roc_str_view", .{ .root_source_file = b.path("src/default_platform/roc_str_view.zig") }),
 
             .vendor_parse_float = b.addModule("vendor_parse_float", .{ .root_source_file = b.path("vendor/parse_float/parse_float.zig") }),
             .vendor_ryu = b.addModule("vendor_ryu", .{ .root_source_file = b.path("vendor/ryu.zig") }),
@@ -531,9 +531,7 @@ pub const RocModules = struct {
             .ctx,
             .build_options,
             .layout,
-            .interpreter_layout,
             .values,
-            .interpreter_values,
             .eval,
             .ipc,
             .fmt,
@@ -580,6 +578,9 @@ pub const RocModules = struct {
             .builtins => {
                 module.addImport("vendor_parse_float", self.vendor_parse_float);
                 module.addImport("vendor_ryu", self.vendor_ryu);
+                // Lets a `builtins` test assert the default-platform `RocStr` view
+                // matches the canonical `RocStr` (see `roc_str_view` above).
+                module.addImport("roc_str_view", self.roc_str_view);
             },
             .eval => {
                 module.addImport("vendor_eval_loader", self.vendor_eval_loader);
@@ -603,7 +604,6 @@ pub const RocModules = struct {
         step.root_module.addImport("ctx", self.ctx);
         step.root_module.addImport("build_options", self.build_options);
         step.root_module.addImport("layout", self.layout);
-        step.root_module.addImport("interpreter_layout", self.interpreter_layout);
         step.root_module.addImport("eval", self.eval);
         step.root_module.addImport("fmt", self.fmt);
         step.root_module.addImport("unbundle", self.unbundle);
@@ -657,9 +657,7 @@ pub const RocModules = struct {
             .ctx => self.ctx,
             .build_options => self.build_options,
             .layout => self.layout,
-            .interpreter_layout => self.interpreter_layout,
             .values => self.values,
-            .interpreter_values => self.interpreter_values,
             .eval => self.eval,
             .ipc => self.ipc,
             .fmt => self.fmt,
@@ -714,7 +712,6 @@ pub const RocModules = struct {
             .check,
             .ctx,
             .layout,
-            .interpreter_layout,
             .values,
             .ipc,
             .fmt,

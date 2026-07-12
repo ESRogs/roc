@@ -10,6 +10,7 @@ const ModuleEnv = @import("can").ModuleEnv;
 const types_mod = @import("types").types;
 
 const DocModel = @import("DocModel.zig");
+const render_type = @import("render_type.zig");
 
 const Allocator = std.mem.Allocator;
 const Ident = base.Ident;
@@ -50,7 +51,7 @@ pub fn extractModuleDocComment(gpa: Allocator, source: []const u8) Allocator.Err
         }
 
         // Check for ## doc comment
-        if (pos + 2 <= source.len and source[pos] == '#' and source[pos + 1] == '#') {
+        if (base.doc_comment.startsWithHashHash(source[pos..])) {
             if (lines.items.len == 0) {
                 first_line_byte = @intCast(line_start);
             }
@@ -130,17 +131,13 @@ pub fn extractDocComment(gpa: Allocator, source: []const u8, def_start_offset: u
         const line = source[line_start..pos];
         const trimmed = trimLeft(line);
 
-        if (trimmed.len >= 2 and trimmed[0] == '#' and trimmed[1] == '#') {
+        if (base.doc_comment.startsWithHashHash(trimmed)) {
             // Track the earliest doc-comment line we've seen so far. Since we
             // scan bottom-up and lines are added in reverse, the most recent
             // assignment to this is the topmost ## line of the block.
             first_line_byte = @intCast(line_start);
             // It's a doc comment line
-            var content = trimmed[2..];
-            // Skip optional leading space after ##
-            if (content.len > 0 and content[0] == ' ') {
-                content = content[1..];
-            }
+            const content = base.doc_comment.stripPrefix(trimmed);
             try lines.append(gpa, content);
         } else if (trimmed.len == 0) {
             // Empty/whitespace line — stop looking if we already have doc lines
@@ -317,11 +314,15 @@ pub fn extractModuleDocs(
                 const duped_name = try gpa.dupe(u8, entry_name);
                 errdefer gpa.free(duped_name);
 
+                const type_header = try render_type.renderTypeHeaderToString(gpa, module_env, decl.header);
+                errdefer gpa.free(type_header);
+
                 const empty_children = try gpa.alloc(DocModel.DocEntry, 0);
                 errdefer gpa.free(empty_children);
 
                 try entries_list.append(gpa, DocModel.DocEntry{
                     .name = duped_name,
+                    .type_header = type_header,
                     .kind = if (decl.is_opaque) .@"opaque" else .nominal,
                     .type_signature = type_sig,
                     .doc_comment = if (doc_extract) |d| d.text else null,
@@ -713,6 +714,9 @@ fn extractDefEntry(
                     const duped_name = try gpa.dupe(u8, entry_name);
                     errdefer gpa.free(duped_name);
 
+                    const type_header = try render_type.renderTypeHeaderToString(gpa, module_env, decl.header);
+                    errdefer gpa.free(type_header);
+
                     // Use the statement region for doc comment scanning
                     const region = module_env.store.getStatementRegion(n.nominal_type_decl);
                     const doc_extract = try extractDocComment(gpa, source, region.start.offset);
@@ -733,6 +737,7 @@ fn extractDefEntry(
 
                     return DocModel.DocEntry{
                         .name = duped_name,
+                        .type_header = type_header,
                         .kind = if (decl.is_opaque) .@"opaque" else .nominal,
                         .type_signature = type_sig,
                         .doc_comment = if (doc_extract) |d| d.text else null,
@@ -2311,6 +2316,7 @@ fn moveEntryForReparenting(
     moved.name = new_name;
 
     entry.children = empty_children;
+    entry.type_header = null;
     entry.type_signature = null;
     entry.doc_comment = null;
     entry.doc_refs = &.{};

@@ -47,7 +47,8 @@ pub const Constants = struct {
     /// 21: Nominal declaration table serialized with the type store.
     /// 22: Checked function serialization no longer carries instantiation stamps.
     /// 23: Stored nested functions carry durable local-procedure context identity.
-    pub const CACHE_VERSION = 23;
+    /// 24: CommonIdents carries the range_exclusive/range_inclusive method idents.
+    pub const CACHE_VERSION = 24;
 };
 
 /// Configuration for the Roc cache system.

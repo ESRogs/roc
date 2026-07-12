@@ -136,6 +136,15 @@ const BuildEnv = compile.BuildEnv;
 const Coordinator = compile.coordinator.Coordinator;
 const Mode = compile.package.Mode;
 const TimingInfo = compile.package.TimingInfo;
+
+/// Resolves the worker-thread count from an optional `--max-threads` value,
+/// defaulting to the detected CPU count (or 1 when detection fails), and derives
+/// the single- vs multi-threaded compilation mode from it. Returned as a
+/// `{ thread_count, mode }` tuple for destructuring at the call site.
+fn resolveThreadDefaults(max_threads: ?usize) struct { usize, Mode } {
+    const thread_count: usize = max_threads orelse (std.Thread.getCpuCount() catch 1);
+    return .{ thread_count, if (thread_count <= 1) .single_threaded else .multi_threaded };
+}
 const CacheManager = compile.CacheManager;
 const CacheConfig = compile.CacheConfig;
 const cache_config_mod = compile.config;
@@ -1373,7 +1382,7 @@ fn generatePlatformHostShim(
     const image_header: *const lir.LirImage.Header = @ptrCast(@alignCast(lir_image.ptr + @sizeOf(SharedMemoryAllocator.Header)));
     // The host shim's C-ABI lowering needs layout sizes for the target being
     // built, so resolve the width-independent image for that pointer width.
-    const shim_target_usize: base.target.TargetUsize = if (target.ptrBitWidth() == 64) .u64 else .u32;
+    const shim_target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
     const view = lir.LirImage.viewMappedImageWithAllocator(image_header, lir_image.ptr, lir_image.len, shim_target_usize, ctx.arena) catch |err| {
         return ctx.fail(.{ .shim_generation_failed = .{ .err = err } });
     };
@@ -5498,8 +5507,7 @@ fn lowerLirWithCoordinator(
     defer package_keys.deinit();
     if (reporter) |r| r.end();
 
-    const thread_count: usize = max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(max_threads);
 
     var coord = try Coordinator.init(
         ctx.gpa,
@@ -5571,27 +5579,33 @@ fn lowerLirWithCoordinator(
             coord.packages.get(package_keys.identity(i)) orelse return error.CliError;
 
         for (package.deps) |dep| {
-            const target = resolved_packages[dep.target];
             const target_name = package_keys.identity(dep.target);
             try from_pkg.shorthands.put(
                 try ctx.gpa.dupe(u8, dep.alias),
                 try ctx.gpa.dupe(u8, target_name),
             );
+        }
+    }
 
-            // The app's platform root module is parsed eagerly so its
-            // provides/hosted declarations are available to the build.
-            if (i == compile.package_resolution.Resolved.root_index and dep.is_platform) {
-                const pf_pkg = coord.packages.get(target_name) orelse return error.CliError;
-                coord.markPlatformPackage(pf_pkg.name);
-                if (pf_pkg.root_module_id == null) {
-                    const pf_module_id = try pf_pkg.ensureModule(ctx.gpa, "main", target.root_file);
-                    pf_pkg.root_module_id = pf_module_id;
-                    pf_pkg.modules.items[pf_module_id].depth = 1;
-                    pf_pkg.remaining_modules += 1;
-                    coord.total_remaining += 1;
-                    try coord.enqueueParseTask(target_name, pf_module_id);
-                }
-            }
+    // Eagerly parse every resolved platform package's root module so its
+    // provides/hosted declarations are available to the build. Scanning by
+    // package kind matches the BuildEnv path; for an app root the sole
+    // platform is the root's direct platform dependency, but scanning keeps
+    // the two paths in lockstep. The module name is derived from the platform's
+    // actual root file rather than assumed to be "main".
+    for (resolved_packages, 0..) |package, i| {
+        if (package.kind != .platform) continue;
+        const platform_name = package_keys.identity(i);
+        const pf_pkg = coord.packages.get(platform_name) orelse return error.CliError;
+        coord.markPlatformPackage(pf_pkg.name);
+        if (pf_pkg.root_module_id == null) {
+            const pf_module_name = base.module_path.getModuleName(package.root_file);
+            const pf_module_id = try pf_pkg.ensureModule(ctx.gpa, pf_module_name, package.root_file);
+            pf_pkg.root_module_id = pf_module_id;
+            pf_pkg.modules.items[pf_module_id].depth = 1;
+            pf_pkg.remaining_modules += 1;
+            coord.total_remaining += 1;
+            try coord.enqueueParseTask(platform_name, pf_module_id);
         }
     }
 
@@ -8140,8 +8154,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     else
         try base.module_path.getModuleNameAlloc(ctx.arena, args.path);
 
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
     defer ctx.gpa.free(cwd);
@@ -8269,16 +8282,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
-    const target_usize: base.target.TargetUsize = switch (target.ptrBitWidth()) {
-        32 => .u32,
-        64 => .u64,
-        else => {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("LLVM build invariant violated: unsupported target pointer width {d}", .{target.ptrBitWidth()});
-            }
-            unreachable;
-        },
-    };
+    const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
 
     const build_roots = try lir.CheckedPipeline.selectPlatformEntrypointRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
     defer ctx.gpa.free(build_roots);
@@ -8486,8 +8490,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         else => return err,
     };
 
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
     defer ctx.gpa.free(cwd);
@@ -8607,16 +8610,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
-    const target_usize: base.target.TargetUsize = switch (target.ptrBitWidth()) {
-        32 => .u32,
-        64 => .u64,
-        else => {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("native build invariant violated: unsupported target pointer width {d}", .{target.ptrBitWidth()});
-            }
-            unreachable;
-        },
-    };
+    const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
 
     const build_roots = try lir.CheckedPipeline.selectPlatformEntrypointRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
     defer ctx.gpa.free(build_roots);
@@ -8843,8 +8837,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         else => return err,
     };
 
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
     defer ctx.gpa.free(cwd);
@@ -11837,8 +11830,7 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
     // --- Normal compilation path ---
 
     // Determine threading mode and thread count
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     // Initialize BuildEnv for compilation
     const cwd = std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa) catch |err| {
@@ -13506,8 +13498,7 @@ fn checkFileWithBuildEnvPreserved(
 
     // Determine threading mode and thread count
     // Default to multi-threaded with auto-detected CPU count; use -j1 for single-threaded
-    const thread_count: usize = if (max_threads) |t| t else (std.Thread.getCpuCount() catch 1);
-    const mode: compile.package.Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(max_threads);
 
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa);
     defer ctx.gpa.free(cwd);
@@ -13685,8 +13676,7 @@ fn checkFileWithBuildEnv(
     const trace = tracy.trace(@src());
     defer trace.end();
 
-    const thread_count: usize = if (max_threads) |t| t else (std.Thread.getCpuCount() catch 1);
-    const mode: compile.package.Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(max_threads);
 
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa);
     defer ctx.gpa.free(cwd);

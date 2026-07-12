@@ -305,6 +305,7 @@ pub const BuiltinFn = enum {
     num_div_trunc_i128,
     num_rem_trunc_u128,
     num_rem_trunc_i128,
+    num_mod_i128,
     num_shl_u128,
     num_shr_i128,
     num_shr_u128,
@@ -460,6 +461,7 @@ pub const BuiltinFn = enum {
             .num_div_trunc_i128 => "roc_builtins_num_div_trunc_i128",
             .num_rem_trunc_u128 => "roc_builtins_num_rem_trunc_u128",
             .num_rem_trunc_i128 => "roc_builtins_num_rem_trunc_i128",
+            .num_mod_i128 => "roc_builtins_num_mod_i128",
             .num_shl_u128 => "roc_builtins_num_shl_u128",
             .num_shr_i128 => "roc_builtins_num_shr_i128",
             .num_shr_u128 => "roc_builtins_num_shr_u128",
@@ -4654,44 +4656,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
         }
 
-        fn hasherDomain(op: lir.LowLevel) u8 {
-            return @intFromEnum(switch (op) {
-                .hasher_write_bool => builtins.hash.HasherDomain.bool,
-                .hasher_write_u8 => builtins.hash.HasherDomain.u8,
-                .hasher_write_u16 => builtins.hash.HasherDomain.u16,
-                .hasher_write_u32 => builtins.hash.HasherDomain.u32,
-                .hasher_write_u64 => builtins.hash.HasherDomain.u64,
-                .hasher_write_u128 => builtins.hash.HasherDomain.u128,
-                .hasher_write_i8 => builtins.hash.HasherDomain.i8,
-                .hasher_write_i16 => builtins.hash.HasherDomain.i16,
-                .hasher_write_i32 => builtins.hash.HasherDomain.i32,
-                .hasher_write_i64 => builtins.hash.HasherDomain.i64,
-                .hasher_write_i128 => builtins.hash.HasherDomain.i128,
-                .hasher_write_dec => builtins.hash.HasherDomain.dec,
-                .hasher_write_bytes => builtins.hash.HasherDomain.bytes,
-                else => unreachable,
-            });
-        }
-
-        fn hasherWidth(op: lir.LowLevel) u8 {
-            return switch (op) {
-                .hasher_write_bool,
-                .hasher_write_u8,
-                .hasher_write_i8,
-                => 1,
-                .hasher_write_u16,
-                .hasher_write_i16,
-                => 2,
-                .hasher_write_u32,
-                .hasher_write_i32,
-                => 4,
-                .hasher_write_u64,
-                .hasher_write_i64,
-                => 8,
-                else => unreachable,
-            };
-        }
-
         fn hasherStateReg(self: *Self, local: LocalId) Allocator.Error!GeneralReg {
             const loc = try self.emitValueLocal(local);
             return switch (loc) {
@@ -4786,7 +4750,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const seed_reg = try self.hasherStateReg(GuardedList.at(args, 0));
                     const value_loc = try self.emitValueLocal(GuardedList.at(args, 1));
                     const value_reg = try self.ensureInGeneralReg(value_loc);
-                    return try self.callHasherWriteU64(seed_reg, value_reg, hasherDomain(ll.op), hasherWidth(ll.op));
+                    return try self.callHasherWriteU64(seed_reg, value_reg, @intFromEnum(lir.hasherDomain(ll.op)), lir.hasherU64Width(ll.op));
                 },
                 .hasher_write_f32 => {
                     if (args.len != 2) unreachable;
@@ -4810,7 +4774,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const seed_reg = try self.hasherStateReg(GuardedList.at(args, 0));
                     const value_loc = try self.emitValueLocal(GuardedList.at(args, 1));
                     const parts = try self.getI128Parts(value_loc, if (ll.op == .hasher_write_u128) .unsigned else .signed);
-                    return try self.callHasherWriteU128(seed_reg, parts, hasherDomain(ll.op));
+                    return try self.callHasherWriteU128(seed_reg, parts, @intFromEnum(lir.hasherDomain(ll.op)));
                 },
                 .hasher_write_bytes => {
                     if (args.len != 2) unreachable;
@@ -7109,14 +7073,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return CheckedArithmetic.zeroDenominatorMessage(op, operand_layout) orelse unreachable;
         }
 
+        /// Lowest representable value for a signed layout that fits in an i64,
+        /// or null for unsigned layouts and i128 (whose minimum does not fit).
         fn signedLowestI64(operand_layout: layout.Idx) ?i64 {
-            return switch (operand_layout) {
-                .i8 => std.math.minInt(i8),
-                .i16 => std.math.minInt(i16),
-                .i32 => std.math.minInt(i32),
-                .i64 => std.math.minInt(i64),
-                else => null,
-            };
+            if (operand_layout == .i128) return null;
+            const lowest = CheckedArithmetic.signedLowestValue(operand_layout) orelse return null;
+            return @intCast(lowest);
         }
 
         /// Generate 128-bit integer binary operation
@@ -7320,14 +7282,33 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         try self.callI128DivRem(lhs_parts, rhs_parts, result_low, result_high, is_unsigned, false);
                     }
                 },
-                .num_rem_by, .num_mod_by => {
+                .num_rem_by => {
                     var done_patch: ?usize = null;
                     if (checked_op) |tag| {
                         try self.emitCheckedI128ZeroDenominator(tag, rhs_parts, operand_layout);
                         done_patch = try self.emitCheckedI128SignedMinRemainderZero(lhs_parts, rhs_parts, result_low, result_high, operand_layout);
                     }
-                    // 128-bit integer remainder/modulo: call builtin function
+                    // 128-bit truncated remainder (sign of dividend): call builtin function
                     try self.callI128DivRem(lhs_parts, rhs_parts, result_low, result_high, is_unsigned, true);
+                    if (done_patch) |patch| self.codegen.patchJump(patch, self.codegen.currentOffset());
+                },
+                .num_mod_by => {
+                    var done_patch: ?usize = null;
+                    if (checked_op) |tag| {
+                        try self.emitCheckedI128ZeroDenominator(tag, rhs_parts, operand_layout);
+                        done_patch = try self.emitCheckedI128SignedMinRemainderZero(lhs_parts, rhs_parts, result_low, result_high, operand_layout);
+                    }
+                    if (is_unsigned) {
+                        // For unsigned operands modulo equals the truncated remainder.
+                        try self.callI128DivRem(lhs_parts, rhs_parts, result_low, result_high, true, true);
+                    } else {
+                        // Signed (and Dec) modulo: the result carries the sign of the
+                        // divisor. The builtin computes the truncated remainder and adds
+                        // the divisor back when the remainder is non-zero and its sign
+                        // differs from the divisor's. Dec shares this path: the raw scaled
+                        // i128 representation is what the adjustment operates on.
+                        try self.callI128Mod(lhs_parts, rhs_parts, result_low, result_high);
+                    }
                     if (done_patch) |patch| self.codegen.patchJump(patch, self.codegen.currentOffset());
                 },
                 // Bitwise operations: apply independently to each 64-bit word.
@@ -8290,6 +8271,34 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.callBuiltin(&builder, fn_addr, builtin_fn);
 
             // Load results from stack slot
+            try self.codegen.emitLoadStack(.w64, result_low, result_slot);
+            try self.codegen.emitLoadStack(.w64, result_high, result_slot + 8);
+        }
+
+        /// Call the signed i128 modulo builtin via the decomposed wrapper.
+        /// Wrapper signature: (out_low: *u64, out_high: *u64, a_low: u64, a_high: u64, b_low: u64, b_high: u64, roc_ops: *RocOps) -> void
+        fn callI128Mod(
+            self: *Self,
+            lhs_parts: I128Parts,
+            rhs_parts: I128Parts,
+            result_low: GeneralReg,
+            result_high: GeneralReg,
+        ) Allocator.Error!void {
+            const fn_addr: usize = @intFromPtr(&dev_wrappers.roc_builtins_num_mod_i128);
+            const roc_ops_reg = self.roc_ops_reg orelse unreachable;
+            const result_slot = self.codegen.allocStackSlot(16);
+            const base_reg = frame_ptr;
+
+            var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+            try builder.addLeaArg(base_reg, result_slot); // out_low
+            try builder.addLeaArg(base_reg, result_slot + 8); // out_high
+            try builder.addRegArg(lhs_parts.low);
+            try builder.addRegArg(lhs_parts.high);
+            try builder.addRegArg(rhs_parts.low);
+            try builder.addRegArg(rhs_parts.high);
+            try builder.addRegArg(roc_ops_reg);
+            try self.callBuiltin(&builder, fn_addr, .num_mod_i128);
+
             try self.codegen.emitLoadStack(.w64, result_low, result_slot);
             try self.codegen.emitLoadStack(.w64, result_high, result_slot + 8);
         }

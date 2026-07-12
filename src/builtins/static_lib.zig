@@ -150,6 +150,7 @@ comptime {
     @export(&dw.roc_builtins_num_div_trunc_i128, .{ .name = "roc_builtins_num_div_trunc_i128" });
     @export(&dw.roc_builtins_num_rem_trunc_u128, .{ .name = "roc_builtins_num_rem_trunc_u128" });
     @export(&dw.roc_builtins_num_rem_trunc_i128, .{ .name = "roc_builtins_num_rem_trunc_i128" });
+    @export(&dw.roc_builtins_num_mod_i128, .{ .name = "roc_builtins_num_mod_i128" });
     // Numeric-to-string wrappers
     @export(&dw.roc_builtins_int_to_str, .{ .name = "roc_builtins_int_to_str" });
     @export(&dw.roc_builtins_float_to_str, .{ .name = "roc_builtins_float_to_str" });

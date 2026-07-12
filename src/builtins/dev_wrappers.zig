@@ -1699,6 +1699,15 @@ pub fn roc_builtins_num_rem_trunc_i128(out_low: *u64, out_high: *u64, a_low: u64
     out_high.* = i128h.hi64(@as(u128, @bitCast(result)));
 }
 
+/// i128 modulo, result carries the sign of the divisor (decomposed)
+pub fn roc_builtins_num_mod_i128(out_low: *u64, out_high: *u64, a_low: u64, a_high: u64, b_low: u64, b_high: u64, roc_ops: *RocOps) callconv(.c) void {
+    const a: i128 = @bitCast(i128h.from_u64_pair(a_low, a_high));
+    const b: i128 = @bitCast(i128h.from_u64_pair(b_low, b_high));
+    const result = num.modI128(a, b, roc_ops);
+    out_low.* = @truncate(@as(u128, @bitCast(result)));
+    out_high.* = i128h.hi64(@as(u128, @bitCast(result)));
+}
+
 // ── i128/u128 shift wrappers (decomposed) ──
 
 /// u128 shift left (decomposed): out = a << shift_amount
