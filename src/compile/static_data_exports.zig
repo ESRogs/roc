@@ -1132,13 +1132,12 @@ fn payloadLayoutForTagArg(
     arg_index: u32,
 ) layout.Idx {
     if (arg_count == 0) return layout.Idx.zst;
+    // A single-argument tag variant stores that argument's layout directly as the
+    // committed payload layout (no wrapper struct), so the whole payload layout is
+    // the argument layout. Only multi-argument variants pack their arguments into a
+    // payload struct that must be indexed by argument position.
+    if (arg_count == 1) return variant_layout_idx;
     const variant_layout = layouts.getLayout(variant_layout_idx);
-    if (arg_count == 1) {
-        if (variant_layout.tag == .struct_ and layouts.getStructInfo(variant_layout).fields.len == 1) {
-            return layouts.getStructFieldLayoutByOriginalIndex(variant_layout.getStruct().idx, 0);
-        }
-        return variant_layout_idx;
-    }
     if (variant_layout.tag != .struct_) staticDataInvariant("multi-payload tag did not use struct payload layout");
     return layouts.getStructFieldLayoutByOriginalIndex(variant_layout.getStruct().idx, arg_index);
 }
