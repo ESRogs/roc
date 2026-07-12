@@ -25220,34 +25220,7 @@ fn nominalHasDeclarationBacking(nominal: checked.CheckedNominalType) bool {
 }
 
 fn builtinOwner(builtin: ?checked.CheckedBuiltinNominal) ?static_dispatch.BuiltinOwner {
-    return switch (builtin orelse return null) {
-        .bool => .bool,
-        .str => .str,
-        .u8 => .u8,
-        .i8 => .i8,
-        .u16 => .u16,
-        .i16 => .i16,
-        .u32 => .u32,
-        .i32 => .i32,
-        .u64 => .u64,
-        .i64 => .i64,
-        .u128 => .u128,
-        .i128 => .i128,
-        .f32 => .f32,
-        .f64 => .f64,
-        .dec => .dec,
-        .list => .list,
-        .box => .box,
-        .dict => .dict,
-        .set => .set,
-        .parse_tag_union_spec => .parse_tag_union_spec,
-        .fields => .fields,
-        .field => .field,
-        .crypto_sha256_digest => .crypto_sha256_digest,
-        .crypto_sha256_hasher => .crypto_sha256_hasher,
-        .crypto_blake3_digest => .crypto_blake3_digest,
-        .crypto_blake3_hasher => .crypto_blake3_hasher,
-    };
+    return static_dispatch.builtinOwnerForCheckedBuiltin(builtin orelse return null);
 }
 
 fn primitiveInspectLowLevelOp(primitive: Type.Primitive) can.CIR.Expr.LowLevel {
