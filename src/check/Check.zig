@@ -4761,9 +4761,6 @@ fn mkFlexWithFromNumeralConstraint(
         },
     };
     const fn_var = try self.freshFromContent(func_content, env, num_literal_info.region);
-    if (source_node) |node_idx| {
-        try self.cir.recordNumeralDispatchPlan(node_idx, flex_var, fn_var);
-    }
 
     // Create the constraint with numeric literal info
     const constraint = types_mod.StaticDispatchConstraint{
@@ -4783,6 +4780,18 @@ fn mkFlexWithFromNumeralConstraint(
         },
     };
     try self.unifyWith(flex_var, flex_content, env);
+
+    // Runtime `from_numeral` receives the exact digit lists. If parsing could
+    // not record those digits, no builtin or custom implementation can perform
+    // the conversion, so reject the literal here rather than publishing an
+    // impossible dispatch plan.
+    if (try self.reportUnmaterializableNumeralLiteral(flex_var, constraint, env)) {
+        return flex_var;
+    }
+
+    if (source_node) |node_idx| {
+        try self.cir.recordNumeralDispatchPlan(node_idx, flex_var, fn_var);
+    }
     try self.recordOpenLiteralVar(flex_var, &.{constraint});
 
     return flex_var;
