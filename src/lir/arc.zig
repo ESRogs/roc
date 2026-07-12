@@ -5640,6 +5640,99 @@ test "RC unreachable join body does not cache nested join ownership" {
     try f.expectRc(carried, 0, 0, 0);
 }
 
+test "RC join body keep excludes units not owned at every jump" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const cond = try f.local(.i64);
+    const elem = try f.local(.str);
+    const list = try f.local(f.list_str);
+    const sink = try f.local(f.list_str);
+    const out = try f.local(.str);
+    const join_id = f.freshJoinPointId();
+
+    const ret = try f.ret(out);
+    const body = try f.assignStr(out, "done", ret);
+    const consuming_jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const consuming_branch = try f.assignCall(sink, &.{list}, consuming_jump);
+    const direct_jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const switch_stmt = try f.switchStmt(cond, consuming_branch, direct_jump, null);
+    const join = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = body,
+        .remainder = switch_stmt,
+    } });
+    const assign_list = try f.assignList(list, &.{elem}, join);
+    const assign_elem = try f.assignStr(elem, "x", assign_list);
+    const start = try f.assignI64(cond, 1, assign_elem);
+
+    _ = try f.addProc(&.{}, start, .str);
+    try f.run();
+    // The body keep is the intersection of the two jump states: the
+    // consuming branch moves the list into the call, so the direct jump
+    // cannot carry it into the shared body and releases it instead.
+    try f.expectRc(list, 0, 1, 0);
+    try f.expectRc(elem, 0, 0, 0);
+}
+
+test "RC switch continuation merge releases branch-divergent owner at the boundary" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const cond = try f.local(.i64);
+    const diverged = try f.local(.str);
+    const consumed = try f.local(.str);
+    const out = try f.local(.i64);
+    const filler = try f.local(.i64);
+
+    const ret = try f.ret(out);
+    const branch = try f.assignCall(consumed, &.{diverged}, ret);
+    const default_branch = try f.assignI64(filler, 7, ret);
+    const switch_stmt = try f.switchStmt(cond, branch, default_branch, ret);
+    const assign_out = try f.assignI64(out, 3, switch_stmt);
+    const assign_diverged = try f.assignStr(diverged, "diverge", assign_out);
+    const start = try f.assignI64(cond, 1, assign_diverged);
+
+    _ = try f.addProc(&.{}, start, .i64);
+    try f.run();
+    // Both branches fall through to the continuation. The call branch moves
+    // the string's unit into the callee, so the merged continuation entry
+    // excludes it and the default branch releases it at the boundary.
+    try f.expectRc(diverged, 0, 1, 0);
+}
+
+fn chainedJoinSolveWork(join_count: usize) !u64 {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const carried = try f.local(.str);
+
+    var current = try f.ret(carried);
+    for (0..join_count) |_| {
+        const id = f.freshJoinPointId();
+        const jump = try f.store.addCFStmt(.{ .jump = .{ .target = id } });
+        current = try f.store.addCFStmt(.{ .join = .{
+            .id = id,
+            .params = LIR.LocalSpan.empty(),
+            .body = current,
+            .remainder = jump,
+        } });
+    }
+    const start = try f.assignStr(carried, "chained", current);
+
+    _ = try f.addProc(&.{}, start, .str);
+    const before = solver_iterations;
+    try f.run();
+    return solver_iterations - before;
+}
+
+test "RC join summary solver work grows linearly with chained joins" {
+    if (builtin.mode != .Debug) return;
+    const small = try chainedJoinSolveWork(8);
+    const large = try chainedJoinSolveWork(16);
+    // Doubling the join count must stay near double the solver work; a
+    // reintroduced per-join region re-walk would grow it quadratically.
+    try testing.expect(large <= small * 3);
+}
+
 test "RC join loop jump releases body-only list but keeps carried state" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
