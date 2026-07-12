@@ -20,6 +20,7 @@ const canonical_type_keys = @import("canonical_type_keys.zig");
 const hoist_roots = @import("hoist_roots.zig");
 const const_store = @import("const_store.zig");
 const problem = @import("problem.zig");
+const requirement_solution = @import("requirement_solution.zig");
 const artifact_serialize = @import("artifact_serialize.zig");
 const SerializedSlice = artifact_serialize.SerializedSlice;
 
@@ -463,6 +464,10 @@ pub const PublishInputs = struct {
     relation_artifacts: []const ImportedModuleView = &.{},
     platform_requirement_context: ?PlatformRequirementContextKey = null,
     platform_app_relation: ?PlatformAppRelation = null,
+    /// Requirement solutions the checker recorded for this app root (empty
+    /// for every other module kind); published as the artifact's
+    /// `PlatformRequirementSolutionTable`.
+    platform_requirement_solutions: []const requirement_solution.SolutionInput = &.{},
     explicit_roots: []const ExplicitRootRequestInput = &.{},
     hoisted_roots: []const hoist_roots.SelectedHoistedRoot = &.{},
     compile_time_finalizer: CompileTimeFinalizer,
@@ -15653,6 +15658,241 @@ pub const PlatformRequirementRelationTable = struct {
     }
 };
 
+/// Public `PlatformRequirementSolution` declaration.
+///
+/// One row of the check-time platform/app correspondence carried on the APP's
+/// checked artifact: the exported app value a platform requirement resolved to
+/// during checking, the requirement type as solved in the app's env, and the
+/// solved types of the requirement's identity variables.
+pub const PlatformRequirementSolution = struct {
+    /// requires-clause index; equals the platform-side
+    /// `PlatformRequiredDeclarationId` by construction (both are assigned
+    /// positionally over the platform's `requires_types`).
+    requires_idx: u32,
+    def: CIR.Def.Idx,
+    pattern: CheckedPatternId,
+    /// The requirement type as solved in the app env, in the app's store.
+    solved_root: CheckedTypeId,
+    value_kind: PlatformRequiredValueKind,
+    /// Range into the table's `identity_solutions`; the offset within the
+    /// range is the canonical identity slot of the platform requirement
+    /// payload (the first-encounter order the canonical key digest assigns).
+    identity_start: u32,
+    identity_len: u32,
+};
+
+/// Public `PlatformRequirementSolutionTable` declaration.
+///
+/// The relation is recorded here, where it is proven: when an app checks
+/// against a platform's requirement surface, each successful unification's
+/// output travels as these rows. Finalization builds the platform/app
+/// relation by reading them — it never re-resolves app exports by name and
+/// never re-derives identity substitutions structurally. Empty for every
+/// module that is not an app root checked against a platform.
+pub const PlatformRequirementSolutionTable = struct {
+    solutions: []PlatformRequirementSolution = &.{},
+    /// Solved app types for requirement identity variables, slot-ordered per
+    /// solution row (`identity_start`/`identity_len` ranges).
+    identity_solutions: []CheckedTypeId = &.{},
+
+    pub const Serialized = extern struct {
+        solutions: SerializedSlice(PlatformRequirementSolution) = .{},
+        identity_solutions: SerializedSlice(CheckedTypeId) = .{},
+        const Serde = artifact_serialize.SliceStoreSerde(PlatformRequirementSolutionTable, @This());
+        pub const serialize = Serde.serialize;
+        pub const deserialize = Serde.deserialize;
+    };
+
+    pub fn lookupByRequiredIndex(
+        self: *const PlatformRequirementSolutionTable,
+        requires_idx: u32,
+    ) ?PlatformRequirementSolution {
+        for (self.solutions) |solution| {
+            if (solution.requires_idx == requires_idx) return solution;
+        }
+        return null;
+    }
+
+    pub fn identitySlice(
+        self: *const PlatformRequirementSolutionTable,
+        solution: PlatformRequirementSolution,
+    ) []const CheckedTypeId {
+        return self.identity_solutions[solution.identity_start .. solution.identity_start + solution.identity_len];
+    }
+
+    pub fn deinit(self: *PlatformRequirementSolutionTable, allocator: Allocator) void {
+        allocator.free(self.identity_solutions);
+        allocator.free(self.solutions);
+        self.* = .{};
+    }
+};
+
+/// Materialize the checker-recorded requirement solutions into checked type
+/// roots in the app's store. A row whose types never solved (the app failed
+/// checking under a flow that still publishes an artifact) is dropped — the
+/// missing row IS the record of the app-side failure, and finalization only
+/// tolerates it on paths that permit user errors.
+fn platformRequirementSolutionTableFromInputs(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *canonical.CanonicalNameStore,
+    current_owner: ModuleId,
+    imports: []const PublishImportArtifact,
+    available: []const ImportedModuleView,
+    checked_types: *CheckedTypeStore,
+    top_level_values: *const TopLevelValueTable,
+    exported_procedure_bindings: *const ExportedProcedureBindingTable,
+    exported_const_templates: *const ExportedConstTemplateTable,
+    inputs: []const requirement_solution.SolutionInput,
+) Allocator.Error!PlatformRequirementSolutionTable {
+    if (inputs.len == 0) return .{};
+
+    const import_views = CheckedImportViews{
+        .current_owner = current_owner,
+        .direct = imports,
+        .available = available,
+    };
+    var active = std.AutoHashMap(Var, CheckedTypeId).init(allocator);
+    defer active.deinit();
+
+    var solutions = std.ArrayList(PlatformRequirementSolution).empty;
+    errdefer solutions.deinit(allocator);
+    var identity_solutions = std.ArrayList(CheckedTypeId).empty;
+    errdefer identity_solutions.deinit(allocator);
+
+    for (inputs) |input| {
+        if (try solutionVarsReachErr(allocator, module.typeStoreConst(), input)) continue;
+
+        const top_level = top_level_values.lookupByDef(input.def) orelse {
+            checkedArtifactInvariant("platform requirement solution references a def with no published top-level value", .{});
+        };
+        const value_kind: PlatformRequiredValueKind = if (input.is_function) .procedure_value else .const_value;
+        const kind_matches = switch (top_level.value) {
+            .procedure_binding => value_kind == .procedure_value,
+            .const_ref => value_kind == .const_value,
+        };
+        if (!kind_matches) {
+            checkedArtifactInvariant("platform requirement solution value kind disagrees with the published app value", .{});
+        }
+        if (builtin.mode == .Debug) {
+            const is_exported = switch (top_level.value) {
+                .procedure_binding => blk: {
+                    for (exported_procedure_bindings.bindings) |binding| {
+                        if (binding.binding.def == top_level.def and binding.binding.pattern == top_level.pattern) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .const_ref => blk: {
+                    for (exported_const_templates.templates) |template| {
+                        if (template.def == top_level.def and template.pattern == top_level.pattern) break :blk true;
+                    }
+                    break :blk false;
+                },
+            };
+            if (!is_exported) {
+                std.debug.panic("checked artifact invariant violated: platform requirement solution references an unexported app value", .{});
+            }
+        }
+
+        const identity_start: u32 = @intCast(identity_solutions.items.len);
+        for (input.identity_vars) |identity_var| {
+            const identity_root = try appendCheckedTypeRoot(allocator, module, names, import_views, checked_types, &active, identity_var);
+            try identity_solutions.append(allocator, identity_root);
+        }
+        const solved_root = try appendCheckedTypeRoot(allocator, module, names, import_views, checked_types, &active, input.solved_var);
+        try solutions.append(allocator, .{
+            .requires_idx = input.requires_idx,
+            .def = input.def,
+            .pattern = top_level.pattern,
+            .solved_root = solved_root,
+            .value_kind = value_kind,
+            .identity_start = identity_start,
+            .identity_len = @intCast(input.identity_vars.len),
+        });
+    }
+
+    return .{
+        .solutions = try solutions.toOwnedSlice(allocator),
+        .identity_solutions = try identity_solutions.toOwnedSlice(allocator),
+    };
+}
+
+fn solutionVarsReachErr(
+    allocator: Allocator,
+    store: *const types.Store,
+    input: requirement_solution.SolutionInput,
+) Allocator.Error!bool {
+    var visited = std.AutoHashMap(Var, void).init(allocator);
+    defer visited.deinit();
+    if (try solverVarReachesErr(store, &visited, input.solved_var)) return true;
+    for (input.identity_vars) |identity_var| {
+        if (try solverVarReachesErr(store, &visited, identity_var)) return true;
+    }
+    return false;
+}
+
+/// Whether any part of a solver var's structure is an error type. Mirrors the
+/// checker's own reachability walk; `visited` must start empty per top-level
+/// query group (a var proven err-free may be memoized as visited, but a var
+/// containing an error must not be re-queried through the memo).
+fn solverVarReachesErr(
+    store: *const types.Store,
+    visited: *std.AutoHashMap(Var, void),
+    var_: Var,
+) Allocator.Error!bool {
+    const resolved = store.resolveVar(var_);
+    if (visited.contains(resolved.var_)) return false;
+    try visited.put(resolved.var_, {});
+
+    return switch (resolved.desc.content) {
+        .err => true,
+        .flex, .rigid => false,
+        .alias => |alias| try solverVarReachesErr(store, visited, store.getAliasBackingVar(alias)),
+        .structure => |flat_type| switch (flat_type) {
+            .tuple => |tuple| try solverVarsReachErr(store, visited, store.sliceVars(tuple.elems)),
+            .nominal_type => |nominal| blk: {
+                var arg_iter = store.iterNominalArgs(nominal);
+                while (arg_iter.next()) |arg_var| {
+                    if (try solverVarReachesErr(store, visited, arg_var)) break :blk true;
+                }
+                break :blk store.nominalDeclIsInvalid(nominal);
+            },
+            .fn_pure, .fn_effectful, .fn_unbound => |func| blk: {
+                if (try solverVarsReachErr(store, visited, store.sliceVars(func.args))) break :blk true;
+                break :blk try solverVarReachesErr(store, visited, func.ret);
+            },
+            .record => |record| blk: {
+                const fields = store.getRecordFieldsSlice(record.fields);
+                if (try solverVarsReachErr(store, visited, fields.items(.var_))) break :blk true;
+                break :blk try solverVarReachesErr(store, visited, record.ext);
+            },
+            .record_unbound => |fields| blk: {
+                const fields_slice = store.getRecordFieldsSlice(fields);
+                break :blk try solverVarsReachErr(store, visited, fields_slice.items(.var_));
+            },
+            .tag_union => |tag_union| blk: {
+                const tags = store.getTagsSlice(tag_union.tags);
+                for (tags.items(.args)) |tag_args| {
+                    if (try solverVarsReachErr(store, visited, store.sliceVars(tag_args))) break :blk true;
+                }
+                break :blk try solverVarReachesErr(store, visited, tag_union.ext);
+            },
+            .empty_record, .empty_tag_union => false,
+        },
+    };
+}
+
+fn solverVarsReachErr(
+    store: *const types.Store,
+    visited: *std.AutoHashMap(Var, void),
+    vars: []const Var,
+) Allocator.Error!bool {
+    for (vars) |var_| {
+        if (try solverVarReachesErr(store, visited, var_)) return true;
+    }
+    return false;
+}
+
 /// Public `PlatformRequiredBinding` declaration.
 pub const PlatformRequiredBinding = struct {
     id: PlatformRequiredBindingId,
@@ -26153,6 +26393,7 @@ pub const CheckedModuleArtifact = struct {
     hosted_procs: HostedProcTable,
     platform_required_declarations: PlatformRequiredDeclarationTable,
     platform_requirement_relations: PlatformRequirementRelationTable = .{},
+    platform_requirement_solutions: PlatformRequirementSolutionTable = .{},
     platform_required_bindings: PlatformRequiredBindingTable,
     interface_capabilities: ModuleInterfaceCapabilities,
     compile_time_roots: CompileTimeRootTable,
@@ -26314,6 +26555,7 @@ pub const CheckedModuleArtifact = struct {
         hosted_procs: HostedProcTable.Serialized,
         platform_required_declarations: PlatformRequiredDeclarationTable.Serialized,
         platform_requirement_relations: PlatformRequirementRelationTable.Serialized,
+        platform_requirement_solutions: PlatformRequirementSolutionTable.Serialized,
         platform_required_bindings: PlatformRequiredBindingTable.Serialized,
         interface_capabilities: ModuleInterfaceCapabilities.Serialized,
         compile_time_roots: CompileTimeRootTable.Serialized,
@@ -26342,7 +26584,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 191);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 193);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -26384,6 +26626,7 @@ pub const CheckedModuleArtifact = struct {
             try self.hosted_procs.serialize(&artifact.hosted_procs, gpa, writer);
             try self.platform_required_declarations.serialize(&artifact.platform_required_declarations, gpa, writer);
             try self.platform_requirement_relations.serialize(&artifact.platform_requirement_relations, gpa, writer);
+            try self.platform_requirement_solutions.serialize(&artifact.platform_requirement_solutions, gpa, writer);
             try self.platform_required_bindings.serialize(&artifact.platform_required_bindings, gpa, writer);
             try self.interface_capabilities.serialize(&artifact.interface_capabilities, gpa, writer);
             try self.compile_time_roots.serialize(&artifact.compile_time_roots, gpa, writer);
@@ -26472,6 +26715,7 @@ pub const CheckedModuleArtifact = struct {
                 .hosted_procs = self.hosted_procs.deserialize(base_addr),
                 .platform_required_declarations = self.platform_required_declarations.deserialize(base_addr),
                 .platform_requirement_relations = self.platform_requirement_relations.deserialize(base_addr),
+                .platform_requirement_solutions = self.platform_requirement_solutions.deserialize(base_addr),
                 .platform_required_bindings = self.platform_required_bindings.deserialize(base_addr),
                 .interface_capabilities = self.interface_capabilities.deserialize(base_addr),
                 .compile_time_roots = self.compile_time_roots.deserialize(base_addr),
@@ -26486,7 +26730,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 17;
+    const serialized_layout_version: u32 = 18;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -26581,6 +26825,7 @@ pub const CheckedModuleArtifact = struct {
         self.compile_time_roots.deinit(allocator);
         self.interface_capabilities.deinit(allocator);
         self.platform_required_bindings.deinit(allocator);
+        self.platform_requirement_solutions.deinit(allocator);
         self.platform_requirement_relations.deinit(allocator);
         self.platform_required_declarations.deinit(allocator);
         self.hosted_procs.deinit(allocator);
@@ -28980,6 +29225,21 @@ pub fn publishFromTypedModule(
     );
     errdefer exported_const_templates.deinit(allocator);
 
+    var platform_requirement_solutions = try platformRequirementSolutionTableFromInputs(
+        allocator,
+        module,
+        &canonical_names,
+        artifact_key,
+        inputs.imports,
+        inputs.available_artifacts,
+        checked_types,
+        &top_level_values,
+        &exported_procedure_bindings,
+        &exported_const_templates,
+        inputs.platform_requirement_solutions,
+    );
+    errdefer platform_requirement_solutions.deinit(allocator);
+
     var interface_capabilities = try ModuleInterfaceCapabilities.fromModule(
         allocator,
         module,
@@ -29078,6 +29338,7 @@ pub fn publishFromTypedModule(
         .hosted_procs = hosted_procs,
         .platform_required_declarations = platform_required_declarations,
         .platform_requirement_relations = platform_requirement_relations,
+        .platform_requirement_solutions = platform_requirement_solutions,
         .platform_required_bindings = platform_required_bindings,
         .interface_capabilities = interface_capabilities,
         .compile_time_roots = compile_time_roots,

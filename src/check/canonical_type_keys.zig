@@ -52,6 +52,26 @@ pub fn fromVarInfo(
     };
 }
 
+/// Public `identityVarsFromVar` function.
+///
+/// The identity variables (flex/rigid) reachable from `var_`, in the exact
+/// first-encounter order the canonical key digest assigns them slots
+/// (`writeIdentityVariable`). The index in the returned slice IS the identity
+/// slot embedded in the key bytes, so two representations of the same type
+/// (solver vars here, checked payloads in a `CheckedTypeStore`) enumerate
+/// identities in the same order. Caller owns the returned slice.
+pub fn identityVarsFromVar(
+    allocator: Allocator,
+    store: *const TypeStore,
+    env: *const ModuleEnv,
+    var_: Var,
+) Allocator.Error![]types.Var {
+    var builder = Builder.init(allocator, store, env);
+    defer builder.deinit();
+    try builder.writeVar(var_);
+    return try allocator.dupe(types.Var, builder.identity_variables.items);
+}
+
 /// Public `fromConcreteVar` function.
 pub fn fromConcreteVar(
     allocator: Allocator,
