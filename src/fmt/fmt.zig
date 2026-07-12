@@ -1876,6 +1876,12 @@ const Formatter = struct {
             },
             .nominal_record => |nr| {
                 try fmt.formatExprDiscard(nr.mapper);
+                const mapper_region = fmt.nodeRegion(@intFromEnum(nr.mapper));
+                if (fmt.hasCommentBefore(mapper_region.end)) {
+                    if (try fmt.flushCommentsBefore(mapper_region.end)) {
+                        try fmt.pushIndent();
+                    }
+                }
                 try fmt.push('.');
                 try fmt.formatExprDiscard(nr.backing);
             },
