@@ -39,42 +39,42 @@ pub const tests = [_]TestCase{
     // --- Expression sources: base + single adapters over a range ---
     .{
         .name = "iter alloc: range fold is zero-alloc",
-        .source = "if Iter.fold(Iter.exclusive_range(0.U64, 5), 0.U64, |a, b| a + b) == 10 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(0.U64..<5, 0.U64, |a, b| a + b) == 10 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
         .name = "iter alloc: range map fold is zero-alloc",
-        .source = "if Iter.fold(Iter.map(Iter.exclusive_range(0.U64, 5), |n| n + 1), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.map(0.U64..<5, |n| n + 1), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
         .name = "iter alloc: range keep_if fold is zero-alloc",
-        .source = "if Iter.fold(Iter.keep_if(Iter.exclusive_range(0.U64, 6), |n| n > 2), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.keep_if(0.U64..<6, |n| n > 2), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
         .name = "iter alloc: range drop_if fold is zero-alloc",
-        .source = "if Iter.fold(Iter.drop_if(Iter.exclusive_range(0.U64, 6), |n| n <= 2), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.drop_if(0.U64..<6, |n| n <= 2), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
         .name = "iter alloc: range take_first fold is zero-alloc",
-        .source = "if Iter.fold(Iter.take_first(Iter.exclusive_range(0.U64, 6), 3), 0.U64, |a, b| a + b) == 3 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.take_first(0.U64..<6, 3), 0.U64, |a, b| a + b) == 3 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
         .name = "iter alloc: range drop_first fold is zero-alloc",
-        .source = "if Iter.fold(Iter.drop_first(Iter.exclusive_range(0.U64, 6), 3), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.drop_first(0.U64..<6, 3), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
         .name = "iter alloc: range concat fold is zero-alloc",
-        .source = "if Iter.fold(Iter.concat(Iter.exclusive_range(0.U64, 3), Iter.exclusive_range(3.U64, 6)), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.concat(0.U64..<3, 3.U64..<6), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
         .name = "iter alloc: range append fold is zero-alloc",
-        .source = "if Iter.fold(Iter.append(Iter.exclusive_range(0.U64, 5), 5), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.append(0.U64..<5, 5), 0.U64, |a, b| a + b) == 15 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
@@ -82,7 +82,7 @@ pub const tests = [_]TestCase{
         // by value; `single`'s successor and concat's exhausted first must each
         // keep one monomorphic type, else the chain is un-representable flat.
         .name = "iter alloc: range concat single fold is zero-alloc",
-        .source = "if Iter.fold(Iter.concat(Iter.exclusive_range(0.U64, 3), Iter.single(9)), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
+        .source = "if Iter.fold(Iter.concat(0.U64..<3, Iter.single(9)), 0.U64, |a, b| a + b) == 12 { \"ok\" } else { \"bad\" }",
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
@@ -102,7 +102,7 @@ pub const tests = [_]TestCase{
         .source =
         \\{
         \\    var sum = 0.U64
-        \\    for x in Iter.append(Iter.exclusive_range(0.U64, 5), 5) {
+        \\    for x in Iter.append(0.U64..<5, 5) {
         \\        sum = sum + x
         \\    }
         \\    if sum == 15 { "ok" } else { "bad" }
@@ -135,7 +135,7 @@ pub const tests = [_]TestCase{
         .source =
         \\{
         \\    var sum = 0.U64
-        \\    for x in Iter.map(Iter.exclusive_range(0.U64, 5), |n| n + 1) {
+        \\    for x in Iter.map(0.U64..<5, |n| n + 1) {
         \\        sum = sum + x
         \\    }
         \\    if sum == 15 { "ok" } else { "bad" }
@@ -149,8 +149,8 @@ pub const tests = [_]TestCase{
         \\{
         \\    offset = 1.U64
         \\    record = { big: 10.U64, small: 3.U64 }
-        \\    small = Iter.fold(Iter.map(Iter.exclusive_range(0.U64, 5), |n| n + offset), 0.U64, |a, b| a + b)
-        \\    large = Iter.fold(Iter.map(Iter.exclusive_range(0.U64, 5), |n| n + record.big + record.small), 0.U64, |a, b| a + b)
+        \\    small = Iter.fold(Iter.map(0.U64..<5, |n| n + offset), 0.U64, |a, b| a + b)
+        \\    large = Iter.fold(Iter.map(0.U64..<5, |n| n + record.big + record.small), 0.U64, |a, b| a + b)
         \\    if small == 15 and large == 75 { "ok" } else { "bad" }
         \\}
         ,
@@ -170,7 +170,7 @@ pub const tests = [_]TestCase{
         \\                                Iter.map(
         \\                                    Iter.map(
         \\                                        Iter.map(
-        \\                                            Iter.exclusive_range(0.U64, 5),
+        \\                                            0.U64..<5,
         \\                                            |n| n + 1,
         \\                                        ),
         \\                                        |n| n + 1,

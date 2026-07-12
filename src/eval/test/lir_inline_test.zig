@@ -2767,7 +2767,7 @@ test "iter alloc static: iterator returned from a function is zero-alloc" {
         \\}
         \\
         \\make : U64 -> Iter(U64)
-        \\make = |n| Iter.map(Iter.exclusive_range(0.U64, n), |x| x + 1)
+        \\make = |n| Iter.map(0.U64..<n, |x| x + 1)
         \\
         \\main : U64
         \\main = consume(make(5))
@@ -2788,7 +2788,7 @@ test "iter alloc static: iterator passed to a non-inlined function is zero-alloc
         \\}
         \\
         \\main : U64
-        \\main = consume(Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + 1))
+        \\main = consume(Iter.map(0.U64..<5, |x| x + 1))
     );
 }
 
@@ -2808,9 +2808,9 @@ test "iter alloc static: branch-chosen iterator is zero-alloc" {
         \\choose : Bool -> Iter(U64)
         \\choose = |flag|
         \\    if flag {
-        \\        Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + 1)
+        \\        Iter.map(0.U64..<5, |x| x + 1)
         \\    } else {
-        \\        Iter.keep_if(Iter.exclusive_range(0.U64, 5), |x| x > 2)
+        \\        Iter.keep_if(0.U64..<5, |x| x > 2)
         \\    }
         \\
         \\main : U64
@@ -2839,9 +2839,9 @@ test "iter alloc static: same adapter with different capture layouts is zero-all
         \\    config : Config
         \\    config = { big: 10, small: 3 }
         \\    if flag {
-        \\        Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + offset)
+        \\        Iter.map(0.U64..<5, |x| x + offset)
         \\    } else {
-        \\        Iter.map(Iter.exclusive_range(0.U64, 5), |x| x + config.big + config.small)
+        \\        Iter.map(0.U64..<5, |x| x + config.big + config.small)
         \\    }
         \\}
         \\
@@ -2877,7 +2877,7 @@ test "iter alloc static: runtime-count map wrapping terminates at dynamic bounda
         \\}
         \\
         \\main : U64 -> U64
-        \\main = |count| consume(wrap(count, Iter.exclusive_range(0.U64, 5)))
+        \\main = |count| consume(wrap(count, 0.U64..<5))
     ;
 
     var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
@@ -2917,7 +2917,7 @@ test "iter alloc static: recursive map wrapping terminates at dynamic boundary" 
         \\    }
         \\
         \\main : U64 -> U64
-        \\main = |count| consume(wrap(count, Iter.exclusive_range(0.U64, 5)))
+        \\main = |count| consume(wrap(count, 0.U64..<5))
     ;
 
     var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
@@ -2949,7 +2949,7 @@ fn deepStaticChainSource(comptime map_count: usize) []const u8 {
             \\
             \\main : U64 -> U64
             \\main = |n| {
-            \\    i0 = Iter.exclusive_range(0.U64, n)
+            \\    i0 = 0.U64..<n
             \\
         ;
         for (0..map_count) |index| {
