@@ -13068,8 +13068,7 @@ const EvidencePass = struct {
         var params = std.ArrayListUnmanaged(EvidenceParam).empty;
         defer params.deinit(self.allocator);
 
-        // by_def maps source defs to templates; entry wrappers and intrinsic
-        // wrappers have no scheme of their own (empty params).
+        // by_def maps source defs to templates.
         var template_defs = std.AutoHashMap(u32, CIR.Def.Idx).init(self.allocator);
         defer template_defs.deinit();
         for (self.templates.by_def) |entry| {
@@ -13078,7 +13077,13 @@ const EvidencePass = struct {
 
         for (self.templates.templates, 0..) |*template, template_index| {
             params.clearRetainingCapacity();
-            if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
+            if (template.body == .intrinsic_wrapper) {
+                // Intrinsic wrappers have no scheme of their own: their
+                // published evidence params are empty by construction, even
+                // though their annotation defs appear in `by_def`. Monotype
+                // lowering relies on this — an under-supplied intrinsic
+                // wrapper request is a consumer invariant.
+            } else if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
                 try self.enumerateParams(ModuleEnv.varFrom(def_idx), &params);
             } else switch (template.body) {
                 // An entry wrapper evaluates a compile-time root; plans inside
@@ -26725,6 +26730,40 @@ pub const CheckedModuleArtifact = struct {
         }
     }
 
+    /// One dispatch-expression plan reference checked for the boundary
+    /// validator: `required` distinguishes expressions that must always name
+    /// a plan from the numeral/quote fast paths, where a null plan means the
+    /// concrete-builtin route that never consults one.
+    fn dispatchPlanFailure(
+        table: *const static_dispatch.StaticDispatchPlanTable,
+        maybe_plan: ?StaticDispatchPlanId,
+        expr: CheckedExprId,
+        required: bool,
+    ) ?DispatchEvidenceFailure {
+        const plan = maybe_plan orelse
+            return if (required) .{ .kind = .dispatch_expr_missing_plan, .expr = expr } else null;
+        if (@intFromEnum(plan) >= table.plans.len) {
+            return .{ .kind = .dispatch_expr_plan_out_of_bounds, .expr = expr };
+        }
+        return null;
+    }
+
+    /// The iterator-plan twin of `dispatchPlanFailure`; `for_` always
+    /// requires a plan, anchored by expression or statement index.
+    fn iteratorPlanFailure(
+        table: *const static_dispatch.StaticDispatchPlanTable,
+        maybe_plan: ?static_dispatch.IteratorForPlanId,
+        expr: ?CheckedExprId,
+        index: ?u32,
+    ) ?DispatchEvidenceFailure {
+        const plan = maybe_plan orelse
+            return .{ .kind = .iterator_for_missing_plan, .expr = expr, .index = index };
+        if (@intFromEnum(plan) >= table.iterator_for_plans.len) {
+            return .{ .kind = .iterator_for_plan_out_of_bounds, .expr = expr, .index = index };
+        }
+        return null;
+    }
+
     /// Public `validateDispatchEvidence` function.
     ///
     /// Dispatch-evidence totality at the check/postcheck boundary: every
@@ -26732,62 +26771,30 @@ pub const CheckedModuleArtifact = struct {
     /// evidence reference lands inside the artifact's evidence tables, and
     /// the site-evidence index is sound. Monotype lowering consumes these
     /// records without re-deriving targets, so a violation is a compiler bug
-    /// reported here at the boundary — not a lowering panic. Returns the
-    /// first failure found, or null when the artifact is total.
+    /// reported here at the boundary (in debug builds, where `verifyComplete`
+    /// runs) — not a lowering panic. Returns the first failure found, or
+    /// null when the artifact is total.
     pub fn validateDispatchEvidence(self: *const CheckedModuleArtifact) ?DispatchEvidenceFailure {
         const table = &self.static_dispatch_plans;
 
         for (self.checked_bodies.stored_exprs.items) |expr| {
-            switch (expr.data) {
-                .dispatch_call, .type_dispatch_call, .method_eq => |maybe_plan| {
-                    const plan = maybe_plan orelse
-                        return .{ .kind = .dispatch_expr_missing_plan, .expr = expr.id };
-                    if (@intFromEnum(plan) >= table.plans.len) {
-                        return .{ .kind = .dispatch_expr_plan_out_of_bounds, .expr = expr.id };
-                    }
-                },
-                .interpolation => |interpolation| {
-                    const plan = interpolation.plan orelse
-                        return .{ .kind = .dispatch_expr_missing_plan, .expr = expr.id };
-                    if (@intFromEnum(plan) >= table.plans.len) {
-                        return .{ .kind = .dispatch_expr_plan_out_of_bounds, .expr = expr.id };
-                    }
-                },
-                // A null numeral/quote plan is the concrete-builtin fast
-                // path: monotype lowering produces the bits directly and
-                // never consults a plan.
-                .numeral => |numeral| if (numeral.plan) |plan| {
-                    if (@intFromEnum(plan) >= table.plans.len) {
-                        return .{ .kind = .dispatch_expr_plan_out_of_bounds, .expr = expr.id };
-                    }
-                },
-                .str_from_quote => |quote| if (quote.plan) |plan| {
-                    if (@intFromEnum(plan) >= table.plans.len) {
-                        return .{ .kind = .dispatch_expr_plan_out_of_bounds, .expr = expr.id };
-                    }
-                },
-                .for_ => |for_| {
-                    const plan = for_.plan orelse
-                        return .{ .kind = .iterator_for_missing_plan, .expr = expr.id };
-                    if (@intFromEnum(plan) >= table.iterator_for_plans.len) {
-                        return .{ .kind = .iterator_for_plan_out_of_bounds, .expr = expr.id };
-                    }
-                },
-                else => {},
-            }
+            const expr_failure: ?DispatchEvidenceFailure = switch (expr.data) {
+                .dispatch_call, .type_dispatch_call, .method_eq => |maybe_plan| dispatchPlanFailure(table, maybe_plan, expr.id, true),
+                .interpolation => |interpolation| dispatchPlanFailure(table, interpolation.plan, expr.id, true),
+                .numeral => |numeral| dispatchPlanFailure(table, numeral.plan, expr.id, false),
+                .str_from_quote => |quote| dispatchPlanFailure(table, quote.plan, expr.id, false),
+                .for_ => |for_| iteratorPlanFailure(table, for_.plan, expr.id, null),
+                else => null,
+            };
+            if (expr_failure) |failure| return failure;
         }
 
         for (self.checked_bodies.stored_statements.items, 0..) |statement, i| {
-            switch (statement.data) {
-                .for_ => |for_| {
-                    const plan = for_.plan orelse
-                        return .{ .kind = .iterator_for_missing_plan, .index = @intCast(i) };
-                    if (@intFromEnum(plan) >= table.iterator_for_plans.len) {
-                        return .{ .kind = .iterator_for_plan_out_of_bounds, .index = @intCast(i) };
-                    }
-                },
-                else => {},
-            }
+            const statement_failure: ?DispatchEvidenceFailure = switch (statement.data) {
+                .for_ => |for_| iteratorPlanFailure(table, for_.plan, null, @intCast(i)),
+                else => null,
+            };
+            if (statement_failure) |failure| return failure;
         }
 
         for (table.plans, 0..) |plan, i| {
