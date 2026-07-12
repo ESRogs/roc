@@ -8399,7 +8399,7 @@ fn processAppPlatformRequirements(self: *Self, env: *Env) std.mem.Allocator.Erro
             .requires_idx = @intCast(requires_idx),
             .def = def_idx,
             .solved_var = instantiated.expected_var,
-            .is_function = requiredPlatformVarIsFunction(&input.env.types, ModuleEnv.varFrom(required_type.type_anno)),
+            .is_function = input.env.types.varResolvesToFunction(ModuleEnv.varFrom(required_type.type_anno)),
             .identity_vars = instantiated.identity_vars,
         });
         identity_vars_owned = false;
@@ -8420,33 +8420,16 @@ pub fn platformRequirementSolutions(self: *const Self) []const requirement_solut
 /// canonical key.
 pub fn requiresTypesContainError(self: *Self) std.mem.Allocator.Error!bool {
     for (self.cir.requires_types.items.items) |required_type| {
-        self.var_set.clearRetainingCapacity();
-        if (try self.varContainsError(ModuleEnv.varFrom(required_type.type_anno), &self.var_set)) {
+        if (try canonical_type_keys.containsError(
+            self.gpa,
+            self.types,
+            self.cir,
+            ModuleEnv.varFrom(required_type.type_anno),
+        )) {
             return true;
         }
     }
     return false;
-}
-
-/// Whether the platform declares a requirement at a function type, resolving
-/// through aliases in the platform's own store (the requirement's declared
-/// shape, independent of how the app solved it).
-fn requiredPlatformVarIsFunction(store: *const types_mod.Store, var_: Var) bool {
-    var current = var_;
-    while (true) {
-        const resolved = store.resolveVar(current);
-        switch (resolved.desc.content) {
-            .alias => |alias| {
-                current = store.getAliasBackingVar(alias);
-                continue;
-            },
-            .structure => |flat| return switch (flat) {
-                .fn_pure, .fn_effectful, .fn_unbound => true,
-                else => false,
-            },
-            .err, .flex, .rigid => return false,
-        }
-    }
 }
 
 fn instantiatePlatformRequiredType(
@@ -8461,8 +8444,7 @@ fn instantiatePlatformRequiredType(
 
     const aliases = input.env.for_clause_aliases.sliceRange(required_type.type_aliases);
     for (aliases) |alias| {
-        const alias_ident = try self.copyPlatformIdent(input.env, alias.alias_name);
-        const binding = forClauseAliasBinding(bindings, alias_ident) orelse {
+        const binding = forClauseAliasBinding(bindings, alias.alias_stmt_idx) orelse {
             if (builtin.mode == .Debug) {
                 std.debug.panic("platform requirement for-clause alias was not collected for the requires clause", .{});
             }
@@ -8532,13 +8514,16 @@ fn instantiatePlatformRequiredType(
 /// A null `app_type_var` records that the app declares no such type; the
 /// diagnostic was emitted when the binding was collected.
 const ForClauseAliasBinding = struct {
-    alias_ident: Ident.Idx,
+    /// Exact declaration locator in the platform root. Names are consulted
+    /// only while resolving the app-side declaration at the language boundary;
+    /// copied occurrences match this declaration identity thereafter.
+    platform_alias_stmt_idx: CIR.Statement.Idx,
     app_type_var: ?Var,
 };
 
-fn forClauseAliasBinding(bindings: []const ForClauseAliasBinding, alias_ident: Ident.Idx) ?ForClauseAliasBinding {
+fn forClauseAliasBinding(bindings: []const ForClauseAliasBinding, platform_alias_stmt_idx: CIR.Statement.Idx) ?ForClauseAliasBinding {
     for (bindings) |binding| {
-        if (binding.alias_ident == alias_ident) return binding;
+        if (binding.platform_alias_stmt_idx == platform_alias_stmt_idx) return binding;
     }
     return null;
 }
@@ -8555,8 +8540,8 @@ fn collectForClauseAliasBindings(
     for (input.env.requires_types.items.items) |required_type| {
         const aliases = input.env.for_clause_aliases.sliceRange(required_type.type_aliases);
         for (aliases) |alias| {
+            if (forClauseAliasBinding(bindings.items, alias.alias_stmt_idx) != null) continue;
             const alias_ident = try self.copyPlatformIdent(input.env, alias.alias_name);
-            if (forClauseAliasBinding(bindings.items, alias_ident) != null) continue;
 
             const app_type_stmt = self.appTypeDeclByIdent(alias_ident) orelse {
                 const value_region = self.topLevelValueRegionByIdent(alias_ident);
@@ -8567,13 +8552,19 @@ fn collectForClauseAliasBindings(
                     .platform_region = input.env.store.getNodeRegion(ModuleEnv.nodeIdxFrom(alias.alias_stmt_idx)),
                     .ctx = if (value_region == null) .not_found else .found_but_not_type,
                 } });
-                try bindings.append(self.gpa, .{ .alias_ident = alias_ident, .app_type_var = null });
+                try bindings.append(self.gpa, .{
+                    .platform_alias_stmt_idx = alias.alias_stmt_idx,
+                    .app_type_var = null,
+                });
                 continue;
             };
 
             const app_type_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(app_type_stmt));
             const app_type_var = try self.instantiateVar(ModuleEnv.varFrom(app_type_stmt), env, .{ .explicit = app_type_region });
-            try bindings.append(self.gpa, .{ .alias_ident = alias_ident, .app_type_var = app_type_var });
+            try bindings.append(self.gpa, .{
+                .platform_alias_stmt_idx = alias.alias_stmt_idx,
+                .app_type_var = app_type_var,
+            });
         }
     }
 }
@@ -8606,10 +8597,6 @@ fn resolveForClauseAliasOccurrences(
     const platform_identity_hash = input.env.moduleIdentityHash(input.env.self_module_identity);
     const platform_origin = self.cir.lookupModuleIdentity(platform_identity_hash) orelse return;
 
-    // `copyVar` interned copied type idents into this module's ident store by
-    // text — the same interning `copyPlatformIdent` used for the binding
-    // idents — so ident indices compare directly (the Instantiator's rigid
-    // substitution lookup relies on the same invariant).
     var it = self.var_map.iterator();
     while (it.next()) |entry| {
         const resolved = self.types.resolveVar(entry.value_ptr.*);
@@ -8618,8 +8605,9 @@ fn resolveForClauseAliasOccurrences(
             else => continue,
         };
         if (alias.origin_module != platform_origin) continue;
+        const source_decl = alias.source_decl.toOptional() orelse continue;
         for (bindings) |binding| {
-            if (alias.ident.ident_idx == binding.alias_ident) {
+            if (source_decl == @intFromEnum(binding.platform_alias_stmt_idx)) {
                 if (binding.app_type_var) |app_type_var| {
                     try self.types.dangerousSetVarRedirect(resolved.var_, app_type_var);
                 }
@@ -22871,7 +22859,10 @@ fn varContainsError(self: *Self, var_: Var, visited: *std.AutoHashMap(Var, void)
     return switch (resolved.desc.content) {
         .err => true,
         .flex, .rigid => false,
-        .alias => |alias| try self.varContainsError(self.types.getAliasBackingVar(alias), visited),
+        .alias => |alias| blk: {
+            if (try self.varContainsError(self.types.getAliasBackingVar(alias), visited)) break :blk true;
+            break :blk try self.varsContainError(self.types.sliceAliasArgs(alias), visited);
+        },
         .structure => |flat_type| try self.flatTypeContainsError(flat_type, visited),
     };
 }

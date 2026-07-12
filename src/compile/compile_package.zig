@@ -336,6 +336,7 @@ pub const SemanticModuleData = struct {
 /// Owned output from type checking before module state takes retained facts.
 pub const TypeCheckOutput = struct {
     checker: Check,
+    checker_owned: bool = true,
     checked_artifact: ?CheckedArtifact.CheckedModuleArtifact = null,
     user_errors_allow_lowering: bool = false,
     /// True when a clean check intentionally skipped publishing a checked
@@ -344,7 +345,7 @@ pub const TypeCheckOutput = struct {
 
     pub fn deinit(self: *TypeCheckOutput) void {
         if (self.checked_artifact) |*artifact| artifact.deinit(artifact.canonical_names.allocator);
-        self.checker.deinit();
+        if (self.checker_owned) self.checker.deinit();
     }
 
     pub fn takeCheckedArtifact(self: *TypeCheckOutput) CheckedArtifact.CheckedModuleArtifact {
@@ -352,6 +353,12 @@ pub const TypeCheckOutput = struct {
             std.debug.panic("compile.typeCheckOutput missing checked artifact", .{});
         self.checked_artifact = null;
         return artifact;
+    }
+
+    pub fn takeChecker(self: *TypeCheckOutput) Check {
+        std.debug.assert(self.checker_owned);
+        self.checker_owned = false;
+        return self.checker;
     }
 };
 
