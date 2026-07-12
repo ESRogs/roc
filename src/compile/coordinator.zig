@@ -1839,18 +1839,15 @@ pub const Coordinator = struct {
 
         const relation = switch (relation_result) {
             .relation => |relation| relation,
-            .type_mismatch, .missing_value => {
+            .missing_value => {
                 // With user errors permitted (the `roc run` lowering path from
                 // the error-recovery contract), an app that failed checking can
                 // publish an artifact whose required values never materialized
                 // as exports; the user already has the diagnostics, so skip the
                 // relation instead of asserting. Without user errors, checking
-                // proved the requirements, so these outcomes are compiler bugs.
+                // proved the requirements, so this outcome is a compiler bug.
                 if (allow_user_errors and self.hasUserErrors()) return;
-                switch (relation_result) {
-                    .type_mismatch => coordinatorInvariant("platform/app relation type mismatch reached executable finalization after checking", .{}),
-                    else => coordinatorInvariant("platform/app relation missing required app value reached executable finalization after checking", .{}),
-                }
+                coordinatorInvariant("platform/app relation missing required app value reached executable finalization after checking", .{});
             },
         };
         const relation_artifacts = [_]check.CheckedArtifact.ImportedModuleView{
@@ -1894,7 +1891,6 @@ pub const Coordinator = struct {
 
         switch (relation_result) {
             .relation => {},
-            .type_mismatch => coordinatorInvariant("platform/app relation type mismatch reached check validation after checking", .{}),
             .missing_value => coordinatorInvariant("platform/app relation missing required app value reached check validation after checking", .{}),
         }
     }
@@ -4842,6 +4838,85 @@ test "app artifact records platform requirement solutions from checking" {
         "Model",
         app_artifact.canonical_names.typeNameText(identity_payload.alias.name),
     );
+}
+
+fn writeAliasBackingRequirementFixture(tmp_dir: *std.testing.TmpDir) (std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError)!void {
+    try tmp_dir.dir.createDirPath(std.testing.io, "app/.roc_state_platform");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/main.roc",
+        .data =
+        \\app [prog] { pf: platform "./.roc_state_platform/main.roc" }
+        \\
+        \\Model : { pins : {} }
+        \\
+        \\prog : { init : {} -> Model, tick : Model -> Model }
+        \\prog = { init: |_| { pins: {} }, tick: |m| m }
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/.roc_state_platform/main.roc",
+        .data =
+        \\platform ""
+        \\    requires { [Model : model] for prog : { init : {} -> model, tick : model -> model } }
+        \\    exposes []
+        \\    packages {}
+        \\    provides { "roc_entry": entry }
+        \\
+        \\entry : {} -> Model
+        \\entry = |_| (prog.init)({})
+        ,
+    });
+}
+
+test "platform requirement relation specializes identity reached through app alias and backing" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try writeAliasBackingRequirementFixture(&tmp_dir);
+    const app_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "app/main.roc", allocator);
+    defer allocator.free(app_path);
+
+    const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
+    var builtin_modules = try eval.BuiltinModules.init(allocator);
+    defer builtin_modules.deinit();
+
+    var coord = try Coordinator.init(
+        allocator,
+        .single_threaded,
+        1,
+        roc_target.RocTarget.detectNative(),
+        &builtin_modules,
+        build_options.compiler_version,
+        null,
+        roc_ctx,
+    );
+    defer coord.deinit();
+    coord.enable_hosted_transform = true;
+
+    var arena_impl = base.SingleThreadArena.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    try coord.start();
+    try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
+    try coord.coordinatorLoop();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    // Finalization builds the platform/app relation from the app's recorded
+    // requirement solutions and republishes the platform root; the requirement
+    // identity is reached through the app-side `Model` alias and its backing
+    // record, so this exercises the recorded-fact path end to end.
+    try coord.finalizeExecutableArtifacts();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    const platform_artifact = coord.executableRootCheckedArtifact();
+    const relations = platform_artifact.platform_requirement_relations.relations;
+    try std.testing.expectEqual(@as(usize, 1), relations.len);
+
+    const relation = relations[0];
+    const payload = platform_artifact.checked_types.payload(relation.requested_source_ty_payload);
+    try std.testing.expect(payload != .pending);
 }
 
 fn writeHostedDistinctnessFixture(tmp_dir: *std.testing.TmpDir) (std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError)!void {
