@@ -9662,6 +9662,23 @@ const BodyContext = struct {
         return Ident.textEql(text, "Builtin.Iter.inclusive_range");
     }
 
+    // Numeric `range_exclusive` / `range_inclusive` methods whose bodies build
+    // the flat self-recursive range shape (each forwards through
+    // `range_*_with_len` to `Iter.exclusive_range` / `Iter.inclusive_range`).
+    // A `..<` / `..=` binop dispatches to one of these, so the method call is
+    // the outermost producer of a flat range — the point it is reached with no
+    // expected type — and therefore where its per-chain type is minted. F32 and
+    // F64 are deliberately absent: their range methods build an `Iter.custom`
+    // chain (float stepping carries seed state), which is a different minted
+    // kind produced by the `Iter.custom` recognition instead.
+    fn isFlatRangeMethodText(text: []const u8, comptime method_suffix: []const u8) bool {
+        const flat_types = [_][]const u8{ "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128", "Dec" };
+        inline for (flat_types) |ty| {
+            if (Ident.textEql(text, "Builtin.Num." ++ ty ++ method_suffix)) return true;
+        }
+        return false;
+    }
+
     fn isBuiltinIterFromStepText(text: []const u8) bool {
         return Ident.textEql(text, "iter_from_step") or Ident.textEql(text, "Builtin.iter_from_step");
     }
@@ -10819,11 +10836,39 @@ const BodyContext = struct {
             }
         }
 
-        if (expected_ret_ty == null and isBuiltinExclusiveRangeText(text)) {
+        // Mint a fresh range iterator at any producer in a range's construction
+        // chain: the numeric `range_exclusive` / `range_inclusive` method a
+        // `..<` / `..=` dispatches to, the `range_*_with_len` helper, and the
+        // `Iter.exclusive_range` / `Iter.inclusive_range` step producer. The
+        // generated-evidence branch above already returned for a minted expected
+        // type, so reaching here means the expected type is absent or the public
+        // source `Iter` (which a numeric-method or helper body imposes on its
+        // forwarded producer call); minting in both cases keeps a range's state
+        // carried by value instead of leaving it as the recursive public nominal
+        // that boxes under an adapter and mismatches a materialized step
+        // callable. The step producer's self-recursive `rest` and `range_done()`
+        // resolve to the minted self type through the evidence branch, so the
+        // recursion does not re-mint.
+        // Mint a fresh range iterator where a range construction is reached with
+        // no expected type. A `..<` / `..=` binop dispatches to the numeric
+        // `range_exclusive` / `range_inclusive` method, so that method call is
+        // the outermost producer; a direct `Iter.exclusive_range` /
+        // `Iter.inclusive_range` call is the step producer itself. The minted
+        // type then flows down the construction chain (numeric method body ->
+        // `range_*_with_len` -> `Iter.*_range` -> `iter_from_step` /
+        // `range_done`) as generated evidence, so the self-recursive step
+        // closure joins the minted callable set. Without minting here a range
+        // stays the recursive public nominal, which boxes its state whenever an
+        // adapter embeds it.
+        if (expected_ret_ty == null and
+            (isBuiltinExclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_exclusive")))
+        {
             return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_exclusive, fn_data.ret, &.{}, null));
         }
 
-        if (expected_ret_ty == null and isBuiltinInclusiveRangeText(text)) {
+        if (expected_ret_ty == null and
+            (isBuiltinInclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_inclusive")))
+        {
             return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_inclusive, fn_data.ret, &.{}, null));
         }
 
@@ -16028,11 +16073,15 @@ const BodyContext = struct {
                 args[index] = if (override) |ty|
                     ty
                 else
-                    try self.graph.sealNode(try self.instNode(formal_ty));
+                    try self.activeTypeFromNode(try self.instNode(formal_ty));
             }
+            // As in `instantiateDispatchPlanCallTypeFromCaller`: seal only the
+            // generated-evidence positions; the other parameters and the return
+            // stay active so a callee that constructs its (iterator-shaped)
+            // result can still extend the result type's callable slots.
             const generated_fn_ty = try self.builder.program.types.add(.{ .func = .{
                 .args = try self.builder.program.types.addSpan(args),
-                .ret = generated_ret_override orelse try self.graph.sealNode(try self.instNode(function.ret)),
+                .ret = generated_ret_override orelse try self.activeTypeFromNode(try self.instNode(function.ret)),
             } });
             return generated_fn_ty;
         }
@@ -16105,11 +16154,18 @@ const BodyContext = struct {
                 args[index] = if (override) |ty|
                     ty
                 else
-                    try self.graph.sealNode(try self.instNode(formal_ty));
+                    try self.activeTypeFromNode(try self.instNode(formal_ty));
             }
+            // Only the generated-evidence positions are sealed snapshots (they
+            // key the specialization). The remaining parameters and the return
+            // stay active: sealing the return would freeze an iterator-shaped
+            // result's callable slots as an empty snapshot, so a callee body
+            // that constructs its result (a step closure flowing into a
+            // returned iterator's backing) could never extend them, leaving a
+            // zero-sized callable layout for a value that carries members.
             return try self.builder.program.types.add(.{ .func = .{
                 .args = try self.builder.program.types.addSpan(args),
-                .ret = generated_ret_override orelse try self.graph.sealNode(try self.instNode(function.ret)),
+                .ret = generated_ret_override orelse try self.activeTypeFromNode(try self.instNode(function.ret)),
             } });
         }
         return try self.activeTypeFromNode(fn_node);
