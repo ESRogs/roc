@@ -1335,8 +1335,8 @@ const Formatter = struct {
             },
             .field_access => |fa| {
                 const left_expr = fmt.ast.store.getExpr(fa.left);
-                const parenthesize_receiver = left_expr == .arrow_call;
-                const expand_parenthesized_receiver = parenthesize_receiver and
+                const parenthesize_receiver = left_expr == .arrow_call or left_expr == .int;
+                const expand_parenthesized_receiver = left_expr == .arrow_call and
                     fmt.nodeWillBeMultiline(AST.Expr.Idx, fa.left);
                 if (parenthesize_receiver) try fmt.push('(');
                 if (expand_parenthesized_receiver) {
@@ -1365,8 +1365,8 @@ const Formatter = struct {
             },
             .method_call => |mc| {
                 const left_expr = fmt.ast.store.getExpr(mc.receiver);
-                const parenthesize_receiver = left_expr == .arrow_call;
-                const expand_parenthesized_receiver = parenthesize_receiver and
+                const parenthesize_receiver = left_expr == .arrow_call or left_expr == .int;
+                const expand_parenthesized_receiver = left_expr == .arrow_call and
                     fmt.nodeWillBeMultiline(AST.Expr.Idx, mc.receiver);
                 if (parenthesize_receiver) try fmt.push('(');
                 if (expand_parenthesized_receiver) {
@@ -3661,6 +3661,12 @@ test "multiline arrow receiver in tuple is idempotent" {
             ")\n",
         result,
     );
+}
+
+test "integer field receiver separated by carriage return is idempotent" {
+    const result = try moduleFmtsStable(std.testing.allocator, "a=(0\r.e)\n", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("a = (\n\t(0).e,\n)\n", result);
 }
 
 test "issue 8851: tuple dispatch with chained zero-arg applies is idempotent" {
