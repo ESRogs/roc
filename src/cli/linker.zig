@@ -273,7 +273,6 @@ pub const LinkError = error{
     OutOfMemory,
     InvalidArguments,
     LLVMNotAvailable,
-    BinaryenNotAvailable,
     WindowsSDKNotFound,
     DarwinSysrootNotFound,
 } || std.zig.system.DetectError;
@@ -946,7 +945,14 @@ fn binaryenConfig(config: LinkConfig) RocBinaryenOptimizeConfig {
 
 fn optimizeWasmOutput(ctx: *CliCtx, config: LinkConfig) LinkError!void {
     if (comptime !binaryen_available) {
-        return LinkError.BinaryenNotAvailable;
+        // This roc build has no bundled Binaryen (a system-LLVM or custom-LLVM
+        // build, where the roc-bootstrap tarball's libbinaryen.a is absent), so
+        // the optimization step is skipped and the already-written wasm at
+        // config.output_path is kept unoptimized. Because binaryen_available is
+        // a comptime build option, in normal builds this whole branch — warning
+        // string included — is compile-time eliminated and costs nothing.
+        std.log.warn("Skipping wasm optimization for {s}: this roc build has no bundled Binaryen (system-LLVM or custom-LLVM build), so the wasm output is left unoptimized.", .{config.output_path});
+        return;
     }
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(ctx.io.std_io, config.output_path, ctx.gpa, .limited(std.math.maxInt(u32))) catch |err| switch (err) {
