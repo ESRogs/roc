@@ -302,6 +302,24 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
                 if (inserter.localContainsRefcounted(param)) owned.set(param);
             }
         }
+
+        var solve_arena = std.heap.ArenaAllocator.init(store.allocator);
+        defer solve_arena.deinit();
+        inserter.solve_allocator = solve_arena.allocator();
+        var join_summaries = JoinSummaryMap.init(solve_arena.allocator());
+        var switch_summaries = SwitchSummaryMap.init(solve_arena.allocator());
+        inserter.join_summaries = &join_summaries;
+        inserter.switch_summaries = &switch_summaries;
+        defer {
+            var solved_joins = join_summaries.valueIterator();
+            while (solved_joins.next()) |summary| {
+                _ = inserter.active_loop_keep_ids.remove(@intFromPtr(&summary.*.body_keep));
+            }
+            inserter.join_summaries = null;
+            inserter.switch_summaries = null;
+        }
+        try inserter.solveProcSummaries(body, &owned);
+
         const rewritten_body = try inserter.rewritePath(body, &owned, .{});
         const join_points = try inserter.procJoinPoints(rewritten_body);
         store.setProcSpecBodyAndJoinPoints(emit_proc, rewritten_body, join_points);
@@ -421,6 +439,139 @@ const JoinBodyMemoBucket = struct {
 };
 
 const JoinBodyMemo = std.AutoHashMap(JoinBodyMemoId, JoinBodyMemoBucket);
+
+// Join-summary solver
+//
+// One structured abstract interpretation per proc emission computes, before
+// any rewriting, the values the rewrite walk previously re-derived on
+// demand: each join's entry keep-set, body keep-set, and body reachability,
+// plus each continuation-carrying switch's merged branch exit state.
+//
+// Domain and soundness: the abstract state is a must-owned unit set — a bit
+// is present at a program point only when every path represented by that
+// point still carries the ownership unit. Statement transfers are the shared
+// `transferFor*` layer, whose state effects are monotone in the input set
+// (every condition on the owned set tests a single unit bit, so smaller
+// inputs produce smaller outputs) and distribute over intersection.
+// Merges therefore commute with transfers, and one canonical state per
+// region equals the intersection of the per-path states the previous
+// on-demand walkers enumerated.
+//
+// Fixpoint and termination: every accumulator — a join's entry state, the
+// per-jump-site states feeding a join's body keep, and a switch's merged
+// continuation entry — only ever shrinks (set intersection) or receives the
+// fixed additions the equations prescribe (join params placed after the
+// body-use filter). A region is re-walked only when an accumulator it
+// depends on shrinks, each accumulator is a finite bitset that can shrink at
+// most once per bit, and segment walks cannot cycle because join bodies are
+// entered only through their seeded keep-set and remainders only through
+// their join statement. The walk count is therefore bounded by the bit
+// budget of the accumulators, and each walk is linear in region size.
+//
+// The equations, matching the rewrite walk they replace:
+// - entry_state(J): intersection of the must-owned states reaching J's join
+//   statement.
+// - entry_keep(J): entry_state filtered to units whose liveness group is
+//   read from the remainder, unioned with `body_keep & entry_state`
+//   (a unit rebound in the remainder before every jump but read in the body
+//   escapes the remainder filter yet must survive the join entry).
+// - body_keep(J): intersection of the states at every eligible jump to J
+//   (a jump is eligible unless it sits inside J's own body region — loop
+//   back edges conform at emission by releasing down to the keep), filtered
+//   to units read in the shared body, then join params placed owned and
+//   maybe-initialized params placed conditionally, exactly like the
+//   emission-side keep construction. Seeded from above (all body-read units
+//   plus params) so descent stays monotone.
+// - body_reachable(J): whether any eligible jump contributed.
+// - switch common: intersection of branch exit states that reach the
+//   continuation statement without crossing a join frame.
+
+const JoinSummary = struct {
+    id: LIR.JoinPointId,
+    start: LIR.CFStmtId,
+    params: LIR.LocalSpan,
+    maybe_uninitialized_params: LIR.LocalSpan,
+    remainder: LIR.CFStmtId,
+    body: LIR.CFStmtId,
+    /// Must-owned state at the join statement, intersected over arrivals.
+    entry_state: OwnedSet,
+    entry_keep: OwnedSet,
+    /// Pointer-stable: loop keep-set registrations and rewrite options
+    /// reference this set in place.
+    body_keep: OwnedSet,
+    body_keep_seeded: bool = false,
+    body_reachable: bool = false,
+    loop_keep_id: u32,
+    /// Context the join statement was first reached in; remainder and body
+    /// segments derive theirs from it.
+    origin_ctx: SolveContext,
+    /// Must-owned state per eligible jump statement targeting this join.
+    jump_states: std.AutoHashMap(LIR.CFStmtId, OwnedSet),
+    process_queued: bool = false,
+    body_walk_queued: bool = false,
+};
+
+const SwitchSummary = struct {
+    start: LIR.CFStmtId,
+    continuation: LIR.CFStmtId,
+    /// Intersection of branch exit states reaching the continuation; only
+    /// meaningful once `reached` is set.
+    common: OwnedSet,
+    reached: bool = false,
+    resume_ctx: SolveContext,
+    resume_queued: bool = false,
+};
+
+/// Stop entry for switch-continuation collection. `summary` is set for the
+/// scope whose branch exits feed the switch merge and null once a join frame
+/// intervenes: a join starts a separate ownership frame, so its interior
+/// reaching an enclosing continuation contributes nothing.
+const SolveStop = struct {
+    stmt: LIR.CFStmtId,
+    summary: ?*SwitchSummary,
+    parent: ?*const SolveStop,
+};
+
+/// Join bodies the current segment is nested inside; jumps targeting one of
+/// these are loop back edges and do not feed that join's body keep.
+const SolveBodyScope = struct {
+    join: LIR.JoinPointId,
+    parent: ?*const SolveBodyScope,
+};
+
+const SolveContext = struct {
+    loop_keep: ?*const OwnedSet = null,
+    loop_keep_id: u32 = 0,
+    stops: ?*const SolveStop = null,
+    body_scope: ?*const SolveBodyScope = null,
+};
+
+const JoinSummaryMap = std.AutoHashMap(LIR.JoinPointId, *JoinSummary);
+const SwitchSummaryMap = std.AutoHashMap(LIR.CFStmtId, *SwitchSummary);
+
+const SolveSegment = struct {
+    cursor: LIR.CFStmtId,
+    owned: OwnedSet,
+    ctx: SolveContext,
+};
+
+const SolveTask = union(enum) {
+    segment: *SolveSegment,
+    join_process: LIR.JoinPointId,
+    body_walk: LIR.JoinPointId,
+    switch_resume: LIR.CFStmtId,
+};
+
+fn cloneOwnedSetWith(allocator: Allocator, source: *const OwnedSet) ResourceError!OwnedSet {
+    const bits = try source.bits.clone(allocator);
+    return .{ .allocator = allocator, .bits = bits };
+}
+
+fn assignOwnedSet(target: *OwnedSet, source: *const OwnedSet) void {
+    if (target.len() != source.len()) arcInvariant("ARC owned-set assignment length mismatch");
+    target.bits.unsetAll();
+    target.bits.setUnion(source.bits);
+}
 
 const AnalysisStop = union(enum) {
     /// Stop at an explicit shared continuation statement.
@@ -560,6 +711,12 @@ const Inserter = struct {
     join_bodies: ?*const JoinBodyMap = null,
     rewritten_joins: ?*RewrittenJoinMap = null,
     join_body_memo: ?*JoinBodyMemo = null,
+    /// Per-emission join summaries computed by the solver before rewriting.
+    join_summaries: ?*JoinSummaryMap = null,
+    /// Per-emission switch-continuation summaries from the same solve.
+    switch_summaries: ?*SwitchSummaryMap = null,
+    /// Arena backing one emission's solver structures.
+    solve_allocator: Allocator = undefined,
 
     const CallArgOwnership = struct {
         retain_args: std.ArrayList(LIR.LocalId) = .empty,
@@ -1076,6 +1233,7 @@ const Inserter = struct {
                 .jump => |jump_stmt| {
                     const keep = keepForJoin(path.options.join_keeps, jump_stmt.target) orelse
                         arcInvariant("ARC jump reached a join without an active ownership target");
+                    if (comptime differential_liveness) self.assertJumpKeepMatches(jump_stmt.target, keep);
                     const jump = try self.store.addCFStmt(.{ .jump = .{ .target = jump_stmt.target } });
                     const tail = try self.releaseDifference(&path.owned, keep, jump);
                     path.result.* = try self.finishLinearRewrite(&path.frames, tail);
@@ -1447,6 +1605,9 @@ const Inserter = struct {
         defer carried_body_keep.deinit();
         carried_body_keep.intersect(&state.incoming_owned);
         state.entry_keep.unionWith(&carried_body_keep);
+        if (comptime differential_liveness) {
+            self.assertJoinSummaryMatches(join_stmt.id, &path.owned, &state.entry_keep, &state.body_keep, state.body_reachable);
+        }
         errdefer if (!queued) state.incoming_owned.deinit();
         errdefer if (!queued) state.entry_keep.deinit();
         errdefer if (!queued) state.body_keep.deinit();
@@ -1532,6 +1693,7 @@ const Inserter = struct {
             try self.analyzeUntil(switch_stmt.default_branch, &path.owned, continuation, &exit_states, path.options.loop_keep);
 
             if (exit_states.items.len == 0) {
+                if (comptime differential_liveness) self.assertSwitchSummaryMatches(start, null);
                 try self.scheduleRewriteSwitchNoContinuation(tasks, path, start, switch_stmt.cond, switch_stmt.branches, switch_stmt.default_branch, switch_stmt.default_is_cold, switch_stmt.continuation);
                 return;
             }
@@ -1539,6 +1701,7 @@ const Inserter = struct {
             var common = try exit_states.items[0].clone();
             defer common.deinit();
             for (exit_states.items[1..]) |*state| common.intersect(state);
+            if (comptime differential_liveness) self.assertSwitchSummaryMatches(start, &common);
             try self.scheduleRewriteSwitchContinuation(tasks, path, start, switch_stmt.cond, switch_stmt.branches, switch_stmt.default_is_cold, continuation, &common);
             return;
         }
@@ -2282,6 +2445,632 @@ const Inserter = struct {
         for (resume_task.switch_exits.items[1..]) |*state| common.intersect(state);
         try self.pushAnalysisPath(tasks, resume_task.continuation, resume_task.stop, &common, resume_task.parent_exits, resume_task.loop_keep, resume_task.scoped_joins, resume_task.seen);
         self.destroyAnalysisSwitchContinuation(resume_task);
+    }
+
+    /// Runs the join-summary solver for one proc emission: a structured
+    /// abstract interpretation of the ownership-neutral body that fills the
+    /// per-emission join and switch summary tables. See the solver comment
+    /// block above `JoinSummary` for the domain, equations, monotonicity,
+    /// and termination argument.
+    fn solveProcSummaries(self: *Inserter, body: LIR.CFStmtId, entry_owned: *const OwnedSet) ResourceError!void {
+        var tasks = std.ArrayList(SolveTask).empty;
+        defer tasks.deinit(self.solve_allocator);
+        try self.pushSolveSegment(&tasks, body, entry_owned, .{});
+        while (true) {
+            while (tasks.pop()) |task| {
+                if (count_migration) migration_counters.summary_solver_iterations += 1;
+                switch (task) {
+                    .segment => |segment| try self.processSolveSegment(&tasks, segment),
+                    .join_process => |join_id| try self.processSolveJoin(&tasks, join_id),
+                    .body_walk => |join_id| try self.processSolveBodyWalk(&tasks, join_id),
+                    .switch_resume => |switch_stmt| try self.processSolveSwitchResume(&tasks, switch_stmt),
+                }
+            }
+            // Jump reachability is structural, so once the tasks drain, a
+            // join with no contributions has an unreachable body for good.
+            // Its keep then settles to the params-only set the emission uses
+            // for unreachable bodies; the shrink can ripple through
+            // loop-keyed liveness, so drain again until nothing adjusts.
+            var adjusted = false;
+            var summaries = self.join_summaries.?.valueIterator();
+            while (summaries.next()) |summary_ptr| {
+                const summary = summary_ptr.*;
+                if (summary.body_reachable) continue;
+                var params_only = try OwnedSet.init(self.solve_allocator, self.store.localCount());
+                self.placeSolveJoinParamsInto(summary, &params_only);
+                if (params_only.eql(&summary.body_keep)) continue;
+                assignOwnedSet(&summary.body_keep, &params_only);
+                try self.purgeLoopKeepLiveness(summary.loop_keep_id);
+                try self.scheduleSolveJoinProcess(&tasks, summary);
+                adjusted = true;
+            }
+            if (!adjusted) break;
+        }
+    }
+
+    fn processSolveSegment(self: *Inserter, tasks: *std.ArrayList(SolveTask), segment: *SolveSegment) ResourceError!void {
+        while (true) {
+            var stop_entry = segment.ctx.stops;
+            while (stop_entry) |entry| : (stop_entry = entry.parent) {
+                if (entry.stmt != segment.cursor) continue;
+                if (entry.summary) |switch_summary| {
+                    try self.contributeSolveSwitchExit(tasks, switch_summary, switch_summary.start, &segment.owned);
+                }
+                return;
+            }
+
+            const stmt = self.store.getCFStmt(segment.cursor);
+            switch (stmt) {
+                .assign_ref => |assign| {
+                    if (!self.isBindingBorrowed(assign.target)) {
+                        switch (assign.op) {
+                            .local => |source| {
+                                if (assign.target != source) {
+                                    _ = try self.transferForAliasBind(&segment.owned, assign.target, source, assign.next, segment.ctx.loop_keep);
+                                }
+                            },
+                            else => _ = self.transferForFreshBind(&segment.owned, assign.target),
+                        }
+                    }
+                    const singles = [_]LIR.LocalId{ refOpSource(assign.op), assign.target };
+                    try self.postStmtDeaths(&segment.owned, &singles, null, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .init_uninitialized => |uninit| {
+                    _ = self.transferForInit(&segment.owned, uninit.target);
+                    segment.cursor = uninit.next;
+                },
+                .assign_literal => |assign| {
+                    _ = self.transferForFreshBind(&segment.owned, assign.target);
+                    const singles = [_]LIR.LocalId{assign.target};
+                    try self.postStmtDeaths(&segment.owned, &singles, null, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .assign_call => |assign| {
+                    // Call targets are not materialized during solving, so
+                    // the unique-demand scan stays off, matching the
+                    // analysis-side transfer call.
+                    var transfer = try self.transferForCall(&segment.owned, null, self.solution.sigOf(assign.proc), false, assign.args, assign.next, assign.target, null, segment.ctx.loop_keep);
+                    defer transfer.deinit(self.store.allocator);
+                    try self.noteCallResultDeathIfUnused(&segment.owned, assign.target, transfer.args.demanded.ret_mode, assign.next, segment.ctx.loop_keep, null);
+                    try self.postStmtDeaths(&segment.owned, &.{}, assign.args, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .assign_call_erased => |assign| {
+                    var transfer = try self.transferForCall(&segment.owned, null, arc_sig.RcSig.all_owned, false, assign.args, assign.next, assign.target, assign.closure, segment.ctx.loop_keep);
+                    defer transfer.deinit(self.store.allocator);
+                    try self.noteCallResultDeathIfUnused(&segment.owned, assign.target, .owned, assign.next, segment.ctx.loop_keep, null);
+                    const singles = [_]LIR.LocalId{assign.closure};
+                    try self.postStmtDeaths(&segment.owned, &singles, assign.args, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .assign_packed_erased_fn => |assign| {
+                    _ = try self.transferForSingle(&segment.owned, assign.capture, assign.target, assign.next, segment.ctx.loop_keep);
+                    const singles = [_]LIR.LocalId{ assign.capture orelse assign.target, assign.target };
+                    try self.postStmtDeaths(&segment.owned, &singles, null, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .assign_low_level => |assign| {
+                    _ = try self.transferForLowLevel(&segment.owned, assign.args, assign.rc_effect, assign.target, assign.next, segment.ctx.loop_keep, false);
+                    const singles = [_]LIR.LocalId{assign.target};
+                    try self.postStmtDeaths(&segment.owned, &singles, assign.args, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .assign_list => |assign| {
+                    _ = try self.transferForAggregate(&segment.owned, assign.elems, assign.target, assign.next, segment.ctx.loop_keep);
+                    const singles = [_]LIR.LocalId{assign.target};
+                    try self.postStmtDeaths(&segment.owned, &singles, assign.elems, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .assign_struct => |assign| {
+                    _ = try self.transferForAggregate(&segment.owned, assign.fields, assign.target, assign.next, segment.ctx.loop_keep);
+                    const singles = [_]LIR.LocalId{assign.target};
+                    try self.postStmtDeaths(&segment.owned, &singles, assign.fields, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .assign_tag => |assign| {
+                    _ = try self.transferForSingle(&segment.owned, assign.payload, assign.target, assign.next, segment.ctx.loop_keep);
+                    const singles = [_]LIR.LocalId{ assign.payload orelse assign.target, assign.target };
+                    try self.postStmtDeaths(&segment.owned, &singles, null, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .set_local => |assign| {
+                    _ = try self.transferForSetLocal(&segment.owned, assign.target, assign.value, assign.mode, assign.next, segment.ctx.loop_keep);
+                    const singles = [_]LIR.LocalId{ assign.value, assign.target };
+                    try self.postStmtDeaths(&segment.owned, &singles, null, assign.next, segment.ctx.loop_keep, null);
+                    segment.cursor = assign.next;
+                },
+                .debug => |debug_stmt| {
+                    const singles = [_]LIR.LocalId{debug_stmt.message};
+                    try self.postStmtDeaths(&segment.owned, &singles, null, debug_stmt.next, segment.ctx.loop_keep, null);
+                    segment.cursor = debug_stmt.next;
+                },
+                .expect => |expect_stmt| {
+                    const singles = [_]LIR.LocalId{expect_stmt.condition};
+                    try self.postStmtDeaths(&segment.owned, &singles, null, expect_stmt.next, segment.ctx.loop_keep, null);
+                    segment.cursor = expect_stmt.next;
+                },
+                .decref_if_initialized => |rc| {
+                    self.noteEmittedRelease(&segment.owned, rc.value);
+                    segment.cursor = rc.next;
+                },
+                .incref, .decref, .free => arcInvariant("ARC summary solver received already-reference-counted LIR"),
+                .switch_stmt => |switch_stmt| {
+                    if (switch_stmt.continuation) |continuation| {
+                        const summaries = self.switch_summaries orelse arcInvariant("ARC solver ran without a switch table");
+                        const gop = try summaries.getOrPut(segment.cursor);
+                        if (!gop.found_existing) {
+                            const switch_summary = try self.solve_allocator.create(SwitchSummary);
+                            switch_summary.* = .{
+                                .start = segment.cursor,
+                                .continuation = continuation,
+                                .common = try OwnedSet.init(self.solve_allocator, self.store.localCount()),
+                                .resume_ctx = segment.ctx,
+                            };
+                            gop.value_ptr.* = switch_summary;
+                        }
+                        const switch_summary = gop.value_ptr.*;
+                        if (!switch_summary.resume_queued) {
+                            switch_summary.resume_queued = true;
+                            try tasks.append(self.solve_allocator, .{ .switch_resume = segment.cursor });
+                        }
+                        const stop = try self.solve_allocator.create(SolveStop);
+                        stop.* = .{ .stmt = continuation, .summary = switch_summary, .parent = segment.ctx.stops };
+                        var branch_ctx = segment.ctx;
+                        branch_ctx.stops = stop;
+                        const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                        for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                            const branch = GuardedList.at(branches, branch_index);
+                            try self.pushSolveSegment(tasks, branch.body, &segment.owned, branch_ctx);
+                        }
+                        try self.pushSolveSegment(tasks, switch_stmt.default_branch, &segment.owned, branch_ctx);
+                        return;
+                    }
+
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
+                        try self.pushSolveSegment(tasks, branch.body, &segment.owned, segment.ctx);
+                    }
+                    try self.pushSolveSegment(tasks, switch_stmt.default_branch, &segment.owned, segment.ctx);
+                    return;
+                },
+                .switch_initialized_payload => |switch_stmt| {
+                    var initialized_owned = try cloneOwnedSetWith(self.solve_allocator, &segment.owned);
+                    self.placeUnit(&initialized_owned, switch_stmt.payload);
+
+                    var uninitialized_owned = try cloneOwnedSetWith(self.solve_allocator, &segment.owned);
+                    // The branch proves the cell uninitialized: the payload
+                    // binding ends with nothing to release.
+                    _ = self.transferForInit(&uninitialized_owned, switch_stmt.payload);
+
+                    try self.pushSolveSegment(tasks, switch_stmt.initialized_branch, &initialized_owned, segment.ctx);
+                    try self.pushSolveSegment(tasks, switch_stmt.uninitialized_branch, &uninitialized_owned, segment.ctx);
+                    return;
+                },
+                .str_match => |str_match| {
+                    var match_owned = try cloneOwnedSetWith(self.solve_allocator, &segment.owned);
+                    const steps = self.store.getStrMatchSteps(str_match.steps);
+                    for (0..GuardedList.borrowLen(steps)) |step_index| {
+                        const step = GuardedList.at(steps, step_index);
+                        switch (step.capture) {
+                            .discard => {},
+                            .view => |local| self.placeUnit(&match_owned, local),
+                        }
+                    }
+                    try self.pushSolveSegment(tasks, str_match.on_match, &match_owned, segment.ctx);
+                    try self.pushSolveSegment(tasks, str_match.on_miss, &segment.owned, segment.ctx);
+                    return;
+                },
+                .str_match_set => |str_match_set| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
+                        var match_owned = try cloneOwnedSetWith(self.solve_allocator, &segment.owned);
+                        const steps = self.store.getStrMatchSteps(arm.steps);
+                        for (0..GuardedList.borrowLen(steps)) |step_index| {
+                            const step = GuardedList.at(steps, step_index);
+                            switch (step.capture) {
+                                .discard => {},
+                                .view => |local| self.placeUnit(&match_owned, local),
+                            }
+                        }
+                        try self.pushSolveSegment(tasks, arm.on_match, &match_owned, segment.ctx);
+                    }
+                    try self.pushSolveSegment(tasks, str_match_set.on_miss, &segment.owned, segment.ctx);
+                    return;
+                },
+                .join => |join_stmt| {
+                    try self.solveArriveAtJoin(tasks, segment, join_stmt);
+                    return;
+                },
+                .jump => |jump_stmt| {
+                    try self.solveJumpContribution(tasks, segment, jump_stmt.target);
+                    return;
+                },
+                .runtime_error,
+                .comptime_exhaustiveness_failed,
+                .loop_continue,
+                .loop_break,
+                .ret,
+                .crash,
+                .expect_err,
+                => return,
+                .comptime_branch_taken => |marker| {
+                    segment.cursor = marker.next;
+                },
+            }
+        }
+    }
+
+    fn solveSummaryOf(self: *Inserter, join_id: LIR.JoinPointId) *JoinSummary {
+        const summaries = self.join_summaries orelse arcInvariant("ARC solver ran without a summary table");
+        return summaries.get(join_id) orelse arcInvariant("ARC solver referenced a join without a summary");
+    }
+
+    fn pushSolveSegment(
+        self: *Inserter,
+        tasks: *std.ArrayList(SolveTask),
+        start: LIR.CFStmtId,
+        owned: *const OwnedSet,
+        ctx: SolveContext,
+    ) ResourceError!void {
+        const segment = try self.solve_allocator.create(SolveSegment);
+        segment.* = .{
+            .cursor = start,
+            .owned = try cloneOwnedSetWith(self.solve_allocator, owned),
+            .ctx = ctx,
+        };
+        try tasks.append(self.solve_allocator, .{ .segment = segment });
+    }
+
+    fn scheduleSolveJoinProcess(self: *Inserter, tasks: *std.ArrayList(SolveTask), summary: *JoinSummary) ResourceError!void {
+        if (summary.process_queued) return;
+        summary.process_queued = true;
+        try tasks.append(self.solve_allocator, .{ .join_process = summary.id });
+    }
+
+    fn scheduleSolveBodyWalk(self: *Inserter, tasks: *std.ArrayList(SolveTask), summary: *JoinSummary) ResourceError!void {
+        if (summary.body_walk_queued) return;
+        summary.body_walk_queued = true;
+        try tasks.append(self.solve_allocator, .{ .body_walk = summary.id });
+    }
+
+    /// Rebuilds a stop chain with contributions disabled: segments inside a
+    /// join frame that reach an enclosing switch continuation end silently.
+    fn stripStopContributions(self: *Inserter, stops: ?*const SolveStop) ResourceError!?*const SolveStop {
+        const entry = stops orelse return null;
+        const parent = try self.stripStopContributions(entry.parent);
+        if (entry.summary == null and parent == entry.parent) return entry;
+        const node = try self.solve_allocator.create(SolveStop);
+        node.* = .{ .stmt = entry.stmt, .summary = null, .parent = parent };
+        return node;
+    }
+
+    /// Drops cached loop-keyed liveness rows after their keep-set shrank.
+    fn purgeLoopKeepLiveness(self: *Inserter, loop_keep_id: u32) ResourceError!void {
+        var stale = std.ArrayList(ReadBeforeRebindKey).empty;
+        defer stale.deinit(self.store.allocator);
+        var keys = self.reads_before_rebind_cache.keyIterator();
+        while (keys.next()) |key| {
+            if (key.loop_keep_id == loop_keep_id) try stale.append(self.store.allocator, key.*);
+        }
+        for (stale.items) |key| {
+            _ = self.reads_before_rebind_cache.remove(key);
+        }
+    }
+
+    /// True when the local's liveness group is read from `start` under no
+    /// loop context, answered directly by the table row.
+    fn groupUsedFromTable(
+        self: *Inserter,
+        reads: *const std.bit_set.DynamicBitSetUnmanaged,
+        local: LIR.LocalId,
+    ) bool {
+        const leader = self.solution.leaderOf(local);
+        if (self.solution.groupMembers(leader).len > 1) {
+            const bit = self.groupBitOf(local) orelse
+                arcInvariant("ARC multi-member borrow group missing its liveness group bit");
+            return reads.isSet(bit);
+        }
+        return reads.isSet(@intFromEnum(local));
+    }
+
+    /// Seeds a join's body keep from above: every refcounted unit whose
+    /// group is read in the body, plus the join params. Always a superset of
+    /// the final keep, so the fixpoint descends monotonically.
+    fn seedSolveBodyKeep(self: *Inserter, summary: *JoinSummary) ResourceError!void {
+        const reads = try self.computeReadsBeforeRebind(summary.body, null, 0);
+        for (0..self.store.localCount()) |index| {
+            const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(index)));
+            if (!self.localContainsRefcounted(local)) continue;
+            if (self.groupUsedFromTable(reads, local)) summary.body_keep.set(local);
+        }
+        self.placeSolveJoinParamsInto(summary, &summary.body_keep);
+    }
+
+    fn placeSolveJoinParamsInto(self: *Inserter, summary: *const JoinSummary, keep: *OwnedSet) void {
+        const params = self.store.getLocalSpan(summary.params);
+        for (0..GuardedList.borrowLen(params)) |index| {
+            self.placeUnit(keep, GuardedList.at(params, index));
+        }
+        const maybe_params = self.store.getLocalSpan(summary.maybe_uninitialized_params);
+        for (0..GuardedList.borrowLen(maybe_params)) |index| {
+            self.placeConditionalUnit(keep, GuardedList.at(maybe_params, index));
+        }
+    }
+
+    /// Recomputes a join's body keep from its jump-site states: intersect,
+    /// filter to units read in the body, then place params. Returns whether
+    /// the stored keep changed (it can only shrink).
+    fn recomputeSolveBodyKeep(self: *Inserter, summary: *JoinSummary) ResourceError!bool {
+        if (summary.jump_states.count() == 0) return false;
+        var merged = try OwnedSet.init(self.solve_allocator, self.store.localCount());
+        var first = true;
+        var sites = summary.jump_states.valueIterator();
+        while (sites.next()) |state| {
+            if (first) {
+                assignOwnedSet(&merged, state);
+                first = false;
+            } else {
+                merged.intersect(state);
+            }
+        }
+        const reads = try self.computeReadsBeforeRebind(summary.body, null, 0);
+        var owned_iter = merged.bits.iterator(.{});
+        while (owned_iter.next()) |index| {
+            const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(index)));
+            if (!self.groupUsedFromTable(reads, local)) merged.unset(local);
+        }
+        self.placeSolveJoinParamsInto(summary, &merged);
+        if (merged.eql(&summary.body_keep)) return false;
+        assignOwnedSet(&summary.body_keep, &merged);
+        try self.purgeLoopKeepLiveness(summary.loop_keep_id);
+        return true;
+    }
+
+    fn processSolveJoin(self: *Inserter, tasks: *std.ArrayList(SolveTask), join_id: LIR.JoinPointId) ResourceError!void {
+        const summary = self.solveSummaryOf(join_id);
+        summary.process_queued = false;
+        if (!summary.body_keep_seeded) {
+            summary.body_keep_seeded = true;
+            try self.seedSolveBodyKeep(summary);
+        }
+
+        // entry_keep = (entry_state filtered to units read from the
+        // remainder) | (body_keep & entry_state).
+        var keep = try OwnedSet.init(self.solve_allocator, self.store.localCount());
+        const remainder_reads = try self.computeReadsBeforeRebind(summary.remainder, null, 0);
+        var entry_iter = summary.entry_state.bits.iterator(.{});
+        while (entry_iter.next()) |index| {
+            const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(index)));
+            if (self.groupUsedFromTable(remainder_reads, local)) keep.set(local);
+        }
+        var carried = try cloneOwnedSetWith(self.solve_allocator, &summary.body_keep);
+        carried.intersect(&summary.entry_state);
+        keep.unionWith(&carried);
+        assignOwnedSet(&summary.entry_keep, &keep);
+
+        const remainder_ctx = SolveContext{
+            .loop_keep = &summary.body_keep,
+            .loop_keep_id = summary.loop_keep_id,
+            .stops = try self.stripStopContributions(summary.origin_ctx.stops),
+            .body_scope = summary.origin_ctx.body_scope,
+        };
+        try self.pushSolveSegment(tasks, summary.remainder, &summary.entry_keep, remainder_ctx);
+        if (summary.body_reachable) try self.scheduleSolveBodyWalk(tasks, summary);
+    }
+
+    fn processSolveBodyWalk(self: *Inserter, tasks: *std.ArrayList(SolveTask), join_id: LIR.JoinPointId) ResourceError!void {
+        const summary = self.solveSummaryOf(join_id);
+        summary.body_walk_queued = false;
+        if (!summary.body_reachable) return;
+        const scope = try self.solve_allocator.create(SolveBodyScope);
+        scope.* = .{ .join = summary.id, .parent = summary.origin_ctx.body_scope };
+        const body_ctx = SolveContext{
+            .loop_keep = &summary.body_keep,
+            .loop_keep_id = summary.loop_keep_id,
+            .stops = try self.stripStopContributions(summary.origin_ctx.stops),
+            .body_scope = scope,
+        };
+        try self.pushSolveSegment(tasks, summary.body, &summary.body_keep, body_ctx);
+    }
+
+    fn processSolveSwitchResume(self: *Inserter, tasks: *std.ArrayList(SolveTask), switch_stmt: LIR.CFStmtId) ResourceError!void {
+        const summaries = self.switch_summaries orelse arcInvariant("ARC solver ran without a switch table");
+        const summary = summaries.get(switch_stmt) orelse arcInvariant("ARC solver resumed an unknown switch");
+        summary.resume_queued = false;
+        if (!summary.reached) return;
+        try self.pushSolveSegment(tasks, summary.continuation, &summary.common, summary.resume_ctx);
+    }
+
+    /// A branch segment reached its switch's continuation: fold its exit
+    /// state into the merged entry and (re)schedule the continuation walk.
+    fn contributeSolveSwitchExit(
+        self: *Inserter,
+        tasks: *std.ArrayList(SolveTask),
+        summary: *SwitchSummary,
+        switch_stmt: LIR.CFStmtId,
+        owned: *const OwnedSet,
+    ) ResourceError!void {
+        var changed = false;
+        if (!summary.reached) {
+            summary.reached = true;
+            assignOwnedSet(&summary.common, owned);
+            changed = true;
+        } else {
+            var merged = try cloneOwnedSetWith(self.solve_allocator, &summary.common);
+            merged.intersect(owned);
+            if (!merged.eql(&summary.common)) {
+                assignOwnedSet(&summary.common, &merged);
+                changed = true;
+            }
+        }
+        if (changed and !summary.resume_queued) {
+            summary.resume_queued = true;
+            try tasks.append(self.solve_allocator, .{ .switch_resume = switch_stmt });
+        }
+    }
+
+    /// A segment arrived at a join statement: intersect the entry state and
+    /// (re)schedule the join's keep computation and remainder walk.
+    fn solveArriveAtJoin(
+        self: *Inserter,
+        tasks: *std.ArrayList(SolveTask),
+        segment: *SolveSegment,
+        join_stmt: anytype,
+    ) ResourceError!void {
+        const summaries = self.join_summaries orelse arcInvariant("ARC solver ran without a summary table");
+        const local_count = self.store.localCount();
+        const gop = try summaries.getOrPut(join_stmt.id);
+        if (!gop.found_existing) {
+            const summary = try self.solve_allocator.create(JoinSummary);
+            summary.* = .{
+                .id = join_stmt.id,
+                .start = segment.cursor,
+                .params = join_stmt.params,
+                .maybe_uninitialized_params = join_stmt.maybe_uninitialized_params,
+                .remainder = join_stmt.remainder,
+                .body = join_stmt.body,
+                .entry_state = try cloneOwnedSetWith(self.solve_allocator, &segment.owned),
+                .entry_keep = try OwnedSet.init(self.solve_allocator, local_count),
+                .body_keep = try OwnedSet.init(self.solve_allocator, local_count),
+                .loop_keep_id = self.next_loop_keep_id,
+                .origin_ctx = segment.ctx,
+                .jump_states = std.AutoHashMap(LIR.CFStmtId, OwnedSet).init(self.solve_allocator),
+            };
+            self.next_loop_keep_id += 1;
+            try self.active_loop_keep_ids.put(@intFromPtr(&summary.body_keep), summary.loop_keep_id);
+            gop.value_ptr.* = summary;
+            try self.scheduleSolveJoinProcess(tasks, summary);
+            return;
+        }
+
+        const summary = gop.value_ptr.*;
+        if (summary.body != join_stmt.body or summary.remainder != join_stmt.remainder or
+            !localSpanEql(summary.params, join_stmt.params) or
+            !localSpanEql(summary.maybe_uninitialized_params, join_stmt.maybe_uninitialized_params))
+        {
+            arcInvariant("ARC solver saw one join id with conflicting metadata");
+        }
+        var merged = try cloneOwnedSetWith(self.solve_allocator, &summary.entry_state);
+        merged.intersect(&segment.owned);
+        if (!merged.eql(&summary.entry_state)) {
+            assignOwnedSet(&summary.entry_state, &merged);
+            try self.scheduleSolveJoinProcess(tasks, summary);
+        }
+    }
+
+    /// A segment reached a jump: contribute its state to the target join's
+    /// body keep unless the jump is a back edge inside that join's own body.
+    fn solveJumpContribution(
+        self: *Inserter,
+        tasks: *std.ArrayList(SolveTask),
+        segment: *SolveSegment,
+        target: LIR.JoinPointId,
+    ) ResourceError!void {
+        var scope = segment.ctx.body_scope;
+        while (scope) |entry| {
+            if (entry.join == target) return;
+            scope = entry.parent;
+        }
+        const summary = self.solveSummaryOf(target);
+        var changed = false;
+        const site = try summary.jump_states.getOrPut(segment.cursor);
+        if (!site.found_existing) {
+            site.value_ptr.* = try cloneOwnedSetWith(self.solve_allocator, &segment.owned);
+            changed = true;
+        } else {
+            var merged = try cloneOwnedSetWith(self.solve_allocator, site.value_ptr);
+            merged.intersect(&segment.owned);
+            if (!merged.eql(site.value_ptr)) {
+                assignOwnedSet(site.value_ptr, &merged);
+                changed = true;
+            }
+        }
+        const first_reach = !summary.body_reachable;
+        if (first_reach) summary.body_reachable = true;
+        if (!changed and !first_reach) return;
+        const keep_changed = try self.recomputeSolveBodyKeep(summary);
+        if (keep_changed) try self.scheduleSolveJoinProcess(tasks, summary);
+        if (keep_changed or first_reach) try self.scheduleSolveBodyWalk(tasks, summary);
+    }
+
+    fn dumpOwnedSetDiff(label: []const u8, solver: *const OwnedSet, rewrite: *const OwnedSet) void {
+        std.debug.print("  {s}: solver-only=[", .{label});
+        var solver_iter = solver.bits.iterator(.{});
+        while (solver_iter.next()) |index| {
+            if (!rewrite.bits.isSet(index)) std.debug.print("{d},", .{index});
+        }
+        std.debug.print("] rewrite-only=[", .{});
+        var rewrite_iter = rewrite.bits.iterator(.{});
+        while (rewrite_iter.next()) |index| {
+            if (!solver.bits.isSet(index)) std.debug.print("{d},", .{index});
+        }
+        std.debug.print("]\n", .{});
+    }
+
+    /// Migration check: the solver's join summary must match the values the
+    /// rewrite-time analysis computed for the same join.
+    fn assertJoinSummaryMatches(
+        self: *Inserter,
+        id: LIR.JoinPointId,
+        incoming: *const OwnedSet,
+        entry_keep: *const OwnedSet,
+        body_keep: *const OwnedSet,
+        body_reachable: bool,
+    ) void {
+        const summaries = self.join_summaries orelse return;
+        const summary = summaries.get(id) orelse {
+            std.debug.print("arc-solver-mismatch: join {d} has no summary\n", .{@intFromEnum(id)});
+            arcInvariant("ARC solver summary missing at join rewrite");
+        };
+        const reachable_ok = summary.body_reachable == body_reachable;
+        const entry_ok = summary.entry_keep.eql(entry_keep);
+        const body_ok = summary.body_keep.eql(body_keep);
+        if (reachable_ok and entry_ok and body_ok) return;
+        std.debug.print(
+            "arc-solver-mismatch: join {d} reachable solver={} rewrite={}\n",
+            .{ @intFromEnum(id), summary.body_reachable, body_reachable },
+        );
+        dumpOwnedSetDiff("entry_state vs incoming", &summary.entry_state, incoming);
+        dumpOwnedSetDiff("entry_keep", &summary.entry_keep, entry_keep);
+        dumpOwnedSetDiff("body_keep", &summary.body_keep, body_keep);
+        arcInvariant("ARC solver join summary disagreed with the rewrite analysis");
+    }
+
+    /// Migration check: a jump's release keep must match the solver's body
+    /// keep for the target join.
+    fn assertJumpKeepMatches(self: *Inserter, target: LIR.JoinPointId, keep: *const OwnedSet) void {
+        const summaries = self.join_summaries orelse return;
+        const summary = summaries.get(target) orelse {
+            std.debug.print("arc-solver-mismatch: jump target {d} has no summary\n", .{@intFromEnum(target)});
+            arcInvariant("ARC solver summary missing at jump rewrite");
+        };
+        if (summary.body_keep.eql(keep)) return;
+        std.debug.print("arc-solver-mismatch: jump target {d}\n", .{@intFromEnum(target)});
+        dumpOwnedSetDiff("body_keep", &summary.body_keep, keep);
+        arcInvariant("ARC solver jump keep disagreed with the rewrite analysis");
+    }
+
+    /// Migration check: a switch's solver summary must agree with the
+    /// rewrite-time branch exit analysis (`null` common means no branch
+    /// reached the continuation).
+    fn assertSwitchSummaryMatches(self: *Inserter, start: LIR.CFStmtId, common: ?*const OwnedSet) void {
+        const summaries = self.switch_summaries orelse return;
+        const summary = summaries.get(start) orelse {
+            std.debug.print("arc-solver-mismatch: switch {d} has no summary\n", .{@intFromEnum(start)});
+            arcInvariant("ARC solver summary missing at switch rewrite");
+        };
+        if (common) |merged| {
+            if (summary.reached and summary.common.eql(merged)) return;
+            std.debug.print("arc-solver-mismatch: switch {d} reached solver={} rewrite=true\n", .{ @intFromEnum(start), summary.reached });
+            dumpOwnedSetDiff("common", &summary.common, merged);
+        } else {
+            if (!summary.reached) return;
+            std.debug.print("arc-solver-mismatch: switch {d} reached solver=true rewrite=false\n", .{@intFromEnum(start)});
+        }
+        arcInvariant("ARC solver switch summary disagreed with the rewrite analysis");
     }
 
     fn destroyRewriteTask(self: *Inserter, task: RewriteTask) void {
