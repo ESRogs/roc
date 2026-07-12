@@ -1875,12 +1875,14 @@ const Formatter = struct {
                 try fmt.formatCollection(args_region, .round, AST.Expr.Idx, fmt.ast.store.exprSlice(na.args), Formatter.formatExpr);
             },
             .nominal_record => |nr| {
-                try fmt.formatExprDiscard(nr.mapper);
+                const mapper = try fmt.formatExprWithInfo(nr.mapper);
                 const mapper_region = fmt.nodeRegion(@intFromEnum(nr.mapper));
                 if (fmt.hasCommentBefore(mapper_region.end)) {
                     if (try fmt.flushCommentsBefore(mapper_region.end)) {
                         try fmt.pushIndent();
                     }
+                } else {
+                    _ = try fmt.continueAfterMultilineStringLine(mapper);
                 }
                 try fmt.push('.');
                 try fmt.formatExprDiscard(nr.backing);
