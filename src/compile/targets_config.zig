@@ -359,8 +359,8 @@ pub const TargetsConfig = struct {
             const target_file = store.getTargetFile(file_idx);
 
             switch (target_file) {
-                .string_literal => |tok| {
-                    const path = ast.resolve(tok);
+                .string_literal => |maybe_tok| {
+                    const path = if (maybe_tok) |tok| ast.resolve(tok) else "";
                     try link_items.append(.{ .file_path = try allocator.dupe(u8, path) });
                 },
                 .special_ident => |tok| {
@@ -405,7 +405,10 @@ pub const TargetsConfig = struct {
 
         for (store.targetConfigValueSlice(values)) |value_idx| {
             switch (store.getTargetConfigValue(value_idx)) {
-                .string_literal => |tok| try exports.append(try allocator.dupe(u8, ast.resolve(tok))),
+                .string_literal => |maybe_tok| {
+                    const name = maybe_tok orelse continue;
+                    try exports.append(try allocator.dupe(u8, ast.resolve(name)));
+                },
                 else => {},
             }
         }

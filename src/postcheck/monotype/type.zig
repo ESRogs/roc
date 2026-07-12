@@ -44,13 +44,6 @@ pub const MonoTypeDigest = names.TypeDigest;
 /// Primitive type copied from checked module data.
 pub const Primitive = checked.CheckedPrimitive;
 
-/// Static-dispatch owner head for a monomorphic receiver type.
-pub const OwnerHead = union(enum(u8)) {
-    none,
-    builtin: static_dispatch.BuiltinOwner,
-    named_type: TypeDef,
-};
-
 /// Named type definition owner.
 pub const TypeDef = struct {
     /// Deep content identity of the declaring module (dense id in the owning
@@ -381,28 +374,31 @@ pub const Store = struct {
         self.declared_fields.restoreLen(mark_.declared_fields_len);
     }
 
-    pub fn ownerHead(self: *const Store, ty: TypeId) OwnerHead {
-        return switch (self.get(ty)) {
-            .primitive => |primitive| .{ .builtin = builtinOwner(primitive) },
-            .list => .{ .builtin = .list },
-            .box => .{ .builtin = .box },
-            .named => |named| if (named.builtin_owner) |owner|
-                .{ .builtin = owner }
-            else if (named.kind == .alias)
-                // Aliases are transparent for static dispatch: the owner is the
-                // backing's owner, mirroring the alias-transparent digest path
-                // above. This unwraps alias-over-alias and alias-over-nominal
-                // uniformly (the backing of an alias-over-nominal is itself a
-                // `named` node carrying the nominal's owner). The recursion
-                // terminates because alias chains in checked output are finite.
-                (if (named.backing) |backing|
-                    self.ownerHead(backing.ty)
-                else
-                    .none)
-            else
-                .{ .named_type = named.def },
-            else => .none,
-        };
+    /// Resolve `ty` through alias `named` nodes to the content that names its
+    /// dispatch head. Aliases are transparent for static dispatch, mirroring
+    /// the alias-transparent digest path: alias-over-alias and
+    /// alias-over-nominal unwrap uniformly (the backing of an
+    /// alias-over-nominal is itself a `named` node carrying the nominal's
+    /// identity). An alias `named` node carrying a builtin owner, or one with
+    /// no backing, is returned as-is. The walk terminates because alias
+    /// chains in checked output are finite.
+    pub fn dispatchHeadContent(self: *const Store, ty: TypeId) Content {
+        var current = ty;
+        while (true) {
+            const content = self.get(current);
+            switch (content) {
+                .named => |named| {
+                    if (named.builtin_owner == null and named.kind == .alias) {
+                        if (named.backing) |backing| {
+                            current = backing.ty;
+                            continue;
+                        }
+                    }
+                    return content;
+                },
+                else => return content,
+            }
+        }
     }
 
     pub fn typeDigest(self: *const Store, name_store: *const names.NameStore, ty: TypeId) names.TypeDigest {
@@ -2012,11 +2008,20 @@ fn writeBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     hasher.update(bytes);
 }
 
-fn generatedEvidenceOwnerUsesBacking(owner: static_dispatch.BuiltinOwner) bool {
+/// Whether a builtin owner is a compiler-generated evidence carrier whose
+/// backing structure distinguishes otherwise same-named applications: the
+/// backing then participates in type digests, identity comparison, and
+/// public-type equivalence. One definition serves every postcheck stage.
+pub fn generatedEvidenceOwnerUsesBacking(owner: static_dispatch.BuiltinOwner) bool {
     return switch (owner) {
         .fields,
         .field,
         .parse_tag_union_spec,
+        // `Iter`/`Stream` instances of one item type share a nominal but
+        // carry different step captures per chain, so their layouts must be
+        // distinguished by backing rather than by nominal identity alone.
+        .iter,
+        .stream,
         => true,
         else => false,
     };
@@ -2045,7 +2050,8 @@ fn optionalDigestEql(lhs: ?names.TypeDigest, rhs: ?names.TypeDigest) bool {
     return std.mem.eql(u8, lhs.?.bytes[0..], rhs.?.bytes[0..]);
 }
 
-fn builtinOwner(primitive: Primitive) static_dispatch.BuiltinOwner {
+/// The builtin method owner a primitive monotype belongs to, by definition.
+pub fn builtinOwnerForPrimitive(primitive: Primitive) static_dispatch.BuiltinOwner {
     return switch (primitive) {
         .bool => .bool,
         .str => .str,
