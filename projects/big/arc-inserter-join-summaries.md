@@ -2,11 +2,10 @@
 
 ## Problem
 
-ARC insertion in `src/lir/arc.zig` still answers join and liveness questions
-by re-walking ownership-neutral LIR under the current `OwnedSet`. That was a
-reasonable implementation shape when the all-owned inserter asked a small
-number of local questions, but it is now a compile-time bottleneck on
-generated, join-heavy code.
+ARC insertion in `src/lir/arc.zig` answers join and liveness questions by
+re-walking ownership-neutral LIR under the current `OwnedSet`. This on-demand
+path interpretation is a compile-time bottleneck on generated, join-heavy
+code.
 
 The concrete stress case is structural JSON encoding. `JsonEncodeRoundTrip.roc`
 contains a 25-field `Shape` with lists, sets, dicts, nested records, tag
@@ -34,15 +33,14 @@ seconds. The large test is slow because generated encoder LIR creates many
 joins and many refcounted locals, and the production ARC inserter treats join
 ownership as an on-demand path-interpretation problem.
 
-The design document already names the intended remedy in "RC Statement
-Emission": if ARC insertion becomes hot, replace on-demand scans with one
-precomputed per-statement liveness table per proc, consumed by the same
-decision points. That narrow liveness table is necessary but no longer
-sufficient: the current hotspot is also `joinBodyOwnedSet`, which recursively
-walks join remainders and nested scoped joins to compute keep sets. The
-production inserter needs the same structural treatment as the certifier
-project: finite summaries, worklists, and explicit joins, not repeated
-rediscovery.
+The design document names the intended remedy in "RC Statement Emission": if
+ARC insertion becomes hot, replace on-demand scans with one precomputed
+per-statement liveness table per proc, consumed by the same decision points.
+That narrow liveness table is necessary but not sufficient: the hotspot is
+also `joinBodyOwnedSet`, which recursively walks join remainders and nested
+scoped joins to compute keep sets. The production inserter needs the same
+structural treatment the debug certifier uses: finite summaries, worklists,
+and explicit joins, not repeated rediscovery.
 
 ## Background
 
@@ -88,12 +86,12 @@ The current implementation answers that with local analysis calls:
   proc emission. A different but overlapping ownership state is a different
   entry and therefore a fresh walk.
 
-The debug certifier already landed this discipline: its distinct-entry-state
-enumeration was replaced with a finite lattice fixpoint (`JoinGroup` joining
-in `src/lir/arc_certify.zig`), and ownership-transfer keying is centralized
-in `arc.zig`'s transfer layer. This project is the production-inserter
-counterpart: it attacks compile time in `arc.zig`, not the debug-only
-certifier.
+The debug certifier follows this discipline: it joins entry states with a
+finite lattice fixpoint (`JoinGroup` in `src/lir/arc_certify.zig`, with no
+capacity cap and no skip path), and ownership-transfer keying is centralized
+in `arc.zig`'s transfer layer (the `transferFor*` functions). This project is
+the production-inserter counterpart: it attacks compile time in `arc.zig`,
+not the debug-only certifier.
 
 One existing LIR pass is the closest implementation model:
 `src/lir/tag_reachability.zig`. It tracks possible tag values in monotone
@@ -163,9 +161,9 @@ change is how it answers liveness and join-keep questions.
 
 ### Part 1: shared transfer decisions
 
-Build on the landed ownership-transfer keying layer in `arc.zig` (the
-`transferFor*` functions shared by both walks). The summary solver must not
-create a third copy of transfer semantics.
+Build on the ownership-transfer keying layer in `arc.zig` (the `transferFor*`
+functions shared by both walks). The summary solver must not create a third
+copy of transfer semantics.
 
 Create a shared inserter transfer layer used by:
 
@@ -177,7 +175,7 @@ The helper returns small decision structs for each ownership-moving statement:
 which source units move, which args must be retained, which target unit is
 born, which previous target unit dies, and which conditionally initialized
 payload state is affected. It routes all ownership-unit keys through
-`Solution.unitLocalOf`, exactly like the keying project requires.
+`Solution.unitLocalOf`, exactly like the rest of the transfer layer.
 
 This part is a prerequisite for confidence, not a performance feature by
 itself. The performance win comes from making the analysis consume the
@@ -303,8 +301,8 @@ Migration order:
 - `groupUsedInPath` is a bit test over a precomputed table; forward liveness
   graph scans are not on the insertion hot path.
 - Post-ARC LIR is byte-identical before and after on the existing corpus,
-  except for explicitly documented latent bugs discovered by the shared
-  transfer-keying audit.
+  except for explicitly documented latent bugs discovered while unifying
+  transfer decisions.
 - `JsonEncodeRoundTrip.roc` no longer spends minutes in ARC insertion; the
   test runner's ordinary timeout is not close to being hit.
 - Debug builds still certify the output. Release/dev behavior differs only in
@@ -374,8 +372,7 @@ explained by a correctness bug in the old inserter or rejected.
 - Differential debug tests that run old and new join summaries together
   during migration, deleted or converted to invariant tests once the old path
   is removed.
-- A post-ARC LIR byte-identity corpus check, as used to land the
-  ownership-transfer keying layer.
+- A post-ARC LIR byte-identity corpus check over the existing test corpus.
 
 ## Related projects
 

@@ -664,6 +664,8 @@ pub const Expr = union(enum) {
             div_trunc, // //
             @"and", // and
             @"or", // or
+            range_exclusive, // ..<
+            range_inclusive, // ..=
         };
 
         pub fn init(op: Op, lhs: Expr.Idx, rhs: Expr.Idx) Binop {

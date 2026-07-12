@@ -410,6 +410,8 @@ const CustomCase = enum {
     glue_zig_bang_record_fields,
     glue_package_nominal_api_alias,
     glue_nominal_canonical_field,
+    glue_try_box_model_unknown_payload,
+    glue_unresolved_by_value_errors,
     glue_c_tests,
 };
 
@@ -744,6 +746,8 @@ const glue_cases = [_]CliCase{
     .{ .id = 0, .suite = .glue, .name = "glue regression: ZigGlue quotes bang record fields", .body = .{ .custom = .glue_zig_bang_record_fields } },
     .{ .id = 0, .suite = .glue, .name = "issue 9865: RustGlue does not panic for package nominal record API alias", .body = .{ .custom = .glue_package_nominal_api_alias } },
     .{ .id = 0, .suite = .glue, .name = "glue regression: nominal scalar field resolves canonical backing", .body = .{ .custom = .glue_nominal_canonical_field } },
+    .{ .id = 0, .suite = .glue, .name = "issue 9824: ZigGlue sizes an unknown Box payload as a pointer at both widths", .body = .{ .custom = .glue_try_box_model_unknown_payload } },
+    .{ .id = 0, .suite = .glue, .name = "issue 9824: glue reports an error for a by-value unresolved type variable", .body = .{ .custom = .glue_unresolved_by_value_errors } },
     .{ .id = 0, .suite = .glue, .name = "CGlue.roc expect tests pass", .body = .{ .custom = .glue_c_tests } },
 };
 
@@ -1188,6 +1192,14 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc build nominal app type bound by platform for-clause does not panic (issue 9731)", .body = .{ .command = .{ .args = &.{ "build", "--no-cache" }, .roc_file = "test/cli/issue_9731_nominal_for_clause/app.roc", .exit = .not_panic, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check and roc run report platform requires diagnostics identically", .body = .{ .custom = .platform_requires_checker_diagnostics } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check platform boundary generic State alias succeeds (issue 9767)", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/postcheck/issue_9767_platform_generic_state/app.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "reached unreachable code" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc check stores selected erased callable variant with uninhabited sibling (issue 10071)", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc check restores dispatch evidence for a used exposed capturing constant (issue 10071)", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app_used.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc check preserves an empty erased callable signature for a mapped exposed constant (issue 10071)", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app_map.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build wasm archive routes HTTP decoder UTF-8 builtin through relocations (issue 10071)", .body = .{ .command = .{ .args = &.{ "build", "--no-cache", "--target=wasm32", "--opt=dev" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app_http.roc", .contains = &.{.{ .stream = .stdout, .text = "successfully building" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "reached unreachable code" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc check preserves helper record field type across nested dispatch (issue 10071)", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app_helper_field_dispatch.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build arm64mac archive preserves helper record field type across nested dispatch (issue 10071)", .body = .{ .command = .{ .args = &.{ "build", "--no-cache", "--target=arm64mac", "--opt=dev" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app_helper_field_dispatch.roc", .contains = &.{.{ .stream = .stdout, .text = "successfully building" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build wasm archive preserves helper record field type across nested dispatch (issue 10071)", .body = .{ .command = .{ .args = &.{ "build", "--no-cache", "--target=wasm32", "--opt=dev" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app_helper_field_dispatch.roc", .contains = &.{.{ .stream = .stdout, .text = "successfully building" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc check reports missing hosted mappings after lowering erased callable variants (issue 10071)", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/postcheck/issue_10071_exposed_capturing_constant/app_invalid_hosted.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "INVALID HOSTED SECTION" }, .{ .stream = .stderr, .text = "HostValue.store_with_capability" }, .{ .stream = .stderr, .text = "HostValue.take_with_capability" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc build opaque method returning backing with imported nested alias does not panic (issue 9750)", .body = .{ .command = .{ .args = &.{ "build", "--no-cache" }, .roc_file = "test/postcheck/issue_9750_opaque_imported_nested_alias/app.roc", .contains = &.{.{ .stream = .stdout, .text = "successfully building" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "imported nominal declaration formal was not projected" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test mutable Str scanner over many vars does not diverge in ARC certifier (issue 9658)", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/Issue9658ArcDiverge.roc", .exit = .not_panic, .not_contains = &.{ .{ .stream = .stderr, .text = "diverge across jumps" }, .{ .stream = .stderr, .text = "ARC borrow certifier" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc build of Err with unannotated numeric payload is a clean type mismatch, not a dev-backend unreachable (issue 9735)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "build", "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue_9735_err_literal.roc", .exit = .not_panic, .not_contains = &.{ .{ .stream = .stderr, .text = "reached unreachable code" }, .{ .stream = .stderr, .text = "panic" } } } } },
@@ -2134,6 +2146,8 @@ fn runCustomCase(
         .glue_zig_bang_record_fields => customGlueZigBangRecordFieldNames(io, allocator, &env, &timer, timeout_ms),
         .glue_package_nominal_api_alias => customGluePackageNominalApiAlias(io, allocator, &env, &timer, timeout_ms),
         .glue_nominal_canonical_field => customGlueNominalCanonicalField(io, allocator, &env, &timer, timeout_ms),
+        .glue_try_box_model_unknown_payload => customGlueTryBoxModelUnknownPayload(io, allocator, &env, &timer, timeout_ms),
+        .glue_unresolved_by_value_errors => customGlueUnresolvedByValueErrors(io, allocator, &env, &timer, timeout_ms),
         .glue_c_tests => customGlueCTests(io, allocator, &env, &timer, timeout_ms),
     };
 
@@ -6669,6 +6683,64 @@ fn customGlueNominalCanonicalField(io: std.Io, allocator: Allocator, env: *const
             .{ .stream = .stderr, .text = "PANIC" },
             .{ .stream = .stderr, .text = "unreachable" },
         },
+    })) |failure| return failure;
+    return null;
+}
+
+fn customGlueTryBoxModelUnknownPayload(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    // Issue 9824: a platform that `requires` a model and returns
+    // `Try(Box(Model), I32)` puts an app-supplied model behind a box across the
+    // host boundary. The box payload has no known layout on its own, but the box
+    // itself is a pointer, so glue must size it as a pointer at both widths and
+    // never as a zero-sized field.
+    const output_dir = createWorkSubdir(io, allocator, env, "glue-out") catch |err|
+        return customInfraFailure(allocator, timer, "failed to create glue output dir: {}", .{err});
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "glue", "src/glue/src/ZigGlue.roc", output_dir, "test/glue/try-box-model/main.roc" },
+        .not_contains = &.{ .{ .stream = .stderr, .text = "PANIC" }, .{ .stream = .stderr, .text = "unreachable" }, .{ .stream = .stderr, .text = "invariant violated" } },
+    })) |failure| return failure;
+
+    const generated_path = std.fs.path.join(allocator, &.{ output_dir, "roc_platform_abi.zig" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate generated Zig path: {}", .{err});
+    const generated = std.Io.Dir.cwd().readFileAlloc(io, generated_path, allocator, .limited(1024 * 1024)) catch |err|
+        return customFailure(allocator, timer, "failed to read generated Zig file: {}", .{err});
+
+    // The `Ok` payload is `Box(Model)`; an opaque box is emitted as `RocBox`, and
+    // the Try tag union sizes it as one pointer per width (8 bytes / tag at
+    // offset 8 at 64-bit, 4 bytes / tag at offset 4 at wasm32), asserted by the
+    // generated comptime checks. A zero-sized unknown payload would collapse the
+    // tag offset to 0 at both widths, so these needles pin the fix in place.
+    for ([_][]const u8{
+        "        ok: RocBox,",
+        "if (@sizeOf(Init_for_hostResult) != 16) @compileError",
+        "if (@offsetOf(Init_for_hostResult, \"tag\") != 8) @compileError",
+        "if (@sizeOf(Init_for_hostResult) != 8) @compileError",
+        "if (@offsetOf(Init_for_hostResult, \"tag\") != 4) @compileError",
+    }) |needle| {
+        if (std.mem.find(u8, generated, needle) == null) {
+            return customFailure(allocator, timer, "generated Zig file missing unknown-box ABI text {s}", .{needle});
+        }
+    }
+    return null;
+}
+
+fn customGlueUnresolvedByValueErrors(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    // Issue 9824: a platform whose glue-visible signature holds an unresolved
+    // (flex/rigid) type variable by value has no committed memory layout. Glue
+    // must report an error naming the type and exit nonzero, never crash and
+    // never fabricate a zero-sized field.
+    const output_dir = createWorkSubdir(io, allocator, env, "glue-out") catch |err|
+        return customInfraFailure(allocator, timer, "failed to create glue output dir: {}", .{err});
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "glue", "src/glue/src/ZigGlue.roc", output_dir, "test/glue/unresolved-by-value/main.roc" },
+        .exit = .failure,
+        .stderr_min_len = 1,
+        .contains = &.{
+            .{ .stream = .stderr, .text = "unresolved type variable" },
+            .{ .stream = .stderr, .text = "no committed memory layout" },
+            .{ .stream = .stderr, .text = "value : rigid" },
+        },
+        .not_contains = &.{ .{ .stream = .stderr, .text = "PANIC" }, .{ .stream = .stderr, .text = "unreachable" }, .{ .stream = .stderr, .text = "invariant violated" } },
     })) |failure| return failure;
     return null;
 }

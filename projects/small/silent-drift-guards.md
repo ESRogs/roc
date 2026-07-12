@@ -116,9 +116,9 @@ specializations; nothing may see more.
 
 ## Related projects
 
-- [A Shared Cycle-Guarded Checked-Type
-  Traversal](shared-checked-type-traversal.md) — same file-family; the
-  visitor should compose with that utility if it lands first.
+- The shared cycle-guarded checked-type traversal utility
+  (`src/check/checked_traverse.zig`) — same file-family; the identity
+  visitor should compose with its digest variant.
 - [Single-Source Builtin
   Registration](../big/single-source-builtin-registration.md) — the
   big-scale version of "two encodings of one rule".

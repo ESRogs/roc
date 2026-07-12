@@ -557,40 +557,6 @@ fn insertQualifiedIdent(self: *Self, parent: []const u8, child: []const u8) std.
     return try self.env.insertIdent(Ident.for_text(qualified));
 }
 
-/// Synthesize the `e_lookup_external` func node for an associated function on the
-/// auto-imported `Iter` type (`Iter.exclusive_range` / `Iter.inclusive_range`).
-///
-/// Mirrors the auto-imported-type resolution path in `prepareModuleQualifiedLookup`,
-/// but is driven by interned text rather than a parsed qualified-ident token chain —
-/// which lets range desugaring build the same func node a written `Iter.member(...)`
-/// call would produce. Returns null only if the member can't be resolved, which would
-/// indicate the builtin constructor is missing.
-fn synthesizeIterMemberLookup(
-    self: *Self,
-    member_text: []const u8,
-    region: Region,
-) std.mem.Allocator.Error!?Expr.Idx {
-    const info = self.lookupAvailableModuleEnv(self.env.idents.iter) orelse return null;
-    if (info.statement_idx == null) return null;
-
-    const module_env = info.env;
-    const import_idx = try self.getOrCreateAutoImportedTypeImport(info, self.env.idents.iter);
-
-    const qualified_type_text = self.env.getIdent(info.qualified_type_ident);
-    const qualified_method_name = try self.insertQualifiedIdent(qualified_type_text, member_text);
-    const qualified_text = self.env.getIdent(qualified_method_name);
-
-    const method_ident_idx = module_env.common.findIdent(qualified_text) orelse return null;
-    const method_node_idx = module_env.getExposedValueNodeIndexById(method_ident_idx) orelse return null;
-
-    return try self.env.addExpr(CIR.Expr{ .e_lookup_external = .{
-        .module_idx = import_idx,
-        .target_node_idx = method_node_idx,
-        .ident_idx = qualified_method_name,
-        .region = region,
-    } }, region);
-}
-
 /// Deinitialize canonicalizer resources
 pub fn deinit(
     self: *Self,
@@ -5999,8 +5965,10 @@ fn importAliased(
 
     // If this import satisfies an exposed type requirement (e.g., platform re-exporting
     // an imported module), remove it from exposed_type_texts so we don't report
-    // "Exposed But Not Defined" for re-exported imports.
-    _ = self.exposed_type_texts.remove(module_name_text);
+    // "Exposed But Not Defined" for re-exported imports. The ident text must be
+    // fetched fresh here: the import processing above interns new idents, which
+    // can grow the interner's byte buffer and invalidate any earlier text slice.
+    _ = self.exposed_type_texts.remove(self.env.getIdent(module_name));
 
     return import_idx;
 }
@@ -6064,8 +6032,10 @@ fn importUnaliased(
 
     // If this import satisfies an exposed type requirement (e.g., platform re-exporting
     // an imported module), remove it from exposed_type_texts so we don't report
-    // "Exposed But Not Defined" for re-exported imports.
-    _ = self.exposed_type_texts.remove(module_name_text);
+    // "Exposed But Not Defined" for re-exported imports. The ident text must be
+    // fetched fresh here: the import processing above interns new idents, which
+    // can grow the interner's byte buffer and invalidate any earlier text slice.
+    _ = self.exposed_type_texts.remove(self.env.getIdent(module_name));
 
     return import_idx;
 }
@@ -11852,13 +11822,9 @@ fn runExprKernel(
                 .OpDoubleSlash => .div_trunc,
                 .OpAnd => .@"and",
                 .OpOr => .@"or",
-                .OpDoubleDotLessThan, .OpDoubleDotEquals => {
-                    // Range syntax desugars to a plain call of the generic
-                    // `Iter` constructor — the same func node a written
-                    // `Iter.exclusive_range(start, end)` would canonicalize to.
-
+                .OpDoubleDotLessThan, .OpDoubleDotEquals => range_blk: {
                     // Reject chained ranges (`a..<b..<c`) by inspecting the AST
-                    // lhs before desugaring loses the operator structure.
+                    // lhs while the operator structure is still visible.
                     const ast_lhs = self.parse_ir.store.getExpr(state.bin_op.left);
                     if (ast_lhs == .bin_op) {
                         const lhs_op_tag = self.parse_ir.tokens.tokens.get(ast_lhs.bin_op.operator).tag;
@@ -11872,30 +11838,10 @@ fn runExprKernel(
                         }
                     }
 
-                    const member_text: []const u8 = if (op_token.tag == .OpDoubleDotLessThan)
-                        "exclusive_range"
+                    break :range_blk if (op_token.tag == .OpDoubleDotLessThan)
+                        .range_exclusive
                     else
-                        "inclusive_range";
-
-                    const range_expr_idx = if (try self.synthesizeIterMemberLookup(member_text, state.region)) |func_expr_idx| blk: {
-                        const scratch_top = self.env.store.scratchExprTop();
-                        try self.env.store.addScratchExpr(can_lhs.idx);
-                        try self.env.store.addScratchExpr(can_rhs.idx);
-                        const args_span = try self.env.store.exprSpanFrom(scratch_top);
-
-                        break :blk try self.env.addExpr(Expr{ .e_call = .{
-                            .func = func_expr_idx,
-                            .args = args_span,
-                            .called_via = .range,
-                        } }, state.region);
-                    } else try self.env.pushMalformed(Expr.Idx, Diagnostic{ .expr_not_canonicalized = .{
-                        .region = state.region,
-                    } });
-
-                    const range_free_vars = self.scratch_free_vars.spanFrom(state.free_vars_start);
-                    child_slots.shrinkRetainingCapacity(result_start);
-                    try storeExprKernelOutput(&last_expr, &child_slots, frame_allocator, current_result_target, CanonicalizedExpr{ .idx = range_expr_idx, .free_vars = range_free_vars });
-                    continue :expr_kernel_loop .dispatch;
+                        .range_inclusive;
                 },
                 .OpCaret, .OpPizza => {
                     const feature = try self.env.insertString("unsupported operator");
