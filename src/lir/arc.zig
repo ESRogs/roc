@@ -5697,6 +5697,81 @@ test "RC join body keep excludes units not owned at every jump" {
     try f.expectRc(elem, 0, 0, 0);
 }
 
+test "RC nested join body keep intersects divergent jumps across frames" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const cond = try f.local(.i64);
+    const elem = try f.local(.str);
+    const list = try f.local(f.list_str);
+    const sink = try f.local(f.list_str);
+    const out = try f.local(.str);
+    const outer_id = f.freshJoinPointId();
+    const inner_id = f.freshJoinPointId();
+
+    const ret = try f.ret(out);
+    const outer_body = try f.assignStr(out, "done", ret);
+    const outer_jump = try f.store.addCFStmt(.{ .jump = .{ .target = outer_id } });
+    const consuming_jump = try f.store.addCFStmt(.{ .jump = .{ .target = inner_id } });
+    const consuming_branch = try f.assignCall(sink, &.{list}, consuming_jump);
+    const direct_jump = try f.store.addCFStmt(.{ .jump = .{ .target = inner_id } });
+    const switch_stmt = try f.switchStmt(cond, consuming_branch, direct_jump, null);
+    const inner_join = try f.store.addCFStmt(.{ .join = .{
+        .id = inner_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = outer_jump,
+        .remainder = switch_stmt,
+    } });
+    const outer_join = try f.store.addCFStmt(.{ .join = .{
+        .id = outer_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = outer_body,
+        .remainder = inner_join,
+    } });
+    const assign_list = try f.assignList(list, &.{elem}, outer_join);
+    const assign_elem = try f.assignStr(elem, "x", assign_list);
+    const start = try f.assignI64(cond, 1, assign_elem);
+
+    _ = try f.addProc(&.{}, start, .str);
+    try f.run();
+    // The inner join's shared body is a jump into the outer frame. Its keep
+    // is the intersection of the two divergent jump states, so the branch
+    // that still owns the list releases it before entering the shared body.
+    try f.expectRc(list, 0, 1, 0);
+    try f.expectRc(elem, 0, 0, 0);
+}
+
+test "RC borrow group member used in a join body keeps the lender across the jump" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const first = try f.local(.str);
+    const second = try f.local(.str);
+    const pair = try f.local(f.pair_str);
+    const elem = try f.local(.str);
+    const result = try f.local(.i64);
+    const join_id = f.freshJoinPointId();
+
+    const ret = try f.ret(result);
+    const call = try f.assignCall(result, &.{elem}, ret);
+    const jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const join = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = call,
+        .remainder = jump,
+    } });
+    const elem_read = try f.assignRefField(elem, pair, 0, join);
+    const assign_pair = try f.assignStruct(pair, &.{ first, second }, elem_read);
+    const assign_second = try f.assignStr(second, "b", assign_pair);
+    const start = try f.assignStr(first, "a", assign_second);
+
+    _ = try f.addProc(&.{}, start, .i64);
+    try f.run();
+    // The field borrow is used only inside the join body, so the pair's
+    // liveness group must carry its unit through the jump: the jump releases
+    // nothing and the pair dies after the borrow's last use in the body.
+    try f.expectRc(pair, 0, 1, 0);
+}
+
 test "RC switch continuation merge releases branch-divergent owner at the boundary" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
