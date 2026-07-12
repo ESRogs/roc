@@ -2676,6 +2676,85 @@ Builtin :: [].{
 			where [num.range_inclusive : num, num -> Iter(num)]
 		range_inclusive = |start, end| start.range_inclusive(end)
 
+		# Flat step loop behind the numeric types' `range_exclusive` methods. The
+		# self-recursive `rest` builds the same monomorphic range iterator (never
+		# a distinct chain component), so an adapter wrapping a range carries its
+		# state by value. `len_if_known`, when `Known`, is the exact remaining
+		# yield count: each step decrements it and the final `range_done()` is
+		# `Known(0)`, which `Iter.take_last`/`drop_last` rely on.
+		exclusive_range : num, num, [Known(U64), Unknown] -> Iter(num)
+			where [
+				num.is_lt : num, num -> Bool,
+				num.add_try : num, num -> Try(num, [Overflow]),
+				num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
+			]
+		exclusive_range = |start, end, len_if_known|
+			iter_from_step(
+				len_if_known,
+				||
+					if start < end {
+						One({
+							item: start,
+							rest: match start.add_try(1) {
+								Ok(next) => if next < end {
+									Iter.exclusive_range(
+										next,
+										end,
+										match len_if_known {
+											Known(l) => Known(l - 1)
+											Unknown => Unknown
+										},
+									)
+								} else {
+									range_done()
+								}
+								Err(Overflow) => range_done()
+							},
+						})
+					} else {
+						Done
+					},
+			)
+
+		# Flat step loop behind the numeric types' `range_inclusive` methods; same
+		# `len_if_known` contract as `exclusive_range`. Each step yields `start`
+		# and continues from `start + 1`; the final value is yielded before `Done`,
+		# including when stepping past it would overflow (that step reaches
+		# `range_done()` after the yield rather than before it).
+		inclusive_range : num, num, [Known(U64), Unknown] -> Iter(num)
+			where [
+				num.is_lte : num, num -> Bool,
+				num.add_try : num, num -> Try(num, [Overflow]),
+				num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
+			]
+		inclusive_range = |start, end, len_if_known|
+			iter_from_step(
+				len_if_known,
+				||
+					if start <= end {
+						One({
+							item: start,
+							rest: match start.add_try(1) {
+								Ok(next) => if next <= end {
+									Iter.inclusive_range(
+										next,
+										end,
+										match len_if_known {
+											Known(l) => Known(l - 1)
+											Unknown => Unknown
+										},
+									)
+								} else {
+									range_done()
+								}
+								Err(Overflow) => range_done()
+							},
+						})
+					} else {
+						Done
+					},
+			)
+
 		iter : Iter(item) -> Iter(item)
 		iter = |self| self
 
@@ -17098,7 +17177,8 @@ range_done = || iter_from_step(
 # Shared step loop behind the numeric types' `range_exclusive` methods. Each
 # caller supplies `len_if_known` computed from its own representation; when it
 # is `Known`, it must be the exact yield count (`Iter.take_last`/`drop_last`
-# rely on that, and `Iter.custom` keeps it exact by decrementing per yield).
+# rely on that). The construction is `Iter.exclusive_range`, whose flat
+# self-recursive shape keeps a range's state unboxed when an adapter wraps it.
 range_exclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
 	where [
 		num.is_lt : num, num -> Bool,
@@ -17106,28 +17186,12 @@ range_exclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
 		num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
 	]
 range_exclusive_with_len = |start, end, len_if_known|
-	Iter.custom(
-		start,
-		len_if_known,
-		|cur|
-			if cur < end {
-				match cur.add_try(1) {
-					Ok(next) => if next < end {
-						Ok((cur, next))
-					} else {
-						Ok((cur, end))
-					}
-					Err(Overflow) => Ok((cur, end))
-				}
-			} else {
-				Err(NoMore)
-			},
-	)
+	Iter.exclusive_range(start, end, len_if_known)
 
 # Shared step loop behind the numeric types' `range_inclusive` methods; same
-# `len_if_known` contract as `range_exclusive_with_len`. The seed carries a
-# done flag because the final value must be yielded before the iterator ends,
-# including when stepping past it would overflow.
+# `len_if_known` contract as `range_exclusive_with_len`. The construction is
+# `Iter.inclusive_range`, whose flat self-recursive shape keeps a range's state
+# unboxed when an adapter wraps it.
 range_inclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
 	where [
 		num.is_lte : num, num -> Bool,
@@ -17135,25 +17199,7 @@ range_inclusive_with_len : num, num, [Known(U64), Unknown] -> Iter(num)
 		num.from_numeral : Builtin.Num.Numeral -> Try(num, [InvalidNumeral(Str)]),
 	]
 range_inclusive_with_len = |start, end, len_if_known|
-	Iter.custom(
-		(start, False),
-		len_if_known,
-		|(cur, done)|
-			if done {
-				Err(NoMore)
-			} else if cur <= end {
-				match cur.add_try(1) {
-					Ok(next) => if next <= end {
-						Ok((cur, (next, False)))
-					} else {
-						Ok((cur, (cur, True)))
-					}
-					Err(Overflow) => Ok((cur, (cur, True)))
-				}
-			} else {
-				Err(NoMore)
-			},
-	)
+	Iter.inclusive_range(start, end, len_if_known)
 
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item
