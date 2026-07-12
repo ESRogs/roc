@@ -1344,7 +1344,7 @@ const Formatter = struct {
             },
             .field_access => |fa| {
                 const left_expr = fmt.ast.store.getExpr(fa.left);
-                const parenthesize_receiver = left_expr == .arrow_call or left_expr == .int;
+                const parenthesize_receiver = left_expr == .arrow_call or fmt.exprIsNumericAccessReceiver(fa.left);
                 const expand_parenthesized_receiver = left_expr == .arrow_call and
                     fmt.nodeWillBeMultiline(AST.Expr.Idx, fa.left);
                 if (parenthesize_receiver) try fmt.push('(');
@@ -1374,7 +1374,7 @@ const Formatter = struct {
             },
             .method_call => |mc| {
                 const left_expr = fmt.ast.store.getExpr(mc.receiver);
-                const parenthesize_receiver = left_expr == .arrow_call or left_expr == .int;
+                const parenthesize_receiver = left_expr == .arrow_call or fmt.exprIsNumericAccessReceiver(mc.receiver);
                 const expand_parenthesized_receiver = left_expr == .arrow_call and
                     fmt.nodeWillBeMultiline(AST.Expr.Idx, mc.receiver);
                 if (parenthesize_receiver) try fmt.push('(');
@@ -1488,8 +1488,11 @@ const Formatter = struct {
             },
             .tuple_access => |ta| {
                 // Format: expr.N (e.g., tuple.0, tuple.1)
+                const parenthesize_receiver = fmt.exprIsNumericAccessReceiver(ta.expr);
+                if (parenthesize_receiver) try fmt.push('(');
                 const target = try fmt.formatExprWithInfo(ta.expr);
                 _ = try fmt.continueAfterMultilineStringLine(target);
+                if (parenthesize_receiver) try fmt.push(')');
                 // Get the element index from the token
                 const token_text = fmt.ast.resolve(ta.elem_token);
                 // Token includes leading dot (e.g., ".0")
@@ -3288,6 +3291,14 @@ const Formatter = struct {
 
         const text = fmt.ast.env.source[start..region.end.offset];
         try fmt.pushAll(text);
+    }
+
+    fn exprIsNumericAccessReceiver(fmt: *Formatter, expr_idx: AST.Expr.Idx) bool {
+        return switch (fmt.ast.store.getExpr(expr_idx)) {
+            .int, .frac, .typed_int, .typed_frac => true,
+            .unary_op => |unary| fmt.exprIsNumericAccessReceiver(unary.expr),
+            else => false,
+        };
     }
 
     fn nodeWillBeMultiline(fmt: *Formatter, comptime T: type, item: T) bool {
