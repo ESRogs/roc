@@ -177,6 +177,11 @@ test "HTTP header parsing platform derives structural parser without runtime all
     defer allocator.free(scrambled_order_response);
     try runServerAndCheckResponse(allocator, output_path, scrambled_order_request, scrambled_order_response);
 
+    // These case-varying header names dispatch through the LLVM-emitted
+    // `emitSwarCaselessAsciiEqualMasked` (this app is built with `--opt=speed`,
+    // i.e. the LLVM backend). They are the end-to-end drift guard for that
+    // routine against `builtins.str.wordCaselessAsciiEqualMasked`, whose raw
+    // word-level contract is pinned by `swar_caseless_word_vectors`.
     const lower_case_request = try buildCacheControlCaseRequest(allocator, "cache-control");
     defer allocator.free(lower_case_request);
     const lower_case_response = try buildExpectedResponse(allocator, expectedHeaderLength(0));

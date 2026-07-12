@@ -68,8 +68,8 @@ Within this batch: land `lambda-mono-oracle-fidelity` before
    — the divergence-classification parity suite; a regression net the big
    lowering projects inherit.
 2. [small/silent-drift-guards.md](small/silent-drift-guards.md)
-   — pins the remaining intentional mirrors (type digests, escape rules,
-   list decref, SWAR string equality) with shared tables or drift tests.
+   — finishes the monotype identity unification: one identity-field
+   visitor for digest and equality, and alias-transparent cached digests.
 3. [small/rceffect-conformance.md](small/rceffect-conformance.md)
    — comptime validity plus a per-op refcount conformance harness for the
    central ownership table (the PR 10023 bug class).

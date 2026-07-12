@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const base = @import("base");
 const tracy = @import("tracy");
 const NumericLiteral = @import("NumericLiteral.zig");
+const escape_table = @import("escape.zig");
 
 const DataSpan = base.DataSpan;
 const CommonEnv = base.CommonEnv;
@@ -1054,11 +1055,18 @@ pub const Cursor = struct {
         // Store the start position of the escape sequence (before the backslash)
         const escape_start = if (self.pos > 0) self.pos - 1 else self.pos;
 
-        switch (self.peek() orelse 0) {
-            '\\', '"', '\'', 'n', 'r', 't', '$' => {
+        const escape_byte = self.peek() orelse 0;
+        const interpretation = escape_table.lookup(escape_byte) orelse {
+            // Include the character after the backslash in the error region
+            const end_pos = if (self.peek() != null) self.pos + 1 else self.pos;
+            self.pushMessage(.InvalidEscapeSequence, escape_start, end_pos);
+            return error.InvalidEscapeSequence;
+        };
+        switch (interpretation) {
+            .byte => {
                 self.pos += 1;
             },
-            'u' => {
+            .unicode => {
                 self.pos += 1;
 
                 if (self.peek() == '(') {
@@ -1123,12 +1131,6 @@ pub const Cursor = struct {
                     self.pushMessage(.InvalidUnicodeEscapeSequence, escape_start, self.pos);
                     return error.InvalidUnicodeEscapeSequence;
                 }
-            },
-            else => {
-                // Include the character after the backslash in the error region
-                const end_pos = if (self.peek() != null) self.pos + 1 else self.pos;
-                self.pushMessage(.InvalidEscapeSequence, escape_start, end_pos);
-                return error.InvalidEscapeSequence;
             },
         }
     }
@@ -3160,5 +3162,38 @@ test "invalid unicode escape sequence in string" {
         const messages = tokenizer.cursor.messages[0..tokenizer.cursor.message_count];
         try std.testing.expect(messages.len > 0);
         try std.testing.expectEqual(Diagnostic.Tag.InvalidUnicodeEscapeSequence, messages[0].tag);
+    }
+}
+
+test "escape alphabet: tokenizer accepts exactly the shared table domain" {
+    // The tokenizer's allowlist and both canonicalizer interpreters derive from
+    // `escape.lookup`, so the set of bytes the tokenizer accepts after a
+    // backslash must equal the table's domain. Iterate every byte and assert
+    // tokenizer-accepts iff the table interprets it. A member byte accepted by
+    // the tokenizer is, by construction, also interpreted by both canonicalizer
+    // interpreters, since each looks the byte up in this same table.
+    var byte: u16 = 0;
+    while (byte < 256) : (byte += 1) {
+        const b: u8 = @intCast(byte);
+        const in_domain = escape_table.lookup(b) != null;
+
+        // Build the bytes following the backslash. The `\u` marker needs a
+        // valid `(hex)` body to be accepted; simple escapes stand alone.
+        var buf: [8]u8 = undefined;
+        const src: []const u8 = if (b == 'u') blk: {
+            const s = "u(0041)";
+            @memcpy(buf[0..s.len], s);
+            break :blk buf[0..s.len];
+        } else blk: {
+            buf[0] = b;
+            break :blk buf[0..1];
+        };
+
+        var messages: [4]Diagnostic = undefined;
+        var cursor = Cursor.init(src, &messages);
+        // Position the cursor as if the backslash were already consumed.
+        const accepted = if (cursor.chompEscapeSequence()) |_| true else |_| false;
+
+        try std.testing.expectEqual(in_domain, accepted);
     }
 }

@@ -535,4 +535,46 @@ pub const tests = [_]TestCase{
         .source = "(I8.rem_by(I8.lowest, -1), I8.mod_by(I8.lowest, -1))",
         .expected = .{ .inspect_str = "(0, 0)" },
     },
+    .{
+        // I128 modulo carries the sign of the divisor: a negative dividend with a
+        // positive divisor yields a positive result, never the truncated
+        // remainder (-1). Exercises the dev and wasm backends' i128-width paths.
+        .name = "i128 mod_by: negative dividend, positive divisor",
+        .source = "I128.mod_by(-7, 3)",
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        // I128 modulo with a positive dividend and negative divisor yields a
+        // negative result (sign of the divisor).
+        .name = "i128 mod_by: positive dividend, negative divisor",
+        .source = "I128.mod_by(7, -3)",
+        .expected = .{ .inspect_str = "-2" },
+    },
+    .{
+        // A dividend larger in magnitude than 64 bits forces the true i128 path.
+        // -(2^64 + 1) mod 3 == 1 (truncated remainder -2, adjusted by +3).
+        .name = "i128 mod_by: magnitude exceeds 64 bits",
+        .source = "I128.mod_by(-18446744073709551617, 3)",
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        // Truncated remainder keeps the sign of the dividend on every backend,
+        // in contrast to modulo which carries the sign of the divisor.
+        .name = "i128 rem_by: negative dividend keeps dividend sign",
+        .source = "I128.rem_by(-7, 3)",
+        .expected = .{ .inspect_str = "-1" },
+    },
+    .{
+        .name = "i128 rem_by: magnitude exceeds 64 bits",
+        .source = "I128.rem_by(-18446744073709551617, 3)",
+        .expected = .{ .inspect_str = "-2" },
+    },
+    .{
+        // Dec truncated remainder keeps the sign of the dividend. Dec has no
+        // mod_by in the language surface, so Dec modulo cannot be exercised
+        // end-to-end; this pins the reachable Dec rem path.
+        .name = "dec rem_by: negative dividend keeps dividend sign",
+        .source = "Dec.rem_by(-7.5, 2.0)",
+        .expected = .{ .inspect_str = "-1.5" },
+    },
 };

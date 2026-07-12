@@ -4119,8 +4119,29 @@ pub const Interpreter = struct {
         }
     }
 
-    /// Iterate through list elements and recursively decref each child.
-    /// This mirrors the element cleanup logic in RocList.decref.
+    /// Carries the interpreter state a list element decref needs through the
+    /// C-callconv `dec` callback that `RocList.decrefElements` invokes. The
+    /// pointer travels as the traversal's `dec_context`.
+    const ListElementDecContext = struct {
+        interp: *LirInterpreter,
+        child_plan: layout_mod.RcHelperPlan,
+        count: u16,
+        atomicity: RcAtomicity,
+    };
+
+    /// Executes one list element's RC plan. Bridges the shared
+    /// `RocList.decrefElements` element walk to the interpreter's own
+    /// per-element cleanup.
+    fn decrefListElementCallback(dec_context: ?*anyopaque, element: ?[*]u8) callconv(.c) void {
+        const ctx: *ListElementDecContext = @ptrCast(@alignCast(dec_context.?));
+        const element_val = Value{ .ptr = element.? };
+        ctx.interp.performRawRcPlan(ctx.child_plan, element_val, ctx.count, ctx.atomicity);
+    }
+
+    /// Decref each refcounted child of a dying unique list. The element walk
+    /// itself lives once in `RocList.decrefElements`; this routes the
+    /// interpreter's per-element cleanup through it so the traversal policy
+    /// cannot drift between interpreted and compiled runs.
     fn decrefListElements(
         self: *LirInterpreter,
         rl: builtins.list.RocList,
@@ -4129,16 +4150,13 @@ pub const Interpreter = struct {
         count: u16,
         atomicity: RcAtomicity,
     ) void {
-        if (rl.getAllocationDataPtr(&self.roc_ops)) |source| {
-            const elem_count = rl.getAllocationElementCount(true, &self.roc_ops);
-            const child_plan = self.cachedRcPlan(child_key);
-            var i: usize = 0;
-            while (i < elem_count) : (i += 1) {
-                const element_ptr = source + i * list_plan.elem_width;
-                const element_val = Value{ .ptr = element_ptr };
-                self.performRawRcPlan(child_plan, element_val, count, atomicity);
-            }
-        }
+        var ctx = ListElementDecContext{
+            .interp = self,
+            .child_plan = self.cachedRcPlan(child_key),
+            .count = count,
+            .atomicity = atomicity,
+        };
+        rl.decrefElements(list_plan.elem_width, &ctx, decrefListElementCallback, &self.roc_ops);
     }
 
     fn performErasedCallableFinalDropIfUnique(

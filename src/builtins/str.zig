@@ -2211,6 +2211,13 @@ inline fn wordCaselessAsciiEqual(left: u64, right: u64) bool {
 // bit 0x20?" We do not need to prove that exact-equal bytes are lowercase-safe.
 // That matters for field names such as "x_auth_token" and for UTF-8 bytes that
 // are identical on both sides.
+//
+// `MonoLlvmCodeGen.emitSwarCaselessAsciiEqualMasked` deliberately re-emits this
+// exact bit-twiddle as inline LLVM IR for static record-field dispatch rather
+// than calling this builtin. The two must agree byte-for-byte;
+// `swar_caseless_word_vectors` pins this Zig side, and the LLVM emitter is
+// pinned end-to-end through caseless field dispatch by
+// `src/cli/test/http_header_decoder_platform_test.zig`.
 const SWAR_ONES: u64 = 0x0101010101010101;
 const SWAR_LOW7: u64 = 0x7f7f7f7f7f7f7f7f;
 const SWAR_HIGHS: u64 = 0x8080808080808080;
@@ -2281,6 +2288,73 @@ inline fn wordCaselessAsciiEqualMasked(left: u64, right: u64, active: u64) bool 
     const left_lower = left | SWAR_ASCII_CASE;
     const left_alpha = swarByteInAsciiRange(left_lower, 'a', 'z') & active_highs;
     return (case_diff_bytes & ~left_alpha) == 0;
+}
+
+/// One shared caseless-ASCII-equality test vector. `left` and `right` are the
+/// eight bytes of each SWAR word (lane 0 first, little-endian); `active_len` is
+/// how many low lanes carry real string bytes — the remaining high lanes are
+/// ignored, exactly as a partial-word tail mask ignores them. `expected` is the
+/// caseless-ASCII-equal answer. This set drives `wordCaselessAsciiEqualMasked`
+/// here and documents the exact behavior the LLVM emitter
+/// (`MonoLlvmCodeGen.emitSwarCaselessAsciiEqualMasked`) must reproduce.
+pub const CaselessWordVector = struct {
+    left: [8]u8,
+    right: [8]u8,
+    active_len: u8,
+    expected: bool,
+};
+
+/// Word-at-a-time caseless-equality vectors covering equal bytes, ASCII letters
+/// differing by case in both directions, bytes differing only in the 0x20 bit
+/// that are NOT letters (must be unequal), high-bit bytes, embedded NULs, and
+/// partial-word masks. Both the Zig builtin and the inline LLVM emitter must
+/// agree with every row.
+pub const swar_caseless_word_vectors = [_]CaselessWordVector{
+    // Fully identical words are equal, punctuation and digits included.
+    .{ .left = "abcdefgh".*, .right = "abcdefgh".*, .active_len = 8, .expected = true },
+    .{ .left = "12_-+={}".*, .right = "12_-+={}".*, .active_len = 8, .expected = true },
+    // ASCII letters differing only by case fold in both directions per lane.
+    .{ .left = "aBcDeFgH".*, .right = "AbCdEfGh".*, .active_len = 8, .expected = true },
+    .{ .left = "Hello123".*, .right = "hELLO123".*, .active_len = 8, .expected = true },
+    // Case-fold at the alphabet boundaries a/z.
+    .{ .left = "azAZazAZ".*, .right = "AZazAZaz".*, .active_len = 8, .expected = true },
+    // Bytes differing by 0x20 that are NOT ASCII letters must be unequal:
+    // '[' (0x5B) vs '{' (0x7B) sit just outside the letter range.
+    .{ .left = "[bcdefgh".*, .right = "{bcdefgh".*, .active_len = 8, .expected = false },
+    // '@' (0x40) vs '`' (0x60): just below 'A'/'a'.
+    .{ .left = "@bcdefgh".*, .right = "`bcdefgh".*, .active_len = 8, .expected = false },
+    // '_' (0x5F) vs DEL (0x7F): differ by 0x20, neither a letter.
+    .{ .left = "_bcdefgh".*, .right = .{ 0x7F, 'b', 'c', 'd', 'e', 'f', 'g', 'h' }, .active_len = 8, .expected = false },
+    // A lane differing by something other than 0x20 is unequal.
+    .{ .left = "abcdefgh".*, .right = "abcdifgh".*, .active_len = 8, .expected = false },
+    // High-bit bytes: identical high-bit bytes are equal (exact-equal lanes
+    // accept anything), but high-bit bytes differing by 0x20 are not letters.
+    .{ .left = .{ 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87 }, .right = .{ 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87 }, .active_len = 8, .expected = true },
+    .{ .left = .{ 0x80, 'b', 'c', 'd', 'e', 'f', 'g', 'h' }, .right = .{ 0xA0, 'b', 'c', 'd', 'e', 'f', 'g', 'h' }, .active_len = 8, .expected = false },
+    // Embedded NULs: equal NUL lanes are equal; NUL (0x00) vs space (0x20)
+    // differ by 0x20 but are not letters, so unequal.
+    .{ .left = .{ 'a', 0x00, 'c', 0x00, 'e', 'f', 'g', 'h' }, .right = .{ 'a', 0x00, 'c', 0x00, 'e', 'f', 'g', 'h' }, .active_len = 8, .expected = true },
+    .{ .left = .{ 0x00, 'b', 'c', 'd', 'e', 'f', 'g', 'h' }, .right = .{ 0x20, 'b', 'c', 'd', 'e', 'f', 'g', 'h' }, .active_len = 8, .expected = false },
+    // Digit vs control byte differing by 0x20: '0' (0x30) vs DLE (0x10).
+    .{ .left = "0bcdefgh".*, .right = .{ 0x10, 'b', 'c', 'd', 'e', 'f', 'g', 'h' }, .active_len = 8, .expected = false },
+    // Partial-word masks: only the active low lanes participate. Here the
+    // inactive high lanes differ arbitrarily but must be ignored.
+    .{ .left = "abcABCDE".*, .right = "ABCzzzzz".*, .active_len = 3, .expected = true },
+    // A non-letter case-bit difference inside the active window is unequal even
+    // when the inactive lanes would match.
+    .{ .left = "ab[defgh".*, .right = "ab{defgh".*, .active_len = 4, .expected = false },
+    // Zero active lanes: nothing participates, so the words are equal even
+    // though every byte differs.
+    .{ .left = "abcdefgh".*, .right = "ABCDEFGH".*, .active_len = 0, .expected = true },
+    .{ .left = "abcdefgh".*, .right = "zzzzzzzz".*, .active_len = 0, .expected = true },
+};
+
+/// Build the `active` mask `wordCaselessAsciiEqualMasked` expects from a count
+/// of active low byte lanes: 0xff in each active lane, 0x00 above it.
+pub fn caselessActiveMask(active_len: u8) u64 {
+    if (active_len >= 8) return std.math.maxInt(u64);
+    if (active_len == 0) return 0;
+    return (@as(u64, 1) << @intCast(active_len * 8)) - 1;
 }
 
 inline fn readTailU64(bytes: [*]const u8, len: usize, index: usize, tail_len: usize) u64 {
@@ -4253,6 +4327,26 @@ test "withAsciiUppercased: seamless slice" {
 
     try std.testing.expect(!str_result.isSmallStr());
     try std.testing.expect(str_result.eql(expected));
+}
+
+test "wordCaselessAsciiEqualMasked matches shared SWAR vectors" {
+    // These vectors are the shared contract between this builtin and the inline
+    // LLVM emitter `MonoLlvmCodeGen.emitSwarCaselessAsciiEqualMasked`. Driving
+    // them here pins the Zig side; a drift in either implementation against this
+    // table is a failing test.
+    for (swar_caseless_word_vectors, 0..) |vec, i| {
+        const left = std.mem.readInt(u64, &vec.left, .little);
+        const right = std.mem.readInt(u64, &vec.right, .little);
+        const active = caselessActiveMask(vec.active_len);
+        const got = wordCaselessAsciiEqualMasked(left, right, active);
+        std.testing.expectEqual(vec.expected, got) catch |err| {
+            std.debug.print(
+                "SWAR vector #{d} failed: left={s} right={s} active_len={d} expected={} got={}\n",
+                .{ i, &vec.left, &vec.right, vec.active_len, vec.expected, got },
+            );
+            return err;
+        };
+    }
 }
 
 test "caselessAsciiEquals: same str" {
