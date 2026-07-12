@@ -1407,7 +1407,7 @@ const Formatter = struct {
                     const apply_fn_idx = apply.@"fn";
                     const apply_fn = fmt.ast.store.getExpr(apply_fn_idx);
                     const fn_needs_parens = switch (apply_fn) {
-                        .ident, .tag, .apply, .tuple, .field_access, .tuple_access, .method_call, .list, .record, .string, .multiline_string, .string_part, .int, .frac, .typed_int, .typed_frac, .single_quote => false,
+                        .ident, .tag => false,
                         else => true,
                     };
                     if (fn_needs_parens) {
