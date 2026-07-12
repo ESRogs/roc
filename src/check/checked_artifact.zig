@@ -12906,10 +12906,10 @@ fn sealCheckedProcedureTemplateRefs(
 /// Runs after `sealCheckedProcedureTemplateRefs` so plans and value refs are
 /// grouped per template: `constraint(k)` indexes the enclosing template's
 /// canonical evidence-param list. Concrete dispatchers resolve through the
-/// checked registry exactly as the pre-total inline resolution did; where-var
-/// dispatchers resolve to their param index; evidence for call edges comes
-/// from the checker's persisted `SchemeInstantiationRecord`s, whose fresh vars
-/// are resolved against the settled type store.
+/// checked registry; where-var dispatchers resolve to their param index;
+/// evidence for call edges comes from the checker's persisted
+/// `SchemeInstantiationRecord`s, whose fresh vars are resolved against the
+/// settled type store.
 const EvidencePass = struct {
     allocator: Allocator,
     module: TypedCIR.Module,
@@ -13563,7 +13563,8 @@ const EvidencePass = struct {
     }
 
     /// The method owner of a settled source var, walking alias content
-    /// transparently (mirrors `methodOwnerForCheckedType` on published types).
+    /// transparently (the source-var analog of monotype lowering's
+    /// dispatch-head read of published type identity).
     fn methodOwnerForSourceContent(self: *EvidencePass, var_: Var) ?static_dispatch.MethodOwner {
         var current = var_;
         var remaining: u64 = self.types.len();
@@ -13705,12 +13706,13 @@ const EvidencePass = struct {
     }
 
     /// The derived-structural kind a constraint method admits, if any.
+    /// Ident-keyed view of `static_dispatch.structural_method_kinds`: each
+    /// table entry's name doubles as the matching `CommonIdents` field.
     fn structuralKindForMethodIdent(self: *EvidencePass, fn_name: anytype) ?static_dispatch.StructuralKind {
         const common = self.module.commonIdents();
-        if (fn_name.eql(common.is_eq)) return .equality;
-        if (fn_name.eql(common.to_hash)) return .hash;
-        if (fn_name.eql(common.parser_for)) return .parser;
-        if (fn_name.eql(common.encoder_for)) return .encoder;
+        inline for (static_dispatch.structural_method_kinds) |entry| {
+            if (fn_name.eql(@field(common, entry.name))) return entry.kind;
+        }
         return null;
     }
 
@@ -26137,6 +26139,7 @@ pub const DispatchEvidenceFailure = struct {
         plan_evidence_node_out_of_bounds,
         evidence_node_nested_refs_out_of_bounds,
         evidence_ref_node_out_of_bounds,
+        site_evidence_key_out_of_bounds,
         site_evidence_refs_out_of_bounds,
         site_evidence_keys_unsorted,
         template_plan_ref_out_of_bounds,
@@ -26830,6 +26833,9 @@ pub const CheckedModuleArtifact = struct {
         }
 
         for (table.site_evidence, 0..) |entry, i| {
+            if (entry.key >= self.checked_bodies.exprCount()) {
+                return .{ .kind = .site_evidence_key_out_of_bounds, .index = @intCast(i) };
+            }
             if (@as(u64, entry.start) + entry.len > table.evidence_refs.len) {
                 return .{ .kind = .site_evidence_refs_out_of_bounds, .index = @intCast(i) };
             }
