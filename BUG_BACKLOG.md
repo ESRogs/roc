@@ -14,17 +14,7 @@ Totals observed:
 
 Unique confirmed issues:
 
-1. [fuzz_crash_100.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_100.md>)
-   Crash family: Canonicalization node-type mismatch (`panic: unreachable, node is not a type annotation tag: .type_header`).
-
-   ```sh
-   cat > /tmp/repro-canonicalize-100.roc <<'EOF'
-   T := [].{
-   	A ::T.A
-   }
-   EOF
-   ./zig-out/bin/repro-canonicalize -v /tmp/repro-canonicalize-100.roc
-   ```
+No unresolved issues.
 
 No hangs reproduced in either run.
 

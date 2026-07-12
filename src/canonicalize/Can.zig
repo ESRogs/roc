@@ -2185,6 +2185,18 @@ fn registerTypeDecl(
             type_header.name,
             type_decl_stmt_idx,
         );
+        if (ast_stmt_idx) |idx| {
+            if (self.parserTypePathForAstStatement(idx)) |path| {
+                const source_path_name = try self.typePathIdent(path, false);
+                if (!source_path_name.eql(type_header.name)) {
+                    try self.introduceAssociatedTypeAliasInScope(
+                        self.scopes.items.len - 1,
+                        source_path_name,
+                        type_decl_stmt_idx,
+                    );
+                }
+            }
+        }
     }
 
     // Process type parameters and annotation in a separate scope
