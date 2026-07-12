@@ -5700,7 +5700,7 @@ test "RC switch continuation merge releases branch-divergent owner at the bounda
     try f.expectRc(diverged, 0, 1, 0);
 }
 
-fn chainedJoinSolveWork(join_count: usize) !u64 {
+fn chainedJoinSolveWork(join_count: usize) Allocator.Error!u64 {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
     const carried = try f.local(.str);
