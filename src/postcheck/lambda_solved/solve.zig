@@ -1517,11 +1517,19 @@ const Solver = struct {
                     }
                     try self.unifySpans(left_named.args, right_named.args, "named type arguments failed Lambda Solved unification");
                     // Aliases have already been unwrapped above. Generated
-                    // opaque evidence uses its backing only to carry generated
-                    // compile-time evidence rows, so two values with the same nominal
-                    // identity may intentionally have different backing rows.
-                    if (isGeneratedOpaqueEvidenceOwner(left_named.builtin_owner) or
-                        isGeneratedOpaqueEvidenceOwner(right_named.builtin_owner))
+                    // compile-time evidence owners (`FieldNames`/`FieldName`/
+                    // `ParseTagUnionSpec`) use their backing only to carry
+                    // evidence rows, so two values with the same nominal identity
+                    // may intentionally have different backing rows; the
+                    // higher-scored backing is selected without unifying them.
+                    // Iterators are excluded: a minted `Iter`/`Stream` keeps its
+                    // step callable in its backing, so two same-identity minted
+                    // iterators must unify their backings for the step callable
+                    // members to merge. Selecting one backing by score instead
+                    // would drop a step closure, leaving a zero-sized callable a
+                    // later construction then mismatches at the box boundary.
+                    if (isScoreSelectedEvidenceOwner(left_named.builtin_owner) or
+                        isScoreSelectedEvidenceOwner(right_named.builtin_owner))
                     {
                         if (self.generatedOpaqueEvidenceScore(right_named) > self.generatedOpaqueEvidenceScore(left_named)) {
                             self.program.types.set(a, .{ .link = b });
@@ -2038,6 +2046,17 @@ fn generatedBackingScore(content: Type.Content) ?u8 {
 
 fn isGeneratedOpaqueEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
     return MonoType.generatedEvidenceOwnerUsesBacking(owner orelse return false);
+}
+
+/// A generated-backing owner whose same-identity instances carry independent
+/// evidence backing rows that unification selects by score rather than unifies
+/// (`FieldNames`/`FieldName`/`ParseTagUnionSpec`). Iterators also carry a
+/// generated backing but are excluded here: their same-identity instances share
+/// one backing structure whose step callable members must merge, so they take
+/// ordinary backing unification instead of score selection.
+fn isScoreSelectedEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
+    const resolved = owner orelse return false;
+    return isGeneratedOpaqueEvidenceOwner(resolved) and !static_dispatch.isIteratorOwner(resolved);
 }
 
 fn isPublicGeneratedIteratorPair(left: anytype, right: anytype) bool {
