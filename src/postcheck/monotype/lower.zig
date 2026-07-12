@@ -1922,10 +1922,7 @@ const Builder = struct {
     }
 
     fn typeHasBuiltinOwner(self: *Builder, ty: Type.TypeId, owner: static_dispatch.BuiltinOwner) bool {
-        return switch (methodOwnerFromType(&self.program.types, ty) orelse return false) {
-            .builtin => |actual| actual == owner,
-            .nominal => false,
-        };
+        return typeHasBuiltinHead(&self.program.types, ty, owner);
     }
 
     fn typeIsBuiltinJsonEncoding(self: *Builder, ty: Type.TypeId) bool {
@@ -2493,22 +2490,53 @@ const Builder = struct {
         };
     }
 
-    fn lookupMethodTarget(
+    /// Exact `(dispatch head, method)` lookup into the checked method
+    /// registries, for compiler-generated call edges only: structural
+    /// derivation internals, inspect/parser/encode helpers, Set/Dict literal
+    /// helpers, and dispatcher-path synthesis. These edges have no checked
+    /// instantiation records, so the registry answers an exact lookup after
+    /// the head is read from the checked type identity the monotype carries
+    /// (`named.def` / `builtin_owner`, alias-transparently). Plan-resolved
+    /// user dispatch never resolves here — its targets are consumed from
+    /// checked evidence.
+    fn componentMethodTargetByName(self: *Builder, ty: Type.TypeId, method_name: []const u8) ?MethodLookup {
+        const method = self.program.names.lookupMethodName(method_name) orelse return null;
+        const owner = self.componentDispatchOwner(ty) orelse return null;
+        return self.component_method_targets.get(.{ .owner = owner, .method = method });
+    }
+
+    /// `componentMethodTargetByName` for a method name interned in a checked
+    /// module view's name store rather than the program's.
+    fn componentMethodTargetForView(
         self: *Builder,
-        owner: static_dispatch.MethodOwner,
+        ty: Type.TypeId,
         method_view: ModuleView,
         method: names.MethodNameId,
     ) ?MethodLookup {
-        return self.lookupMethodTargetByName(owner, method_view.names.methodNameText(method));
+        return self.componentMethodTargetByName(ty, method_view.names.methodNameText(method));
     }
 
-    fn lookupMethodTargetByName(
-        self: *Builder,
-        owner: static_dispatch.MethodOwner,
-        method_name: []const u8,
-    ) ?MethodLookup {
-        const method = self.program.names.lookupMethodName(method_name) orelse return null;
-        return self.component_method_targets.get(.{ .owner = owner, .method = method });
+    /// The registry key naming `ty`'s dispatch head, read from the checked
+    /// type identity the monotype carries; null for shapes with no head
+    /// (structural rows, functions, unsolved placeholders).
+    fn componentDispatchOwner(self: *Builder, ty: Type.TypeId) ?static_dispatch.MethodOwner {
+        return switch (self.program.types.dispatchHeadContent(ty)) {
+            .primitive => |primitive| .{ .builtin = Type.builtinOwnerForPrimitive(primitive) },
+            .list => .{ .builtin = .list },
+            .box => .{ .builtin = .box },
+            .named => |named| if (named.builtin_owner) |owner|
+                .{ .builtin = owner }
+            else if (named.kind == .alias)
+                // An alias with no backing has no head.
+                null
+            else
+                .{ .nominal = .{
+                    .module = named.def.module,
+                    .type_name = named.def.type_name,
+                    .source_decl = named.def.source_decl,
+                } },
+            else => null,
+        };
     }
 
     fn importModuleAlreadyScanned(self: *Builder, module_id: checked.ModuleId, import_index: usize) bool {
@@ -4270,8 +4298,7 @@ const Builder = struct {
     }
 
     fn toInspectCall(self: *Builder, value: Ast.ExprId, value_ty: Type.TypeId, str_ty: Type.TypeId) Allocator.Error!?Ast.ExprId {
-        const owner = methodOwnerFromType(&self.program.types, value_ty) orelse return null;
-        const lookup = self.lookupMethodTargetByName(owner, "to_inspect") orelse return null;
+        const lookup = self.componentMethodTargetByName(value_ty, "to_inspect") orelse return null;
         const procedure = switch (lookup.target.kind) {
             .procedure => |procedure| procedure,
             .generated_structural_parser, .generated_structural_encoder, .local_proc => return null,
@@ -7012,8 +7039,7 @@ const BodyContext = struct {
     }
 
     fn toInspectCall(self: *BodyContext, value: DraftExprId, value_ty: Type.TypeId, str_ty: Type.TypeId) Allocator.Error!?DraftExprId {
-        const owner = methodOwnerFromType(&self.builder.program.types, value_ty) orelse return null;
-        const lookup = self.builder.lookupMethodTargetByName(owner, "to_inspect") orelse return null;
+        const lookup = self.builder.componentMethodTargetByName(value_ty, "to_inspect") orelse return null;
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{value_ty}, str_ty);
         const callee = try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize);
 
@@ -16669,9 +16695,9 @@ const BodyContext = struct {
         // unresolved until that operand's target resolves. Lowering the
         // dispatcher operand first supplies the receiver's solved type; the
         // lowered expression is reused as the call argument.
-        const owner_is_null = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null;
+        const dispatcher_ungrounded = !dispatcherIsGrounded(&self.builder.program.types, dispatcher_ty);
         var pre_lowered: ?PreLoweredOperand = null;
-        if (owner_is_null) {
+        if (dispatcher_ungrounded) {
             switch (plan.dispatcher) {
                 .arg => |index| {
                     const deferred_top = self.graph.deferred_templates.items.len;
@@ -17124,10 +17150,7 @@ const BodyContext = struct {
     }
 
     fn typeHasBuiltinOwner(self: *BodyContext, ty: Type.TypeId, owner: static_dispatch.BuiltinOwner) bool {
-        return switch (methodOwnerFromType(&self.builder.program.types, ty) orelse return false) {
-            .builtin => |actual| actual == owner,
-            .nominal => false,
-        };
+        return typeHasBuiltinHead(&self.builder.program.types, ty, owner);
     }
 
     fn setPayloadType(self: *BodyContext, ty: Type.TypeId) ?Type.TypeId {
@@ -17411,7 +17434,7 @@ const BodyContext = struct {
         // The dispatcher may not be solved yet when this runs for argument
         // evidence; the target then resolves when the expression itself
         // lowers, and the plan's return carries the evidence for now.
-        if (methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null or
+        if (!dispatcherIsGrounded(&self.builder.program.types, dispatcher_ty) or
             self.planUnexecutable(plan) != null)
         {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
@@ -17748,10 +17771,8 @@ const BodyContext = struct {
         owner_ty: Type.TypeId,
         method_name: []const u8,
     ) MethodLookup {
-        const owner = methodOwnerFromType(&self.builder.program.types, owner_ty) orelse
-            Common.invariant("parser format type did not have a method owner");
-        return self.builder.lookupMethodTargetByName(owner, method_name) orelse
-            Common.invariant("checked method registry is missing parser format method");
+        return self.builder.componentMethodTargetByName(owner_ty, method_name) orelse
+            Common.invariant("checked method registry is missing a compiler-generated helper method");
     }
 
     /// Resolve a target's requirements from its checked dispatcher paths
@@ -17842,13 +17863,11 @@ const BodyContext = struct {
         method: names.MethodNameId,
         component_ty: Type.TypeId,
     ) Allocator.Error!SpecEvidence {
-        if (methodOwnerFromType(&self.builder.program.types, component_ty)) |owner| {
-            if (self.builder.lookupMethodTarget(owner, view, method)) |found| {
-                const arena = self.builder.evidence_arena.allocator();
-                const target = try arena.create(SpecEvidenceTarget);
-                target.* = .{ .view = found.view, .target = found.target, .nested = .synthesize };
-                return .{ .target = target };
-            }
+        if (self.builder.componentMethodTargetForView(component_ty, view, method)) |found| {
+            const arena = self.builder.evidence_arena.allocator();
+            const target = try arena.create(SpecEvidenceTarget);
+            target.* = .{ .view = found.view, .target = found.target, .nested = .synthesize };
+            return .{ .target = target };
         }
         if (structuralKindForMethodText(view.names.methodNameText(method))) |kind| {
             return .{ .structural = kind };
@@ -20228,9 +20247,7 @@ const BodyContext = struct {
             .nominal, .@"opaque" => {},
             .alias => return null,
         }
-        const owner = methodOwnerFromType(&self.builder.program.types, ty) orelse
-            Common.invariant("custom named parser type had no method owner");
-        const lookup = self.builder.lookupMethodTargetByName(owner, "parser_for") orelse
+        const lookup = self.builder.componentMethodTargetByName(ty, "parser_for") orelse
             Common.invariant("checked method registry is missing custom parser_for target");
         return switch (lookup.target.kind) {
             .generated_structural_parser => null,
@@ -20247,8 +20264,7 @@ const BodyContext = struct {
             else => return false,
         };
         if (named.builtin_owner != null) return false;
-        const owner = methodOwnerFromType(&self.builder.program.types, ty) orelse return false;
-        return self.builder.lookupMethodTargetByName(owner, "parser_for") != null;
+        return self.builder.componentMethodTargetByName(ty, "parser_for") != null;
     }
 
     fn customEncoderForLookup(self: *BodyContext, ty: Type.TypeId) ?MethodLookup {
@@ -20261,9 +20277,7 @@ const BodyContext = struct {
             .nominal, .@"opaque" => {},
             .alias => return null,
         }
-        const owner = methodOwnerFromType(&self.builder.program.types, ty) orelse
-            Common.invariant("custom named encoder_for type had no method owner");
-        const lookup = self.builder.lookupMethodTargetByName(owner, "encoder_for") orelse
+        const lookup = self.builder.componentMethodTargetByName(ty, "encoder_for") orelse
             Common.invariant("checked method registry is missing custom encoder_for target");
         return switch (lookup.target.kind) {
             .generated_structural_encoder => null,
@@ -20758,9 +20772,7 @@ const BodyContext = struct {
         operand: D.Operand,
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
-        const owner = methodOwnerFromType(&self.builder.program.types, ty) orelse
-            Common.invariant(D.owned_missing_owner_msg);
-        const lookup = self.builder.lookupMethodTargetByName(owner, ctx.method_name) orelse
+        const lookup = self.builder.componentMethodTargetByName(ty, ctx.method_name) orelse
             Common.invariant(D.owned_missing_target_msg);
 
         const arg_tys = D.ownedArgTypes(ty, ctx.result_ty);
@@ -24320,20 +24332,18 @@ const BodyContext = struct {
         };
         const scrutinee = try self.localExpr(entry.local, entry.ty);
         const expected = try self.lowerExpr(conversion);
-        if (methodOwnerFromType(&self.builder.program.types, entry.ty)) |owner| {
-            if (self.builder.lookupMethodTargetByName(owner, "is_eq")) |lookup| {
-                var target_ctx = try self.methodTargetContext(lookup);
-                defer target_ctx.deinit();
-                const target_fn = target_ctx.checkedFunctionType(lookup.target.callable_ty);
-                const bool_ty = try self.builder.lowerType(lookup.view, target_fn.ret);
-                const arg_tys = [_]Type.TypeId{ entry.ty, entry.ty };
-                const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &arg_tys, bool_ty);
-                const callee = try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize);
-                return try self.addExpr(.{ .ty = bool_ty, .data = .{ .call_proc = .{
-                    .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(callee)),
-                    .args = try self.addExprSpan(&.{ scrutinee, expected }),
-                } } });
-            }
+        if (self.builder.componentMethodTargetByName(entry.ty, "is_eq")) |lookup| {
+            var target_ctx = try self.methodTargetContext(lookup);
+            defer target_ctx.deinit();
+            const target_fn = target_ctx.checkedFunctionType(lookup.target.callable_ty);
+            const bool_ty = try self.builder.lowerType(lookup.view, target_fn.ret);
+            const arg_tys = [_]Type.TypeId{ entry.ty, entry.ty };
+            const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &arg_tys, bool_ty);
+            const callee = try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize);
+            return try self.addExpr(.{ .ty = bool_ty, .data = .{ .call_proc = .{
+                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(callee)),
+                .args = try self.addExprSpan(&.{ scrutinee, expected }),
+            } } });
         }
         return try self.lowerEqualityExpr(entry.ty, scrutinee, expected, "is_eq", try self.builder.primitiveType(.bool));
     }
@@ -24530,7 +24540,6 @@ const EqDeriver = struct {
         return .{ .lhs = lhs_item, .rhs = rhs_item };
     }
 
-    const owned_missing_owner_msg = "owned equality call requested for a type without a method owner";
     const owned_missing_target_msg = "checked method registry is missing owned equality target";
 
     fn ownedArgTypes(ty: Type.TypeId, _: Type.TypeId) [2]Type.TypeId {
@@ -24753,7 +24762,6 @@ const HashDeriver = struct {
         return .{ .value = item_value, .hasher = state };
     }
 
-    const owned_missing_owner_msg = "owned hash call requested for a type without a method owner";
     const owned_missing_target_msg = "checked method registry is missing owned to_hash target";
 
     fn ownedArgTypes(ty: Type.TypeId, result_ty: Type.TypeId) [2]Type.TypeId {
@@ -25183,15 +25191,28 @@ fn hostedTemplate(hosted: anytype) names.ProcTemplate {
     @compileError("unsupported hosted function payload");
 }
 
-fn methodOwnerFromType(types: *const Type.Store, ty: Type.TypeId) ?static_dispatch.MethodOwner {
-    return switch (types.ownerHead(ty)) {
-        .none => null,
-        .builtin => |owner| .{ .builtin = owner },
-        .named_type => |def| .{ .nominal = .{
-            .module = def.module,
-            .type_name = def.type_name,
-            .source_decl = def.source_decl,
-        } },
+/// Whether a dispatcher's monotype has grounded to a shape that names a
+/// dispatch head (a builtin or nominal type, alias-transparently). This only
+/// orders lowering — operand pre-lowering and argument-evidence passes wait
+/// for ungrounded dispatchers to solve; dispatch targets themselves are
+/// always consumed from checked evidence, never resolved from this shape.
+fn dispatcherIsGrounded(types: *const Type.Store, ty: Type.TypeId) bool {
+    return switch (types.dispatchHeadContent(ty)) {
+        .primitive, .list, .box => true,
+        .named => |named| named.builtin_owner != null or named.kind != .alias,
+        else => false,
+    };
+}
+
+/// Whether `ty`'s dispatch head is the given builtin (alias-transparently).
+/// Shape predicate only — never resolves a dispatch target.
+fn typeHasBuiltinHead(types: *const Type.Store, ty: Type.TypeId, owner: static_dispatch.BuiltinOwner) bool {
+    return switch (types.dispatchHeadContent(ty)) {
+        .primitive => |primitive| Type.builtinOwnerForPrimitive(primitive) == owner,
+        .list => owner == .list,
+        .box => owner == .box,
+        .named => |named| if (named.builtin_owner) |builtin| builtin == owner else false,
+        else => false,
     };
 }
 
