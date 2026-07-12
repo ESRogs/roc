@@ -166,6 +166,8 @@ const CliMainError =
     lir.CheckedPipeline.LowerResourceError ||
     backend.wasm.WasmModule.NoLinkObjectContractError ||
     backend.wasm.WasmModule.RelocatableEncodeError ||
+    backend.wasm.WasmModule.RelocationError ||
+    backend.wasm.WasmModule.EncodeError ||
     backend.wasm.WasmModule.SymbolLookupError ||
     backend.RunImage.WriteError ||
     backend.RunImage.ImageError ||
