@@ -2797,3 +2797,49 @@ test "dispatch evidence boundary validator names the method of a dangling eviden
     const named_method = resources.checked_artifact.canonical_names.methodNameText(failure.method orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings(corrupted_method.?, named_method);
 }
+
+test "compiler-generated dispatch classes lower via checked evidence" {
+    const allocator = std.testing.allocator;
+    // One program exercising every compiler-generated dispatch class served
+    // by the component-lookup seam: iterator `for` dispatch, structural
+    // record equality dispatching a nominal component's own `is_eq`,
+    // `Str.inspect` through a custom `to_inspect`, and parser-format
+    // synthesis with builtin Set helpers (JSON parse of a Set field).
+    // Debug-mode lowering asserts dispatch-evidence totality by invariant
+    // throughout, so completing the lowering is the assertion.
+    const source =
+        \\module [main]
+        \\
+        \\Speed := [Mph(U64)].{
+        \\    is_eq : Speed, Speed -> Bool
+        \\    is_eq = |Speed.Mph(a), Speed.Mph(b)| a == b
+        \\    to_inspect : Speed -> Str
+        \\    to_inspect = |Speed.Mph(mph)| Str.inspect(mph)
+        \\}
+        \\
+        \\main : Str
+        \\main = {
+        \\    var $sum = 0.U64
+        \\    for item in [1.U64, 2.U64, 3.U64] {
+        \\        $sum = $sum + item
+        \\    }
+        \\    lhs = { speed: Speed.Mph($sum), label: "total" }
+        \\    rhs = { speed: Speed.Mph(6), label: "total" }
+        \\    parsed : Try({ names : Set(Str) }, Json.ParseErr)
+        \\    parsed = Json.parse("{ \"names\": [\"a\", \"b\"] }")
+        \\    parsed_count = match parsed {
+        \\        Ok(rec) => rec.names.len()
+        \\        Err(_) => 0
+        \\    }
+        \\    if lhs == rhs and parsed_count > 0 Str.inspect(lhs.speed) else "no"
+        \\}
+    ;
+
+    var mono = try lowerMonotypeModule(allocator, source);
+    defer mono.deinit(allocator);
+
+    // The program must check cleanly: a reported problem would resolve the
+    // dispatch plans as checked errors and crash-lower the very classes this
+    // test exists to exercise.
+    try std.testing.expectEqual(@as(usize, 0), mono.resources.checker.problems.problems.items.len);
+}
