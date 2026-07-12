@@ -420,6 +420,24 @@ const Transform = struct {
         return true;
     }
 
+    /// Fuse a discarded erased-callable pack into the same-shape pack that
+    /// replaces it, so the second pack reuses the first pack's allocation
+    /// instead of allocating fresh.
+    ///
+    /// The matched shape is a proc that packs one erased callable, immediately
+    /// packs another of the same payload size and alignment, and returns the
+    /// second while never reading the first. Real lowering interposes
+    /// `assign_ref .local` aliases (and zero-sized struct statements) between
+    /// the two packs and between the second pack and the return, so the matcher
+    /// crosses those the way the box variants do: it skips such statements to
+    /// reach the second pack, then forwards the second pack's result through an
+    /// alias chain to the `ret`.
+    ///
+    /// Setting `reuse = old.target` makes ARC treat the first pack's allocation
+    /// as consumed by the second, so the fusion is only sound when the first
+    /// pack's result has no other consumer and the crossed return-chain aliases
+    /// are each single-use. Both preconditions are proven from proc-wide operand
+    /// read counts rather than assumed from the local shape.
     fn rewritePackedErasedAt(self: *Transform, old_stmt_id: CFStmtId) ResourceError!bool {
         const old_stmt = switch (self.store.getCFStmt(old_stmt_id)) {
             .assign_packed_erased_fn => |s| s,
@@ -427,7 +445,7 @@ const Transform = struct {
         };
         if (old_stmt.reuse != null) return false;
 
-        const new_stmt_id = old_stmt.next;
+        const new_stmt_id = self.skipLocalAliasesAndZsts(old_stmt.next);
         const new_stmt = switch (self.store.getCFStmt(new_stmt_id)) {
             .assign_packed_erased_fn => |s| s,
             else => return false,
@@ -436,11 +454,20 @@ const Transform = struct {
         if (old_stmt.target == new_stmt.target) return false;
         if (new_stmt.capture != null and new_stmt.capture.? == old_stmt.target) return false;
 
-        const ret_stmt = switch (self.store.getCFStmt(new_stmt.next)) {
+        var return_chain = std.ArrayList(LocalId).empty;
+        defer return_chain.deinit(self.store.allocator);
+        const returned = try body_clone.forwardLocalAliasChainInto(
+            self.store,
+            self.store.allocator,
+            new_stmt.target,
+            new_stmt.next,
+            &return_chain,
+        );
+        const ret_stmt = switch (self.store.getCFStmt(returned.next)) {
             .ret => |s| s,
             else => return false,
         };
-        if (ret_stmt.value != new_stmt.target) return false;
+        if (ret_stmt.value != returned.value) return false;
 
         const erased_layout = self.store.getLocal(old_stmt.target).layout_idx;
         if (self.store.getLocal(new_stmt.target).layout_idx != erased_layout) return false;
@@ -448,6 +475,22 @@ const Transform = struct {
         if (self.layouts.getLayout(erased_layout).tag != .erased_callable) return false;
 
         if (!self.samePackedErasedPayloadShape(old_stmt.capture_layout, new_stmt.capture_layout)) return false;
+
+        const proc_body = self.store.getProcSpec(self.proc_id).body orelse return false;
+        var reads = try body_clone.countReachableReads(self.store, proc_body);
+        defer reads.deinit();
+
+        // The first pack's allocation becomes the reuse target, so its result
+        // must have no other consumer: any read would still be live after the
+        // second pack overwrote the allocation. An alias of it read elsewhere
+        // shows up here as a nonzero count and declines the rewrite.
+        if (reads.get(old_stmt.target) != 0) return false;
+        // Each crossed return-chain local (the second pack's result and its
+        // aliases) must be read exactly once, so the matched chain is that
+        // local's only use and no other statement observes it.
+        for (return_chain.items) |local| {
+            if (reads.get(local) != 1) return false;
+        }
 
         self.store.getCFStmtPtr(new_stmt_id).* = .{ .assign_packed_erased_fn = .{
             .target = new_stmt.target,
@@ -611,6 +654,24 @@ fn testFreshJoinPointId(next_join_point: *u32) LIR.JoinPointId {
     const id: LIR.JoinPointId = @enumFromInt(next_join_point.*);
     next_join_point.* += 1;
     return id;
+}
+
+fn testPackedErased(
+    store: *LirStore,
+    target: LocalId,
+    proc: LIR.LirProcSpecId,
+    capture: ?LocalId,
+    capture_layout: ?layout_mod.Idx,
+    next: CFStmtId,
+) ResourceError!CFStmtId {
+    return try store.addCFStmt(.{ .assign_packed_erased_fn = .{
+        .target = target,
+        .proc = proc,
+        .capture = capture,
+        .capture_layout = capture_layout,
+        .on_drop = .none,
+        .next = next,
+    } });
 }
 
 test "box reuse rewrites the direct unbox call rebox return chain" {
@@ -954,4 +1015,182 @@ test "erased callable reuse rewrites adjacent same-shape repack" {
 
     const frame_locals = store.getLocalSpan(store.getProcSpec(caller).frame_locals);
     try std.testing.expectEqual(@as(usize, 4), frame_locals.len);
+}
+
+test "erased callable reuse forwards through aliases between the packs" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(allocator, @import("base").target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const erased_callable = try layouts.insertErasedCallable();
+    const old_capture = try testLocal(&store, .u64);
+    const new_capture = try testLocal(&store, .u64);
+    const capture_alias_a = try testLocal(&store, .u64);
+    const capture_alias_b = try testLocal(&store, .u64);
+    const capture_alias_c = try testLocal(&store, .u64);
+    const old_callable = try testLocal(&store, erased_callable);
+    const new_callable = try testLocal(&store, erased_callable);
+    const callee_arg = try testLocal(&store, .u64);
+
+    const old_proc = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{callee_arg}),
+        .frame_locals = try store.addLocalSpan(&.{callee_arg}),
+        .ret_layout = .u64,
+    });
+    const new_proc = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{callee_arg}),
+        .frame_locals = try store.addLocalSpan(&.{callee_arg}),
+        .ret_layout = .u64,
+    });
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = new_callable } });
+    const new_pack = try testPackedErased(&store, new_callable, new_proc, capture_alias_c, .u64, ret);
+    // Three `assign_ref .local` aliases (of the second pack's capture, not of
+    // the discarded first pack) sit between the two packs.
+    const alias_c = try testLocalRef(&store, capture_alias_c, capture_alias_b, new_pack);
+    const alias_b = try testLocalRef(&store, capture_alias_b, capture_alias_a, alias_c);
+    const alias_a = try testLocalRef(&store, capture_alias_a, new_capture, alias_b);
+    const old_pack = try testPackedErased(&store, old_callable, old_proc, old_capture, .u64, alias_a);
+    const caller = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{}),
+        .frame_locals = try store.addLocalSpan(&.{
+            old_capture,
+            new_capture,
+            capture_alias_a,
+            capture_alias_b,
+            capture_alias_c,
+            old_callable,
+            new_callable,
+        }),
+        .body = old_pack,
+        .ret_layout = erased_callable,
+    });
+    _ = caller;
+
+    try run(&store, &layouts);
+
+    const rewritten = store.getCFStmt(new_pack).assign_packed_erased_fn;
+    try std.testing.expectEqual(old_callable, rewritten.reuse.?);
+    try std.testing.expect(!rewritten.reuse_unique);
+}
+
+test "erased callable reuse declines when an alias of the old pack is read elsewhere" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(allocator, @import("base").target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const erased_callable = try layouts.insertErasedCallable();
+    const old_capture = try testLocal(&store, .u64);
+    const new_capture = try testLocal(&store, .u64);
+    const old_callable = try testLocal(&store, erased_callable);
+    const old_callable_alias = try testLocal(&store, erased_callable);
+    const old_callable_alias2 = try testLocal(&store, erased_callable);
+    const new_callable = try testLocal(&store, erased_callable);
+    const callee_arg = try testLocal(&store, .u64);
+
+    const old_proc = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{callee_arg}),
+        .frame_locals = try store.addLocalSpan(&.{callee_arg}),
+        .ret_layout = .u64,
+    });
+    const new_proc = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{callee_arg}),
+        .frame_locals = try store.addLocalSpan(&.{callee_arg}),
+        .ret_layout = .u64,
+    });
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = new_callable } });
+    const new_pack = try testPackedErased(&store, new_callable, new_proc, new_capture, .u64, ret);
+    // The discarded first pack is aliased, and that alias is itself read again,
+    // so the first pack's allocation still has a live consumer and reuse is
+    // unsound.
+    const alias2 = try testLocalRef(&store, old_callable_alias2, old_callable_alias, new_pack);
+    const alias1 = try testLocalRef(&store, old_callable_alias, old_callable, alias2);
+    const old_pack = try testPackedErased(&store, old_callable, old_proc, old_capture, .u64, alias1);
+    const caller = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{}),
+        .frame_locals = try store.addLocalSpan(&.{
+            old_capture,
+            new_capture,
+            old_callable,
+            old_callable_alias,
+            old_callable_alias2,
+            new_callable,
+        }),
+        .body = old_pack,
+        .ret_layout = erased_callable,
+    });
+    _ = caller;
+
+    try run(&store, &layouts);
+
+    const unchanged = store.getCFStmt(new_pack).assign_packed_erased_fn;
+    try std.testing.expectEqual(@as(?LocalId, null), unchanged.reuse);
+}
+
+test "erased callable reuse forwards through the aliased return path" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(allocator, @import("base").target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const erased_callable = try layouts.insertErasedCallable();
+    const old_capture = try testLocal(&store, .u64);
+    const new_capture = try testLocal(&store, .u64);
+    const old_callable = try testLocal(&store, erased_callable);
+    const new_callable = try testLocal(&store, erased_callable);
+    const return_alias_a = try testLocal(&store, erased_callable);
+    const return_alias_b = try testLocal(&store, erased_callable);
+    const callee_arg = try testLocal(&store, .u64);
+
+    const old_proc = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{callee_arg}),
+        .frame_locals = try store.addLocalSpan(&.{callee_arg}),
+        .ret_layout = .u64,
+    });
+    const new_proc = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{callee_arg}),
+        .frame_locals = try store.addLocalSpan(&.{callee_arg}),
+        .ret_layout = .u64,
+    });
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = return_alias_b } });
+    const alias_b = try testLocalRef(&store, return_alias_b, return_alias_a, ret);
+    const alias_a = try testLocalRef(&store, return_alias_a, new_callable, alias_b);
+    const new_pack = try testPackedErased(&store, new_callable, new_proc, new_capture, .u64, alias_a);
+    const old_pack = try testPackedErased(&store, old_callable, old_proc, old_capture, .u64, new_pack);
+    const caller = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{}),
+        .frame_locals = try store.addLocalSpan(&.{
+            old_capture,
+            new_capture,
+            old_callable,
+            new_callable,
+            return_alias_a,
+            return_alias_b,
+        }),
+        .body = old_pack,
+        .ret_layout = erased_callable,
+    });
+    _ = caller;
+
+    try run(&store, &layouts);
+
+    const rewritten = store.getCFStmt(new_pack).assign_packed_erased_fn;
+    try std.testing.expectEqual(old_callable, rewritten.reuse.?);
+    try std.testing.expect(!rewritten.reuse_unique);
 }
