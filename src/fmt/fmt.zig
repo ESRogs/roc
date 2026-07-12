@@ -3581,6 +3581,10 @@ const Formatter = struct {
                 const exposed_item_slice = fmt.ast.store.exposedItemSlice(.{ .span = collection.span });
                 return fmt.nodesWillBeMultiline(AST.ExposedItem.Idx, exposed_item_slice);
             },
+            AST.WhereClause.Idx => {
+                const where_clause_slice = fmt.ast.store.whereClauseSlice(.{ .span = collection.span });
+                return fmt.nodesWillBeMultiline(AST.WhereClause.Idx, where_clause_slice);
+            },
             else => return false,
         }
     }
