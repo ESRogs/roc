@@ -1055,7 +1055,7 @@ test "erased callable reuse forwards through aliases between the packs" {
     const alias_b = try testLocalRef(&store, capture_alias_b, capture_alias_a, alias_c);
     const alias_a = try testLocalRef(&store, capture_alias_a, new_capture, alias_b);
     const old_pack = try testPackedErased(&store, old_callable, old_proc, old_capture, .u64, alias_a);
-    const caller = try store.addProcSpec(.{
+    _ = try store.addProcSpec(.{
         .name = store.freshSyntheticSymbol(),
         .args = try store.addLocalSpan(&.{}),
         .frame_locals = try store.addLocalSpan(&.{
@@ -1070,7 +1070,6 @@ test "erased callable reuse forwards through aliases between the packs" {
         .body = old_pack,
         .ret_layout = erased_callable,
     });
-    _ = caller;
 
     try run(&store, &layouts);
 
@@ -1116,7 +1115,7 @@ test "erased callable reuse declines when an alias of the old pack is read elsew
     const alias2 = try testLocalRef(&store, old_callable_alias2, old_callable_alias, new_pack);
     const alias1 = try testLocalRef(&store, old_callable_alias, old_callable, alias2);
     const old_pack = try testPackedErased(&store, old_callable, old_proc, old_capture, .u64, alias1);
-    const caller = try store.addProcSpec(.{
+    _ = try store.addProcSpec(.{
         .name = store.freshSyntheticSymbol(),
         .args = try store.addLocalSpan(&.{}),
         .frame_locals = try store.addLocalSpan(&.{
@@ -1130,7 +1129,6 @@ test "erased callable reuse declines when an alias of the old pack is read elsew
         .body = old_pack,
         .ret_layout = erased_callable,
     });
-    _ = caller;
 
     try run(&store, &layouts);
 
@@ -1172,7 +1170,7 @@ test "erased callable reuse forwards through the aliased return path" {
     const alias_a = try testLocalRef(&store, return_alias_a, new_callable, alias_b);
     const new_pack = try testPackedErased(&store, new_callable, new_proc, new_capture, .u64, alias_a);
     const old_pack = try testPackedErased(&store, old_callable, old_proc, old_capture, .u64, new_pack);
-    const caller = try store.addProcSpec(.{
+    _ = try store.addProcSpec(.{
         .name = store.freshSyntheticSymbol(),
         .args = try store.addLocalSpan(&.{}),
         .frame_locals = try store.addLocalSpan(&.{
@@ -1186,7 +1184,6 @@ test "erased callable reuse forwards through the aliased return path" {
         .body = old_pack,
         .ret_layout = erased_callable,
     });
-    _ = caller;
 
     try run(&store, &layouts);
 
