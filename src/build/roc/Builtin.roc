@@ -1260,103 +1260,42 @@ Builtin :: [].{
 				Ok({ value, after })
 			}
 
+			## Split a JSON scalar (number, boolean, or null) from the text after it.
+			## The scalar ends at the first `,`, `}`, `]`, or JSON whitespace; `after`
+			## keeps that delimiter. Both results are zero-copy slices.
 			split_json_scalar_tail : Str -> Try({ value : Str, after : Str }, Json.ParseErr)
 			split_json_scalar_tail = |raw| {
-				var $value = raw
-				var $after = ""
-				var $offset = Str.count_utf8_bytes(raw)
+				bytes = Str.to_utf8(raw)
 
-				match Str.find_first(raw, ",") {
-					Ok(parts) => {
-						parts_offset = Str.count_utf8_bytes(parts.before)
-						if parts_offset < $offset {
-							$value = parts.before
-							$after = ",".concat(parts.after)
-							$offset = parts_offset
+				match List.find_first_index(bytes, is_json_scalar_delimiter) {
+					Ok(0) => {
+						# missing scalar value
+						Err(Json.invalid_json)
+					}
+					Ok(index) => {
+						value = match Str.from_utf8(List.take_first(bytes, index)) {
+							Ok(v) => v
+							# unreachable: the split point is an ASCII delimiter, so the prefix is always valid UTF-8
+							Err(_) => {
+								crash "Json scalar splitter invariant violated: split at a delimiter was not valid UTF-8"
+							}
+						}
+
+						# `value` is a content-matched prefix of `raw`, so dropping it yields the
+						# tail beginning with the delimiter — a zero-copy slice operation.
+						Ok({ value, after: Str.drop_prefix(raw, value) })
+					}
+					Err(NotFound) => {
+						if Str.is_empty(raw) {
+							# missing scalar value (end of input)
+							Err(Json.invalid_json)
+						} else {
+							# the scalar runs to the end of the input
+							Ok({ value: raw, after: "" })
 						}
 					}
-					Err(NotFound) => {}
-				}
-
-				match Str.find_first(raw, "}") {
-					Ok(parts) => {
-						parts_offset = Str.count_utf8_bytes(parts.before)
-						if parts_offset < $offset {
-							$value = parts.before
-							$after = "}".concat(parts.after)
-							$offset = parts_offset
-						}
-					}
-					Err(NotFound) => {}
-				}
-
-				match Str.find_first(raw, "]") {
-					Ok(parts) => {
-						parts_offset = Str.count_utf8_bytes(parts.before)
-						if parts_offset < $offset {
-							$value = parts.before
-							$after = "]".concat(parts.after)
-							$offset = parts_offset
-						}
-					}
-					Err(NotFound) => {}
-				}
-
-				match Str.find_first(raw, " ") {
-					Ok(parts) => {
-						parts_offset = Str.count_utf8_bytes(parts.before)
-						if parts_offset < $offset {
-							$value = parts.before
-							$after = " ".concat(parts.after)
-							$offset = parts_offset
-						}
-					}
-					Err(NotFound) => {}
-				}
-
-				match Str.find_first(raw, "\n") {
-					Ok(parts) => {
-						parts_offset = Str.count_utf8_bytes(parts.before)
-						if parts_offset < $offset {
-							$value = parts.before
-							$after = "\n".concat(parts.after)
-							$offset = parts_offset
-						}
-					}
-					Err(NotFound) => {}
-				}
-
-				match Str.find_first(raw, "\t") {
-					Ok(parts) => {
-						parts_offset = Str.count_utf8_bytes(parts.before)
-						if parts_offset < $offset {
-							$value = parts.before
-							$after = "\t".concat(parts.after)
-							$offset = parts_offset
-						}
-					}
-					Err(NotFound) => {}
-				}
-
-				match Str.find_first(raw, "\r") {
-					Ok(parts) => {
-						parts_offset = Str.count_utf8_bytes(parts.before)
-						if parts_offset < $offset {
-							$value = parts.before
-							$after = "\r".concat(parts.after)
-							$offset = parts_offset
-						}
-					}
-					Err(NotFound) => {}
-				}
-
-				if Str.is_empty($value) {
-					Err(Json.invalid_json)
-				} else {
-					Ok({ value: $value, after: $after })
 				}
 			}
-
 		}
 
 		JsonEncoding :: [Default, CamelCase, TrailingCommas].{
@@ -17379,6 +17318,14 @@ decode_json_hex_digit : U8 -> Try(U64, Json.ParseErr)
 decode_json_hex_digit = |byte|
 	hex_digit_value(byte).map_ok(|value| value.to_u64()).map_err(|_| Json.invalid_json)
 
+## A byte that ends a JSON scalar: `,`, `}`, `]`, or JSON whitespace.
+is_json_scalar_delimiter : U8 -> Bool
+is_json_scalar_delimiter = |byte|
+	match byte {
+		',' | '}' | ']' | ' ' | '\n' | '\t' | '\r' => True
+		_ => False
+	}
+
 ## Append a Unicode code point as UTF-8 bytes. The caller guarantees the code point is at
 ## most U+10FFFF and not an unpaired surrogate.
 append_utf8_code_point : List(U8), U64 -> List(U8)
@@ -17417,6 +17364,7 @@ list_replace_unsafe : List(item), U64, item -> { list : List(item), prev : item 
 
 # Implemented by the compiler, does not perform bounds checks
 list_swap_unsafe : List(item), U64, U64 -> List(item)
+
 
 # Implemented by the compiler. Returns string slices into the source string.
 str_find_first_raw : Str, Str -> { before : Str, found : Bool, after : Str }
