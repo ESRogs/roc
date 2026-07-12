@@ -14,20 +14,7 @@ Totals observed:
 
 Unique confirmed issues:
 
-1. [fuzz_crash_099.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_099.md>)
-   Crash family: Canonicalization invariant violation (`unreachable`, duplicate record fields in `canonical_type_keys`).
-
-   ```sh
-   cat > /tmp/repro-canonicalize-099.roc <<'EOF'
-   main! = |_args| {
-       dbg Dict.empty().insert({a: 1, b: 2}, 3)
-       fn1 = |a,insert({a: 1, a: 2}, 3)nt b||||| a + b Ok({})
-   }
-   EOF
-   ./zig-out/bin/repro-canonicalize -v /tmp/repro-canonicalize-099.roc
-   ```
-
-2. [fuzz_crash_100.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_100.md>)
+1. [fuzz_crash_100.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_100.md>)
    Crash family: Canonicalization node-type mismatch (`panic: unreachable, node is not a type annotation tag: .type_header`).
 
    ```sh
