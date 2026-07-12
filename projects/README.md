@@ -80,10 +80,7 @@ Within this batch: land `lambda-mono-oracle-fidelity` before
 
 ### Chain A — dispatch evidence, consumed everywhere
 
-1. [big/complete-dispatch-evidence-migration.md](big/complete-dispatch-evidence-migration.md)
-   — finishes the migration from owner re-derivation to checked dispatch
-   evidence (`evidence_missing` → 0), then deletes the derivation path.
-2. [small/hoist-consumes-dispatch-evidence.md](small/hoist-consumes-dispatch-evidence.md)
+1. [small/hoist-consumes-dispatch-evidence.md](small/hoist-consumes-dispatch-evidence.md)
    — hoist selection reads the dispatch resolution instead of re-deriving
    evidence-dependence from type-var content (the PR 10073 seam), and
    recovers the hoisting its conservative gate gives up.
@@ -120,9 +117,6 @@ Small:
   lists, ending the one-local-per-element explosion behind issue 9898.
 
 Big:
-- [big/unify-build-pipelines.md](big/unify-build-pipelines.md)
-  — one orchestration core behind check/run/test; lands best after
-  Chain B step 3 shrinks what finalization does.
 - [big/single-source-builtin-registration.md](big/single-source-builtin-registration.md)
   — collapses the seven hand-typed `roc_builtins_*` symbol/ABI tables onto
   one comptime-generated registry.
@@ -139,13 +133,11 @@ front-loads leverage and keeps prerequisites satisfied:
 3. `small/rceffect-conformance.md`
 4. `small/cache-and-identity-residuals.md`
 5. `small/pin-deferred-spec-requests.md`
-6. `big/complete-dispatch-evidence-migration.md`
-7. `small/hoist-consumes-dispatch-evidence.md`
-8. `small/hosted-extern-declared-abi.md`
-9. `small/audit-solver-mutating-rewrites.md`
-10. `big/platform-relation-from-checking.md`
-11. `small/frame-partitioned-checker-state.md`
-12. `small/compact-constant-aggregates.md`
-13. `big/unify-build-pipelines.md`
-14. `big/single-source-builtin-registration.md`
-15. `big/decision-tree-match-compiler.md`
+6. `small/hoist-consumes-dispatch-evidence.md`
+7. `small/hosted-extern-declared-abi.md`
+8. `small/audit-solver-mutating-rewrites.md`
+9. `big/platform-relation-from-checking.md`
+10. `small/frame-partitioned-checker-state.md`
+11. `small/compact-constant-aggregates.md`
+12. `big/single-source-builtin-registration.md`
+13. `big/decision-tree-match-compiler.md`

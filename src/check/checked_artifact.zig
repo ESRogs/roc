@@ -12906,10 +12906,10 @@ fn sealCheckedProcedureTemplateRefs(
 /// Runs after `sealCheckedProcedureTemplateRefs` so plans and value refs are
 /// grouped per template: `constraint(k)` indexes the enclosing template's
 /// canonical evidence-param list. Concrete dispatchers resolve through the
-/// checked registry exactly as the pre-total inline resolution did; where-var
-/// dispatchers resolve to their param index; evidence for call edges comes
-/// from the checker's persisted `SchemeInstantiationRecord`s, whose fresh vars
-/// are resolved against the settled type store.
+/// checked registry; where-var dispatchers resolve to their param index;
+/// evidence for call edges comes from the checker's persisted
+/// `SchemeInstantiationRecord`s, whose fresh vars are resolved against the
+/// settled type store.
 const EvidencePass = struct {
     allocator: Allocator,
     module: TypedCIR.Module,
@@ -13068,8 +13068,7 @@ const EvidencePass = struct {
         var params = std.ArrayListUnmanaged(EvidenceParam).empty;
         defer params.deinit(self.allocator);
 
-        // by_def maps source defs to templates; entry wrappers and intrinsic
-        // wrappers have no scheme of their own (empty params).
+        // by_def maps source defs to templates.
         var template_defs = std.AutoHashMap(u32, CIR.Def.Idx).init(self.allocator);
         defer template_defs.deinit();
         for (self.templates.by_def) |entry| {
@@ -13078,7 +13077,13 @@ const EvidencePass = struct {
 
         for (self.templates.templates, 0..) |*template, template_index| {
             params.clearRetainingCapacity();
-            if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
+            if (template.body == .intrinsic_wrapper) {
+                // Intrinsic wrappers have no scheme of their own: their
+                // published evidence params are empty by construction, even
+                // though their annotation defs appear in `by_def`. Monotype
+                // lowering relies on this — an under-supplied intrinsic
+                // wrapper request is a consumer invariant.
+            } else if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
                 try self.enumerateParams(ModuleEnv.varFrom(def_idx), &params);
             } else switch (template.body) {
                 // An entry wrapper evaluates a compile-time root; plans inside
@@ -13563,7 +13568,8 @@ const EvidencePass = struct {
     }
 
     /// The method owner of a settled source var, walking alias content
-    /// transparently (mirrors `methodOwnerForCheckedType` on published types).
+    /// transparently (the source-var analog of monotype lowering's
+    /// dispatch-head read of published type identity).
     fn methodOwnerForSourceContent(self: *EvidencePass, var_: Var) ?static_dispatch.MethodOwner {
         var current = var_;
         var remaining: u64 = self.types.len();
@@ -13705,12 +13711,13 @@ const EvidencePass = struct {
     }
 
     /// The derived-structural kind a constraint method admits, if any.
+    /// Ident-keyed view of `static_dispatch.structural_method_kinds`: each
+    /// table entry's name doubles as the matching `CommonIdents` field.
     fn structuralKindForMethodIdent(self: *EvidencePass, fn_name: anytype) ?static_dispatch.StructuralKind {
         const common = self.module.commonIdents();
-        if (fn_name.eql(common.is_eq)) return .equality;
-        if (fn_name.eql(common.to_hash)) return .hash;
-        if (fn_name.eql(common.parser_for)) return .parser;
-        if (fn_name.eql(common.encoder_for)) return .encoder;
+        inline for (static_dispatch.structural_method_kinds) |entry| {
+            if (fn_name.eql(@field(common, entry.name))) return entry.kind;
+        }
         return null;
     }
 
@@ -20828,10 +20835,15 @@ fn topLevelDefSourceName(
     names: *canonical.CanonicalNameStore,
     def: TypedCIR.Def,
 ) Allocator.Error!?canonical.ExportNameId {
-    switch (def.pattern.data) {
-        .assign => |assign| return try names.internExportIdent(module.identStoreConst(), assign.ident),
-        else => return null,
-    }
+    const ident = topLevelDefSourceIdent(def) orelse return null;
+    return try names.internExportIdent(module.identStoreConst(), ident);
+}
+
+fn topLevelDefSourceIdent(def: TypedCIR.Def) ?base.Ident.Idx {
+    return switch (def.pattern.data) {
+        .assign => |assign| assign.ident,
+        else => null,
+    };
 }
 
 fn publishProvidesMetadata(
@@ -21564,6 +21576,7 @@ pub const CompileTimeRootTable = struct {
         const module_env = module.moduleEnvConst();
         for (global_value_defs) |def_idx| {
             const def = module.def(def_idx);
+            if (topLevelDefSourceIdent(def) == null) continue;
             if (procedure_templates.lookupByDef(def_idx) != null) continue;
 
             const source_ty = module.defType(def_idx);
@@ -26114,6 +26127,41 @@ pub fn procedureBindingRefEql(a: ProcedureBindingRef, b: ProcedureBindingRef) bo
     };
 }
 
+/// Public `DispatchEvidenceFailure` declaration.
+///
+/// One dispatch-evidence totality violation found at the check/postcheck
+/// boundary by `CheckedModuleArtifact.validateDispatchEvidence`: which rule
+/// the artifact breaks and where. `expr` anchors expression-keyed failures,
+/// `index` anchors table-keyed ones, and `method` names the dispatch
+/// requirement when the anchor carries one.
+pub const DispatchEvidenceFailure = struct {
+    /// The totality rule the artifact violates.
+    pub const Kind = enum {
+        dispatch_expr_missing_plan,
+        dispatch_expr_plan_out_of_bounds,
+        iterator_for_missing_plan,
+        iterator_for_plan_out_of_bounds,
+        plan_evidence_node_out_of_bounds,
+        evidence_node_nested_refs_out_of_bounds,
+        evidence_ref_node_out_of_bounds,
+        site_evidence_key_out_of_bounds,
+        site_evidence_refs_out_of_bounds,
+        site_evidence_keys_unsorted,
+        template_plan_ref_out_of_bounds,
+        template_plan_refs_out_of_bounds,
+        template_evidence_params_out_of_bounds,
+        evidence_param_path_out_of_bounds,
+    };
+
+    kind: Kind,
+    /// Checked expression anchoring an expression-keyed failure.
+    expr: ?CheckedExprId = null,
+    /// Offending index into the violated rule's table, for table-keyed failures.
+    index: ?u32 = null,
+    /// The dispatch method the requirement names, when known.
+    method: ?canonical.MethodNameId = null,
+};
+
 /// Public `CheckedModuleArtifact` declaration.
 pub const CheckedModuleArtifact = struct {
     key: CheckedModuleArtifactKey,
@@ -26682,11 +26730,165 @@ pub const CheckedModuleArtifact = struct {
         }
     }
 
+    /// One dispatch-expression plan reference checked for the boundary
+    /// validator: `required` distinguishes expressions that must always name
+    /// a plan from the numeral/quote fast paths, where a null plan means the
+    /// concrete-builtin route that never consults one.
+    fn dispatchPlanFailure(
+        table: *const static_dispatch.StaticDispatchPlanTable,
+        maybe_plan: ?StaticDispatchPlanId,
+        expr: CheckedExprId,
+        required: bool,
+    ) ?DispatchEvidenceFailure {
+        const plan = maybe_plan orelse
+            return if (required) .{ .kind = .dispatch_expr_missing_plan, .expr = expr } else null;
+        if (@intFromEnum(plan) >= table.plans.len) {
+            return .{ .kind = .dispatch_expr_plan_out_of_bounds, .expr = expr };
+        }
+        return null;
+    }
+
+    /// The iterator-plan twin of `dispatchPlanFailure`; `for_` always
+    /// requires a plan, anchored by expression or statement index.
+    fn iteratorPlanFailure(
+        table: *const static_dispatch.StaticDispatchPlanTable,
+        maybe_plan: ?static_dispatch.IteratorForPlanId,
+        expr: ?CheckedExprId,
+        index: ?u32,
+    ) ?DispatchEvidenceFailure {
+        const plan = maybe_plan orelse
+            return .{ .kind = .iterator_for_missing_plan, .expr = expr, .index = index };
+        if (@intFromEnum(plan) >= table.iterator_for_plans.len) {
+            return .{ .kind = .iterator_for_plan_out_of_bounds, .expr = expr, .index = index };
+        }
+        return null;
+    }
+
+    /// Public `validateDispatchEvidence` function.
+    ///
+    /// Dispatch-evidence totality at the check/postcheck boundary: every
+    /// dispatch-bearing checked expression names a plan, every plan and
+    /// evidence reference lands inside the artifact's evidence tables, and
+    /// the site-evidence index is sound. Monotype lowering consumes these
+    /// records without re-deriving targets, so a violation is a compiler bug
+    /// reported here at the boundary (in debug builds, where `verifyComplete`
+    /// runs) — not a lowering panic. Returns the first failure found, or
+    /// null when the artifact is total.
+    pub fn validateDispatchEvidence(self: *const CheckedModuleArtifact) ?DispatchEvidenceFailure {
+        const table = &self.static_dispatch_plans;
+
+        for (self.checked_bodies.stored_exprs.items) |expr| {
+            const expr_failure: ?DispatchEvidenceFailure = switch (expr.data) {
+                .dispatch_call, .type_dispatch_call, .method_eq => |maybe_plan| dispatchPlanFailure(table, maybe_plan, expr.id, true),
+                .interpolation => |interpolation| dispatchPlanFailure(table, interpolation.plan, expr.id, true),
+                .numeral => |numeral| dispatchPlanFailure(table, numeral.plan, expr.id, false),
+                .str_from_quote => |quote| dispatchPlanFailure(table, quote.plan, expr.id, false),
+                .for_ => |for_| iteratorPlanFailure(table, for_.plan, expr.id, null),
+                else => null,
+            };
+            if (expr_failure) |failure| return failure;
+        }
+
+        for (self.checked_bodies.stored_statements.items, 0..) |statement, i| {
+            const statement_failure: ?DispatchEvidenceFailure = switch (statement.data) {
+                .for_ => |for_| iteratorPlanFailure(table, for_.plan, null, @intCast(i)),
+                else => null,
+            };
+            if (statement_failure) |failure| return failure;
+        }
+
+        for (table.plans, 0..) |plan, i| {
+            switch (plan.resolution) {
+                .direct => |node| if (@intFromEnum(node) >= table.evidence_nodes.len) {
+                    return .{
+                        .kind = .plan_evidence_node_out_of_bounds,
+                        .expr = plan.expr,
+                        .index = @intCast(i),
+                        .method = plan.method,
+                    };
+                },
+                .constraint, .structural, .checked_error, .unreachable_dispatch => {},
+            }
+        }
+        for (table.iterator_for_plans, 0..) |plan, i| {
+            for ([2]static_dispatch.IteratorDispatchCall{ plan.iter, plan.next }) |call| {
+                switch (call.resolution) {
+                    .direct => |node| if (@intFromEnum(node) >= table.evidence_nodes.len) {
+                        return .{
+                            .kind = .plan_evidence_node_out_of_bounds,
+                            .index = @intCast(i),
+                            .method = call.method,
+                        };
+                    },
+                    .constraint, .structural, .checked_error, .unreachable_dispatch => {},
+                }
+            }
+        }
+
+        for (table.evidence_nodes, 0..) |node, i| {
+            if (@as(u64, node.nested.start) + node.nested.len > table.evidence_refs.len) {
+                return .{ .kind = .evidence_node_nested_refs_out_of_bounds, .index = @intCast(i) };
+            }
+        }
+        for (table.evidence_refs, 0..) |ref, i| {
+            switch (ref) {
+                .direct => |node| if (@intFromEnum(node) >= table.evidence_nodes.len) {
+                    return .{ .kind = .evidence_ref_node_out_of_bounds, .index = @intCast(i) };
+                },
+                .constraint, .structural, .checked_error, .unreachable_value => {},
+            }
+        }
+
+        for (table.site_evidence, 0..) |entry, i| {
+            if (entry.key >= self.checked_bodies.exprCount()) {
+                return .{ .kind = .site_evidence_key_out_of_bounds, .index = @intCast(i) };
+            }
+            if (@as(u64, entry.start) + entry.len > table.evidence_refs.len) {
+                return .{ .kind = .site_evidence_refs_out_of_bounds, .index = @intCast(i) };
+            }
+            if (i > 0 and table.site_evidence[i - 1].key >= entry.key) {
+                return .{ .kind = .site_evidence_keys_unsorted, .index = @intCast(i) };
+            }
+        }
+
+        for (table.template_refs, 0..) |plan_id, i| {
+            if (@intFromEnum(plan_id) >= table.plans.len) {
+                return .{ .kind = .template_plan_ref_out_of_bounds, .index = @intCast(i) };
+            }
+        }
+
+        const templates = &self.checked_procedure_templates;
+        for (templates.templates, 0..) |template, i| {
+            if (@as(u64, template.static_dispatch_plans.start) + template.static_dispatch_plans.len > table.template_refs.len) {
+                return .{ .kind = .template_plan_refs_out_of_bounds, .index = @intCast(i) };
+            }
+            if (@as(u64, template.evidence_params.start) + template.evidence_params.len > templates.evidence_params_pool.len) {
+                return .{ .kind = .template_evidence_params_out_of_bounds, .index = @intCast(i) };
+            }
+        }
+        for (templates.evidence_params_pool, 0..) |param, i| {
+            if (@as(u64, param.path.start) + param.path.len > templates.evidence_param_paths.len) {
+                return .{ .kind = .evidence_param_path_out_of_bounds, .index = @intCast(i), .method = param.method };
+            }
+        }
+
+        return null;
+    }
+
     pub fn verifyComplete(self: *const CheckedModuleArtifact) Allocator.Error!void {
         if (builtin.mode != .Debug) return;
 
         std.debug.assert(self.module_identity.module_idx != std.math.maxInt(u32));
         verifyRootRequestSubsets(self.root_requests);
+
+        if (self.validateDispatchEvidence()) |failure| {
+            const expr_idx: ?u32 = if (failure.expr) |expr| @intFromEnum(expr) else null;
+            const method_text: []const u8 = if (failure.method) |method| self.canonical_names.methodNameText(method) else "<none>";
+            std.debug.panic(
+                "checked artifact invariant violated: dispatch evidence boundary: {s} (expr {?d}, index {?d}, method {s})",
+                .{ @tagName(failure.kind), expr_idx, failure.index, method_text },
+            );
+        }
 
         for (self.root_requests.requests, 0..) |request, i| {
             std.debug.assert(request.order == i);

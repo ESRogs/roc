@@ -2727,3 +2727,156 @@ test "shared callees are lifted once and never gain spurious captures" {
         try std.testing.expectEqual(@as(u32, 0), func.captures.len);
     }
 }
+
+const dispatch_boundary_source =
+    \\module [main]
+    \\
+    \\Thing := [Val(Str)].{
+    \\    to_str : Thing -> Str
+    \\    to_str = |Thing.Val(s)| s
+    \\}
+    \\
+    \\main : Str
+    \\main = Thing.Val("hi").to_str()
+;
+
+test "dispatch evidence boundary validator accepts a published artifact" {
+    const allocator = std.testing.allocator;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, dispatch_boundary_source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    try std.testing.expect(resources.checked_artifact.validateDispatchEvidence() == null);
+}
+
+test "dispatch evidence boundary validator reports a removed dispatch plan by expression" {
+    const allocator = std.testing.allocator;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, dispatch_boundary_source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    var removed: ?check.CheckedArtifact.CheckedExprId = null;
+    for (resources.checked_artifact.checked_bodies.stored_exprs.items) |*expr| {
+        switch (expr.data) {
+            .dispatch_call => |maybe_plan| if (maybe_plan != null) {
+                expr.data = .{ .dispatch_call = null };
+                removed = expr.id;
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(removed != null);
+
+    const failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.dispatch_expr_missing_plan, failure.kind);
+    try std.testing.expectEqual(removed.?, failure.expr.?);
+}
+
+test "dispatch evidence boundary validator names the method of a dangling evidence node" {
+    const allocator = std.testing.allocator;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, dispatch_boundary_source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    const table = &resources.checked_artifact.static_dispatch_plans;
+    var corrupted_method: ?[]const u8 = null;
+    for (table.plans) |*plan| {
+        switch (plan.resolution) {
+            .direct => {
+                plan.resolution = .{ .direct = @enumFromInt(table.evidence_nodes.len) };
+                corrupted_method = resources.checked_artifact.canonical_names.methodNameText(plan.method);
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(corrupted_method != null);
+
+    const failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.plan_evidence_node_out_of_bounds, failure.kind);
+    const named_method = resources.checked_artifact.canonical_names.methodNameText(failure.method orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings(corrupted_method.?, named_method);
+}
+
+test "dispatch evidence boundary validator reports a site-evidence key outside the body store" {
+    const allocator = std.testing.allocator;
+    // A where-constrained helper instantiated at a concrete type gives the
+    // instantiation site a site-evidence entry to corrupt.
+    const source =
+        \\module [main]
+        \\
+        \\Thing := [Val(Str)].{
+        \\    to_str : Thing -> Str
+        \\    to_str = |Thing.Val(s)| s
+        \\}
+        \\
+        \\helper : a -> Str where [a.to_str : a -> Str]
+        \\helper = |x| x.to_str()
+        \\
+        \\main : Str
+        \\main = helper(Thing.Val("hi"))
+    ;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    const table = &resources.checked_artifact.static_dispatch_plans;
+    try std.testing.expect(table.site_evidence.len > 0);
+    table.site_evidence[0].key = @intCast(resources.checked_artifact.checked_bodies.exprCount());
+
+    const failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.site_evidence_key_out_of_bounds, failure.kind);
+    try std.testing.expectEqual(@as(?u32, 0), failure.index);
+}
+
+test "compiler-generated dispatch classes lower via checked evidence" {
+    const allocator = std.testing.allocator;
+    // One program exercising every compiler-generated dispatch class served
+    // by the component-lookup seam: iterator `for` dispatch, structural
+    // record equality dispatching a nominal component's own `is_eq`,
+    // `Str.inspect` through a custom `to_inspect`, and parser-format
+    // synthesis with builtin Set helpers (JSON parse of a Set field).
+    // Debug-mode lowering asserts dispatch-evidence totality by invariant
+    // throughout, and the evaluated output asserts every class resolved to
+    // the RIGHT target, not merely some lowerable one.
+    const source =
+        \\module [main]
+        \\
+        \\Speed := [Mph(U64)].{
+        \\    is_eq : Speed, Speed -> Bool
+        \\    is_eq = |Speed.Mph(a), Speed.Mph(b)| a == b
+        \\    to_inspect : Speed -> Str
+        \\    to_inspect = |Speed.Mph(mph)| Str.inspect(mph)
+        \\}
+        \\
+        \\main : Bool
+        \\main = {
+        \\    var $sum = 0.U64
+        \\    for item in [1.U64, 2.U64, 3.U64] {
+        \\        $sum = $sum + item
+        \\    }
+        \\    lhs = { speed: Speed.Mph($sum), label: "total" }
+        \\    rhs = { speed: Speed.Mph(6), label: "total" }
+        \\    other = { speed: Speed.Mph(7), label: "total" }
+        \\    parsed : Try({ names : Set(Str) }, Json.ParseErr)
+        \\    parsed = Json.parse("{ \"names\": [\"a\", \"b\"] }")
+        \\    parsed_count = match parsed {
+        \\        Ok(rec) => rec.names.len()
+        \\        Err(_) => 0
+        \\    }
+        \\    lhs == rhs and lhs != other and parsed_count == 2 and Str.inspect(lhs.speed) == "6"
+        \\}
+    ;
+
+    var compiled = try helpers.compileInspectedProgramWithBuiltin(allocator, std.testing.io, .module, source, &.{}, try sharedPrePublishedBuiltin(), null);
+    defer compiled.deinit(allocator);
+
+    // The program must check cleanly: a reported problem would resolve the
+    // dispatch plans as checked errors and crash-lower the very classes this
+    // test exists to exercise.
+    try std.testing.expectEqual(@as(usize, 0), compiled.resources.checker.problems.problems.items.len);
+
+    const output = try helpers.lirInterpreterInspectedStr(allocator, &compiled.lowered);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("True", output);
+}
