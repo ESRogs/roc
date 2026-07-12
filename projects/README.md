@@ -120,10 +120,6 @@ Small:
   lists, ending the one-local-per-element explosion behind issue 9898.
 
 Big:
-- [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
-  — applies the certifier's finite-summary/dataflow discipline to
-  production ARC insertion, replacing the join and liveness re-walks that
-  make generated structural encoders compile in minutes.
 - [big/unify-build-pipelines.md](big/unify-build-pipelines.md)
   — one orchestration core behind check/run/test; lands best after
   Chain B step 3 shrinks what finalization does.
@@ -150,7 +146,6 @@ front-loads leverage and keeps prerequisites satisfied:
 10. `big/platform-relation-from-checking.md`
 11. `small/frame-partitioned-checker-state.md`
 12. `small/compact-constant-aggregates.md`
-13. `big/arc-inserter-join-summaries.md`
-14. `big/unify-build-pipelines.md`
-15. `big/single-source-builtin-registration.md`
-16. `big/decision-tree-match-compiler.md`
+13. `big/unify-build-pipelines.md`
+14. `big/single-source-builtin-registration.md`
+15. `big/decision-tree-match-compiler.md`
