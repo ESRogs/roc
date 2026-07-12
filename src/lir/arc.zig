@@ -448,6 +448,15 @@ fn assignOwnedSet(target: *OwnedSet, source: *const OwnedSet) void {
     target.bits.setUnion(source.bits);
 }
 
+/// Intersects `target` with `other` in place, reporting whether any bit
+/// dropped. Intersection never adds bits, so a changed population count is
+/// exactly a changed set.
+fn intersectOwnedSetChanged(target: *OwnedSet, other: *const OwnedSet) bool {
+    const before = target.bits.count();
+    target.intersect(other);
+    return target.bits.count() != before;
+}
+
 fn rewriteBoundaryForStop(boundaries: []const RewriteBoundary, cursor: LIR.CFStmtId) ?RewriteBoundary {
     var i = boundaries.len;
     while (i > 0) {
@@ -2146,8 +2155,9 @@ const Inserter = struct {
         return true;
     }
 
-    /// True when the local's liveness group is read from `start` under no
-    /// loop context, answered directly by the table row.
+    /// True when the local's liveness group is read according to the given
+    /// table row: the group bit for multi-member groups, the raw bit
+    /// otherwise.
     fn groupUsedFromTable(
         self: *Inserter,
         reads: *const std.bit_set.DynamicBitSetUnmanaged,
@@ -2230,14 +2240,29 @@ const Inserter = struct {
         var entry_iter = summary.entry_state.bits.iterator(.{});
         while (entry_iter.next()) |index| {
             const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(index)));
-            if (self.groupUsedFromTable(remainder_reads, local)) keep.set(local);
+            if (self.groupUsedFromTable(remainder_reads, local) or summary.body_keep.contains(local)) {
+                keep.set(local);
+            }
         }
-        var carried = try cloneOwnedSetWith(self.solve_allocator, &summary.body_keep);
-        carried.intersect(&summary.entry_state);
-        keep.unionWith(&carried);
         if (keep.eql(&summary.entry_keep)) return false;
         assignOwnedSet(&summary.entry_keep, &keep);
         return true;
+    }
+
+    /// Context for walking one of a join's regions: the join's body keep is
+    /// the loop keep-set, and inherited switch stops still bound the walk
+    /// but collect no contributions across the join frame.
+    fn solveRegionCtx(
+        self: *Inserter,
+        summary: *JoinSummary,
+        body_scope: ?*const SolveBodyScope,
+    ) ResourceError!SolveContext {
+        return .{
+            .loop_keep = &summary.body_keep,
+            .loop_keep_id = summary.loop_keep_id,
+            .stops = try self.stripStopContributions(summary.origin_ctx.stops),
+            .body_scope = body_scope,
+        };
     }
 
     fn processSolveJoin(self: *Inserter, tasks: *std.ArrayList(SolveTask), join_id: LIR.JoinPointId) ResourceError!void {
@@ -2250,12 +2275,7 @@ const Inserter = struct {
 
         _ = try self.recomputeSolveEntryKeep(summary);
 
-        const remainder_ctx = SolveContext{
-            .loop_keep = &summary.body_keep,
-            .loop_keep_id = summary.loop_keep_id,
-            .stops = try self.stripStopContributions(summary.origin_ctx.stops),
-            .body_scope = summary.origin_ctx.body_scope,
-        };
+        const remainder_ctx = try self.solveRegionCtx(summary, summary.origin_ctx.body_scope);
         try self.pushSolveSegment(tasks, summary.remainder, &summary.entry_keep, remainder_ctx);
         if (summary.body_reachable) try self.scheduleSolveBodyWalk(tasks, summary);
     }
@@ -2266,12 +2286,7 @@ const Inserter = struct {
         if (!summary.body_reachable) return;
         const scope = try self.solve_allocator.create(SolveBodyScope);
         scope.* = .{ .join = summary.id, .parent = summary.origin_ctx.body_scope };
-        const body_ctx = SolveContext{
-            .loop_keep = &summary.body_keep,
-            .loop_keep_id = summary.loop_keep_id,
-            .stops = try self.stripStopContributions(summary.origin_ctx.stops),
-            .body_scope = scope,
-        };
+        const body_ctx = try self.solveRegionCtx(summary, scope);
         try self.pushSolveSegment(tasks, summary.body, &summary.body_keep, body_ctx);
     }
 
@@ -2298,12 +2313,7 @@ const Inserter = struct {
             assignOwnedSet(&summary.common, owned);
             changed = true;
         } else {
-            var merged = try cloneOwnedSetWith(self.solve_allocator, &summary.common);
-            merged.intersect(owned);
-            if (!merged.eql(&summary.common)) {
-                assignOwnedSet(&summary.common, &merged);
-                changed = true;
-            }
+            changed = intersectOwnedSetChanged(&summary.common, owned);
         }
         if (changed and !summary.resume_queued) {
             summary.resume_queued = true;
@@ -2323,6 +2333,7 @@ const Inserter = struct {
         const local_count = self.store.localCount();
         const gop = try summaries.getOrPut(join_stmt.id);
         if (!gop.found_existing) {
+            errdefer _ = summaries.remove(join_stmt.id);
             const summary = try self.solve_allocator.create(JoinSummary);
             summary.* = .{
                 .id = join_stmt.id,
@@ -2352,10 +2363,7 @@ const Inserter = struct {
         {
             arcInvariant("ARC solver saw one join id with conflicting metadata");
         }
-        var merged = try cloneOwnedSetWith(self.solve_allocator, &summary.entry_state);
-        merged.intersect(&segment.owned);
-        if (!merged.eql(&summary.entry_state)) {
-            assignOwnedSet(&summary.entry_state, &merged);
+        if (intersectOwnedSetChanged(&summary.entry_state, &segment.owned)) {
             try self.scheduleSolveJoinProcess(tasks, summary);
         }
     }
@@ -2380,12 +2388,7 @@ const Inserter = struct {
             site.value_ptr.* = try cloneOwnedSetWith(self.solve_allocator, &segment.owned);
             changed = true;
         } else {
-            var merged = try cloneOwnedSetWith(self.solve_allocator, site.value_ptr);
-            merged.intersect(&segment.owned);
-            if (!merged.eql(site.value_ptr)) {
-                assignOwnedSet(site.value_ptr, &merged);
-                changed = true;
-            }
+            changed = intersectOwnedSetChanged(site.value_ptr, &segment.owned);
         }
         const first_reach = !summary.body_reachable;
         if (first_reach) summary.body_reachable = true;
@@ -3721,23 +3724,12 @@ const Inserter = struct {
     /// kept units, groups with any kept member, and kept call-result locals
     /// all stay live across the loop edge.
     fn noteLivenessLoopKeep(self: *const Inserter, reads: *std.bit_set.DynamicBitSetUnmanaged, keep: *const OwnedSet) void {
-        // The keep-set is local-count wide while the table rows carry the
-        // extra group and value-use bits, so the raw bits copy one by one.
+        // Every kept unit reads as a value use, which also sets its group
+        // and value-use bits, so the loop edge keeps a group alive whenever
+        // any member is kept.
         var keep_iter = keep.bits.iterator(.{});
-        while (keep_iter.next()) |kept| reads.set(kept);
-        for (self.group_leaders, 0..) |leader, group_index| {
-            const members = self.solution.groupMembers(leader);
-            for (members) |member| {
-                if (keep.bits.isSet(member)) {
-                    reads.set(self.store.localCount() + group_index);
-                    break;
-                }
-            }
-        }
-        for (self.value_use_locals, 0..) |local, value_index| {
-            if (keep.contains(local)) {
-                reads.set(self.store.localCount() + self.group_leaders.len + value_index);
-            }
+        while (keep_iter.next()) |kept| {
+            self.noteLivenessUseLocal(reads, @enumFromInt(@as(u32, @intCast(kept))));
         }
     }
 
@@ -4140,13 +4132,7 @@ const Inserter = struct {
         loop_keep: ?*const OwnedSet,
     ) ResourceError!bool {
         const reads = try self.livenessRow(start, loop_keep);
-        const leader = self.solution.leaderOf(local);
-        if (self.solution.groupMembers(leader).len <= 1) {
-            return reads.isSet(@intFromEnum(local));
-        }
-        const group_bit = self.groupBitOf(local) orelse
-            arcInvariant("ARC multi-member borrow group missing its liveness group bit");
-        return reads.isSet(group_bit);
+        return self.groupUsedFromTable(reads, local);
     }
 
     fn retainSpanExcept(self: *Inserter, span: LIR.LocalSpan, skip_mask: u64, next: LIR.CFStmtId) ResourceError!LIR.CFStmtId {
@@ -5760,6 +5746,9 @@ fn chainedJoinSolveWork(join_count: usize) Allocator.Error!u64 {
     const start = try f.assignStr(carried, "chained", current);
 
     _ = try f.addProc(&.{}, start, .str);
+    // The delta over the process-global counter is meaningful because the
+    // test runner executes tests in one thread; nothing else runs `insert`
+    // between the two reads.
     const before = solver_iterations;
     try f.run();
     return solver_iterations - before;
@@ -5769,8 +5758,8 @@ test "RC join summary solver work grows linearly with chained joins" {
     if (builtin.mode != .Debug) return;
     const small = try chainedJoinSolveWork(8);
     const large = try chainedJoinSolveWork(16);
-    // Doubling the join count must stay near double the solver work; a
-    // reintroduced per-join region re-walk would grow it quadratically.
+    // Doubling the join count must stay near double the solver work;
+    // per-join region re-walks would grow it quadratically.
     try testing.expect(large <= small * 3);
 }
 
