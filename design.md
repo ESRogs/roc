@@ -1298,6 +1298,16 @@ The method registry is an exact table keyed by `(MethodOwner, MethodNameId)`.
 It is not an owner-discovery mechanism. Post-check code may use it only after a
 concrete monomorphic dispatcher type has already determined the owner.
 
+Each checked module also outputs the ordered checked-module id span that defines
+method-registry visibility after its own registry. The span preserves checking
+order and contains only modules with non-empty registries. The same owner and
+method pair may therefore exist in multiple registries when those definitions
+belong to different lookup scopes. Monotype lowering resolves a target using the
+lookup module together with the owner and method, and may memoize that scoped
+result without changing the checked output. Procedure specializations include
+the lookup module in their identity because generated dispatch embedded in a
+specialized body can depend on that scope.
+
 Some method registry targets are generated structural targets rather than
 procedure bodies. A nominal or opaque type can opt in to a compiler-derived
 structural codec with an annotation-only associated method such as

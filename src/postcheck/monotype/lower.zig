@@ -96,7 +96,6 @@ pub fn run(
     var builder = Builder.init(allocator, modules, &program, options);
     defer builder.deinit();
     try builder.initHostedCatalog();
-    try builder.initComponentMethodTargets();
     try builder.loadCandidateSpecializationShards();
 
     for (roots.requests) |request| {
@@ -150,6 +149,7 @@ const ModuleView = struct {
     hosted_procs: *const checked.HostedProcTable,
     static_dispatch_plans: *const static_dispatch.StaticDispatchPlanTable,
     method_registry: *const static_dispatch.MethodRegistry,
+    method_lookup_scope: []const checked.ModuleId,
     resolved_refs: *const checked.ResolvedValueTable,
     nested_proc_sites: *const checked.NestedProcSiteTable,
     exported_procedure_bindings: checked.ExportedProcedureBindingView,
@@ -274,9 +274,43 @@ fn specEvidenceVectorEql(a: []const SpecEvidence, b: []const SpecEvidence) bool 
     return true;
 }
 
-const MethodDispatch = struct {
-    owner: static_dispatch.MethodOwner,
-    method: names.MethodNameId,
+const ScopedMethodDispatch = struct {
+    scope: [32]u8,
+    owner_tag: u8,
+    owner_first: u32,
+    owner_second: u32,
+    owner_third: u32,
+    method: u32,
+
+    fn init(scope: checked.ModuleId, owner: static_dispatch.MethodOwner, method: names.MethodNameId) ScopedMethodDispatch {
+        const owner_fields: struct { tag: u8, first: u32, second: u32, third: u32 } = switch (owner) {
+            .builtin => |builtin| .{
+                .tag = 1,
+                .first = @intFromEnum(builtin),
+                .second = 0,
+                .third = 0,
+            },
+            .nominal => |nominal| .{
+                .tag = 0,
+                .first = @intFromEnum(nominal.module),
+                .second = @intFromEnum(nominal.type_name),
+                .third = if (nominal.source_decl) |source_decl| source_decl +| 1 else 0,
+            },
+        };
+        return .{
+            .scope = scope.bytes,
+            .owner_tag = owner_fields.tag,
+            .owner_first = owner_fields.first,
+            .owner_second = owner_fields.second,
+            .owner_third = owner_fields.third,
+            .method = @intFromEnum(method),
+        };
+    }
+};
+
+const ScopedMethodResolution = union(enum) {
+    missing,
+    target: MethodLookup,
 };
 
 const FunctionShape = struct {
@@ -485,6 +519,7 @@ const DraftGeneratedHelperDefEntry = union(enum) {
 
 fn templateSpecIdentity(
     template_ref: names.ProcTemplate,
+    method_scope: checked.ModuleId,
     source_fn_key: names.TypeDigest,
     request_fn_ty: Type.TypeId,
     request_fn_ty_digest: names.TypeDigest,
@@ -495,6 +530,7 @@ fn templateSpecIdentity(
             .proc_base = @intFromEnum(template_ref.proc_base),
             .template = @intFromEnum(template_ref.template),
         } },
+        .method_scope = moduleDigestFromId(method_scope),
         .source_fn_ty_digest = source_fn_key,
         .request_fn_ty_digest = request_fn_ty_digest,
         .request_fn_ty = request_fn_ty,
@@ -503,6 +539,7 @@ fn templateSpecIdentity(
 
 fn nestedSpecIdentity(
     nested: Ast.NestedFn,
+    method_scope: checked.ModuleId,
     source_fn_key: names.TypeDigest,
     request_fn_ty: Type.TypeId,
     request_fn_ty_digest: names.TypeDigest,
@@ -515,6 +552,7 @@ fn nestedSpecIdentity(
             .owner_fn_digest = nested.context_fn_key,
             .site = @intFromEnum(nested.site),
         } },
+        .method_scope = moduleDigestFromId(method_scope),
         .source_fn_ty_digest = source_fn_key,
         .request_fn_ty_digest = request_fn_ty_digest,
         .request_fn_ty = request_fn_ty,
@@ -548,12 +586,11 @@ const Builder = struct {
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hosted_catalog: []HostedCatalogEntry = &.{},
-    /// Exact `(owner, method)` -> target index over every reachable module's
-    /// checked method registry, consulted only through the
-    /// `componentMethodTargetByName`/`ForView` seam. Built once; keys use the
-    /// same program-name interning as `typeDef`, so the checked type identity
-    /// carried on monotypes correlates directly.
-    component_method_targets: std.AutoHashMapUnmanaged(MethodDispatch, MethodLookup) = .{},
+    /// Demand-filled method lookup results keyed by the checked module whose
+    /// registry scope applies. Checked modules output the ordered registry
+    /// scope; this memo only accelerates repeated exact lookups during the
+    /// current Monotype run.
+    scoped_method_targets: std.AutoHashMapUnmanaged(ScopedMethodDispatch, ScopedMethodResolution) = .{},
     u64_ty: ?Type.TypeId = null,
     bool_ty: ?Type.TypeId = null,
     constrain_depth: usize = 0,
@@ -618,7 +655,7 @@ const Builder = struct {
     }
 
     fn deinit(self: *Builder) void {
-        self.component_method_targets.deinit(self.allocator);
+        self.scoped_method_targets.deinit(self.allocator);
         self.allocator.free(self.hosted_catalog);
         self.hash_defs.deinit();
         self.equality_defs.deinit();
@@ -767,39 +804,6 @@ const Builder = struct {
         return .{ .keys = keys, .symbols = symbols };
     }
 
-    fn initComponentMethodTargets(self: *Builder) Allocator.Error!void {
-        try self.appendComponentMethodTargetsFromView(moduleView(self.root_view));
-        for (self.modules.imports, 0..) |imported, index| {
-            if (self.importModuleAlreadyScanned(imported.key, index)) continue;
-            try self.appendComponentMethodTargetsFromView(moduleView(imported));
-        }
-        for (self.modules.root.relation_modules, 0..) |relation, index| {
-            if (self.relationModuleAlreadyScanned(relation.key, index)) continue;
-            try self.appendComponentMethodTargetsFromView(moduleView(relation));
-        }
-    }
-
-    fn appendComponentMethodTargetsFromView(self: *Builder, view: ModuleView) Allocator.Error!void {
-        for (view.method_registry.entries) |entry| {
-            const owner: static_dispatch.MethodOwner = switch (entry.key.owner) {
-                .builtin => |builtin| .{ .builtin = builtin },
-                .nominal => |nominal| .{ .nominal = .{
-                    .module = try self.moduleIdentity(view, nominal.module),
-                    .type_name = try self.typeName(view, nominal.type_name),
-                    .source_decl = nominal.source_decl,
-                } },
-            };
-            const slot = try self.component_method_targets.getOrPut(self.allocator, .{
-                .owner = owner,
-                .method = try self.methodName(view, entry.key.method),
-            });
-            if (slot.found_existing) {
-                Common.invariant("checked method registries contain duplicate dispatch targets");
-            }
-            slot.value_ptr.* = .{ .view = view, .target = entry.target };
-        }
-    }
-
     fn appendHostedCatalogFromView(self: *Builder, entries: *std.ArrayList(HostedCatalogEntry), view: ModuleView) Allocator.Error!void {
         for (view.hosted_procs.procs) |proc| {
             try entries.append(self.allocator, .{
@@ -826,10 +830,6 @@ const Builder = struct {
 
     fn typeName(self: *Builder, view: ModuleView, id: names.TypeNameId) Allocator.Error!names.TypeNameId {
         return self.program.names.internTypeName(view.names.typeNameText(id));
-    }
-
-    fn methodName(self: *Builder, view: ModuleView, id: names.MethodNameId) Allocator.Error!names.MethodNameId {
-        return self.program.names.internMethodName(view.names.methodNameText(id));
     }
 
     fn moduleIdentity(self: *Builder, view: ModuleView, id: names.ModuleIdentityId) Allocator.Error!names.ModuleIdentityId {
@@ -1105,7 +1105,7 @@ const Builder = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.lowerFnTemplateDef(fn_template, &.{});
+                const fn_id = try self.lowerFnTemplateDef(view, fn_template, &.{});
                 break :blk try self.program.addExpr(.{
                     .ty = self.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = fn_id } },
@@ -1188,18 +1188,19 @@ const Builder = struct {
         source_fn_ty: checked.CheckedTypeId,
     ) Allocator.Error!Ast.DefId {
         const fn_ty = try self.lowerType(source_ty_view, source_fn_ty);
-        return try self.lowerTemplateWithMono(template_ref, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
+        return try self.lowerTemplateWithMono(template_ref, source_ty_view, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
     }
 
     fn lowerTemplateWithMono(
         self: *Builder,
         template_ref: names.ProcTemplate,
+        method_scope: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
         evidence: []const SpecEvidence,
     ) Allocator.Error!Ast.DefId {
-        return try self.lowerTemplateWithMonoFor(template_ref, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null, null);
+        return try self.lowerTemplateWithMonoFor(template_ref, method_scope, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null, null);
     }
 
     /// Specializations of one template family are deduplicated by structural
@@ -1211,6 +1212,7 @@ const Builder = struct {
     fn lowerTemplateWithMonoFor(
         self: *Builder,
         template_ref: names.ProcTemplate,
+        method_scope: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
@@ -1246,7 +1248,7 @@ const Builder = struct {
         } else {
             const fn_ty_digest = self.specializationTypeDigest(fn_ty);
             request_digest = fn_ty_digest;
-            if (try self.spec_store.findLocal(templateSpecIdentity(template_ref, source_fn_key, fn_ty, fn_ty_digest))) |hit| {
+            if (try self.spec_store.findLocal(templateSpecIdentity(template_ref, method_scope.key, source_fn_key, fn_ty, fn_ty_digest))) |hit| {
                 self.count("template_hits");
                 const existing = self.lowered_templates.get(hit.fn_id) orelse
                     Common.invariant("Monotype specialization index found a local template missing from lowering state");
@@ -1312,7 +1314,7 @@ const Builder = struct {
             // path above, which already digested the requested type.
             const fresh_request_digest = request_digest orelse
                 Common.invariant("fresh Monotype procedure template reservation was missing its request digest");
-            const spec = try self.addTemplateSpecRecord(template_ref, source_fn_key, lower_fn_ty, fresh_request_digest, fn_id, .lowering);
+            const spec = try self.addTemplateSpecRecord(template_ref, method_scope.key, source_fn_key, lower_fn_ty, fresh_request_digest, fn_id, .lowering);
             try self.lowered_templates.put(fn_id, .{
                 .def = def_id,
                 .spec = spec,
@@ -1350,6 +1352,7 @@ const Builder = struct {
                 if (self.hostedUseNeedsTryAdapter(declared_mono_fn_ty, lower_fn_ty)) {
                     const source_def = try self.lowerTemplateWithMonoFor(
                         template_ref,
+                        method_scope,
                         declared_source_fn_ty,
                         declared_source_fn_key,
                         declared_mono_fn_ty,
@@ -1410,7 +1413,7 @@ const Builder = struct {
         defer self.active_graph = saved_graph;
         var body_draft = BodyDraftStore.init(self.allocator);
         defer body_draft.deinit();
-        var body_ctx = try BodyContext.init(self.allocator, self, view, template_ref, graph, &body_draft);
+        var body_ctx = try BodyContext.initWithMethodScope(self.allocator, self, view, method_scope, template_ref, graph, &body_draft);
         body_ctx.evidence = .{ .vector = spec_evidence };
         if (spec_evidence.len < template.evidence_params.len) {
             // An entry wrapper's only caller is the root edge itself;
@@ -1502,6 +1505,7 @@ const Builder = struct {
     fn reserveTemplateWithMonoFor(
         self: *Builder,
         template_ref: names.ProcTemplate,
+        method_scope: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
@@ -1514,7 +1518,7 @@ const Builder = struct {
             try requester.addMonoView(try requester.importMono(fn_ty), fn_ty);
         }
         const fn_ty_digest = self.specializationTypeDigest(fn_ty);
-        const identity = templateSpecIdentity(template_ref, source_fn_key, fn_ty, fn_ty_digest);
+        const identity = templateSpecIdentity(template_ref, method_scope.key, source_fn_key, fn_ty, fn_ty_digest);
         if (try self.spec_store.find(identity)) |found| {
             self.count("template_hits");
             switch (found) {
@@ -1561,7 +1565,7 @@ const Builder = struct {
             .body = .hosted,
             .ret = self.functionShape(fn_ty, "procedure template root type was not a function").ret,
         });
-        const spec = try self.addTemplateSpecRecord(template_ref, source_fn_key, fn_ty, fn_ty_digest, fn_id, .reserved);
+        const spec = try self.addTemplateSpecRecord(template_ref, method_scope.key, source_fn_key, fn_ty, fn_ty_digest, fn_id, .reserved);
         try self.lowered_templates.put(fn_id, .{
             .def = def_id,
             .spec = spec,
@@ -1644,24 +1648,26 @@ const Builder = struct {
     fn addTemplateSpecRecord(
         self: *Builder,
         template_ref: names.ProcTemplate,
+        method_scope: checked.ModuleId,
         source_fn_key: names.TypeDigest,
         request_fn_ty: Type.TypeId,
         request_fn_ty_digest: names.TypeDigest,
         fn_id: Ast.FnId,
         status: Ast.SpecStatus,
     ) Allocator.Error!Ast.SpecId {
-        return try self.addSpecRecord(templateSpecIdentity(template_ref, source_fn_key, request_fn_ty, request_fn_ty_digest), fn_id, status);
+        return try self.addSpecRecord(templateSpecIdentity(template_ref, method_scope, source_fn_key, request_fn_ty, request_fn_ty_digest), fn_id, status);
     }
 
     fn addNestedSpecRecord(
         self: *Builder,
         nested: Ast.NestedFn,
+        method_scope: checked.ModuleId,
         source_fn_key: names.TypeDigest,
         request_fn_ty: Type.TypeId,
         request_fn_ty_digest: names.TypeDigest,
         fn_id: Ast.FnId,
     ) Allocator.Error!Ast.SpecId {
-        return try self.addSpecRecord(nestedSpecIdentity(nested, source_fn_key, request_fn_ty, request_fn_ty_digest), fn_id, .lowering);
+        return try self.addSpecRecord(nestedSpecIdentity(nested, method_scope, source_fn_key, request_fn_ty, request_fn_ty_digest), fn_id, .lowering);
     }
 
     fn addSpecRecord(
@@ -2372,7 +2378,7 @@ const Builder = struct {
         for (self.modules.root.relation_modules) |relation| {
             if (moduleBytesEqual(module_id.bytes, relation.key.bytes)) return moduleView(relation);
         }
-        Common.invariant("procedure binding referenced a checked module that is not in the lowering input");
+        Common.invariant("checked module id was not present in the lowering input");
     }
 
     fn moduleForModuleIndex(self: *Builder, module_idx: u32) ModuleView {
@@ -2499,21 +2505,36 @@ const Builder = struct {
     /// (`named.def` / `builtin_owner`, alias-transparently). Plan-resolved
     /// user dispatch never resolves here — its targets are consumed from
     /// checked evidence.
-    fn componentMethodTargetByName(self: *Builder, ty: Type.TypeId, method_name: []const u8) ?MethodLookup {
-        const method = self.program.names.lookupMethodName(method_name) orelse return null;
+    fn componentMethodTargetByName(
+        self: *Builder,
+        scope: ModuleView,
+        ty: Type.TypeId,
+        method_name: []const u8,
+    ) Allocator.Error!?MethodLookup {
         const owner = self.componentDispatchOwner(ty) orelse return null;
-        return self.component_method_targets.get(.{ .owner = owner, .method = method });
+        return try self.lookupMethodTargetByName(scope, owner, method_name);
+    }
+
+    fn findComponentMethodTargetByName(
+        self: *Builder,
+        scope: ModuleView,
+        ty: Type.TypeId,
+        method_name: []const u8,
+    ) ?MethodLookup {
+        const owner = self.componentDispatchOwner(ty) orelse return null;
+        return self.findMethodTargetByName(scope, owner, method_name);
     }
 
     /// `componentMethodTargetByName` for a method name interned in a checked
     /// module view's name store rather than the program's.
     fn componentMethodTargetForView(
         self: *Builder,
+        scope: ModuleView,
         ty: Type.TypeId,
         method_view: ModuleView,
         method: names.MethodNameId,
-    ) ?MethodLookup {
-        return self.componentMethodTargetByName(ty, method_view.names.methodNameText(method));
+    ) Allocator.Error!?MethodLookup {
+        return try self.componentMethodTargetByName(scope, ty, method_view.names.methodNameText(method));
     }
 
     /// The registry key naming `ty`'s dispatch head, read from the checked
@@ -2537,6 +2558,61 @@ const Builder = struct {
                 } },
             else => null,
         };
+    }
+
+    fn lookupMethodTargetByName(
+        self: *Builder,
+        scope: ModuleView,
+        owner: static_dispatch.MethodOwner,
+        method_name: []const u8,
+    ) Allocator.Error!?MethodLookup {
+        const method = try self.program.names.internMethodName(method_name);
+        const address = ScopedMethodDispatch.init(scope.key, owner, method);
+        if (self.scoped_method_targets.get(address)) |resolution| {
+            return switch (resolution) {
+                .missing => null,
+                .target => |target| target,
+            };
+        }
+
+        const resolution: ScopedMethodResolution = if (self.findMethodTargetByName(scope, owner, method_name)) |target|
+            .{ .target = target }
+        else
+            .missing;
+
+        try self.scoped_method_targets.put(self.allocator, address, resolution);
+        return switch (resolution) {
+            .missing => null,
+            .target => |target| target,
+        };
+    }
+
+    fn findMethodTargetByName(
+        self: *Builder,
+        scope: ModuleView,
+        owner: static_dispatch.MethodOwner,
+        method_name: []const u8,
+    ) ?MethodLookup {
+        if (self.methodTargetInView(scope, owner, method_name, true)) |target| return target;
+        for (scope.method_lookup_scope) |module_id| {
+            const candidate = self.moduleForId(module_id);
+            if (self.methodTargetInView(candidate, owner, method_name, false)) |target| return target;
+        }
+        return null;
+    }
+
+    fn methodTargetInView(
+        self: *Builder,
+        view: ModuleView,
+        owner: static_dispatch.MethodOwner,
+        method_name: []const u8,
+        allow_local_proc: bool,
+    ) ?MethodLookup {
+        const view_owner = static_dispatch.methodOwnerInImportedStore(&self.program.names, view.names, owner) orelse return null;
+        const view_method = view.names.lookupMethodName(method_name) orelse return null;
+        const target = view.method_registry.lookup(.{ .owner = view_owner, .method = view_method }) orelse return null;
+        if (!allow_local_proc and target.kind == .local_proc) return null;
+        return .{ .view = view, .target = target };
     }
 
     fn importModuleAlreadyScanned(self: *Builder, module_id: checked.ModuleId, import_index: usize) bool {
@@ -2592,7 +2668,7 @@ const Builder = struct {
                 break :blk self.fnDefForProcedureBindingBody(app_view, binding.body, source_fn_ty, source_fn_key, mono_fn_ty);
             },
         };
-        return try self.lowerFnTemplateCallTarget(fn_template, &.{});
+        return try self.lowerFnTemplateCallTarget(source_ty_view, fn_template, &.{});
     }
 
     /// Lower (or defer) a procedure template body and return the Monotype
@@ -2600,7 +2676,7 @@ const Builder = struct {
     /// request reserves an id and defers the body; outside one (root and
     /// wrapper paths, whose types come from the builder-global cache without
     /// body evidence), the body lowers now.
-    fn lowerFnTemplateCallTarget(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
+    fn lowerFnTemplateCallTarget(self: *Builder, method_scope: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
         const template_ref = switch (fn_template.fn_def) {
             .local_template,
             .imported_template,
@@ -2624,6 +2700,7 @@ const Builder = struct {
             request_template.mono_fn_ty = try self.stableSpecializationRequestType(graph, fn_template.mono_fn_ty);
             const reserved = try self.reserveTemplateWithMonoFor(
                 template_ref,
+                method_scope,
                 request_template.source_fn_ty,
                 request_template.source_fn_key,
                 request_template.mono_fn_ty,
@@ -2635,6 +2712,7 @@ const Builder = struct {
                 try graph.deferred_templates.append(self.allocator, .{
                     .fn_id = reserved.localFnId(),
                     .template_ref = template_ref,
+                    .method_scope = method_scope.key,
                     .source_fn_ty = request_template.source_fn_ty,
                     .source_fn_key = request_template.source_fn_key,
                     .requester_fn_node = requester_fn_node,
@@ -2645,7 +2723,7 @@ const Builder = struct {
             }
             return reserved.target;
         }
-        const def = try self.lowerTemplateWithMono(template_ref, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
+        const def = try self.lowerTemplateWithMono(template_ref, method_scope, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
         return .{ .local = self.defFnId(def) };
     }
 
@@ -2680,9 +2758,9 @@ const Builder = struct {
         try ctx.constrainTypeToMono(template.checked_fn_root, fn_ty);
     }
 
-    fn lowerFnTemplateDef(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
+    fn lowerFnTemplateDef(self: *Builder, method_scope: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
         return localFnIdFromSlot(
-            try self.lowerFnTemplateCallTarget(fn_template, evidence),
+            try self.lowerFnTemplateCallTarget(method_scope, fn_template, evidence),
             "Monotype function value lowering requires a local function definition",
         );
     }
@@ -2707,7 +2785,7 @@ const Builder = struct {
                 _ = try self.sealActiveBodyDraft(graph, &body_draft, draft, draft_end, null, null);
                 return fn_id;
             },
-            else => return try self.lowerFnTemplateDef(fn_template, &.{}),
+            else => return try self.lowerFnTemplateDef(self.moduleForConstFnDef(fn_template.fn_def), fn_template, &.{}),
         }
     }
 
@@ -2730,6 +2808,7 @@ const Builder = struct {
         request_template.mono_fn_ty = try self.stableSpecializationRequestType(source_ctx.graph, fn_template.mono_fn_ty);
         const reserved = try self.reserveTemplateWithMonoFor(
             template_ref,
+            source_ctx.method_scope,
             request_template.source_fn_ty,
             request_template.source_fn_key,
             request_template.mono_fn_ty,
@@ -2741,6 +2820,7 @@ const Builder = struct {
             try source_ctx.graph.deferred_templates.append(self.allocator, .{
                 .fn_id = reserved.localFnId(),
                 .template_ref = template_ref,
+                .method_scope = source_ctx.method_scope.key,
                 .source_fn_ty = request_template.source_fn_ty,
                 .source_fn_key = request_template.source_fn_key,
                 .requester_fn_node = requester_fn_node,
@@ -2849,7 +2929,7 @@ const Builder = struct {
         };
         self.count("nested_requests");
         const fn_ty_digest = self.specializationTypeDigest(fn_template.mono_fn_ty);
-        if (try self.spec_store.findLocal(nestedSpecIdentity(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest))) |hit| {
+        if (try self.spec_store.findLocal(nestedSpecIdentity(nested, request.ctx.method_scope.key, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest))) |hit| {
             self.count("nested_hits");
             try self.unifyRequestWithLocalHit(request.ctx.graph, fn_template.mono_fn_ty, hit);
             switch (hit.status) {
@@ -2863,7 +2943,7 @@ const Builder = struct {
         }
 
         const fn_id = try self.program.addFn(fn_template);
-        const spec = try self.addNestedSpecRecord(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest, fn_id);
+        const spec = try self.addNestedSpecRecord(nested, request.ctx.method_scope.key, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest, fn_id);
         try self.lowered_nested_by_fn.put(fn_id, spec);
 
         const public_constraint_fn_ty = try request.ctx.publicOpaqueFunctionUnificationType(fn_template.mono_fn_ty);
@@ -2980,6 +3060,7 @@ const Builder = struct {
                 Common.invariant("deferred template queue length changed while draining");
             _ = try self.lowerTemplateWithMonoFor(
                 request.template_ref,
+                self.moduleForId(request.method_scope),
                 request.source_fn_ty,
                 request.source_fn_key,
                 request.fn_ty,
@@ -4298,7 +4379,7 @@ const Builder = struct {
     }
 
     fn toInspectCall(self: *Builder, value: Ast.ExprId, value_ty: Type.TypeId, str_ty: Type.TypeId) Allocator.Error!?Ast.ExprId {
-        const lookup = self.componentMethodTargetByName(value_ty, "to_inspect") orelse return null;
+        const lookup = (try self.componentMethodTargetByName(moduleView(self.root_view), value_ty, "to_inspect")) orelse return null;
         const procedure = switch (lookup.target.kind) {
             .procedure => |procedure| procedure,
             .generated_structural_parser, .generated_structural_encoder, .local_proc => return null,
@@ -4312,12 +4393,14 @@ const Builder = struct {
         defer self.active_graph = saved_graph;
         var body_draft = BodyDraftStore.init(self.allocator);
         defer body_draft.deinit();
-        var target_ctx = try BodyContext.init(self.allocator, self, lookup.view, template, graph, &body_draft);
+        const method_scope = moduleView(self.root_view);
+        var target_ctx = try BodyContext.initWithMethodScope(self.allocator, self, lookup.view, method_scope, template, graph, &body_draft);
         defer target_ctx.deinit();
         const callable_node = try target_ctx.instantiateTargetCallNodeFromMonoArgs(lookup.target.callable_ty, &.{value_ty}, str_ty);
         const callable_mono_ty = try graph.sealNode(callable_node);
         const callee_def = try self.lowerTemplateWithMono(
             template,
+            method_scope,
             lookup.target.callable_ty,
             lookup.view.types.rootKey(lookup.target.callable_ty),
             callable_mono_ty,
@@ -6389,6 +6472,10 @@ const CollectedListPattern = struct {
 const BodyContext = struct {
     allocator: Allocator,
     builder: *Builder,
+    /// Checked module whose ordered registry scope governs generated method
+    /// dispatch in this specialization. This can differ from `view` when an
+    /// imported template is specialized for a caller's concrete types.
+    method_scope: ModuleView,
     view: ModuleView,
     owner_template: names.ProcTemplate,
     owner_context_fn_key: names.TypeDigest,
@@ -6636,7 +6723,20 @@ const BodyContext = struct {
         graph: *InstGraph,
         draft: *BodyDraftStore,
     ) Allocator.Error!BodyContext {
+        return try initWithMethodScope(allocator, builder, view, view, owner_template, graph, draft);
+    }
+
+    fn initWithMethodScope(
+        allocator: Allocator,
+        builder: *Builder,
+        view: ModuleView,
+        method_scope: ModuleView,
+        owner_template: names.ProcTemplate,
+        graph: *InstGraph,
+        draft: *BodyDraftStore,
+    ) Allocator.Error!BodyContext {
         var ctx = initTypeOnly(allocator, builder, view, owner_template, graph, draft);
+        ctx.method_scope = method_scope;
         const string_literals = try allocator.alloc(?DraftStringLiteralId, view.bodies.stringLiteralCount());
         @memset(string_literals, null);
         ctx.string_literals = string_literals;
@@ -6657,6 +6757,7 @@ const BodyContext = struct {
         return .{
             .allocator = allocator,
             .builder = builder,
+            .method_scope = view,
             .view = view,
             .owner_template = owner_template,
             .owner_context_fn_key = .{},
@@ -7039,7 +7140,7 @@ const BodyContext = struct {
     }
 
     fn toInspectCall(self: *BodyContext, value: DraftExprId, value_ty: Type.TypeId, str_ty: Type.TypeId) Allocator.Error!?DraftExprId {
-        const lookup = self.builder.componentMethodTargetByName(value_ty, "to_inspect") orelse return null;
+        const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, value_ty, "to_inspect")) orelse return null;
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{value_ty}, str_ty);
         const callee = try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize);
 
@@ -7248,7 +7349,7 @@ const BodyContext = struct {
         current_fn_key: names.TypeDigest,
         copy_type_cells: bool,
     ) Allocator.Error!BodyContext {
-        var child = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        var child = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
         child.evidence = self.evidence;
         errdefer child.deinit();
         child.owner_context_fn_key = self.owner_context_fn_key;
@@ -8179,7 +8280,7 @@ const BodyContext = struct {
         const backing = if (moduleBytesEqual(source.view.key.bytes, self.view.key.bytes)) backing: {
             break :backing try self.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
         } else backing: {
-            var source_ctx = try BodyContext.init(self.allocator, self.builder, source.view, self.owner_template, self.graph, self.draft);
+            var source_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, source.view, self.method_scope, self.owner_template, self.graph, self.draft);
             source_ctx.evidence = self.evidence;
             defer source_ctx.deinit();
             source_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -9067,7 +9168,7 @@ const BodyContext = struct {
                     if (binding.binding.def == imported.def and binding.binding.pattern == imported.pattern) {
                         const binding_source = schemeRoot(view, binding.source_scheme, "imported procedure binding source scheme was not output");
                         const fn_template = self.builder.fnDefForImportedBindingBody(view, binding.body, binding_source, view.types.rootKey(binding_source), mono_fn_ty);
-                        const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
+                        const fn_id = try self.builder.lowerFnTemplateDef(self.method_scope, fn_template, evidence);
                         break :blk try self.addExpr(.{
                             .ty = mono_fn_ty,
                             .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
@@ -9110,7 +9211,7 @@ const BodyContext = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
+                const fn_id = try self.builder.lowerFnTemplateDef(self.method_scope, fn_template, evidence);
                 break :blk try self.addExpr(.{
                     .ty = self.builder.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
@@ -9167,7 +9268,7 @@ const BodyContext = struct {
             wrapper_fn_ty,
         );
 
-        var body_ctx = try BodyContext.init(self.allocator, self.builder, view, wrapper.template, self.graph, self.draft);
+        var body_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, view, self.method_scope, wrapper.template, self.graph, self.draft);
         body_ctx.evidence = self.evidence;
         defer body_ctx.deinit();
         const root_fn_key = Ast.fnTemplateDigest(wrapper_template, &self.builder.program.types, &self.builder.program.names);
@@ -10756,7 +10857,7 @@ const BodyContext = struct {
         if (self.optionalParseTryInfo(shape_ty)) |info| {
             return try self.buildParserConstructionPrecomputedPlan(plan, info.ok_ty, encoding_expr, encoding_ty, str_ty);
         }
-        if (self.customParserLookup(shape_ty) != null) return;
+        if (try self.customParserLookup(shape_ty) != null) return;
         if (self.jsonParseScalarMethodName(shape_ty) != null) return;
         if (self.setPayloadType(shape_ty)) |payload_ty| {
             return try self.buildParserConstructionPrecomputedPlan(plan, payload_ty, encoding_expr, encoding_ty, str_ty);
@@ -10802,7 +10903,7 @@ const BodyContext = struct {
         if (self.tryJsonInfo(shape_ty)) |info| {
             return try self.buildEncodeConstructionPrecomputedPlan(plan, info.ok_payload_ty, encoding_expr, encoding_ty, str_ty);
         }
-        if (self.customEncoderForLookup(shape_ty) != null) return;
+        if (try self.customEncoderForLookup(shape_ty) != null) return;
         if (self.jsonEncodeScalarMethodName(shape_ty) != null) return;
         if (self.setPayloadType(shape_ty)) |payload_ty| {
             return try self.buildEncodeConstructionPrecomputedPlan(plan, payload_ty, encoding_expr, encoding_ty, str_ty);
@@ -10857,7 +10958,7 @@ const BodyContext = struct {
         if (self.tryJsonInfo(shape_ty)) |info| {
             return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, info.ok_payload_ty, encoding_ty, str_ty);
         }
-        if (self.customEncoderForLookup(shape_ty) != null) return;
+        if (try self.customEncoderForLookup(shape_ty) != null) return;
         if (self.jsonEncodeScalarMethodName(shape_ty) != null) return;
         if (self.setPayloadType(shape_ty)) |payload_ty| {
             return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, encoding_ty, str_ty);
@@ -11048,7 +11149,7 @@ const BodyContext = struct {
         if (self.tryJsonInfo(shape_ty)) |info| {
             return try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, info.ok_payload_ty, str_ty);
         }
-        if (self.customParserLookup(shape_ty) != null) return;
+        if (try self.customParserLookup(shape_ty) != null) return;
         if (self.jsonParseScalarMethodName(shape_ty) != null) return;
         if (self.setPayloadType(shape_ty)) |payload_ty| {
             return try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, str_ty);
@@ -11107,7 +11208,7 @@ const BodyContext = struct {
         if (self.tryJsonInfo(shape_ty)) |info| {
             return try self.appendParserPrecomputedRecordShapes(plan, shapes, seen, info.ok_payload_ty);
         }
-        if (self.customParserLookup(shape_ty) != null) return;
+        if (try self.customParserLookup(shape_ty) != null) return;
         if (self.jsonParseScalarMethodName(shape_ty) != null) return;
         if (self.setPayloadType(shape_ty)) |payload_ty| {
             return try self.appendParserPrecomputedRecordShapes(plan, shapes, seen, payload_ty);
@@ -11415,7 +11516,7 @@ const BodyContext = struct {
             else
                 selected.tag_text;
 
-        const parse_lookup = self.methodLookupForTypeName(encoding_ty, method_name);
+        const parse_lookup = try self.methodLookupForTypeName(encoding_ty, method_name);
         const state_arg_index: usize = if (Ident.textEql(selected.tag_text, "TagUnion")) 2 else 1;
         const parse_mono_ty = try self.methodTargetMonoTypeFromArgAtIndexAndRet(parse_lookup, state_arg_index, state_ty, ret_ty);
         const parse_fn = self.builder.functionShape(parse_mono_ty, "parser target method was not a function");
@@ -11538,7 +11639,7 @@ const BodyContext = struct {
             .payload_tys = payload_tys,
         };
 
-        const parse_lookup = self.methodLookupForTypeName(encoding_ty, "parse_record_field");
+        const parse_lookup = try self.methodLookupForTypeName(encoding_ty, "parse_record_field");
         const generic_callable_ty = try self.methodTargetMonoTypeFromArgAtIndexIsolated(parse_lookup, 2, state_ty);
         const generic_parse_fn = self.builder.functionShape(generic_callable_ty, "parse_record_field target method was not a function");
         const generic_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(generic_parse_fn.args));
@@ -12246,7 +12347,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const ret_info = self.tryInfo(ret_ty);
         const skip_try_ty = try self.tryTypeLike(ret_ty, state_ty, ret_info.err_ty);
-        const lookup = self.methodLookupForTypeName(encoding_ty, "skip_record_field");
+        const lookup = try self.methodLookupForTypeName(encoding_ty, "skip_record_field");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ encoding_ty, state_ty }, skip_try_ty);
         const skip_fn = self.builder.functionShape(callable_mono_ty, "skip_record_field target method was not a function");
         const arg_tys = self.builder.program.types.span(skip_fn.args);
@@ -12351,7 +12452,7 @@ const BodyContext = struct {
             .box => |payload_ty| return try self.lowerParseBoxFromState(payload_ty, shape_ty, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan),
             else => {},
         }
-        if (self.customParserLookup(shape_ty)) |lookup| {
+        if (try self.customParserLookup(shape_ty)) |lookup| {
             return try self.lowerCustomParserFromState(lookup, shape_ty, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty);
         }
         return try self.lowerParseShapeFromState(shape_ty, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan);
@@ -13238,7 +13339,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const ret_info = self.tryInfo(ret_ty);
         const null_try_ty = try self.tryTypeLike(ret_ty, state_ty, ret_info.err_ty);
-        const parse_null_lookup = self.methodLookupForTypeName(encoding_ty, "parse_null");
+        const parse_null_lookup = try self.methodLookupForTypeName(encoding_ty, "parse_null");
         const parse_null_mono_ty = try self.methodTargetMonoTypeFromArgs(parse_null_lookup, &.{ encoding_ty, state_ty }, null_try_ty);
         const parse_null_fn = self.builder.functionShape(parse_null_mono_ty, "parse_null target method was not a function");
         const parse_null_arg_tys = self.builder.program.types.span(parse_null_fn.args);
@@ -14079,7 +14180,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const field_text = self.builder.program.names.recordFieldLabelText(field.name);
         const field_expr = try self.stringExpr(field_text, str_ty);
-        const lookup = self.methodLookupForTypeName(encoding_ty, "rename_field");
+        const lookup = try self.methodLookupForTypeName(encoding_ty, "rename_field");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ encoding_ty, str_ty }, str_ty);
         const rename_fn = self.builder.functionShape(callable_mono_ty, "rename_field target method was not a function");
         const arg_tys = self.builder.program.types.span(rename_fn.args);
@@ -14165,7 +14266,7 @@ const BodyContext = struct {
         if (try self.lowerCallThatCannotReachCallee(checked_ret_ty, call, expected_ret_ty)) |lowered| return lowered;
 
         if (call.direct_target) |target| {
-            var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+            var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
             call_ctx.evidence = self.evidence;
             defer call_ctx.deinit();
             call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -14194,7 +14295,7 @@ const BodyContext = struct {
         }
 
         const fn_ty = (try self.indirectCalleeMonoType(call.func, call.args, expected_ret_ty)) orelse fn_ty: {
-            var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+            var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
             call_ctx.evidence = self.evidence;
             defer call_ctx.deinit();
             call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -14690,7 +14791,7 @@ const BodyContext = struct {
                 return ret_ty;
             }
 
-            var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+            var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
             call_ctx.evidence = self.evidence;
             defer call_ctx.deinit();
             call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -14702,7 +14803,7 @@ const BodyContext = struct {
             return call_ctx.functionReturnType(mono_fn_ty);
         }
 
-        var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
         call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -15118,7 +15219,7 @@ const BodyContext = struct {
             wrapper_fn_ty,
         );
 
-        var body_ctx = try BodyContext.init(self.allocator, self.builder, store_view, eval.entry_template, self.graph, self.draft);
+        var body_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, store_view, self.method_scope, eval.entry_template, self.graph, self.draft);
         // The re-lowered constant body's plans index the constant's own
         // scheme; the use edge supplied that vector. Wrapper entries reached
         // without a use edge (the root drain itself) take checking's
@@ -15531,7 +15632,7 @@ const BodyContext = struct {
         return switch (template.fn_def) {
             .nested => {
                 const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
-                var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
+                var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
                 defer fn_ctx.deinit();
                 try self.prepareRestoredFnEvidence(&fn_ctx, fn_view, fn_value, template);
                 return try self.builder.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def), template, null);
@@ -15575,7 +15676,7 @@ const BodyContext = struct {
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
-        var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
+        var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
         fn_ctx.evidence = self.restore_evidence;
         fn_ctx.restore_evidence = self.restore_evidence;
         defer fn_ctx.deinit();
@@ -15707,7 +15808,7 @@ const BodyContext = struct {
         };
         const fn_view = self.builder.moduleForDigest(names.procTemplateModuleDigest(runtime.owner));
 
-        var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, runtime.owner, self.graph, self.draft);
+        var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, runtime.owner, self.graph, self.draft);
         fn_ctx.evidence = self.evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
@@ -15800,7 +15901,7 @@ const BodyContext = struct {
         };
         const fn_view = self.builder.moduleForDigest(names.procTemplateModuleDigest(runtime.owner));
 
-        var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, runtime.owner, self.graph, self.draft);
+        var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, runtime.owner, self.graph, self.draft);
         fn_ctx.evidence = self.evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
@@ -16676,7 +16777,7 @@ const BodyContext = struct {
         const plan = self.view.static_dispatch_plans.plans[@intFromEnum(plan_id)];
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
 
-        var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
         call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -16838,7 +16939,7 @@ const BodyContext = struct {
         if (plan.result_mode != .value) Common.invariant("checked from_numeral plan had a non-value result mode");
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
 
-        var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
         call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -17194,7 +17295,7 @@ const BodyContext = struct {
         list_ty: Type.TypeId,
         list_expr: DraftExprId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(set_ty, "from_list");
+        const lookup = try self.methodLookupForTypeName(set_ty, "from_list");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{list_ty}, set_ty);
         const from_list_fn = self.builder.functionShape(callable_mono_ty, "Set.from_list target method was not a function");
         const arg_tys = self.builder.program.types.span(from_list_fn.args);
@@ -17217,7 +17318,7 @@ const BodyContext = struct {
         list_ty: Type.TypeId,
         set_expr: DraftExprId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(set_ty, "to_list");
+        const lookup = try self.methodLookupForTypeName(set_ty, "to_list");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{set_ty}, list_ty);
         const to_list_fn = self.builder.functionShape(callable_mono_ty, "Set.to_list target method was not a function");
         const arg_tys = self.builder.program.types.span(to_list_fn.args);
@@ -17240,7 +17341,7 @@ const BodyContext = struct {
         capacity_expr: DraftExprId,
         capacity_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(dict_ty, "with_capacity");
+        const lookup = try self.methodLookupForTypeName(dict_ty, "with_capacity");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{capacity_ty}, dict_ty);
         const with_capacity_fn = self.builder.functionShape(callable_mono_ty, "Dict.with_capacity target method was not a function");
         const arg_tys = self.builder.program.types.span(with_capacity_fn.args);
@@ -17266,7 +17367,7 @@ const BodyContext = struct {
         key_expr: DraftExprId,
         value_expr: DraftExprId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(dict_ty, "insert");
+        const lookup = try self.methodLookupForTypeName(dict_ty, "insert");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ dict_ty, key_ty, value_ty }, dict_ty);
         const insert_fn = self.builder.functionShape(callable_mono_ty, "Dict.insert target method was not a function");
         const arg_tys = self.builder.program.types.span(insert_fn.args);
@@ -17291,7 +17392,7 @@ const BodyContext = struct {
         list_ty: Type.TypeId,
         dict_expr: DraftExprId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(dict_ty, "to_list");
+        const lookup = try self.methodLookupForTypeName(dict_ty, "to_list");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{dict_ty}, list_ty);
         const to_list_fn = self.builder.functionShape(callable_mono_ty, "Dict.to_list target method was not a function");
         const arg_tys = self.builder.program.types.span(to_list_fn.args);
@@ -17415,7 +17516,7 @@ const BodyContext = struct {
         const plan_id = maybe_plan orelse Common.invariant("checked dispatch expression reached Monotype without a dispatch plan");
         const plan = self.view.static_dispatch_plans.plans[@intFromEnum(plan_id)];
 
-        var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
         call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -17627,7 +17728,6 @@ const BodyContext = struct {
             .structural => null,
         };
     }
-
     fn structuralKindForMethodText(method_text: []const u8) ?static_dispatch.StructuralKind {
         if (std.mem.eql(u8, method_text, "is_eq")) return .equality;
         if (std.mem.eql(u8, method_text, "to_hash")) return .hash;
@@ -17672,7 +17772,7 @@ const BodyContext = struct {
             .generated_structural_encoder,
             => self.owner_template,
         };
-        return BodyContext.init(self.allocator, self.builder, lookup.view, owner_template, self.graph, self.draft);
+        return BodyContext.initWithMethodScope(self.allocator, self.builder, lookup.view, self.method_scope, owner_template, self.graph, self.draft);
     }
 
     fn requireLocalMethodTargetInCurrentView(self: *BodyContext, lookup: MethodLookup) void {
@@ -17760,7 +17860,7 @@ const BodyContext = struct {
         };
         var body_draft = BodyDraftStore.init(self.allocator);
         defer body_draft.deinit();
-        var target_ctx = try BodyContext.init(self.allocator, self.builder, lookup.view, owner_template, graph, &body_draft);
+        var target_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, lookup.view, self.method_scope, owner_template, graph, &body_draft);
         defer target_ctx.deinit();
         const fn_node = try target_ctx.instantiateTargetCallNodeFromMonoArgAtIndex(lookup.target.callable_ty, arg_index, arg_ty);
         return try graph.sealNode(fn_node);
@@ -17770,8 +17870,8 @@ const BodyContext = struct {
         self: *BodyContext,
         owner_ty: Type.TypeId,
         method_name: []const u8,
-    ) MethodLookup {
-        return self.builder.componentMethodTargetByName(owner_ty, method_name) orelse
+    ) Allocator.Error!MethodLookup {
+        return (try self.builder.componentMethodTargetByName(self.method_scope, owner_ty, method_name)) orelse
             Common.invariant("checked method registry is missing a compiler-generated helper method");
     }
 
@@ -17863,7 +17963,7 @@ const BodyContext = struct {
         method: names.MethodNameId,
         component_ty: Type.TypeId,
     ) Allocator.Error!SpecEvidence {
-        if (self.builder.componentMethodTargetForView(component_ty, view, method)) |found| {
+        if (try self.builder.componentMethodTargetForView(self.method_scope, component_ty, view, method)) |found| {
             const arena = self.builder.evidence_arena.allocator();
             const target = try arena.create(SpecEvidenceTarget);
             target.* = .{ .view = found.view, .target = found.target, .nested = .synthesize };
@@ -18401,7 +18501,7 @@ const BodyContext = struct {
             },
             else => {},
         }
-        if (self.customEncoderForLookup(shape_ty)) |lookup| {
+        if (try self.customEncoderForLookup(shape_ty)) |lookup| {
             return try self.lowerCustomEncoderForState(lookup, shape_ty, value_expr, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty);
         }
         if (self.jsonEncodeScalarMethodName(shape_ty)) |method_name| {
@@ -19759,7 +19859,7 @@ const BodyContext = struct {
         encoding_ty: Type.TypeId,
         ret_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(encoding_ty, method_name);
+        const lookup = try self.methodLookupForTypeName(encoding_ty, method_name);
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, arg_tys, ret_ty);
         const encode_fn = self.builder.functionShape(callable_mono_ty, "encoder_for target method was not a function");
         const actual_arg_tys = self.builder.program.types.span(encode_fn.args);
@@ -19787,7 +19887,7 @@ const BodyContext = struct {
         encoding_ty: Type.TypeId,
         ret_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(encoding_ty, method_name);
+        const lookup = try self.methodLookupForTypeName(encoding_ty, method_name);
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, arg_tys, ret_ty);
         const parse_fn = self.builder.functionShape(callable_mono_ty, "parser_for target method was not a function");
         const actual_arg_tys = self.builder.program.types.span(parse_fn.args);
@@ -20163,7 +20263,7 @@ const BodyContext = struct {
             if (!allow_missing) return false;
             return self.parseFieldTypeIsSupported(info.ok_ty, false);
         }
-        if (self.customParserLookup(ty) != null) return true;
+        if (self.customParserLookupReadOnly(ty) != null) return true;
         if (self.setPayloadType(ty)) |payload_ty| return self.parseFieldTypeIsSupported(payload_ty, false);
         if (self.dictEntryShape(ty)) |dict| return self.jsonObjectKeyTypeIsSupported(dict.key_ty) and self.parseFieldTypeIsSupported(dict.value_ty, false);
         return switch (self.builder.shapeContent(ty)) {
@@ -20209,7 +20309,7 @@ const BodyContext = struct {
             if (info.has_missing) return false;
             return self.encodeFieldTypeIsSupported(info.ok_payload_ty, encoding_ty);
         }
-        if (self.customEncoderForLookup(ty) != null) return true;
+        if (self.customEncoderForLookupReadOnly(ty) != null) return true;
         if (self.setPayloadType(ty)) |payload_ty| return self.encodeFieldTypeIsSupported(payload_ty, encoding_ty);
         if (self.dictEntryShape(ty)) |dict| return self.jsonObjectKeyTypeIsSupported(dict.key_ty) and self.encodeFieldTypeIsSupported(dict.value_ty, encoding_ty);
         return switch (self.builder.shapeContent(ty)) {
@@ -20237,7 +20337,7 @@ const BodyContext = struct {
         };
     }
 
-    fn customParserLookup(self: *BodyContext, ty: Type.TypeId) ?MethodLookup {
+    fn customParserLookup(self: *BodyContext, ty: Type.TypeId) Allocator.Error!?MethodLookup {
         const named = switch (self.builder.program.types.get(ty)) {
             .named => |named| named,
             else => return null,
@@ -20247,7 +20347,7 @@ const BodyContext = struct {
             .nominal, .@"opaque" => {},
             .alias => return null,
         }
-        const lookup = self.builder.componentMethodTargetByName(ty, "parser_for") orelse
+        const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, "parser_for")) orelse
             Common.invariant("checked method registry is missing custom parser_for target");
         return switch (lookup.target.kind) {
             .generated_structural_parser => null,
@@ -20264,10 +20364,10 @@ const BodyContext = struct {
             else => return false,
         };
         if (named.builtin_owner != null) return false;
-        return self.builder.componentMethodTargetByName(ty, "parser_for") != null;
+        return self.builder.findComponentMethodTargetByName(self.method_scope, ty, "parser_for") != null;
     }
 
-    fn customEncoderForLookup(self: *BodyContext, ty: Type.TypeId) ?MethodLookup {
+    fn customParserLookupReadOnly(self: *BodyContext, ty: Type.TypeId) ?MethodLookup {
         const named = switch (self.builder.program.types.get(ty)) {
             .named => |named| named,
             else => return null,
@@ -20277,7 +20377,26 @@ const BodyContext = struct {
             .nominal, .@"opaque" => {},
             .alias => return null,
         }
-        const lookup = self.builder.componentMethodTargetByName(ty, "encoder_for") orelse
+        const lookup = self.builder.findComponentMethodTargetByName(self.method_scope, ty, "parser_for") orelse
+            Common.invariant("checked method registry is missing custom parser_for target");
+        return switch (lookup.target.kind) {
+            .generated_structural_parser => null,
+            .generated_structural_encoder => Common.invariant("parser_for lookup resolved to generated encoder_for target"),
+            .procedure, .local_proc => lookup,
+        };
+    }
+
+    fn customEncoderForLookup(self: *BodyContext, ty: Type.TypeId) Allocator.Error!?MethodLookup {
+        const named = switch (self.builder.program.types.get(ty)) {
+            .named => |named| named,
+            else => return null,
+        };
+        if (named.builtin_owner != null) return null;
+        switch (named.kind) {
+            .nominal, .@"opaque" => {},
+            .alias => return null,
+        }
+        const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, "encoder_for")) orelse
             Common.invariant("checked method registry is missing custom encoder_for target");
         return switch (lookup.target.kind) {
             .generated_structural_encoder => null,
@@ -20285,6 +20404,25 @@ const BodyContext = struct {
             .procedure,
             .local_proc,
             => lookup,
+        };
+    }
+
+    fn customEncoderForLookupReadOnly(self: *BodyContext, ty: Type.TypeId) ?MethodLookup {
+        const named = switch (self.builder.program.types.get(ty)) {
+            .named => |named| named,
+            else => return null,
+        };
+        if (named.builtin_owner != null) return null;
+        switch (named.kind) {
+            .nominal, .@"opaque" => {},
+            .alias => return null,
+        }
+        const lookup = self.builder.findComponentMethodTargetByName(self.method_scope, ty, "encoder_for") orelse
+            Common.invariant("checked method registry is missing custom encoder_for target");
+        return switch (lookup.target.kind) {
+            .generated_structural_encoder => null,
+            .generated_structural_parser => Common.invariant("encoder_for lookup resolved to generated parser_for target"),
+            .procedure, .local_proc => lookup,
         };
     }
 
@@ -20440,7 +20578,7 @@ const BodyContext = struct {
         err_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
         const str_ty = try self.builder.primitiveType(.str);
-        const lookup = self.methodLookupForTypeName(encoding_ty, "missing_record_field");
+        const lookup = try self.methodLookupForTypeName(encoding_ty, "missing_record_field");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ encoding_ty, str_ty, state_ty }, err_ty);
         const missing_fn = self.builder.functionShape(callable_mono_ty, "missing_record_field target method was not a function");
         const arg_tys = self.builder.program.types.span(missing_fn.args);
@@ -20488,7 +20626,7 @@ const BodyContext = struct {
         state_ty: Type.TypeId,
         err_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.methodLookupForTypeName(encoding_ty, "invalid_value");
+        const lookup = try self.methodLookupForTypeName(encoding_ty, "invalid_value");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ encoding_ty, state_ty }, err_ty);
         const invalid_fn = self.builder.functionShape(callable_mono_ty, "invalid_value target method was not a function");
         const arg_tys = self.builder.program.types.span(invalid_fn.args);
@@ -20517,7 +20655,7 @@ const BodyContext = struct {
         err_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
         const str_ty = try self.builder.primitiveType(.str);
-        const lookup = self.methodLookupForTypeName(encoding_ty, "missing_optional_field");
+        const lookup = try self.methodLookupForTypeName(encoding_ty, "missing_optional_field");
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ encoding_ty, str_ty, state_ty }, err_ty);
         const missing_fn = self.builder.functionShape(callable_mono_ty, "missing_optional_field target method was not a function");
         const arg_tys = self.builder.program.types.span(missing_fn.args);
@@ -20772,7 +20910,7 @@ const BodyContext = struct {
         operand: D.Operand,
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
-        const lookup = self.builder.componentMethodTargetByName(ty, ctx.method_name) orelse
+        const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) orelse
             Common.invariant(D.owned_missing_target_msg);
 
         const arg_tys = D.ownedArgTypes(ty, ctx.result_ty);
@@ -23152,7 +23290,7 @@ const BodyContext = struct {
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
         if (plan.dispatcher_arg_index >= plan_args.len) Common.invariant("iterator dispatch plan dispatcher argument index was outside the argument span");
 
-        var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
+        var call_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, self.view, self.method_scope, self.owner_template, self.graph, self.draft);
         call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
         call_ctx.owner_context_fn_key = self.owner_context_fn_key;
@@ -24332,7 +24470,7 @@ const BodyContext = struct {
         };
         const scrutinee = try self.localExpr(entry.local, entry.ty);
         const expected = try self.lowerExpr(conversion);
-        if (self.builder.componentMethodTargetByName(entry.ty, "is_eq")) |lookup| {
+        if (try self.builder.componentMethodTargetByName(self.method_scope, entry.ty, "is_eq")) |lookup| {
             var target_ctx = try self.methodTargetContext(lookup);
             defer target_ctx.deinit();
             const target_fn = target_ctx.checkedFunctionType(lookup.target.callable_ty);
@@ -24886,6 +25024,7 @@ fn moduleView(view: checked.ImportedModuleView) ModuleView {
         .hosted_procs = view.hosted_procs,
         .static_dispatch_plans = view.static_dispatch_plans,
         .method_registry = view.method_registry,
+        .method_lookup_scope = view.method_lookup_scope,
         .resolved_refs = view.resolved_value_refs,
         .nested_proc_sites = view.nested_proc_sites,
         .exported_procedure_bindings = view.exported_procedure_bindings,
