@@ -4918,7 +4918,7 @@ fn parityNormalizedReports(allocator: Allocator, stderr_bytes: []const u8) Alloc
     while (lines.next()) |line| {
         const trimmed = std.mem.trimEnd(u8, line, " \t\r");
         if (std.mem.find(u8, trimmed, ".roc:") != null) {
-            if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| {
+            if (std.mem.findScalarLast(u8, trimmed, '/')) |slash| {
                 try out.appendSlice(allocator, std.mem.trimStart(u8, trimmed[slash + 1 ..], " "));
                 try out.append(allocator, '\n');
                 continue;
