@@ -124,7 +124,31 @@ main! = |_| {
 					(e-literal (string ""))))))
 	(d-let
 		(p-assign (ident "main!"))
-		(e-runtime-error (tag "erroneous_value_expr"))))
+		(e-lambda
+			(args
+				(p-underscore))
+			(e-block
+				(s-let
+					(p-assign (ident "thunk"))
+					(e-lambda
+						(args)
+						(e-call (constraint-fn-var 250)
+							(e-lookup-local
+								(p-assign (ident "echo!")))
+							(e-string
+								(e-literal (string ""))))))
+				(s-expr
+					(e-call (constraint-fn-var 263)
+						(e-lookup-local
+							(p-assign (ident "thunk")))))
+				(s-expr
+					(e-call (constraint-fn-var 265)
+						(e-lookup-local
+							(p-assign (ident "topThunk")))))
+				(e-tuple
+					(elems
+						(e-empty_record)
+						(e-runtime-error (tag "erroneous_value_expr"))))))))
 ~~~
 # TYPES
 ~~~clojure

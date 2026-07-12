@@ -3236,7 +3236,8 @@ const ImportCache = std.HashMapUnmanaged(ImportCacheKey, Var, struct {
 
 const OpenNumeralLiteral = struct {
     var_: Var,
-    info: types_mod.NumeralInfo,
+    constraint: StaticDispatchConstraint,
+    source_node: ?CIR.Node.Idx,
 };
 
 const PendingTupleAccess = struct {
@@ -3925,7 +3926,7 @@ fn instantiateVarHelp(
                         }
                     }
                     if (has_literal_constraint) {
-                        try self.recordOpenLiteralVar(fresh_var, constraints);
+                        try self.recordOpenLiteralVar(fresh_var, constraints, null);
                     }
                     if (has_other_constraint) {
                         try self.instantiation_dispatchers.append(self.gpa, .{
@@ -4679,6 +4680,7 @@ fn recordOpenLiteralVar(
     self: *Self,
     literal_var: Var,
     constraints: []const StaticDispatchConstraint,
+    source_node: ?CIR.Node.Idx,
 ) Allocator.Error!void {
     var has_literal = false;
     for (constraints) |constraint| {
@@ -4686,9 +4688,10 @@ fn recordOpenLiteralVar(
             .from_literal => |lit| {
                 has_literal = true;
                 switch (lit) {
-                    .numeral => |info| try self.open_numeral_literals.append(self.gpa, .{
+                    .numeral => try self.open_numeral_literals.append(self.gpa, .{
                         .var_ = literal_var,
-                        .info = info,
+                        .constraint = constraint,
+                        .source_node = source_node,
                     }),
                     .quote, .interpolation => {},
                 }
@@ -4781,18 +4784,10 @@ fn mkFlexWithFromNumeralConstraint(
     };
     try self.unifyWith(flex_var, flex_content, env);
 
-    // Runtime `from_numeral` receives the exact digit lists. If parsing could
-    // not record those digits, no builtin or custom implementation can perform
-    // the conversion, so reject the literal here rather than publishing an
-    // impossible dispatch plan.
-    if (try self.reportUnmaterializableNumeralLiteral(flex_var, constraint, env)) {
-        return flex_var;
-    }
-
     if (source_node) |node_idx| {
         try self.cir.recordNumeralDispatchPlan(node_idx, flex_var, fn_var);
     }
-    try self.recordOpenLiteralVar(flex_var, &.{constraint});
+    try self.recordOpenLiteralVar(flex_var, &.{constraint}, source_node);
 
     return flex_var;
 }
@@ -4869,7 +4864,7 @@ fn mkFlexWithFromQuoteConstraint(
         },
     };
     try self.unifyWith(flex_var, flex_content, env);
-    try self.recordOpenLiteralVar(flex_var, &.{constraint});
+    try self.recordOpenLiteralVar(flex_var, &.{constraint}, source_node);
 
     return flex_var;
 }
@@ -16188,7 +16183,7 @@ fn mkInterpolationConstraint(
 
     _ = try self.unify(constrained_var, dispatcher_var, env);
 
-    try self.recordOpenLiteralVar(constrained_var, &.{constraint});
+    try self.recordOpenLiteralVar(constrained_var, &.{constraint}, ModuleEnv.nodeIdxFrom(expr_idx));
 
     return constraint_fn_var;
 }
@@ -16413,7 +16408,7 @@ fn postProcessCopiedVars(self: *Self, region: Region) std.mem.Allocator.Error!vo
                 const constraints = self.types.sliceStaticDispatchConstraints(fresh_content.flex.constraints);
                 for (constraints) |c| {
                     if (c.origin == .from_literal) {
-                        try self.recordOpenLiteralVar(fresh_var, constraints);
+                        try self.recordOpenLiteralVar(fresh_var, constraints, null);
                         break;
                     }
                 }
@@ -20607,6 +20602,16 @@ fn validateResolvedOpenNumeralLiterals(
     while (i < literal_count) : (i += 1) {
         const entry = self.open_numeral_literals.items[i];
         const resolved = self.types.resolveVar(entry.var_);
+        if (resolved.desc.content == .err) continue;
+        if (try self.reportUnmaterializableNumeralLiteral(resolved.var_, entry.constraint, env)) {
+            if (entry.source_node) |node_idx| {
+                if (isExprNodeTag(self.cir.store.nodes.get(node_idx).tag)) {
+                    try self.erroneous_value_exprs.put(self.gpa, @enumFromInt(@intFromEnum(node_idx)), {});
+                }
+            }
+            continue;
+        }
+
         const nominal_type = switch (resolved.desc.content) {
             .structure => |flat_type| switch (flat_type) {
                 .nominal_type => |nominal| nominal,
@@ -20616,7 +20621,7 @@ fn validateResolvedOpenNumeralLiterals(
             else => continue,
         };
         const num_kind = self.builtinNumKindFromNominalType(nominal_type) orelse continue;
-        _ = try self.reportInvalidBuiltinFromNumeralInfo(resolved.var_, num_kind, entry.info, env);
+        _ = try self.reportInvalidBuiltinFromNumeralInfo(resolved.var_, num_kind, entry.constraint.origin.numeralInfo().?, env);
     }
 }
 
