@@ -4330,11 +4330,6 @@ const OwnedSet = struct {
         if (self.len() != other.len()) arcInvariant("ARC owned-set intersection length mismatch");
         self.bits.setIntersection(other.bits);
     }
-
-    fn unionWith(self: *OwnedSet, other: *const OwnedSet) void {
-        if (self.len() != other.len()) arcInvariant("ARC owned-set union length mismatch");
-        self.bits.setUnion(other.bits);
-    }
 };
 
 fn refOpSource(op: LIR.RefOp) LIR.LocalId {
