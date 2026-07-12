@@ -1336,8 +1336,21 @@ const Formatter = struct {
             .field_access => |fa| {
                 const left_expr = fmt.ast.store.getExpr(fa.left);
                 const parenthesize_receiver = left_expr == .arrow_call;
+                const expand_parenthesized_receiver = parenthesize_receiver and
+                    fmt.nodeWillBeMultiline(AST.Expr.Idx, fa.left);
                 if (parenthesize_receiver) try fmt.push('(');
+                if (expand_parenthesized_receiver) {
+                    fmt.curr_indent += 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 const left = try fmt.formatExprWithInfo(fa.left);
+                if (expand_parenthesized_receiver) {
+                    try fmt.push(',');
+                    fmt.curr_indent -= 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 if (parenthesize_receiver) try fmt.push(')');
                 const right_region = fmt.nodeRegion(@intFromEnum(fa.right));
                 if (!parenthesize_receiver) {
@@ -1353,8 +1366,21 @@ const Formatter = struct {
             .method_call => |mc| {
                 const left_expr = fmt.ast.store.getExpr(mc.receiver);
                 const parenthesize_receiver = left_expr == .arrow_call;
+                const expand_parenthesized_receiver = parenthesize_receiver and
+                    fmt.nodeWillBeMultiline(AST.Expr.Idx, mc.receiver);
                 if (parenthesize_receiver) try fmt.push('(');
+                if (expand_parenthesized_receiver) {
+                    fmt.curr_indent += 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 const receiver = try fmt.formatExprWithInfo(mc.receiver);
+                if (expand_parenthesized_receiver) {
+                    try fmt.push(',');
+                    fmt.curr_indent -= 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 if (parenthesize_receiver) try fmt.push(')');
                 if (!parenthesize_receiver) {
                     const continued = try fmt.continueAfterMultilineStringLine(receiver);
@@ -3618,6 +3644,23 @@ test "issue 8851: multiline arrow call with field access is idempotent" {
     , false);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("a = (0->b()).c()\n", result);
+}
+
+test "multiline arrow receiver in tuple is idempotent" {
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\a=(0(0->X)
+        \\->X .a)
+    , false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "a = (\n" ++
+            "\t(\n" ++
+            "\t\t0(0->X)\n" ++
+            "\t\t\t->X,\n" ++
+            "\t).a,\n" ++
+            ")\n",
+        result,
+    );
 }
 
 test "issue 8851: tuple dispatch with chained zero-arg applies is idempotent" {

@@ -14,17 +14,7 @@ Totals observed:
 
 Unique confirmed issues:
 
-1. [fuzz_crash_097.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_097.md>)  
-   Crash family: Parser formatter instability (`panic: Formatting not stable`).
-
-   ```sh
-   printf $'a=(0(0->X)\\n->X .a)\\n' > /tmp/repro-parse-097.roc && \
-   ./zig-out/bin/repro-parse -v /tmp/repro-parse-097.roc
-   ```
-
-   Original corpus hits: `id:000000`, `id:000001`, `id:000002`, `id:000004`, `id:000005`.
-
-2. [fuzz_crash_098.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_098.md>)  
+1. [fuzz_crash_098.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_098.md>)
    Crash family: Parser formatter round-trip failure (`panic: Parsing of formatter output failed`), including control-byte handling.
 
    ```sh
@@ -34,7 +24,7 @@ Unique confirmed issues:
 
    Original corpus hits: `id:000003`, `id:000007` (`id:000006` did not reproduce on replay).
 
-3. [fuzz_crash_099.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_099.md>)  
+2. [fuzz_crash_099.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_099.md>)
    Crash family: Canonicalization invariant violation (`unreachable`, duplicate record fields in `canonical_type_keys`).
 
    ```sh
@@ -47,7 +37,7 @@ Unique confirmed issues:
    ./zig-out/bin/repro-canonicalize -v /tmp/repro-canonicalize-099.roc
    ```
 
-4. [fuzz_crash_100.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_100.md>)  
+3. [fuzz_crash_100.md](</home/lbw/Documents/Github/roc/test/snapshots/fuzz_crash/fuzz_crash_100.md>)
    Crash family: Canonicalization node-type mismatch (`panic: unreachable, node is not a type annotation tag: .type_header`).
 
    ```sh
