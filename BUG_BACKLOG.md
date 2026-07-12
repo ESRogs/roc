@@ -17,18 +17,21 @@ Crash IDs:
 - Parser: `id:000000`, `id:000001`, `id:000002`
 - Canonicalize: `id:000000`, `id:000001`, `id:000002`, `id:000003`
 
-Triage (unique issues):
+Triage (unique issues, all resolved):
 
 1. `moduleFmtsStable` formatting instability (panic: `error.FormattingNotStable`)
    - Snapshot repro: `test/snapshots/fuzz_crash/fuzz_crash_101.md`
    - Crash IDs: parser `id:000000`, `id:000001`, `id:000002`
+   - Resolved by `ccb9ee7610` (`Stabilize nested multiline function type formatting`)
 
 2. Canonicalization invariant violation while building canonical type keys
    - Panic: `src/check/canonical_type_keys.zig:653` (`invariantViolation` / `"canonical type key requested for erroneous checked type"`)
    - Snapshot repro: `test/snapshots/fuzz_crash/fuzz_crash_102.md`
    - Crash IDs: canonicalize `id:000000`, `id:000001`
+   - Resolved by `3c4d57892c` (`Publish explicit erroneous checked types`)
 
 3. Canonicalization invariant violation in static dispatch publication
    - Panic: `src/check/static_dispatch_registry.zig:1221` (`unreachable` in `fromModule__anon_*`)
    - Snapshot repro: `test/snapshots/fuzz_crash/fuzz_crash_103.md`
    - Crash IDs: canonicalize `id:000002`, `id:000003`
+   - Resolved by `aecec4d5a5` (`Reject unmaterializable numeral literals during checking`)

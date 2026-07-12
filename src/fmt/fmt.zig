@@ -3634,14 +3634,11 @@ test "function type expands when its return type is multiline" {
     );
     defer std.testing.allocator.free(result);
 
-    try std.testing.expectEqualStrings(
-        \\r : (),
-        \\(() -> c),
-        \\(() -> d) -> (
-        \\    c,
-        \\)
-        \\
-    , result);
+    try std.testing.expectEqualStrings("r : (),\n" ++
+        "(() -> c),\n" ++
+        "(() -> d) -> (\n" ++
+        "\tc,\n" ++
+        ")\n", result);
 }
 
 test "issue 8851: arrow call with space before field access is idempotent" {
