@@ -146,10 +146,13 @@ const OwnedSemanticModuleData = struct {
     }
 };
 
+/// A superseded checked artifact whose published module id can still appear in
+/// another artifact's exact dependency scope.
 pub const RetiredCheckedArtifact = struct {
     artifact: *CheckedModuleArtifact,
     retain_module_env: bool,
 
+    /// Release the retired artifact and its optionally retained module state.
     pub fn deinit(self: *RetiredCheckedArtifact) void {
         destroyCheckedArtifact(self.artifact, self.retain_module_env);
         self.artifact = undefined;
