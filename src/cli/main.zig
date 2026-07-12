@@ -7709,7 +7709,7 @@ fn sharedLibraryAppExports(
         try symbols.append(entrypoint.symbol_name);
     }
     for (static_data_exports) |data_export| {
-        if (!data_export.is_global) continue;
+        if (!data_export.is_exported) continue;
         try symbols.append(data_export.symbol_name);
     }
 
