@@ -26,6 +26,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("lir_core");
 const layout_mod = @import("layout");
+const body_clone = @import("body_clone.zig");
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
@@ -66,23 +67,24 @@ const ReturnSlotPass = struct {
     fn transformProc(self: *ReturnSlotPass, proc_id: LIR.LirProcSpecId) ResourceError!void {
         const proc = self.store.getProcSpec(proc_id);
         if (proc.body == null or proc.hosted != null or proc.abi != .roc) return;
+        const body = proc.body.?;
 
         var work = std.ArrayList(CFStmtId).empty;
         defer work.deinit(self.store.allocator);
         var visited = std.AutoHashMap(CFStmtId, void).init(self.store.allocator);
         defer visited.deinit();
 
-        try work.append(self.store.allocator, proc.body.?);
+        try work.append(self.store.allocator, body);
         while (work.pop()) |stmt_id| {
             const entry = try visited.getOrPut(stmt_id);
             if (entry.found_existing) continue;
 
-            _ = try self.rewriteAt(stmt_id);
-            try self.appendSuccessors(&work, stmt_id);
+            _ = try self.rewriteAt(body, stmt_id);
+            try body_clone.appendSuccessors(self.store, &work, stmt_id);
         }
     }
 
-    fn rewriteAt(self: *ReturnSlotPass, call_stmt_id: CFStmtId) ResourceError!bool {
+    fn rewriteAt(self: *ReturnSlotPass, proc_body: CFStmtId, call_stmt_id: CFStmtId) ResourceError!bool {
         const call_stmt = switch (self.store.getCFStmt(call_stmt_id)) {
             .assign_call => |s| s,
             else => return false,
@@ -95,7 +97,9 @@ const ReturnSlotPass = struct {
         if (callee.body == null or callee.hosted != null or callee.abi != .roc) return false;
         if (callee.ret_layout != result_layout) return false;
 
-        const stored_alias = self.forwardLocalAliasChain(call_stmt.target, call_stmt.next);
+        var chain = std.ArrayList(LocalId).empty;
+        defer chain.deinit(self.store.allocator);
+        const stored_alias = try body_clone.forwardLocalAliasChainInto(self.store, self.store.allocator, call_stmt.target, call_stmt.next, &chain);
         const stored_value = stored_alias.value;
         const store_stmt_id = stored_alias.next;
         const store_stmt = switch (self.store.getCFStmt(store_stmt_id)) {
@@ -113,6 +117,8 @@ const ReturnSlotPass = struct {
         const destination_layout = self.layouts.getLayout(self.store.getLocal(destination).layout_idx);
         if (destination_layout.tag != .ptr) return false;
         if (destination_layout.getIdx() != result_layout) return false;
+
+        if (!try self.chainIsSingleUse(proc_body, chain.items)) return false;
 
         const variant = try self.returnSlotVariant(call_stmt.proc, result_layout);
 
@@ -135,29 +141,17 @@ const ReturnSlotPass = struct {
         return true;
     }
 
-    const ForwardedAlias = struct {
-        value: LocalId,
-        next: CFStmtId,
-    };
-
-    fn forwardLocalAliasChain(self: *const ReturnSlotPass, source: LocalId, first_stmt: CFStmtId) ForwardedAlias {
-        var value = source;
-        var current = first_stmt;
-        while (true) {
-            const stmt = switch (self.store.getCFStmt(current)) {
-                .assign_ref => |s| s,
-                else => return .{ .value = value, .next = current },
-            };
-            switch (stmt.op) {
-                .local => |local| if (local == value and self.store.getLocal(stmt.target).layout_idx == self.store.getLocal(value).layout_idx) {
-                    value = stmt.target;
-                    current = stmt.next;
-                    continue;
-                },
-                else => {},
-            }
-            return .{ .value = value, .next = current };
+    /// Every local in `chain` must have exactly one read across the proc: the
+    /// call result is aliased or stored exactly once, each alias feeds the next
+    /// link exactly once, and the final value is the matched store's only
+    /// consumer. Any extra read means the fusion would orphan a still-live local.
+    fn chainIsSingleUse(self: *ReturnSlotPass, proc_body: CFStmtId, chain: []const LocalId) ResourceError!bool {
+        var reads = try body_clone.countReachableReads(self.store, proc_body);
+        defer reads.deinit();
+        for (chain) |local| {
+            if (reads.get(local) != 1) return false;
         }
+        return true;
     }
 
     fn returnSlotEligible(self: *const ReturnSlotPass, result_layout: layout_mod.Idx) bool {
@@ -212,7 +206,7 @@ const ReturnSlotPass = struct {
             variant_args.appendAssumeCapacity(arg);
         }
 
-        var cloner = try BodyCloner.init(self.store, out_ptr, store_unit);
+        var cloner = try Cloner.init(self.store, .{ .out_ptr = out_ptr, .store_unit = store_unit });
         defer cloner.deinit();
 
         for (0..source_args.len) |index| {
@@ -233,8 +227,8 @@ const ReturnSlotPass = struct {
         var frame_locals = try std.ArrayList(LocalId).initCapacity(self.store.allocator, cloner.new_locals.items.len);
         defer frame_locals.deinit(self.store.allocator);
         frame_locals.appendSliceAssumeCapacity(cloner.new_locals.items);
-        std.mem.sort(LocalId, frame_locals.items, {}, localIdLessThan);
-        const unique_len = uniqueSortedLocals(frame_locals.items);
+        std.mem.sort(LocalId, frame_locals.items, {}, body_clone.localIdLessThan);
+        const unique_len = body_clone.uniqueSortedLocals(frame_locals.items);
 
         const variant = try self.store.addProcSpec(.{
             .name = self.store.freshSyntheticSymbol(),
@@ -248,441 +242,64 @@ const ReturnSlotPass = struct {
 
         return variant;
     }
-
-    fn appendSuccessors(
-        self: *ReturnSlotPass,
-        work: *std.ArrayList(CFStmtId),
-        stmt_id: CFStmtId,
-    ) ResourceError!void {
-        switch (self.store.getCFStmt(stmt_id)) {
-            inline .assign_ref,
-            .assign_literal,
-            .init_uninitialized,
-            .assign_call,
-            .assign_call_erased,
-            .assign_packed_erased_fn,
-            .assign_low_level,
-            .assign_list,
-            .assign_struct,
-            .assign_tag,
-            .store_struct,
-            .store_tag,
-            .set_local,
-            .debug,
-            .expect,
-            .comptime_branch_taken,
-            .incref,
-            .decref,
-            .decref_if_initialized,
-            .free,
-            => |s| try work.append(self.store.allocator, s.next),
-
-            .switch_stmt => |s| {
-                if (s.continuation) |continuation| try work.append(self.store.allocator, continuation);
-                try work.append(self.store.allocator, s.default_branch);
-                const branches = self.store.getCFSwitchBranches(s.branches);
-                for (0..branches.len) |index| {
-                    try work.append(self.store.allocator, GuardedList.at(branches, index).body);
-                }
-            },
-            .switch_initialized_payload => |s| {
-                try work.append(self.store.allocator, s.initialized_branch);
-                try work.append(self.store.allocator, s.uninitialized_branch);
-            },
-            .str_match => |s| {
-                try work.append(self.store.allocator, s.on_match);
-                try work.append(self.store.allocator, s.on_miss);
-            },
-            .str_match_set => |s| {
-                const arms = self.store.getStrMatchArms(s.arms);
-                for (0..arms.len) |index| {
-                    try work.append(self.store.allocator, GuardedList.at(arms, index).on_match);
-                }
-                try work.append(self.store.allocator, s.on_miss);
-            },
-            .join => |s| {
-                try work.append(self.store.allocator, s.body);
-                try work.append(self.store.allocator, s.remainder);
-            },
-            .runtime_error,
-            .comptime_exhaustiveness_failed,
-            .expect_err,
-            .loop_continue,
-            .loop_break,
-            .jump,
-            .ret,
-            .crash,
-            => {},
-        }
-    }
-
-    fn localIdLessThan(_: void, a: LocalId, b: LocalId) bool {
-        return @intFromEnum(a) < @intFromEnum(b);
-    }
 };
 
-const BodyCloner = struct {
-    store: *LirStore,
+const Cloner = body_clone.BodyCloner(ReturnSlotRewriter);
+
+/// Return rewriter that stores each source return value into the caller's
+/// destination pointer, folding a direct struct or tag construction into a
+/// destination store so the aggregate is never built into a temporary first.
+const ReturnSlotRewriter = struct {
     out_ptr: LocalId,
     store_unit: LocalId,
-    local_map: []?LocalId,
-    stmt_map: std.AutoHashMap(CFStmtId, CFStmtId),
-    new_locals: std.ArrayList(LocalId),
 
-    fn init(store: *LirStore, out_ptr: LocalId, store_unit: LocalId) ResourceError!BodyCloner {
-        const local_map = try store.allocator.alloc(?LocalId, store.localCount());
-        @memset(local_map, null);
-        return .{
-            .store = store,
-            .out_ptr = out_ptr,
-            .store_unit = store_unit,
-            .local_map = local_map,
-            .stmt_map = std.AutoHashMap(CFStmtId, CFStmtId).init(store.allocator),
-            .new_locals = .empty,
-        };
-    }
-
-    fn deinit(self: *BodyCloner) void {
-        self.new_locals.deinit(self.store.allocator);
-        self.stmt_map.deinit();
-        self.store.allocator.free(self.local_map);
-    }
-
-    fn cloneStmt(self: *BodyCloner, old_id: CFStmtId) ResourceError!CFStmtId {
-        if (self.stmt_map.get(old_id)) |existing| return existing;
-
-        const cloned = switch (self.store.getCFStmt(old_id)) {
-            .init_uninitialized => |s| try self.store.addCFStmt(.{ .init_uninitialized = .{
-                .target = try self.mapLocal(s.target),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_ref => |s| try self.store.addCFStmt(.{ .assign_ref = .{
-                .target = try self.mapLocal(s.target),
-                .op = try self.mapRefOp(s.op),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_literal => |s| try self.store.addCFStmt(.{ .assign_literal = .{
-                .target = try self.mapLocal(s.target),
-                .value = s.value,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_call => |s| try self.store.addCFStmt(.{ .assign_call = .{
-                .target = try self.mapLocal(s.target),
-                .proc = s.proc,
-                .args = try self.mapLocalSpan(s.args),
-                .is_cold = s.is_cold,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_call_erased => |s| try self.store.addCFStmt(.{ .assign_call_erased = .{
-                .target = try self.mapLocal(s.target),
-                .closure = try self.mapLocal(s.closure),
-                .args = try self.mapLocalSpan(s.args),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_packed_erased_fn => |s| try self.store.addCFStmt(.{ .assign_packed_erased_fn = .{
-                .target = try self.mapLocal(s.target),
-                .proc = s.proc,
-                .capture = try self.mapMaybeLocal(s.capture),
-                .capture_layout = s.capture_layout,
-                .on_drop = s.on_drop,
-                .reuse = try self.mapMaybeLocal(s.reuse),
-                .reuse_unique = s.reuse_unique,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_low_level => |s| try self.store.addCFStmt(.{ .assign_low_level = .{
-                .target = try self.mapLocal(s.target),
-                .op = s.op,
-                .rc_effect = s.rc_effect,
-                .unique_args = s.unique_args,
-                .args = try self.mapLocalSpan(s.args),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_list => |s| try self.store.addCFStmt(.{ .assign_list = .{
-                .target = try self.mapLocal(s.target),
-                .elems = try self.mapLocalSpan(s.elems),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .assign_struct => |s| if (self.directReturnOf(s.next, s.target))
-                try self.cloneStructReturn(s)
-            else
-                try self.store.addCFStmt(.{ .assign_struct = .{
-                    .target = try self.mapLocal(s.target),
-                    .fields = try self.mapLocalSpan(s.fields),
-                    .next = try self.cloneStmt(s.next),
-                } }),
-            .assign_tag => |s| if (self.directReturnOf(s.next, s.target))
-                try self.cloneTagReturn(s)
-            else
-                try self.store.addCFStmt(.{ .assign_tag = .{
-                    .target = try self.mapLocal(s.target),
-                    .variant_index = s.variant_index,
-                    .discriminant = s.discriminant,
-                    .payload = try self.mapMaybeLocal(s.payload),
-                    .next = try self.cloneStmt(s.next),
-                } }),
-            .store_struct => |s| try self.store.addCFStmt(.{ .store_struct = .{
-                .dest = try self.mapLocal(s.dest),
-                .struct_layout = s.struct_layout,
-                .fields = try self.mapLocalSpan(s.fields),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .store_tag => |s| try self.store.addCFStmt(.{ .store_tag = .{
-                .dest = try self.mapLocal(s.dest),
-                .tag_layout = s.tag_layout,
-                .variant_index = s.variant_index,
-                .discriminant = s.discriminant,
-                .payload = try self.mapMaybeLocal(s.payload),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .set_local => |s| try self.store.addCFStmt(.{ .set_local = .{
-                .target = try self.mapLocal(s.target),
-                .value = try self.mapLocal(s.value),
-                .mode = s.mode,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .debug => |s| try self.store.addCFStmt(.{ .debug = .{
-                .message = try self.mapLocal(s.message),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .expect => |s| try self.store.addCFStmt(.{ .expect = .{
-                .condition = try self.mapLocal(s.condition),
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .expect_err => |s| try self.store.addCFStmt(.{ .expect_err = .{
-                .message = try self.mapLocal(s.message),
-                .region = s.region,
-            } }),
-            .runtime_error => try self.store.addCFStmt(.runtime_error),
-            .comptime_exhaustiveness_failed => |s| try self.store.addCFStmt(.{ .comptime_exhaustiveness_failed = .{
-                .site = s.site,
-            } }),
-            .comptime_branch_taken => |s| try self.store.addCFStmt(.{ .comptime_branch_taken = .{
-                .site = s.site,
-                .branch_index = s.branch_index,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .incref => |s| try self.store.addCFStmt(.{ .incref = .{
-                .value = try self.mapLocal(s.value),
-                .rc = s.rc,
-                .count = s.count,
-                .atomicity = s.atomicity,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .decref => |s| try self.store.addCFStmt(.{ .decref = .{
-                .value = try self.mapLocal(s.value),
-                .rc = s.rc,
-                .atomicity = s.atomicity,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .decref_if_initialized => |s| try self.store.addCFStmt(.{ .decref_if_initialized = .{
-                .cond = try self.mapLocal(s.cond),
-                .cond_mask = s.cond_mask,
-                .value = try self.mapLocal(s.value),
-                .rc = s.rc,
-                .atomicity = s.atomicity,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .free => |s| try self.store.addCFStmt(.{ .free = .{
-                .value = try self.mapLocal(s.value),
-                .rc = s.rc,
-                .atomicity = s.atomicity,
-                .next = try self.cloneStmt(s.next),
-            } }),
-            .switch_stmt => |s| try self.cloneSwitch(s),
-            .switch_initialized_payload => |s| try self.store.addCFStmt(.{ .switch_initialized_payload = .{
-                .cond = try self.mapLocal(s.cond),
-                .cond_mask = s.cond_mask,
-                .payload = try self.mapLocal(s.payload),
-                .uninitialized_is_cold = s.uninitialized_is_cold,
-                .initialized_branch = try self.cloneStmt(s.initialized_branch),
-                .uninitialized_branch = try self.cloneStmt(s.uninitialized_branch),
-            } }),
-            .str_match => |s| try self.store.addCFStmt(.{ .str_match = .{
-                .source = try self.mapLocal(s.source),
-                .prefix = s.prefix,
-                .steps = try self.mapStrMatchSteps(s.steps),
-                .end = s.end,
-                .on_match = try self.cloneStmt(s.on_match),
-                .on_miss = try self.cloneStmt(s.on_miss),
-            } }),
-            .str_match_set => |s| try self.cloneStrMatchSet(s),
-            .loop_continue => try self.store.addCFStmt(.loop_continue),
-            .loop_break => try self.store.addCFStmt(.loop_break),
-            .join => |s| try self.store.addCFStmt(.{ .join = .{
-                .id = s.id,
-                .params = try self.mapLocalSpan(s.params),
-                .maybe_uninitialized_params = try self.mapLocalSpan(s.maybe_uninitialized_params),
-                .maybe_uninitialized_conditions = try self.mapLocalSpan(s.maybe_uninitialized_conditions),
-                .maybe_uninitialized_condition_masks = s.maybe_uninitialized_condition_masks,
-                .body = try self.cloneStmt(s.body),
-                .remainder = try self.cloneStmt(s.remainder),
-            } }),
-            .jump => |s| try self.store.addCFStmt(.{ .jump = .{ .target = s.target } }),
-            .ret => |s| try self.cloneRet(s.value),
-            .crash => |s| try self.store.addCFStmt(.{ .crash = .{ .msg = s.msg } }),
-        };
-
-        try self.stmt_map.put(old_id, cloned);
-        return cloned;
-    }
-
-    fn cloneRet(self: *BodyCloner, value: LocalId) ResourceError!CFStmtId {
-        const ret_stmt = try self.store.addCFStmt(.{ .ret = .{ .value = self.store_unit } });
-        return try self.store.addCFStmt(.{ .assign_low_level = .{
+    pub fn cloneRet(self: *ReturnSlotRewriter, cloner: anytype, value: LocalId) ResourceError!CFStmtId {
+        const ret_stmt = try cloner.store.addCFStmt(.{ .ret = .{ .value = self.store_unit } });
+        return try cloner.store.addCFStmt(.{ .assign_low_level = .{
             .target = self.store_unit,
             .op = .ptr_store,
             .rc_effect = LowLevelOp.ptr_store.rcEffect(),
-            .args = try self.store.addLocalSpan(&.{ self.out_ptr, try self.mapLocal(value) }),
+            .args = try cloner.store.addLocalSpan(&.{ self.out_ptr, try cloner.mapLocal(value) }),
             .next = ret_stmt,
         } });
     }
 
-    fn directReturnOf(self: *const BodyCloner, next: CFStmtId, value: LocalId) bool {
-        return switch (self.store.getCFStmt(next)) {
-            .ret => |ret_stmt| ret_stmt.value == value,
-            else => false,
-        };
+    pub fn interceptStmt(self: *ReturnSlotRewriter, cloner: anytype, stmt: LIR.CFStmt) ResourceError!?CFStmtId {
+        switch (stmt) {
+            .assign_struct => |s| {
+                if (cloner.directReturnOf(s.next, s.target)) return try self.cloneStructReturn(cloner, s);
+                return null;
+            },
+            .assign_tag => |s| {
+                if (cloner.directReturnOf(s.next, s.target)) return try self.cloneTagReturn(cloner, s);
+                return null;
+            },
+            else => return null,
+        }
     }
 
-    fn cloneStructReturn(self: *BodyCloner, s: anytype) ResourceError!CFStmtId {
-        const ret_stmt = try self.store.addCFStmt(.{ .ret = .{ .value = self.store_unit } });
-        return try self.store.addCFStmt(.{ .store_struct = .{
+    fn cloneStructReturn(self: *ReturnSlotRewriter, cloner: anytype, s: anytype) ResourceError!CFStmtId {
+        const ret_stmt = try cloner.store.addCFStmt(.{ .ret = .{ .value = self.store_unit } });
+        return try cloner.store.addCFStmt(.{ .store_struct = .{
             .dest = self.out_ptr,
-            .struct_layout = self.store.getLocal(s.target).layout_idx,
-            .fields = try self.mapLocalSpan(s.fields),
+            .struct_layout = cloner.store.getLocal(s.target).layout_idx,
+            .fields = try cloner.mapLocalSpan(s.fields),
             .next = ret_stmt,
         } });
     }
 
-    fn cloneTagReturn(self: *BodyCloner, s: anytype) ResourceError!CFStmtId {
-        const ret_stmt = try self.store.addCFStmt(.{ .ret = .{ .value = self.store_unit } });
-        return try self.store.addCFStmt(.{ .store_tag = .{
+    fn cloneTagReturn(self: *ReturnSlotRewriter, cloner: anytype, s: anytype) ResourceError!CFStmtId {
+        const ret_stmt = try cloner.store.addCFStmt(.{ .ret = .{ .value = self.store_unit } });
+        return try cloner.store.addCFStmt(.{ .store_tag = .{
             .dest = self.out_ptr,
-            .tag_layout = self.store.getLocal(s.target).layout_idx,
+            .tag_layout = cloner.store.getLocal(s.target).layout_idx,
             .variant_index = s.variant_index,
             .discriminant = s.discriminant,
-            .payload = try self.mapMaybeLocal(s.payload),
+            .payload = try cloner.mapMaybeLocal(s.payload),
             .next = ret_stmt,
         } });
     }
-
-    fn cloneSwitch(self: *BodyCloner, s: anytype) ResourceError!CFStmtId {
-        const old_branches = self.store.getCFSwitchBranches(s.branches);
-        const branches = try self.store.allocator.alloc(LIR.CFSwitchBranch, old_branches.len);
-        defer self.store.allocator.free(branches);
-        for (0..old_branches.len) |index| {
-            const old = GuardedList.at(old_branches, index);
-            const new = &branches[index];
-            new.* = .{
-                .value = old.value,
-                .body = try self.cloneStmt(old.body),
-            };
-        }
-        return try self.store.addCFStmt(.{ .switch_stmt = .{
-            .cond = try self.mapLocal(s.cond),
-            .branches = try self.store.addCFSwitchBranches(branches),
-            .default_branch = try self.cloneStmt(s.default_branch),
-            .default_is_cold = s.default_is_cold,
-            .continuation = if (s.continuation) |continuation| try self.cloneStmt(continuation) else null,
-        } });
-    }
-
-    fn cloneStrMatchSet(self: *BodyCloner, s: anytype) ResourceError!CFStmtId {
-        const old_arms = self.store.getStrMatchArms(s.arms);
-        const arms = try self.store.allocator.alloc(LIR.StrMatchArm, old_arms.len);
-        defer self.store.allocator.free(arms);
-        for (0..old_arms.len) |index| {
-            const old = GuardedList.at(old_arms, index);
-            const new = &arms[index];
-            new.* = .{
-                .prefix = old.prefix,
-                .steps = try self.mapStrMatchSteps(old.steps),
-                .end = old.end,
-                .on_match = try self.cloneStmt(old.on_match),
-            };
-        }
-        return try self.store.addCFStmt(.{ .str_match_set = .{
-            .source = try self.mapLocal(s.source),
-            .arms = try self.store.addStrMatchArms(arms),
-            .on_miss = try self.cloneStmt(s.on_miss),
-        } });
-    }
-
-    fn mapStrMatchSteps(self: *BodyCloner, span: LIR.StrMatchStepSpan) ResourceError!LIR.StrMatchStepSpan {
-        const old_steps = self.store.getStrMatchSteps(span);
-        const steps = try self.store.allocator.alloc(LIR.StrMatchStep, old_steps.len);
-        defer self.store.allocator.free(steps);
-        for (0..old_steps.len) |index| {
-            const old = GuardedList.at(old_steps, index);
-            const new = &steps[index];
-            new.* = old;
-            new.capture = switch (old.capture) {
-                .discard => .discard,
-                .view => |local| .{ .view = try self.mapLocal(local) },
-            };
-        }
-        return try self.store.addStrMatchSteps(steps);
-    }
-
-    fn mapRefOp(self: *BodyCloner, op: LIR.RefOp) ResourceError!LIR.RefOp {
-        return switch (op) {
-            .local => |local| .{ .local = try self.mapLocal(local) },
-            .discriminant => |d| .{ .discriminant = .{ .source = try self.mapLocal(d.source) } },
-            .field => |f| .{ .field = .{
-                .source = try self.mapLocal(f.source),
-                .field_idx = f.field_idx,
-            } },
-            .tag_payload => |t| .{ .tag_payload = .{
-                .source = try self.mapLocal(t.source),
-                .payload_idx = t.payload_idx,
-                .variant_index = t.variant_index,
-                .tag_discriminant = t.tag_discriminant,
-            } },
-            .tag_payload_struct => |t| .{ .tag_payload_struct = .{
-                .source = try self.mapLocal(t.source),
-                .variant_index = t.variant_index,
-                .tag_discriminant = t.tag_discriminant,
-            } },
-            .list_reinterpret => |l| .{ .list_reinterpret = .{ .backing_ref = try self.mapLocal(l.backing_ref) } },
-            .nominal => |n| .{ .nominal = .{ .backing_ref = try self.mapLocal(n.backing_ref) } },
-        };
-    }
-
-    fn mapLocalSpan(self: *BodyCloner, span: LIR.LocalSpan) ResourceError!LIR.LocalSpan {
-        const old_locals = self.store.getLocalSpan(span);
-        const locals = try self.store.allocator.alloc(LocalId, old_locals.len);
-        defer self.store.allocator.free(locals);
-        for (0..old_locals.len) |index| {
-            locals[index] = try self.mapLocal(GuardedList.at(old_locals, index));
-        }
-        return try self.store.addLocalSpan(locals);
-    }
-
-    fn mapMaybeLocal(self: *BodyCloner, maybe: ?LocalId) ResourceError!?LocalId {
-        return if (maybe) |local| try self.mapLocal(local) else null;
-    }
-
-    fn mapLocal(self: *BodyCloner, old: LocalId) ResourceError!LocalId {
-        const index = @intFromEnum(old);
-        if (index >= self.local_map.len) unreachable;
-        if (self.local_map[index]) |existing| return existing;
-
-        const fresh = try self.store.addLocal(.{ .layout_idx = self.store.getLocal(old).layout_idx });
-        self.local_map[index] = fresh;
-        try self.new_locals.append(self.store.allocator, fresh);
-        return fresh;
-    }
 };
-
-fn uniqueSortedLocals(items: []LocalId) usize {
-    var unique_len: usize = 0;
-    for (items, 0..) |local, idx| {
-        if (idx > 0 and items[unique_len - 1] == local) continue;
-        items[unique_len] = local;
-        unique_len += 1;
-    }
-    return unique_len;
-}
 
 fn testLocal(store: *LirStore, layout_idx: layout_mod.Idx) ResourceError!LocalId {
     return try store.addLocal(.{ .layout_idx = layout_idx });
@@ -915,4 +532,48 @@ test "return slot shares one variant for identical proc and layout demands" {
     const rewritten_b = store.getCFStmt(call_b).assign_call;
     try std.testing.expectEqual(rewritten_a.proc, rewritten_b.proc);
     try std.testing.expectEqual(@as(usize, before_proc_count + 1), store.procSpecCount());
+}
+
+test "return slot does not fuse a multi-use stored call result" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(allocator, @import("base").target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const aggregate = try testStructLayout(&layouts);
+    const aggregate_ptr = try layouts.insertPtr(aggregate);
+    const callee = try testAggregateCallee(&store, aggregate);
+
+    const destination_a = try testLocal(&store, aggregate_ptr);
+    const destination_b = try testLocal(&store, aggregate_ptr);
+    const arg = try testLocal(&store, .u64);
+    const temporary = try testLocal(&store, aggregate);
+    const store_unit_a = try testLocal(&store, .zst);
+    const store_unit_b = try testLocal(&store, .zst);
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = store_unit_b } });
+    const ptr_store_b = try testLowLevel(&store, store_unit_b, .ptr_store, &.{ destination_b, temporary }, ret);
+    const ptr_store_a = try testLowLevel(&store, store_unit_a, .ptr_store, &.{ destination_a, temporary }, ptr_store_b);
+    const call = try store.addCFStmt(.{ .assign_call = .{
+        .target = temporary,
+        .proc = callee,
+        .args = try store.addLocalSpan(&.{arg}),
+        .next = ptr_store_a,
+    } });
+    _ = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .args = try store.addLocalSpan(&.{ destination_a, destination_b, arg }),
+        .frame_locals = try store.addLocalSpan(&.{ destination_a, destination_b, arg, temporary, store_unit_a, store_unit_b }),
+        .body = call,
+        .ret_layout = .zst,
+    });
+
+    const before_proc_count = store.procSpecCount();
+    try run(&store, &layouts);
+
+    const unchanged = store.getCFStmt(call).assign_call;
+    try std.testing.expectEqual(callee, unchanged.proc);
+    try std.testing.expectEqual(temporary, unchanged.target);
+    try std.testing.expectEqual(before_proc_count, store.procSpecCount());
 }

@@ -32,6 +32,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("lir_core");
 const layout_mod = @import("layout");
+const body_clone = @import("body_clone.zig");
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
@@ -39,6 +40,10 @@ const GuardedList = LirStore.GuardedList;
 const LocalId = LIR.LocalId;
 const CFStmtId = LIR.CFStmtId;
 const LowLevelOp = LIR.LowLevel;
+
+/// A local reached by forwarding through `assign_ref .local` aliases, paired
+/// with the first statement past the alias chain.
+const ForwardedAlias = body_clone.ForwardedAlias;
 
 /// Allocation failure raised while rewriting box update statements.
 pub const ResourceError = Allocator.Error;
@@ -117,7 +122,7 @@ const Transform = struct {
         const call_args = self.store.getLocalSpan(call_stmt.args);
         if (call_args.len != 1 or GuardedList.at(call_args, 0) != unbox_stmt.target) return false;
 
-        const payload_alias = self.forwardLocalAliasChain(call_stmt.target, call_stmt.next);
+        const payload_alias = body_clone.forwardLocalAliasChain(self.store, call_stmt.target, call_stmt.next);
         const payload_value = payload_alias.value;
         const box_stmt_id = payload_alias.next;
         const box_stmt = switch (self.store.getCFStmt(box_stmt_id)) {
@@ -206,7 +211,7 @@ const Transform = struct {
         if (self.store.getU64Span(join_stmt.maybe_uninitialized_condition_masks).len != 0) return false;
         const join_payload = GuardedList.at(join_params, 0);
 
-        const body_alias = self.forwardLocalAliasChain(join_payload, join_stmt.body);
+        const body_alias = body_clone.forwardLocalAliasChain(self.store, join_payload, join_stmt.body);
         const payload_value = body_alias.value;
         const box_stmt_id = body_alias.next;
         const box_stmt = switch (self.store.getCFStmt(box_stmt_id)) {
@@ -307,7 +312,7 @@ const Transform = struct {
         if (self.store.getU64Span(join_stmt.maybe_uninitialized_condition_masks).len != 0) return false;
         const join_payload = GuardedList.at(join_params, 0);
 
-        const body_alias = self.forwardLocalAliasChain(join_payload, join_stmt.body);
+        const body_alias = body_clone.forwardLocalAliasChain(self.store, join_payload, join_stmt.body);
         const payload_value = body_alias.value;
         const box_stmt_id = body_alias.next;
         const box_stmt = switch (self.store.getCFStmt(box_stmt_id)) {
@@ -465,31 +470,6 @@ const Transform = struct {
             old_size_align.alignment.toByteUnits() == new_size_align.alignment.toByteUnits();
     }
 
-    const ForwardedAlias = struct {
-        value: LocalId,
-        next: CFStmtId,
-    };
-
-    fn forwardLocalAliasChain(self: *const Transform, source: LocalId, first_stmt: CFStmtId) ForwardedAlias {
-        var value = source;
-        var current = first_stmt;
-        while (true) {
-            const stmt = switch (self.store.getCFStmt(current)) {
-                .assign_ref => |s| s,
-                else => return .{ .value = value, .next = current },
-            };
-            switch (stmt.op) {
-                .local => |local| if (local == value and self.store.getLocal(stmt.target).layout_idx == self.store.getLocal(value).layout_idx) {
-                    value = stmt.target;
-                    current = stmt.next;
-                    continue;
-                },
-                else => {},
-            }
-            return .{ .value = value, .next = current };
-        }
-    }
-
     fn forwardThroughLocalAliasesAndZsts(self: *const Transform, source: LocalId, first_stmt: CFStmtId) ForwardedAlias {
         var value = source;
         var current = first_stmt;
@@ -555,73 +535,11 @@ const Transform = struct {
                 .jump => |stmt| {
                     if (stmt.target == join_id) count += 1;
                 },
-                else => try self.appendSuccessors(&work, stmt_id),
+                else => try body_clone.appendSuccessors(self.store, &work, stmt_id),
             }
         }
 
         return count;
-    }
-
-    fn appendSuccessors(self: *Transform, work: *std.ArrayList(CFStmtId), stmt_id: CFStmtId) ResourceError!void {
-        switch (self.store.getCFStmt(stmt_id)) {
-            inline .assign_ref,
-            .assign_literal,
-            .init_uninitialized,
-            .assign_call,
-            .assign_call_erased,
-            .assign_packed_erased_fn,
-            .assign_low_level,
-            .assign_list,
-            .assign_struct,
-            .assign_tag,
-            .store_struct,
-            .store_tag,
-            .set_local,
-            .debug,
-            .expect,
-            .comptime_branch_taken,
-            .incref,
-            .decref,
-            .decref_if_initialized,
-            .free,
-            => |stmt| try work.append(self.store.allocator, stmt.next),
-            .switch_stmt => |stmt| {
-                if (stmt.continuation) |continuation| try work.append(self.store.allocator, continuation);
-                const cases = self.store.getCFSwitchBranches(stmt.branches);
-                for (0..cases.len) |case_index| {
-                    try work.append(self.store.allocator, GuardedList.at(cases, case_index).body);
-                }
-                try work.append(self.store.allocator, stmt.default_branch);
-            },
-            .switch_initialized_payload => |stmt| {
-                try work.append(self.store.allocator, stmt.initialized_branch);
-                try work.append(self.store.allocator, stmt.uninitialized_branch);
-            },
-            .str_match => |stmt| {
-                try work.append(self.store.allocator, stmt.on_match);
-                try work.append(self.store.allocator, stmt.on_miss);
-            },
-            .str_match_set => |stmt| {
-                const arms = self.store.getStrMatchArms(stmt.arms);
-                for (0..arms.len) |arm_index| {
-                    try work.append(self.store.allocator, GuardedList.at(arms, arm_index).on_match);
-                }
-                try work.append(self.store.allocator, stmt.on_miss);
-            },
-            .join => |stmt| {
-                try work.append(self.store.allocator, stmt.body);
-                try work.append(self.store.allocator, stmt.remainder);
-            },
-            .runtime_error,
-            .comptime_exhaustiveness_failed,
-            .loop_continue,
-            .loop_break,
-            .jump,
-            .ret,
-            .crash,
-            .expect_err,
-            => {},
-        }
     }
 
     fn addLocal(self: *Transform, layout_idx: layout_mod.Idx) ResourceError!LocalId {
@@ -637,21 +555,11 @@ const Transform = struct {
         defer merged.deinit(self.store.allocator);
         for (0..old.len) |index| merged.appendAssumeCapacity(GuardedList.at(old, index));
         merged.appendSliceAssumeCapacity(self.new_locals.items);
-        std.mem.sort(LocalId, merged.items, {}, localIdLessThan);
-
-        var unique_len: usize = 0;
-        for (merged.items, 0..) |local, idx| {
-            if (idx > 0 and merged.items[unique_len - 1] == local) continue;
-            merged.items[unique_len] = local;
-            unique_len += 1;
-        }
+        std.mem.sort(LocalId, merged.items, {}, body_clone.localIdLessThan);
+        const unique_len = body_clone.uniqueSortedLocals(merged.items);
 
         const frame_locals = try self.store.addLocalSpan(merged.items[0..unique_len]);
         self.store.getProcSpecPtr(self.proc_id).frame_locals = frame_locals;
-    }
-
-    fn localIdLessThan(_: void, a: LocalId, b: LocalId) bool {
-        return @intFromEnum(a) < @intFromEnum(b);
     }
 
     fn nextOf(self: *const Transform, stmt_id: CFStmtId) ?CFStmtId {

@@ -23,6 +23,8 @@ pub const BoxReuse = @import("box_reuse.zig");
 pub const ReturnSlot = @import("return_slot.zig");
 /// Internal append-into-string variants before ARC.
 pub const StrAppend = @import("str_append.zig");
+/// Shared proc-body cloning and rewrite-soundness helpers before ARC.
+pub const BodyClone = @import("body_clone.zig");
 /// Struct-typed join parameters split into per-field parameters before ARC.
 pub const ScalarizeJoins = @import("scalarize_joins.zig");
 /// Switch branch pruning from explicit possible-tag analysis.
@@ -101,6 +103,7 @@ test "lir tests" {
     std.testing.refAllDecls(BoxReuse);
     std.testing.refAllDecls(ReturnSlot);
     std.testing.refAllDecls(StrAppend);
+    std.testing.refAllDecls(BodyClone);
     std.testing.refAllDecls(ScalarizeJoins);
     std.testing.refAllDecls(TagReachability);
     std.testing.refAllDecls(CheckedArithmetic);
