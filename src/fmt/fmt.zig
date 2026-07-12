@@ -3473,10 +3473,11 @@ const Formatter = struct {
                         fmt.nodesWillBeMultiline(AST.AnnoRecordField.Idx, fmt.ast.store.annoRecordFieldSlice(r.fields)),
                     .tag_union => |t| type_has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
                         fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(t.tags)),
-                    .@"fn" => |f| type_has_comment or
+                    .@"fn" => |f| type_has_comment or fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()) or
                         fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(f.args)) or
                         fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, f.ret),
-                    .parens => |p| type_has_comment or fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, p.anno),
+                    .parens => |p| type_has_comment or fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()) or
+                        fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, p.anno),
                     else => fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()),
                 };
             },
