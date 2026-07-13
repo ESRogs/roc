@@ -22884,7 +22884,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 194);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 196);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -23032,7 +23032,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 21;
+    const serialized_layout_version: u32 = 22;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -27646,8 +27646,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xB6, 0x92, 0xF9, 0x99, 0x3B, 0x83, 0x2D, 0xCB, 0xA1, 0x70, 0x28, 0xB1, 0xBE, 0xB9, 0x14, 0x70,
-        0xA1, 0x2E, 0xFA, 0xE9, 0x75, 0x18, 0x6F, 0xAE, 0x80, 0xD8, 0xE1, 0xFD, 0x7F, 0x5C, 0xA7, 0x55,
+        0x5D, 0xF6, 0xAB, 0x64, 0xC5, 0x46, 0xD5, 0xE6, 0x71, 0xAD, 0x77, 0xC1, 0x91, 0xAA, 0x46, 0xD9,
+        0x2C, 0xD9, 0x8D, 0x55, 0x1E, 0xD5, 0x56, 0xD8, 0x30, 0x61, 0xF3, 0x15, 0x60, 0x76, 0x2C, 0x86,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

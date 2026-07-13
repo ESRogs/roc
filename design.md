@@ -1758,8 +1758,8 @@ from the target, backend, symbol names, builtin names, or emitted code. The mode
 changes optimization work, not source meaning or the stage route.
 
 Optional tag reachability uses a recursive abstract value tree. A struct field
-or tag payload carries the complete nested tag, field, and payload facts of the
-value stored there, and every `set_local` join merges that complete tree. The
+or tag payload carries the complete nested `ValueInfo` output for the value
+stored there, and every `set_local` join merges that complete tree. The
 pass may remove a switch edge only from this producer-complete fixed point; it
 must not flatten nested values to their top-level tag set, because an iterator
 successor can change a tag nested below both a step payload and the loop-carried
@@ -1864,11 +1864,11 @@ The representation producer is `generatedIteratorType` in
 - a hard minted depth limit of 16;
 - a structural-walk budget of 64.
 
-A public `Iter` expected type is a semantic compatibility constraint, not a
-veto on producer-owned representation evidence. A source or adapter whose
-inputs prove a bounded chain mints its concrete result and relates that result
-to the public type for checking. This keeps constant and non-constant chains on
-the same representation path.
+A public `Iter` expected type constrains the checked result type; it does not
+veto producer-owned representation evidence. A source or adapter whose inputs
+prove a bounded chain mints its concrete result and relates that result to the
+public type during checking. This keeps constant and non-constant chains on the
+same representation path.
 
 A `minted` child contributes its recorded depth. A `forced_dynamic` child
 contributes the cap, so every adapter above it remains dynamic. Ordinary named
@@ -1961,8 +1961,9 @@ The direct LIR const plan also records the root's exact Monotype return type.
 Finalization clones that type into the durable `ConstStore` type store and saves
 its id beside the stored root node. Restoration lowers the saved root type first
 and restores the node at that exact type; the checked public type is used only
-to assert semantic compatibility. Representation evidence therefore survives
-CTFE without a consumer reconstructing it from constant node shape.
+to assert that the saved representation has the checked root type.
+Representation evidence therefore survives CTFE without a consumer
+reconstructing it from constant node shape.
 
 #### Correctness Boundaries
 
@@ -3975,6 +3976,11 @@ against the borrow typing rules:
   refinement is bounded by the name count; balance divergence across
   mode-identical entries is itself a finding — per-iteration accumulation),
   so certification of every procedure runs to completion
+- explicit initialized-payload control flow refines conditional ownership:
+  the initialized edge promotes the payload to ordinary owned state and the
+  uninitialized edge removes its possible unit and binding. Presence
+  conditions never survive an edge that has proved them true, so independent
+  tests do not accumulate stale mode dimensions at later joins
 - every call site satisfies the callee variant's signature, and every pinned
   signature holds
 
