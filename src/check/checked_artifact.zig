@@ -1424,6 +1424,7 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
     }
     return switch (checked_types.payload(@enumFromInt(index))) {
         .pending => checkedArtifactInvariant("compile-time root checked type was pending", .{}),
+        .err => false,
         .flex => false,
         .rigid => walk == .decl_template,
         .empty_record,
@@ -1506,6 +1507,93 @@ fn checkedTagsAreConcreteCompileTimeRoots(
         if (!try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, tag.argsSlice(checked_types), active)) return false;
     }
     return true;
+}
+
+fn checkedTypeContainsError(
+    allocator: Allocator,
+    checked_types: *const CheckedTypeStore,
+    root: CheckedTypeId,
+) Allocator.Error!bool {
+    var active = std.AutoHashMap(CheckedTypeId, void).init(allocator);
+    defer active.deinit();
+    return checkedTypeContainsErrorInner(checked_types, root, &active);
+}
+
+fn checkedTypeContainsErrorInner(
+    checked_types: *const CheckedTypeStore,
+    root: CheckedTypeId,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    if (active.contains(root)) return false;
+    try active.put(root, {});
+    defer _ = active.remove(root);
+
+    return switch (checked_types.payload(root)) {
+        .pending => checkedArtifactInvariant("checked error-type scan reached pending payload", .{}),
+        .err => true,
+        .empty_record, .empty_tag_union => false,
+        .flex => |variable| checkedConstraintsContainError(checked_types, variable.constraints, active),
+        .rigid => |variable| checkedConstraintsContainError(checked_types, variable.constraints, active),
+        .alias => |alias| (try checkedTypeContainsErrorInner(checked_types, alias.backing, active)) or
+            try checkedTypeSliceContainsError(checked_types, alias.args, active),
+        .record => |record| (try checkedFieldsContainError(checked_types, record.fields, active)) or
+            try checkedTypeContainsErrorInner(checked_types, record.ext, active),
+        .record_unbound => |fields| checkedFieldsContainError(checked_types, fields, active),
+        .tuple => |items| checkedTypeSliceContainsError(checked_types, items, active),
+        .nominal => |nominal| blk: {
+            if (try checkedTypeSliceContainsError(checked_types, nominal.args, active)) break :blk true;
+            const backing = checked_types.nominalBackingTemplateForPayload(nominal) orelse break :blk false;
+            break :blk try checkedTypeContainsErrorInner(checked_types, backing, active);
+        },
+        .function => |function| (try checkedTypeSliceContainsError(checked_types, function.args, active)) or
+            try checkedTypeContainsErrorInner(checked_types, function.ret, active),
+        .tag_union => |tag_union| (try checkedTagsContainError(checked_types, tag_union.tags, active)) or
+            try checkedTypeContainsErrorInner(checked_types, tag_union.ext, active),
+    };
+}
+
+fn checkedConstraintsContainError(
+    checked_types: *const CheckedTypeStore,
+    constraints: []const CheckedStaticDispatchConstraint,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (constraints) |constraint| {
+        if (try checkedTypeContainsErrorInner(checked_types, constraint.fn_ty, active)) return true;
+    }
+    return false;
+}
+
+fn checkedTypeSliceContainsError(
+    checked_types: *const CheckedTypeStore,
+    roots: []const CheckedTypeId,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (roots) |root| {
+        if (try checkedTypeContainsErrorInner(checked_types, root, active)) return true;
+    }
+    return false;
+}
+
+fn checkedFieldsContainError(
+    checked_types: *const CheckedTypeStore,
+    fields: []const CheckedRecordField,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (fields) |field| {
+        if (try checkedTypeContainsErrorInner(checked_types, field.ty, active)) return true;
+    }
+    return false;
+}
+
+fn checkedTagsContainError(
+    checked_types: *const CheckedTypeStore,
+    tags: []const CheckedTag,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (tags) |tag| {
+        if (try checkedTypeSliceContainsError(checked_types, tag.argsSlice(checked_types), active)) return true;
+    }
+    return false;
 }
 
 fn compileTimeRootHasRootRequest(
@@ -1849,11 +1937,13 @@ fn appendPublishedEntrypointRoots(
                 unreachable;
             };
             const main_def: CIR.Def.Idx = @enumFromInt(@as(u32, @intCast(main_node_idx)));
+            const checked_type = try checkedTypeIdForRootSource(allocator, module, checked_types, .{ .def = main_def });
+            if (try checkedTypeContainsError(allocator, &checked_types.store, checked_type)) return;
             try appendRoot(requests, allocator, .{
                 .module_idx = module.moduleIndex(),
                 .kind = .runtime_entrypoint,
                 .source = .{ .def = main_def },
-                .checked_type = try checkedTypeIdForRootSource(allocator, module, checked_types, .{ .def = main_def }),
+                .checked_type = checked_type,
                 .abi = .roc,
                 .exposure = .exported,
                 .procedure_template = requiredProcedureTemplateForRootSource(procedure_templates, .{ .def = main_def }),
@@ -1982,6 +2072,7 @@ const PlatformRelationSubstitutionCollector = struct {
 
         switch (platform_payload) {
             .pending => checkedArtifactInvariant("platform relation substitution reached pending platform payload", .{}),
+            .err => checkedArtifactInvariant("platform relation substitution reached erroneous platform payload", .{}),
             .flex, .rigid => unreachable,
             .alias => |platform_alias| return try self.collectAlias(platform_alias, resolved_root, resolved_payload, context),
             .record, .record_unbound, .empty_record => return try self.collectRecord(platform_payload, resolved_payload),
@@ -2953,6 +3044,7 @@ test "checked nominal payloads do not carry instantiated backing roots" {
 /// `StoredCheckedTypePayload` (POD ranges into the pools).
 pub const CheckedTypePayload = union(enum) {
     pending,
+    err,
     flex: CheckedTypeVariable,
     rigid: CheckedTypeVariable,
     alias: CheckedAliasType,
@@ -2971,6 +3063,7 @@ pub const CheckedTypePayload = union(enum) {
 /// store's commit path copies it into the pools (freeing the build memory).
 pub const CheckedTypePayloadBuild = union(enum) {
     pending,
+    err,
     flex: CheckedTypeVariable,
     rigid: CheckedTypeVariable,
     alias: CheckedAliasType,
@@ -3047,6 +3140,7 @@ pub const StoredTagUnion = struct {
 /// `CheckedTypePayload` (with slices) is reconstructed on demand by `payload`.
 pub const StoredCheckedTypePayload = union(enum) {
     pending,
+    err,
     flex: StoredTypeVariable,
     rigid: StoredTypeVariable,
     alias: StoredAlias,
@@ -3077,6 +3171,7 @@ pub const StoredCheckedTypePayload = union(enum) {
 fn reconstructCheckedTypePayload(pool_owner: anytype, stored: StoredCheckedTypePayload) CheckedTypePayload {
     return switch (stored) {
         .pending => .pending,
+        .err => .err,
         .empty_record => .empty_record,
         .empty_tag_union => .empty_tag_union,
         .flex => |v| .{ .flex = reconstructCheckedTypeVariable(pool_owner, v) },
@@ -3707,6 +3802,7 @@ pub const CheckedTypeStore = struct {
     fn commitPayload(self: *CheckedTypeStore, allocator: Allocator, build: CheckedTypePayloadBuild) Allocator.Error!StoredCheckedTypePayload {
         return switch (build) {
             .pending => .pending,
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |v| .{ .flex = try self.commitVariable(allocator, v) },
@@ -4347,6 +4443,7 @@ pub const CheckedTypeStore = struct {
         const read = reconstructCheckedTypePayload(self, stored);
         return switch (read) {
             .pending => .pending,
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |v| .{ .flex = try snapshotCheckedTypeVariable(allocator, v) },
@@ -4408,6 +4505,7 @@ pub const CheckedTypeStore = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (build_payload) {
             .pending => checkedArtifactInvariant("checked type substitution reached pending payload", .{}),
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |flex| .{ .flex = .{
@@ -4641,6 +4739,7 @@ fn deinitCheckedTagsBuild(allocator: Allocator, tags: []const CheckedTagBuild) v
 fn deinitCheckedTypePayloadBuild(allocator: Allocator, payload: *CheckedTypePayloadBuild) void {
     switch (payload.*) {
         .pending,
+        .err,
         .empty_record,
         .empty_tag_union,
         => {},
@@ -5937,6 +6036,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
     fn writePayload(self: *SubstitutedCheckedTypeKeyBuilder, payload: CheckedTypePayload) Allocator.Error!void {
         switch (payload) {
             .pending => checkedArtifactInvariant("checked type substitution key reached pending payload", .{}),
+            .err => self.writeTag("err"),
             .flex,
             .rigid,
             => checkedArtifactInvariant("checked type substitution key reached identity payload without root identity", .{}),
@@ -5999,6 +6099,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
                 try self.writeNormalizedTagUnionFromHead(tags.items, tag_union.ext);
             },
             inline .pending,
+            .err,
             .flex,
             .rigid,
             .alias,
@@ -6576,12 +6677,7 @@ fn copyCheckedTypePayload(
     content: types.Content,
 ) Allocator.Error!CheckedTypePayloadBuild {
     return switch (content) {
-        .err => {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("checked artifact invariant violated: erroneous checked type reached artifact publication", .{});
-            }
-            unreachable;
-        },
+        .err => .err,
         .flex => |flex| .{ .flex = .{
             .name = try copyOptionalIdentText(allocator, module, flex.name),
             .constraints = try copyCheckedStaticDispatchConstraints(allocator, module, names, imports, store, active, flex.constraints),
@@ -17209,6 +17305,7 @@ const PlatformRequirementTypeCompatibilityChecker = struct {
 
         return switch (expected_payload) {
             .pending => checkedArtifactInvariant("platform requirement type compatibility reached pending expected payload", .{}),
+            .err => false,
             .flex, .rigid, .alias => unreachable,
             .empty_record => self.compatibleRecord(expected_payload, actual_payload),
             .record, .record_unbound => self.compatibleRecord(expected_payload, actual_payload),
@@ -17954,6 +18051,7 @@ const PlatformAppRelationTypeResolver = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (platform_payload) {
             .pending => checkedArtifactInvariant("platform/app relation merge reached pending platform payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation merge reached erroneous platform payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .record, .record_unbound => try self.mergeRecordPayload(platform_root, app_root),
             .tag_union => try self.mergeTagUnionPayload(platform_root, app_root),
@@ -18178,6 +18276,7 @@ const PlatformAppRelationTypeResolver = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (root_payload) {
             .pending => checkedArtifactInvariant("platform/app relation finalization reached pending payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation finalization reached erroneous payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .tuple => |items| blk: {
                 const finalized = try self.finalizeRootSlice(items);
@@ -19083,6 +19182,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         const app_payload = self.payload(app_root);
         return switch (platform_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending platform payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation digest reached erroneous platform payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .record, .record_unbound => try self.writeMergeRecord(platform_root, app_root),
             .tag_union => try self.writeMergeTagUnion(platform_root, app_root),
@@ -19222,6 +19322,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation digest reached erroneous payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .tuple => |items| {
                 self.writeTag("tuple");
@@ -19283,6 +19384,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     fn writeSourcePayload(self: *PlatformAppRelationTypeDigestBuilder, source_payload: CheckedTypePayload) Allocator.Error!void {
         switch (source_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending source payload", .{}),
+            .err => self.writeTag("err"),
             .flex,
             .rigid,
             => checkedArtifactInvariant("platform/app relation digest reached identity source payload without root", .{}),
@@ -20182,6 +20284,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     ) Allocator.Error!bool {
         return switch (self.payload(root)) {
             .pending => true,
+            .err => false,
             .flex,
             .rigid,
             => true,
@@ -20257,6 +20360,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     ) Allocator.Error!bool {
         return switch (self.payload(root)) {
             .pending => true,
+            .err => false,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .tuple => |items| try self.finalizeSliceIdentityRec(traversal, items),
             .function => |function| try self.finalizeSliceIdentityRec(traversal, function.args) or
@@ -20378,6 +20482,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         const app_payload = self.payload(app_root);
         return switch (platform_payload) {
             .pending => true,
+            .err => false,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .record, .record_unbound => try self.mergeRecordIdentityRec(traversal, platform_root, app_root),
             .tag_union => try self.mergeTagIdentityRec(traversal, platform_root, app_root),
@@ -21394,6 +21499,7 @@ fn checkedTypeHasNoReachableCallableSlotsInner(
 
     return switch (checked_types.payload(@enumFromInt(index))) {
         .pending => checkedArtifactInvariant("callable-slot proof reached pending checked type", .{}),
+        .err => true,
         .flex,
         .rigid,
         .function,
@@ -22186,6 +22292,20 @@ fn publishCheckedExhaustivenessSites(
     errdefer sites.deinit(allocator);
 
     for (problem_store.pending_static_exhaustiveness.items) |pending| {
+        const source_is_published = switch (pending.source) {
+            .match_expr => |source_expr| checked_bodies.exprIdForSource(source_expr) != null,
+            .destructure_pattern => |source_pattern| checked_bodies.patternIdForSource(source_pattern) != null,
+        };
+        if (!source_is_published) {
+            // Checking may replace an erroneous enclosing expression with a
+            // runtime-error node. Its child source occurrences are then
+            // intentionally absent from the checked body graph. Leave the
+            // diagnostic pending: static failures are flushed after
+            // compile-time finalization, while an empirical-only site under a
+            // runtime error can never execute and needs no publication.
+            continue;
+        }
+
         const id: CheckedExhaustivenessSiteId = @enumFromInt(@as(u32, @intCast(sites.items.len)));
         const owner_template = exhaustivenessOwnerTemplateForSource(checked_bodies, pending.source);
         const replacing_root = exhaustivenessReplacingRootForSource(checked_bodies, compile_time_roots, pending.source);
@@ -23932,7 +24052,7 @@ fn appendPublicApiTypeDependencies(
 
     switch (checked_types.payload(@enumFromInt(index))) {
         .pending => checkedArtifactInvariant("public API dependency scan reached pending checked type payload", .{}),
-        .empty_record, .empty_tag_union => {},
+        .err, .empty_record, .empty_tag_union => {},
         .flex => |flex| try appendPublicApiConstraintDependencies(
             allocator,
             names,
@@ -24491,7 +24611,7 @@ const LoweringVisibilityBuilder = struct {
         }
         switch (store.payload(root)) {
             .pending => checkedArtifactInvariant("lowering visibility type traversal reached pending payload", .{}),
-            .empty_record, .empty_tag_union => {},
+            .err, .empty_record, .empty_tag_union => {},
             .flex => |flex| try self.appendConstraintTypes(artifact, flex.constraints),
             .rigid => |rigid| try self.appendConstraintTypes(artifact, rigid.constraints),
             .alias => |alias| {
@@ -26528,7 +26648,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 17;
+    const serialized_layout_version: u32 = 18;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -28256,6 +28376,7 @@ const CheckedTypeStoreImportProjector = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (payload) {
             .pending => checkedArtifactInvariant("platform for-clause projection reached pending app checked type payload", .{}),
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |flex| .{ .flex = try self.projectVariable(flex) },
@@ -31237,8 +31358,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xEF, 0xC7, 0x05, 0x6C, 0x4E, 0x81, 0x86, 0x77, 0x57, 0xBE, 0xA6, 0x2F, 0x69, 0x29, 0x56, 0x9A,
-        0x94, 0x4A, 0xFC, 0x44, 0x42, 0xB9, 0xC8, 0x5C, 0x8A, 0x04, 0xC8, 0xF6, 0x78, 0xE7, 0x59, 0x05,
+        0xC2, 0xFC, 0x3A, 0x47, 0xDF, 0x2B, 0x17, 0x76, 0x78, 0xDB, 0x5F, 0x73, 0x7D, 0x70, 0xEF, 0x97,
+        0xCF, 0x89, 0xEC, 0xA0, 0xE0, 0x79, 0x15, 0xF5, 0xCF, 0x4A, 0x17, 0x46, 0xCE, 0xFE, 0x50, 0x3D,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
