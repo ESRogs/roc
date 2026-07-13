@@ -917,6 +917,121 @@ const CheckPostcheckArchitectureStep = struct {
     }
 };
 
+const CheckWasmBuiltinRoutingStep = struct {
+    step: Step,
+
+    fn create(b: *std.Build) *CheckWasmBuiltinRoutingStep {
+        const self = b.allocator.create(CheckWasmBuiltinRoutingStep) catch @panic("OOM");
+        self.* = .{
+            .step = Step.init(.{
+                .id = Step.Id.custom,
+                .name = "check-wasm-builtin-routing",
+                .owner = b,
+                .makeFn = make,
+            }),
+        };
+        return self;
+    }
+
+    fn make(step: *Step, _: Step.MakeOptions) !void {
+        const b = step.owner;
+        if (builtin.os.tag == .windows) {
+            std.debug.print("Skipping WASM builtin routing check on Windows (perl not available)\n", .{});
+            return;
+        }
+
+        const io = b.graph.io;
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "perl", "ci/check_wasm_builtin_routing.pl" },
+            .environ_map = &b.graph.environ_map,
+        });
+        const term = try child.wait(io);
+        switch (term) {
+            .exited => |code| if (code != 0) {
+                return step.fail(
+                    "WASM builtin routing check failed. Run 'perl ci/check_wasm_builtin_routing.pl' to see details.",
+                    .{},
+                );
+            },
+            else => return step.fail("ci/check_wasm_builtin_routing.pl terminated abnormally", .{}),
+        }
+    }
+};
+
+/// Build step that fails when tracked snapshots differ from the freshly regenerated
+/// output. Detects whether the build root is backed by Git or JJ and invokes the
+/// matching diff command directly. This deliberately avoids shelling out through
+/// `sh -c`, which is not available on Windows (it fails to spawn with FileNotFound).
+const CheckSnapshotDiffStep = struct {
+    step: Step,
+
+    const regen_hint = "Tracked snapshots changed after regeneration. Run 'zig build run-snapshot-tool' and commit the result.\n{s}";
+
+    fn create(b: *std.Build) *CheckSnapshotDiffStep {
+        const self = b.allocator.create(CheckSnapshotDiffStep) catch @panic("OOM");
+        self.* = .{
+            .step = Step.init(.{
+                .id = Step.Id.custom,
+                .name = "check-snapshot-diff",
+                .owner = b,
+                .makeFn = make,
+            }),
+        };
+        return self;
+    }
+
+    fn make(step: *Step, _: Step.MakeOptions) !void {
+        const b = step.owner;
+        const io = b.graph.io;
+
+        // Prefer Git when the working directory is inside a Git work tree.
+        const in_git = blk: {
+            const probe = std.process.run(b.allocator, io, .{
+                .argv = &.{ "git", "rev-parse", "--is-inside-work-tree" },
+            }) catch break :blk false;
+            defer b.allocator.free(probe.stdout);
+            defer b.allocator.free(probe.stderr);
+            break :blk probe.term == .exited and probe.term.exited == 0 and
+                std.mem.eql(u8, std.mem.trim(u8, probe.stdout, " \n\r\t"), "true");
+        };
+
+        if (in_git) {
+            const result = try std.process.run(b.allocator, io, .{
+                .argv = &.{ "git", "diff", "--exit-code", "test/snapshots" },
+            });
+            defer b.allocator.free(result.stdout);
+            defer b.allocator.free(result.stderr);
+            if (!(result.term == .exited and result.term.exited == 0)) {
+                return step.fail(regen_hint, .{result.stdout});
+            }
+            return;
+        }
+
+        // Fall back to JJ for a standalone JJ workspace (no Git backing).
+        const in_jj = blk: {
+            std.Io.Dir.cwd().access(io, ".jj", .{}) catch break :blk false;
+            break :blk true;
+        };
+
+        if (in_jj) {
+            const result = try std.process.run(b.allocator, io, .{
+                .argv = &.{ "jj", "diff", "--summary", "test/snapshots" },
+            });
+            defer b.allocator.free(result.stdout);
+            defer b.allocator.free(result.stderr);
+            if (!(result.term == .exited and result.term.exited == 0)) {
+                return step.fail("jj diff --summary test/snapshots failed:\n{s}", .{result.stderr});
+            }
+            if (std.mem.trim(u8, result.stdout, " \n\r\t").len != 0) {
+                return step.fail(regen_hint, .{result.stdout});
+            }
+            return;
+        }
+
+        return step.fail("run-check-snapshots requires a Git or JJ workspace", .{});
+    }
+};
+
 /// Build step that checks for @panic and std.debug.panic usage in interpreter and builtins.
 ///
 /// In Roc's design philosophy, compile-time errors become runtime errors with helpful messages.
@@ -2257,6 +2372,7 @@ pub fn build(b: *std.Build) void {
     const run_check_unused_suppression_step = b.step("run-check-unused-suppression", "Check unused-variable suppression patterns");
     const run_check_semantic_audit_step = b.step("run-check-semantic-audit", "Run the checked-data audit gate");
     const run_check_postcheck_architecture_step = b.step("run-check-postcheck-architecture", "Check that deleted post-check output/remapping APIs stay gone");
+    const run_check_wasm_builtin_routing_step = b.step("run-check-wasm-builtin-routing", "Check that WASM builtin calls use explicit host/relocation routing");
     const run_check_panic_step = b.step("run-check-panic", "Check forbidden panic usage in interpreter and builtins");
     const run_check_cli_global_stdio_step = b.step("run-check-cli-global-stdio", "Check forbidden global stdio usage in CLI code");
     const run_check_test_wiring_step = b.step("run-check-test-wiring", "Check test files are wired");
@@ -2457,7 +2573,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const roc_modules = modules.RocModules.create(b, build_options, zstd, valgrind_support);
+    const roc_modules = modules.RocModules.create(b, build_options, zstd);
 
     // Build-time compiler for builtin .roc modules
     //
@@ -2782,6 +2898,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "test_harness", .module = createTestHarnessModule(b, roc_modules) },
                     .{ .name = "collections", .module = roc_modules.collections },
+                    .{ .name = "backend", .module = roc_modules.backend },
                     .{ .name = "bytebox", .module = bytebox.module("bytebox") },
                 },
             }),
@@ -3177,11 +3294,7 @@ pub fn build(b: *std.Build) void {
         run_snapshot_tool_step,
         run_args,
     );
-    const check_snapshot_diff = b.addSystemCommand(&.{
-        "sh",
-        "-c",
-        "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git diff --exit-code test/snapshots; elif test -d .jj; then test -z \"$(jj diff --summary test/snapshots)\"; else echo 'run-check-snapshots requires a Git or JJ workspace' >&2; exit 1; fi",
-    });
+    const check_snapshot_diff = CheckSnapshotDiffStep.create(b);
     check_snapshot_diff.step.dependOn(run_snapshot_tool_step);
     run_check_snapshots_step.dependOn(&check_snapshot_diff.step);
 
@@ -3613,6 +3726,17 @@ pub fn build(b: *std.Build) void {
         build_wasm_list_builtin_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_list_builtin_app.step);
 
+        const build_wasm_builtin_routing_app = b.addRunArtifact(roc_exe);
+        build_wasm_builtin_routing_app.addArgs(&.{
+            "build",
+            "test/wasm/builtin_routing_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/builtin_routing_static_lib_app.wasm.a",
+        });
+        build_wasm_builtin_routing_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_builtin_routing_app.step);
+
         const build_wasm_single_variant_hosted_app = b.addRunArtifact(roc_exe);
         build_wasm_single_variant_hosted_app.addArgs(&.{
             "build",
@@ -3635,6 +3759,72 @@ pub fn build(b: *std.Build) void {
         build_wasm_str_concat_join_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_str_concat_join_app.step);
 
+        // End-to-end cart gate for the minted-iterator `for`-loop drive. The
+        // size build covers the LLVM cart path, and the dev build covers wasm
+        // composite loop-state rebinding for recursive generated iterators.
+        const build_wasm_iter_for_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_for_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_static_lib_app.wasm",
+        });
+        build_wasm_iter_for_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_app.step);
+
+        const build_wasm_iter_for_dev_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_for_dev_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_static_lib_app_dev.wasm",
+        });
+        build_wasm_iter_for_dev_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_dev_app.step);
+
+        // Dev-mode recursive iterator construction must converge at the
+        // explicit forced-dynamic representation tier.
+        const build_wasm_iter_recursive_concat_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_recursive_concat_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_recursive_concat_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/iter_recursive_concat_static_lib_app.wasm",
+        });
+        build_wasm_iter_recursive_concat_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_recursive_concat_app.step);
+
+        // Static-data hoisting gate: a constant list literal consumed via
+        // `.iter()` must materialize as static data and allocate nothing, so the
+        // whole minted chain (base list included) is zero-alloc on the cart path.
+        const build_wasm_iter_list_hoist_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_list_hoist_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_list_hoist_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_list_hoist_static_lib_app.wasm",
+        });
+        build_wasm_iter_list_hoist_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_list_hoist_app.step);
+
+        // Noiter twin: the same sums over plain list literals. The runner prints
+        // each cart's byte size, so the iter build minus this baseline is the
+        // minted-adapter premium tracked in CI (the fusion pass's target).
+        const build_wasm_iter_noiter_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_noiter_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_noiter_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_noiter_static_lib_app.wasm",
+        });
+        build_wasm_iter_noiter_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_noiter_app.step);
+
         const build_wasm_rc_cleanup_app = b.addRunArtifact(roc_exe);
         build_wasm_rc_cleanup_app.addArgs(&.{
             "build",
@@ -3656,6 +3846,17 @@ pub fn build(b: *std.Build) void {
         });
         build_wasm_rc_cleanup_model_list_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_rc_cleanup_model_list_app.step);
+
+        const build_wasm_boxed_model_update_app = b.addRunArtifact(roc_exe);
+        build_wasm_boxed_model_update_app.addArgs(&.{
+            "build",
+            "test/wasm/boxed_model_update_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/boxed_model_update_static_lib_app.wasm",
+        });
+        build_wasm_boxed_model_update_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_boxed_model_update_app.step);
 
         const wasm_test_exe = b.addExecutable(.{
             .name = "wasm_static_lib_test",
@@ -3732,6 +3933,81 @@ pub fn build(b: *std.Build) void {
             run_wasm_str_concat_join_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_str_concat_join_test.step);
 
+            // Boot-and-play the minted-iterator `for`-loop cart; "ok" means every
+            // inlined `for` over append/map/concat/chained minted chains ran to
+            // completion with correct sums (i.e. the drive advanced its inner
+            // iterators and terminated). `--assert-alloc-balanced` also catches a
+            // per-step allocate/free leak in the drive.
+            const run_wasm_iter_for_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_for_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+                // Absolute-size ceiling: the un-fused minted cart is ~48 KB
+                // (premium ~18 KB over the noiter twin). This catches a gross
+                // size blowup; the premium itself is read from the two printed
+                // sizes and is the fusion pass's target, not a hard gate pre-fusion.
+                "--max-bytes",
+                "65536",
+            });
+            run_wasm_iter_for_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_test.step);
+
+            const run_wasm_iter_recursive_concat_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_recursive_concat_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_recursive_concat_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+                // The fixed cart is ~542 KB. The prior unbounded generated
+                // callable expansion exceeded 815 KB before failing to lower.
+                "--max-bytes",
+                "600000",
+            });
+            run_wasm_iter_recursive_concat_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_recursive_concat_test.step);
+
+            // Static-data hoisting: the constant list literal is materialized as
+            // static data, so the whole chain allocates nothing. `--max-allocs 0`
+            // is a strictly stronger assertion than `--assert-alloc-balanced`.
+            const run_wasm_iter_list_hoist_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_list_hoist_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_list_hoist_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--max-allocs",
+                "0",
+            });
+            run_wasm_iter_list_hoist_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_list_hoist_test.step);
+
+            const run_wasm_iter_for_dev_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_for_dev_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_static_lib_app_dev.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+            });
+            run_wasm_iter_for_dev_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_dev_test.step);
+
+            // Noiter twin — asserts correctness and prints its size so CI logs
+            // carry both numbers for premium tracking.
+            const run_wasm_iter_noiter_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_noiter_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_noiter_static_lib_app.wasm",
+                "--expected",
+                "ok",
+            });
+            run_wasm_iter_noiter_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_noiter_test.step);
+
             const run_wasm_rc_cleanup_test = b.addRunArtifact(wasm_test_exe);
             run_wasm_rc_cleanup_test.addArgs(&.{
                 "--wasm-path",
@@ -3757,6 +4033,16 @@ pub fn build(b: *std.Build) void {
             });
             run_wasm_rc_cleanup_model_list_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_rc_cleanup_model_list_test.step);
+
+            const run_wasm_boxed_model_update_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_boxed_model_update_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/boxed_model_update_static_lib_app.wasm",
+                "--expected",
+                "ok",
+            });
+            run_wasm_boxed_model_update_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_boxed_model_update_test.step);
         }
         run_wasm_test.step.dependOn(build_test_wasm_static_lib_runner_step);
         run_test_wasm_static_lib_step.dependOn(&run_wasm_test.step);
@@ -4454,6 +4740,9 @@ pub fn build(b: *std.Build) void {
     // Add check that deleted post-check output/remapping APIs do not reappear
     const check_postcheck_architecture = CheckPostcheckArchitectureStep.create(b);
     run_check_postcheck_architecture_step.dependOn(&check_postcheck_architecture.step);
+
+    const check_wasm_builtin_routing = CheckWasmBuiltinRoutingStep.create(b);
+    run_check_wasm_builtin_routing_step.dependOn(&check_wasm_builtin_routing.step);
 
     // Add check that semantic compiler stages do not recover missing data.
     const run_semantic_audit = ci_steps.SemanticAuditStep.create(b);
@@ -5721,6 +6010,7 @@ fn addMainExe(
                     .single_threaded = true,
                 }),
             });
+            default_platform_runtime_obj.root_module.addImport("roc_str_view", roc_modules.roc_str_view);
             default_platform_runtime_obj.root_module.stack_check = false;
             default_platform_runtime_obj.root_module.link_libc = false;
             default_platform_runtime_obj.bundle_compiler_rt = false;
@@ -5736,14 +6026,20 @@ fn addMainExe(
         }
     }
 
+    const use_bundled_deps = !use_system_llvm and user_llvm_path == null;
+
     const config = b.addOptions();
     config.addOption(bool, "llvm", true);
+    config.addOption(bool, "binaryen", use_bundled_deps);
     exe.root_module.addOptions("config", config);
     exe.root_module.addAnonymousImport("legal_details", .{ .root_source_file = b.path("legal_details") });
 
     const llvm_paths_exe = llvmPaths(b, target, use_system_llvm, user_llvm_path) orelse return null;
     exe.root_module.addLibraryPath(.{ .cwd_relative = llvm_paths_exe.lib });
     exe.root_module.addIncludePath(.{ .cwd_relative = llvm_paths_exe.include });
+    if (use_bundled_deps) {
+        addStaticBinaryenOptionsToModule(exe.root_module);
+    }
     try addStaticLlvmOptionsToModule(exe.root_module);
 
     add_tracy(b, roc_modules.build_options, exe, target, true, tracy);
@@ -6040,6 +6336,18 @@ fn addStaticLlvmOptionsToModule(mod: *std.Build.Module) !void {
         mod.linkSystemLibrary("uuid", .{});
         mod.linkSystemLibrary("ole32", .{});
     }
+}
+
+fn addStaticBinaryenOptionsToModule(mod: *std.Build.Module) void {
+    const link_static = std.Build.Module.LinkSystemLibraryOptions{
+        .preferred_link_mode = .static,
+        .search_strategy = .mode_first,
+    };
+    mod.addCSourceFile(.{
+        .file = .{ .cwd_relative = "src/build/zig_binaryen.cpp" },
+        .flags = &exe_cflags,
+    });
+    mod.linkSystemLibrary("binaryen", link_static);
 }
 
 const cpp_sources = [_][]const u8{

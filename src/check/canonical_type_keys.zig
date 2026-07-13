@@ -52,6 +52,26 @@ pub fn fromVarInfo(
     };
 }
 
+/// Public `identityVarsFromVar` function.
+///
+/// The identity variables (flex/rigid) reachable from `var_`, in the exact
+/// first-encounter order the canonical key digest assigns them slots
+/// (`writeIdentityVariable`). The index in the returned slice IS the identity
+/// slot embedded in the key bytes, so two representations of the same type
+/// (solver vars here, checked payloads in a `CheckedTypeStore`) enumerate
+/// identities in the same order. Caller owns the returned slice.
+pub fn identityVarsFromVar(
+    allocator: Allocator,
+    store: *const TypeStore,
+    env: *const ModuleEnv,
+    var_: Var,
+) Allocator.Error![]types.Var {
+    var builder = Builder.init(allocator, store, env);
+    defer builder.deinit();
+    try builder.writeVar(var_);
+    return try allocator.dupe(types.Var, builder.identity_variables.items);
+}
+
 /// Public `fromConcreteVar` function.
 pub fn fromConcreteVar(
     allocator: Allocator,
@@ -98,6 +118,22 @@ pub fn schemeFromVar(
     return .{ .bytes = builder.hasher.finalResult() };
 }
 
+/// Whether the canonical-key traversal for `var_` reaches erroneous checked
+/// type content. This uses the key builder itself in detection mode, so guards
+/// for later key construction cannot accidentally inspect a narrower graph.
+pub fn containsError(
+    allocator: Allocator,
+    store: *const TypeStore,
+    env: *const ModuleEnv,
+    var_: Var,
+) Allocator.Error!bool {
+    var builder = Builder.init(allocator, store, env);
+    defer builder.deinit();
+    builder.detect_errors = true;
+    try builder.writeVar(var_);
+    return builder.contains_error;
+}
+
 const Builder = struct {
     allocator: Allocator,
     store: *const TypeStore,
@@ -108,6 +144,8 @@ const Builder = struct {
     identity_variables: std.ArrayList(Var),
     require_concrete: bool = false,
     contains_identity_variables: bool = false,
+    detect_errors: bool = false,
+    contains_error: bool = false,
 
     fn init(allocator: Allocator, store: *const TypeStore, env: *const ModuleEnv) Builder {
         return .{
@@ -195,7 +233,10 @@ const Builder = struct {
 
     fn writeContent(self: *Builder, content: types.Content) Allocator.Error!void {
         switch (content) {
-            .err => invariantViolation("canonical type key requested for erroneous checked type"),
+            .err => {
+                if (self.detect_errors) self.contains_error = true;
+                self.writeTag("err");
+            },
             .flex => |flex| {
                 if (self.require_concrete) {
                     if (self.flexLiteralDefaultKind(flex)) |kind| {
@@ -286,6 +327,9 @@ const Builder = struct {
                 try self.writeVarRange(tuple.elems);
             },
             .nominal_type => |nominal| {
+                if (self.detect_errors and self.store.nominalDeclIsInvalid(nominal)) {
+                    self.contains_error = true;
+                }
                 self.writeTag("nominal");
                 self.writeNamedSourceIdentity(nominal.origin_module, nominal.ident.ident_idx, nominal.sourceDeclOptional());
                 self.writeBool(nominal.isOpaque());
@@ -657,6 +701,21 @@ test "canonical type key declarations are referenced" {
     std.testing.refAllDecls(@This());
 }
 
+test "erroneous checked types have a canonical key" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+
+    var store = try TypeStore.initCapacity(allocator, 1, 0);
+    defer store.deinit();
+    const err_var = try store.freshFromContent(.err);
+
+    const first = try fromVar(allocator, &store, &env, err_var);
+    const second = try fromVar(allocator, &store, &env, err_var);
+    try std.testing.expectEqual(first, second);
+}
+
 test "concrete keys default open literal flex vars per kind (numeral -> Dec, quote -> Str)" {
     const allocator = std.testing.allocator;
 
@@ -745,4 +804,27 @@ test "source type keys normalize closed empty tag unions to empty tag union" {
     const closed_key = try fromVar(allocator, &store, &env, closed_empty);
 
     try std.testing.expectEqualSlices(u8, empty_key.bytes[0..], closed_key.bytes[0..]);
+}
+
+test "canonical error detection traverses alias arguments" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+    try env.setContentIdentity([_]u8{0xA5} ** 32);
+    const alias_ident = try env.insertIdent(Ident.for_text("Alias"));
+
+    var store = try TypeStore.initCapacity(allocator, 16, 8);
+    defer store.deinit();
+
+    const backing = try store.freshFromContent(.{ .structure = .empty_record });
+    const erroneous_arg = try store.freshFromContent(.err);
+    const alias = try store.freshFromContent(try store.mkAlias(
+        .{ .ident_idx = alias_ident },
+        backing,
+        &.{erroneous_arg},
+        env.selfModuleIdentity(),
+    ));
+
+    try std.testing.expect(try containsError(allocator, &store, &env, alias));
 }

@@ -32,12 +32,37 @@ pub const RocList = extern struct {
     // This pointer is to the first element of the original list.
     capacity_or_alloc_ptr: usize,
 
+    /// Number of pointer-sized words in a RocList's in-memory layout. The layout
+    /// is target-width parameterized: its byte size is `word_count` times the
+    /// target pointer width. Sites that build a RocList for a target of a
+    /// different width than the host multiply this by the target word size.
+    pub const word_count = 3;
+
+    /// Big-list capacities are stored shifted left by this many bits so the low
+    /// bit stays free for the seamless-slice tag.
+    pub const capacity_shift = 1;
+
+    comptime {
+        std.debug.assert(word_count * @sizeOf(usize) == @sizeOf(RocList));
+    }
+
+    fn encodeCapacityGeneric(comptime T: type, capacity: T) T {
+        return capacity << capacity_shift;
+    }
+
     pub inline fn encodeCapacity(capacity: usize) usize {
-        return capacity << 1;
+        return encodeCapacityGeneric(usize, capacity);
+    }
+
+    /// Encode a big-list capacity for a target whose pointer width may differ
+    /// from the host's. Applies the same shift as the host-width
+    /// `encodeCapacity`, but on a `u64` so it can hold any target word's value.
+    pub fn encodeCapacityForWidth(capacity: u64) u64 {
+        return encodeCapacityGeneric(u64, capacity);
     }
 
     pub inline fn decodeCapacity(encoded_capacity: usize) usize {
-        return encoded_capacity >> 1;
+        return encoded_capacity >> capacity_shift;
     }
 
     pub inline fn encodeSliceAllocationPtr(alloc_ptr: [*]u8) usize {
@@ -175,6 +200,32 @@ pub const RocList = extern struct {
         self.increfWithAtomicity(amount, elements_refcounted, .atomic, roc_ops);
     }
 
+    /// Walk every element in the list's backing allocation and apply `dec` to
+    /// each. This is the single definition of the "a dying unique refcounted
+    /// list decrefs its children first" traversal: the compiled `decref` path
+    /// and the interpreter's list teardown both route through it, so they
+    /// cannot disagree about which elements are visited. For seamless slices,
+    /// `getAllocationElementCount` reads the heap-stored whole-allocation
+    /// element count, so teardown visits elements outside the visible slice
+    /// window too. Callers own the uniqueness gate before invoking this.
+    pub fn decrefElements(
+        self: RocList,
+        element_width: usize,
+        dec_context: ?*anyopaque,
+        dec: Dec,
+        roc_ops: *RocOps,
+    ) void {
+        if (self.getAllocationDataPtr(roc_ops)) |source| {
+            const count = self.getAllocationElementCount(true, roc_ops);
+
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const element = source + i * element_width;
+                dec(dec_context, element);
+            }
+        }
+    }
+
     /// Always uses atomic count updates: this entry serves primitive-internal
     /// RC inside runtime-checked list ops, which serve both modes and make no
     /// thread-confinement claim. Single-thread statement teardown instead goes
@@ -191,19 +242,8 @@ pub const RocList = extern struct {
         roc_ops: *RocOps,
     ) void {
         // If unique, decref will free the list. Before that happens, all elements must be decremented.
-        // For seamless slices, getAllocationElementCount reads the heap-stored
-        // whole-allocation element count, so full teardown visits elements
-        // outside the visible slice window too.
         if (elements_refcounted and self.isUnique(roc_ops)) {
-            if (self.getAllocationDataPtr(roc_ops)) |source| {
-                const count = self.getAllocationElementCount(elements_refcounted, roc_ops);
-
-                var i: usize = 0;
-                while (i < count) : (i += 1) {
-                    const element = source + i * element_width;
-                    dec(dec_context, element);
-                }
-            }
+            self.decrefElements(element_width, dec_context, dec, roc_ops);
         }
 
         // We use the raw capacity to ensure we always decrement the refcount of seamless slices.

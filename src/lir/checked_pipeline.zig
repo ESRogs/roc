@@ -12,6 +12,9 @@ const core = @import("lir_core");
 
 const Arc = @import("arc.zig");
 const Trmc = @import("trmc.zig");
+const BoxReuse = @import("box_reuse.zig");
+const ReturnSlot = @import("return_slot.zig");
+const StrAppend = @import("str_append.zig");
 const ScalarizeJoins = @import("scalarize_joins.zig");
 const TagReachability = @import("tag_reachability.zig");
 const ReachableProcs = @import("reachable_procs.zig");
@@ -219,6 +222,8 @@ pub fn lowerCheckedModulesToLir(
         .{
             .proc_debug_names = target.proc_debug_names,
             .specialization_cache = target.monotype_cache,
+            .static_data_literals = target.checked_module_state == .complete and roots.include_static_data_exports,
+            .target_usize = target.target_usize,
             .inline_expects = switch (target.inline_expects) {
                 .run => .run,
                 .omit => .omit,
@@ -252,6 +257,10 @@ pub fn lowerCheckedModulesToLir(
         .inline_plan = inline_plan.view(),
         .inline_expects = target.inline_expects,
         .list_in_place_map = target.list_in_place_map,
+        .dict_seed_mode = switch (target.checked_module_state) {
+            .complete => .runtime,
+            .checking_finalization => .comptime_zero,
+        },
         .proc_debug_names = target.proc_debug_names,
         .layout_request_const_plans = target.layout_request_const_plans,
         .test_plan_metadata = roots.test_plan_metadata,
@@ -265,6 +274,9 @@ pub fn lowerCheckedModulesToLir(
     // statements (see src/lir/trmc.zig).
     try Trmc.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
     try ScalarizeJoins.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
+    try BoxReuse.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
+    try ReturnSlot.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
+    try StrAppend.run(&lowered.lir_result.store);
     if (target.tag_reachability) {
         try TagReachability.run(&lowered.lir_result);
     }
@@ -399,7 +411,10 @@ fn collectStaticDataRequests(
         switch (provided) {
             .data => |data| {
                 if (try checkedTypeContainsFunction(allocator, root.checked_types.view(), data.checked_type)) {
-                    try requests.append(allocator, .{ .data = data });
+                    try requests.append(allocator, .{
+                        .const_locator = data.const_ref,
+                        .checked_type = data.checked_type,
+                    });
                 }
             },
             .procedure => {},
@@ -432,6 +447,7 @@ fn checkedTypeContainsFunctionInner(
     if (index >= types.payloadCount()) checkedPipelineInvariant("checked type function scan referenced a missing type");
     return switch (types.payload(root)) {
         .pending => checkedPipelineInvariant("checked type function scan reached a pending type"),
+        .err => false,
         .function => true,
         .alias => |alias| (try checkedTypeContainsFunctionInner(types, alias.backing, active)) or
             try checkedTypeSliceContainsFunction(types, alias.args, active),

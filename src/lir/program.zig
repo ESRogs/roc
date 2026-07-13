@@ -41,6 +41,7 @@ pub const FnTemplate = struct {
     fn_def: const_store.FnDef,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
+    const_evidence_chain: const_store.ConstRange = .{},
 };
 
 /// Capture field copied from a checked binder into a callable payload.
@@ -123,6 +124,20 @@ pub const ConstRootPlan = struct {
     plan: ConstPlanId,
 };
 
+/// One checked value that is materialized as readonly target data.
+pub const StaticDataValue = struct {
+    const_locator: checked.ConstLocator,
+    node: ?checked.ConstNodeId = null,
+    checked_type: checked.CheckedTypeId,
+    layout_idx: layout.Idx,
+    plan: ConstPlanId,
+};
+
+/// Deterministic symbol name for an internal static-data value.
+pub fn staticDataSymbolName(allocator: Allocator, id: LIR.StaticDataId) Allocator.Error![]u8 {
+    return try std.fmt.allocPrint(allocator, "roc__static_const_value_{d}", .{@intFromEnum(id)});
+}
+
 /// Complete LIR program and side data consumed by ARC, backends, and eval.
 pub const Result = struct {
     store: LirStore,
@@ -132,10 +147,15 @@ pub const Result = struct {
     requested_layouts: std.ArrayList(RequestedLayout),
     const_types: const_store.ConstTypeStore,
     const_type_names: names.NameStore,
+    /// Target-independent evidence copied from Monotype. FnTemplate ranges and
+    /// nested target ranges index these pools until ConstStore materialization.
+    const_evidence_pool: std.ArrayList(const_store.ConstEvidence),
+    const_evidence_chain_pool: std.ArrayList(const_store.ConstRange),
     fn_sets: std.ArrayList(FnSet),
     erased_fns: std.ArrayList(ErasedFns),
     const_plans: std.ArrayList(ConstPlan),
     const_roots: std.ArrayList(ConstRootPlan),
+    static_data_values: std.ArrayList(StaticDataValue),
     comptime_sites: std.ArrayList(LIR.ComptimeSite),
 
     pub fn init(allocator: Allocator, target_usize: @import("base").target.TargetUsize) Allocator.Error!Result {
@@ -147,10 +167,13 @@ pub const Result = struct {
             .requested_layouts = .empty,
             .const_types = const_store.ConstTypeStore.init(allocator),
             .const_type_names = names.NameStore.init(allocator),
+            .const_evidence_pool = .empty,
+            .const_evidence_chain_pool = .empty,
             .fn_sets = .empty,
             .erased_fns = .empty,
             .const_plans = .empty,
             .const_roots = .empty,
+            .static_data_values = .empty,
             .comptime_sites = .empty,
         };
     }
@@ -161,6 +184,7 @@ pub const Result = struct {
             allocator.free(site.branch_regions);
         }
         self.comptime_sites.deinit(allocator);
+        self.static_data_values.deinit(allocator);
         deinitConstPlans(allocator, self.const_plans.items);
         self.const_roots.deinit(allocator);
         self.const_plans.deinit(allocator);
@@ -168,6 +192,8 @@ pub const Result = struct {
         deinitErasedFns(allocator, self.erased_fns.items);
         self.erased_fns.deinit(allocator);
         self.fn_sets.deinit(allocator);
+        self.const_evidence_chain_pool.deinit(allocator);
+        self.const_evidence_pool.deinit(allocator);
         self.const_type_names.deinit();
         self.const_types.deinit();
         self.requested_layouts.deinit(allocator);

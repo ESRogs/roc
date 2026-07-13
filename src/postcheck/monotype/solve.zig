@@ -40,6 +40,8 @@ pub const EntryRoot = struct {
 pub const DeferredTemplate = struct {
     fn_id: Ast.FnId,
     template_ref: names.ProcTemplate,
+    /// Checked module whose method registry scope the specialization must use.
+    method_scope: checked.ModuleId,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     /// The requester's live function type cell. `fn_ty` may be replaced by a
@@ -178,32 +180,34 @@ const RelationStamp = struct {
     right_version: u32,
 };
 
-const NominalBackingInstanceId = struct {
+const NominalBackingDeclaration = struct {
     module_bytes: [32]u8,
     declaration_id: u32,
-    args: []const NodeId,
 };
 
-const NominalBackingCacheContext = struct {
-    pub fn hash(_: NominalBackingCacheContext, key: NominalBackingInstanceId) u64 {
+const NominalBackingDeclarationContext = struct {
+    pub fn hash(_: NominalBackingDeclarationContext, key: NominalBackingDeclaration) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(&key.module_bytes);
         var declaration_id = std.mem.nativeToLittle(u32, key.declaration_id);
         hasher.update(std.mem.asBytes(&declaration_id));
-        var arg_len = std.mem.nativeToLittle(u32, @intCast(key.args.len));
-        hasher.update(std.mem.asBytes(&arg_len));
-        for (key.args) |arg| {
-            var raw_arg = std.mem.nativeToLittle(u32, @intFromEnum(arg));
-            hasher.update(std.mem.asBytes(&raw_arg));
-        }
         return hasher.final();
     }
 
-    pub fn eql(_: NominalBackingCacheContext, left: NominalBackingInstanceId, right: NominalBackingInstanceId) bool {
+    pub fn eql(_: NominalBackingDeclarationContext, left: NominalBackingDeclaration, right: NominalBackingDeclaration) bool {
         return std.mem.eql(u8, left.module_bytes[0..], right.module_bytes[0..]) and
-            left.declaration_id == right.declaration_id and
-            nodeSliceEql(left.args, right.args);
+            left.declaration_id == right.declaration_id;
     }
+};
+
+/// One instantiated backing of a declaration, keyed by the argument cells
+/// that seeded the declaration formal scope. Arguments are compared by their
+/// current union-find roots: raw node ids drift as unification merges cells,
+/// and comparing raw ids would treat the same instantiation as new each time
+/// its arguments gain evidence.
+const NominalBackingInstance = struct {
+    args: []NodeId,
+    node: NodeId,
 };
 
 /// Per-specialization type solver. Checked types instantiate into union-find
@@ -245,13 +249,37 @@ pub const InstGraph = struct {
     /// dirty marks propagate through these back references.
     row_parents: std.AutoHashMap(NodeId, std.ArrayList(NodeId)),
     /// Declaration-backed nominal backings already instantiated in this graph,
-    /// keyed by the source declaration and the exact argument cells that seeded
-    /// the declaration formal scope. This preserves per-argument correctness
-    /// without rebuilding the same backing template repeatedly.
-    nominal_backings: std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80),
+    /// bucketed by source declaration. Instances inside a bucket compare their
+    /// argument cells by union-find root, so an instantiation stays shared
+    /// after unification merges or redirects its argument nodes. This
+    /// preserves per-argument correctness without rebuilding the same backing
+    /// template repeatedly.
+    nominal_backings: std.HashMap(NominalBackingDeclaration, std.ArrayList(NominalBackingInstance), NominalBackingDeclarationContext, 80),
     /// Template body requests made while lowering this specialization,
     /// processed once its body is complete and its types are final.
     deferred_templates: std.ArrayList(DeferredTemplate) = .empty,
+    /// Worklist and per-walk relation dedup for `unify`. One walk is active at
+    /// a time; a `unify` call issued while a walk is draining (a row-empty
+    /// collapse inside `unifyConcrete`) queues its pair onto the active walk,
+    /// which resolves the same constraints because unification is
+    /// order-independent.
+    unify_pending: std.ArrayList(NodePair) = .empty,
+    unify_related: std.AutoHashMap(NodePair, void),
+    unify_active: bool = false,
+    /// Reused traversal state for `markDirty` (never re-entered: dirty marking
+    /// only walks row back references).
+    dirty_mark_pending: std.ArrayList(NodeId) = .empty,
+    dirty_mark_visited: std.AutoHashMap(NodeId, void),
+    /// Reused row-collection state for `flattenTagRow`/`flattenRecordRow`.
+    /// Flattening reads node contents and allocates only fresh nodes and arena
+    /// copies, so no call inside the collection window can start another
+    /// flatten.
+    flat_tags_scratch: std.ArrayList(InstTag) = .empty,
+    flat_fields_scratch: std.ArrayList(InstField) = .empty,
+    row_seen_scratch: std.AutoHashMap(NodeId, void),
+    /// Reused chain-walk state for `findStructuralBackingNode`. Backing chains
+    /// are short, so membership is a linear scan.
+    backing_chain_scratch: std.ArrayList(NodeId) = .empty,
 
     pub fn create(
         allocator: Allocator,
@@ -275,13 +303,24 @@ pub const InstGraph = struct {
             .dirty_set = std.AutoHashMap(NodeId, void).init(allocator),
             .row_exts = std.AutoHashMap(NodeId, NodeId).init(allocator),
             .row_parents = std.AutoHashMap(NodeId, std.ArrayList(NodeId)).init(allocator),
-            .nominal_backings = std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80).init(allocator),
+            .nominal_backings = std.HashMap(NominalBackingDeclaration, std.ArrayList(NominalBackingInstance), NominalBackingDeclarationContext, 80).init(allocator),
+            .unify_related = std.AutoHashMap(NodePair, void).init(allocator),
+            .dirty_mark_visited = std.AutoHashMap(NodeId, void).init(allocator),
+            .row_seen_scratch = std.AutoHashMap(NodeId, void).init(allocator),
         };
         return graph;
     }
 
     pub fn destroy(self: *InstGraph) void {
         const allocator = self.allocator;
+        self.backing_chain_scratch.deinit(allocator);
+        self.row_seen_scratch.deinit();
+        self.flat_fields_scratch.deinit(allocator);
+        self.flat_tags_scratch.deinit(allocator);
+        self.dirty_mark_visited.deinit();
+        self.dirty_mark_pending.deinit(allocator);
+        self.unify_related.deinit();
+        self.unify_pending.deinit(allocator);
         self.deferred_templates.deinit(allocator);
         var views = self.node_monos.valueIterator();
         while (views.next()) |list| {
@@ -291,6 +330,10 @@ pub const InstGraph = struct {
         var parents = self.row_parents.valueIterator();
         while (parents.next()) |list| {
             list.deinit(allocator);
+        }
+        var backing_buckets = self.nominal_backings.valueIterator();
+        while (backing_buckets.next()) |bucket| {
+            bucket.deinit(allocator);
         }
         self.nominal_backings.deinit();
         self.row_parents.deinit();
@@ -323,11 +366,21 @@ pub const InstGraph = struct {
         declaration_id: u32,
         args: []const NodeId,
     ) ?NodeId {
-        return self.nominal_backings.get(.{
+        const bucket = self.nominal_backings.getPtr(.{
             .module_bytes = module_bytes,
             .declaration_id = declaration_id,
-            .args = args,
-        });
+        }) orelse return null;
+        instances: for (bucket.items) |*instance| {
+            if (instance.args.len != args.len) continue;
+            for (instance.args, args) |*stored, wanted| {
+                // Repoint the stored cell at its current root so repeated
+                // lookups after heavy unification stay cheap.
+                stored.* = self.find(stored.*);
+                if (stored.* != self.find(wanted)) continue :instances;
+            }
+            return instance.node;
+        }
+        return null;
     }
 
     pub fn putNominalBackingNode(
@@ -338,12 +391,18 @@ pub const InstGraph = struct {
         node: NodeId,
     ) Allocator.Error!void {
         const stored_args = try self.arena().alloc(NodeId, args.len);
-        @memcpy(stored_args, args);
-        try self.nominal_backings.put(.{
+        for (stored_args, args) |*stored, arg| {
+            stored.* = self.find(arg);
+        }
+        const bucket = try self.nominal_backings.getOrPut(.{
             .module_bytes = module_bytes,
             .declaration_id = declaration_id,
+        });
+        if (!bucket.found_existing) bucket.value_ptr.* = .empty;
+        try bucket.value_ptr.append(self.allocator, .{
             .args = stored_args,
-        }, node);
+            .node = node,
+        });
     }
 
     fn registerRowParent(self: *InstGraph, row: NodeId, node_content: InstNode) Allocator.Error!void {
@@ -466,23 +525,21 @@ pub const InstGraph = struct {
     /// Queue the views of a changed root and of every row whose flattened view
     /// chains through it for a content refill.
     fn markDirty(self: *InstGraph, changed: NodeId) Allocator.Error!void {
-        var pending = std.ArrayList(NodeId).empty;
-        defer pending.deinit(self.allocator);
-        var visited = std.AutoHashMap(NodeId, void).init(self.allocator);
-        defer visited.deinit();
-        try pending.append(self.allocator, changed);
-        while (pending.pop()) |raw| {
+        self.dirty_mark_pending.clearRetainingCapacity();
+        self.dirty_mark_visited.clearRetainingCapacity();
+        try self.dirty_mark_pending.append(self.allocator, changed);
+        while (self.dirty_mark_pending.pop()) |raw| {
             const root = self.find(raw);
-            if (visited.contains(root)) continue;
-            try visited.put(root, {});
+            if (self.dirty_mark_visited.contains(root)) continue;
+            try self.dirty_mark_visited.put(root, {});
             if (self.node_monos.contains(root)) {
                 try self.queueDirty(root);
             }
             if (self.row_parents.get(root)) |parents| {
-                try pending.appendSlice(self.allocator, parents.items);
+                try self.dirty_mark_pending.appendSlice(self.allocator, parents.items);
             }
             if (self.row_parents.get(raw)) |parents| {
-                if (raw != root) try pending.appendSlice(self.allocator, parents.items);
+                if (raw != root) try self.dirty_mark_pending.appendSlice(self.allocator, parents.items);
             }
         }
     }
@@ -544,13 +601,20 @@ pub const InstGraph = struct {
     }
 
     pub fn unify(self: *InstGraph, a: NodeId, b: NodeId) Allocator.Error!void {
-        var pending = std.ArrayList(NodePair).empty;
-        defer pending.deinit(self.allocator);
-        var related = std.AutoHashMap(NodePair, void).init(self.allocator);
-        defer related.deinit();
-        try pending.append(self.allocator, .{ .left = a, .right = b });
-        while (pending.pop()) |pair| {
-            try self.unifyRoots(pair.left, pair.right, &pending, &related);
+        try self.unify_pending.append(self.allocator, .{ .left = a, .right = b });
+        // A unify issued while a walk is draining (a row-empty collapse inside
+        // `unifyConcrete`) joins the active walk: constraints resolve
+        // order-independently, so draining the pair later in the same walk is
+        // equivalent to a nested walk, without nested traversal state.
+        if (self.unify_active) return;
+        self.unify_active = true;
+        defer {
+            self.unify_active = false;
+            self.unify_pending.clearRetainingCapacity();
+            self.unify_related.clearRetainingCapacity();
+        }
+        while (self.unify_pending.pop()) |pair| {
+            try self.unifyRoots(pair.left, pair.right, &self.unify_pending, &self.unify_related);
         }
     }
 
@@ -724,11 +788,44 @@ pub const InstGraph = struct {
                         try self.unifyThroughBacking(right, right_content, left, pending);
                         return;
                     }
+                    if (isPublicMintedIteratorPair(left_named, right_named)) {
+                        if (left_named.args.len == 0 or right_named.args.len == 0) {
+                            Common.invariant("minted/public iterator pair reached Monotype instantiation without a public item argument");
+                        }
+                        try pending.append(self.allocator, .{
+                            .left = left_named.args[0],
+                            .right = right_named.args[0],
+                        });
+                        if (left_named.def.iterator_representation == .minted) {
+                            try self.union_(left, right);
+                        } else {
+                            try self.union_(right, left);
+                        }
+                        return;
+                    }
+                    if (isForcedDynamicIteratorPair(left_named, right_named)) {
+                        if (left_named.args.len == 0 or right_named.args.len == 0) {
+                            Common.invariant("forced-dynamic iterator reached Monotype instantiation without a public item argument");
+                        }
+                        try pending.append(self.allocator, .{
+                            .left = left_named.args[0],
+                            .right = right_named.args[0],
+                        });
+                        if (left_named.def.iterator_representation == .forced_dynamic) {
+                            try self.union_(left, right);
+                        } else {
+                            try self.union_(right, left);
+                        }
+                        return;
+                    }
                     if (std.meta.eql(left_named.def, right_named.def) and left_named.args.len == right_named.args.len) {
                         for (left_named.args, right_named.args) |left_arg, right_arg| {
                             try pending.append(self.allocator, .{ .left = left_arg, .right = right_arg });
                         }
-                        if (!sameBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .fields)) {
+                        if (!sameBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .fields) and
+                            !eitherBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .iter) and
+                            !eitherBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .stream))
+                        {
                             if (left_named.backing) |left_backing| {
                                 if (right_named.backing) |right_backing| {
                                     try pending.append(self.allocator, .{ .left = left_backing.node, .right = right_backing.node });
@@ -828,13 +925,14 @@ pub const InstGraph = struct {
     }
 
     fn findStructuralBackingNode(self: *InstGraph, raw: NodeId, owner: InstNamed) Allocator.Error!StructuralBacking {
-        var seen = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.nodes.items.len);
-        defer seen.deinit(self.allocator);
+        const seen = &self.backing_chain_scratch;
+        seen.clearRetainingCapacity();
         var current = self.find(raw);
         while (true) {
-            const index = @intFromEnum(current);
-            if (seen.isSet(index)) return .{ .node = current, .recursive = true };
-            seen.set(index);
+            for (seen.items) |visited| {
+                if (visited == current) return .{ .node = current, .recursive = true };
+            }
+            try seen.append(self.allocator, current);
             const next = self.structuralBackingNext(current, owner) orelse return .{ .node = current, .recursive = false };
             current = next;
         }
@@ -892,7 +990,17 @@ pub const InstGraph = struct {
 
     fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
         return left.module == right.module and
-            left.type_name == right.type_name;
+            left.type_name == right.type_name and
+            left.source_decl == right.source_decl and
+            optionalDigestEql(left.generated, right.generated) and
+            left.iterator_representation == right.iterator_representation and
+            left.iterator_depth == right.iterator_depth;
+    }
+
+    fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {
+        if (left == null and right == null) return true;
+        if (left == null or right == null) return false;
+        return std.mem.eql(u8, left.?.bytes[0..], right.?.bytes[0..]);
     }
 
     const RowKind = enum {
@@ -940,13 +1048,6 @@ pub const InstGraph = struct {
             .tag_union => |row| row,
             else => Common.invariant("instantiation flattened a non-tag-union row"),
         };
-        var tags = std.ArrayList(InstTag).empty;
-        defer tags.deinit(self.allocator);
-        try tags.appendSlice(self.allocator, row.tags);
-
-        var seen = std.AutoHashMap(NodeId, void).init(self.allocator);
-        defer seen.deinit();
-        try seen.put(root, {});
 
         var ext = self.find(row.ext);
         switch (self.nodes.items[@intFromEnum(ext)]) {
@@ -959,6 +1060,18 @@ pub const InstGraph = struct {
             },
             else => {},
         }
+
+        // The collection scratch never survives a call that could start
+        // another flatten: the loop below only reads nodes and appends fresh
+        // nodes, and the collected tags are copied into the arena before the
+        // root is rewritten.
+        const tags = &self.flat_tags_scratch;
+        tags.clearRetainingCapacity();
+        try tags.appendSlice(self.allocator, row.tags);
+
+        const seen = &self.row_seen_scratch;
+        seen.clearRetainingCapacity();
+        try seen.put(root, {});
 
         while (true) {
             if (seen.contains(ext)) {
@@ -991,13 +1104,6 @@ pub const InstGraph = struct {
             .record => |row| row,
             else => Common.invariant("instantiation flattened a non-record row"),
         };
-        var fields = std.ArrayList(InstField).empty;
-        defer fields.deinit(self.allocator);
-        try fields.appendSlice(self.allocator, row.fields);
-
-        var seen = std.AutoHashMap(NodeId, void).init(self.allocator);
-        defer seen.deinit();
-        try seen.put(root, {});
 
         var ext = self.find(row.ext);
         switch (self.nodes.items[@intFromEnum(ext)]) {
@@ -1010,6 +1116,16 @@ pub const InstGraph = struct {
             },
             else => {},
         }
+
+        // Same scratch discipline as `flattenTagRow`: the collection window
+        // contains no call that could start another flatten.
+        const fields = &self.flat_fields_scratch;
+        fields.clearRetainingCapacity();
+        try fields.appendSlice(self.allocator, row.fields);
+
+        const seen = &self.row_seen_scratch;
+        seen.clearRetainingCapacity();
+        try seen.put(root, {});
 
         while (true) {
             if (seen.contains(ext)) {
@@ -1634,10 +1750,10 @@ pub const InstGraph = struct {
     ) Allocator.Error!Type.TypeId {
         const ty = existing orelse return try self.monoFor(node);
         const root = self.find(node);
-        const previous_root = if (self.mono_nodes.get(ty)) |mapped| self.find(mapped) else null;
+        const previous_root = self.monoViewNode(ty) orelse return try self.monoFor(root);
         try self.mono_nodes.put(ty, root);
         try self.registerMonoView(root, ty);
-        if (previous_root == null or previous_root.? != root) {
+        if (previous_root != root) {
             try self.queueDirty(root);
         }
         return ty;
@@ -1648,15 +1764,17 @@ pub const InstGraph = struct {
         nodes_slice: []const NodeId,
         existing: ?Type.Span,
     ) Allocator.Error![]Type.TypeId {
+        const existing_copy = if (existing) |old_span| blk: {
+            const old = self.types.span(old_span);
+            break :blk if (old.len == nodes_slice.len) try GuardedList.dupe(self.allocator, Type.TypeId, old) else null;
+        } else null;
+        defer if (existing_copy) |old| self.allocator.free(old);
+
         const out = try self.arena().alloc(Type.TypeId, nodes_slice.len);
         for (nodes_slice, 0..) |node, index| {
-            const existing_ty: ?Type.TypeId = if (existing) |span| existing_ty: {
-                const old = self.types.span(span);
-                break :existing_ty if (old.len == nodes_slice.len) GuardedList.at(old, index) else null;
-            } else null;
             out[index] = try self.monoForWithReuse(
                 node,
-                existing_ty,
+                if (existing_copy) |old| old[index] else null,
             );
         }
         return out;
@@ -1811,6 +1929,11 @@ pub const GraphTypeFinals = struct {
     }
 
     pub fn sealType(self: *GraphTypeFinals, ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        if (self.isGeneratedIteratorEvidenceType(ty)) {
+            if (self.graph.monoViewNode(ty) != null) return try self.sealStoreType(ty);
+            if (try self.typeHasGraphViews(ty)) return try self.sealStoreType(ty);
+            return ty;
+        }
         if (self.graph.mono_nodes.get(ty)) |raw_node| {
             const node = self.graph.find(raw_node);
             if (self.graph.node_monos.get(node)) |views| {
@@ -1821,6 +1944,19 @@ pub const GraphTypeFinals = struct {
         }
         if (try self.typeHasGraphViews(ty)) return try self.sealStoreType(ty);
         return ty;
+    }
+
+    fn isGeneratedIteratorEvidenceType(self: *GraphTypeFinals, ty: Type.TypeId) bool {
+        return switch (self.graph.types.get(ty)) {
+            .named => |named| switch (named.def.iterator_representation) {
+                .minted, .forced_dynamic => switch (named.builtin_owner orelse return false) {
+                    .iter, .stream => true,
+                    else => false,
+                },
+                .none => false,
+            },
+            else => false,
+        };
     }
 
     pub fn sealNode(self: *GraphTypeFinals, raw_node: NodeId) Allocator.Error!Type.TypeId {
@@ -2261,6 +2397,54 @@ fn sameBuiltinOwner(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch
     return left_owner == owner and right_owner == owner;
 }
 
+fn eitherBuiltinOwner(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner, owner: static_dispatch.BuiltinOwner) bool {
+    if (left) |left_owner| {
+        if (left_owner == owner) return true;
+    }
+    if (right) |right_owner| {
+        if (right_owner == owner) return true;
+    }
+    return false;
+}
+
+fn isForcedDynamicIteratorPair(left: InstNamed, right: InstNamed) bool {
+    if (left.kind != right.kind) return false;
+    if (left.def.module != right.def.module or
+        left.def.type_name != right.def.type_name or
+        left.def.source_decl != right.def.source_decl)
+    {
+        return false;
+    }
+    if (!isIteratorLikeOwnerPair(left.builtin_owner, right.builtin_owner)) return false;
+    return (left.def.iterator_representation == .forced_dynamic) !=
+        (right.def.iterator_representation == .forced_dynamic);
+}
+
+fn isPublicMintedIteratorPair(left: InstNamed, right: InstNamed) bool {
+    if (left.kind != right.kind) return false;
+    if (left.def.module != right.def.module or
+        left.def.type_name != right.def.type_name or
+        left.def.source_decl != right.def.source_decl)
+    {
+        return false;
+    }
+    if (!isIteratorLikeOwnerPair(left.builtin_owner, right.builtin_owner)) return false;
+    return (left.def.iterator_representation == .minted and right.def.iterator_representation == .none) or
+        (left.def.iterator_representation == .none and right.def.iterator_representation == .minted);
+}
+
+fn isIteratorLikeOwnerPair(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner) bool {
+    const owner = left orelse right orelse return false;
+    if (owner != .iter and owner != .stream) return false;
+    if (left) |left_owner| {
+        if (left_owner != owner) return false;
+    }
+    if (right) |right_owner| {
+        if (right_owner != owner) return false;
+    }
+    return true;
+}
+
 fn testCheckedTypeId(comptime value: u32) checked.CheckedTypeId {
     comptime std.debug.assert(value != 0);
     return @enumFromInt(value);
@@ -2605,6 +2789,100 @@ test "unconstrained checked graph node seals to empty tag union" {
     const sealed = try graph.sealNode(node);
     const content = type_store.get(sealed);
     try std.testing.expectEqual(Type.Span.empty(), content.tag_union);
+}
+
+test "issue 10128: nominal backing cache follows argument roots" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const original_arg = try graph.newNode(.{ .unresolved = InstVariable.placeholder() });
+    const resolved_arg = try graph.newNode(.{ .primitive = .u64 });
+    const backing = try graph.newNode(.empty_record);
+    const module_bytes = [_]u8{0xA1} ** 32;
+
+    try graph.putNominalBackingNode(module_bytes, 17, &.{original_arg}, backing);
+    try graph.unify(original_arg, resolved_arg);
+
+    try std.testing.expectEqual(
+        backing,
+        graph.nominalBackingNode(module_bytes, 17, &.{resolved_arg}),
+    );
+}
+
+test "minted iterator unification with its public type preserves the minted backing" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xA7} ** 32));
+    const type_name = try name_store.internTypeName("Builtin.Iter");
+    const named_type: Type.NamedType = .{ .module = .{}, .ty = testCheckedTypeId(5) };
+    const public_def: Type.TypeDef = .{
+        .module = module_identity,
+        .type_name = type_name,
+        .source_decl = 62,
+    };
+    var minted_def = public_def;
+    minted_def.generated = .{ .bytes = [_]u8{0x5A} ** 32 };
+    minted_def.iterator_representation = .minted;
+    minted_def.iterator_depth = 1;
+
+    const item = try graph.newNode(.{ .primitive = .u64 });
+    const public_backing = try graph.newNode(.empty_record);
+    const minted_backing = try graph.newNode(.empty_record);
+    const public_args = try graph.arena().alloc(NodeId, 1);
+    public_args[0] = item;
+    const minted_args = try graph.arena().alloc(NodeId, 1);
+    minted_args[0] = item;
+
+    const public_iter = try graph.newNode(.{ .named = .{
+        .named_type = named_type,
+        .def = public_def,
+        .kind = .@"opaque",
+        .builtin_owner = .iter,
+        .args = public_args,
+        .backing = .{ .node = public_backing, .use = .inspectable },
+    } });
+    const minted_iter = try graph.newNode(.{ .named = .{
+        .named_type = named_type,
+        .def = minted_def,
+        .kind = .@"opaque",
+        .builtin_owner = .iter,
+        .args = minted_args,
+        .backing = .{ .node = minted_backing, .use = .inspectable },
+    } });
+
+    try graph.unify(public_iter, minted_iter);
+
+    try std.testing.expectEqual(graph.find(public_iter), graph.find(minted_iter));
+    const unified = switch (graph.content(minted_iter)) {
+        .named => |named| named,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(Type.IteratorRepresentation.minted, unified.def.iterator_representation);
+    try std.testing.expectEqual(minted_backing, unified.backing.?.node);
+    try std.testing.expect(graph.find(public_backing) != graph.find(minted_backing));
 }
 
 test "issue 9647: unresolved tag row extension absorbs rest without allocating a rest node" {

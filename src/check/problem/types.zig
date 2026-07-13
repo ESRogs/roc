@@ -37,6 +37,7 @@ pub const Problem = union(enum) {
     nominal_type_resolution_failed: NominalTypeResolutionFailed,
     recursive_alias: RecursiveAlias,
     unsupported_alias_where_clause: UnsupportedAliasWhereClause,
+    where_clause_receiver_not_introduced: WhereClauseReceiverNotIntroduced,
     invalid_nominal_decl_recursion: InvalidNominalDeclRecursion,
     infinite_recursion: VarWithSnapshot,
     anonymous_recursion: VarWithSnapshot,
@@ -58,6 +59,7 @@ pub const Problem = union(enum) {
     comptime_eval_error: ComptimeEvalError,
     invalid_numeric_literal: InvalidNumericLiteral,
     tuple_access_needs_annotation: TupleAccessNeedsAnnotation,
+    invalid_tuple_access: InvalidTupleAccess,
     literal_defaulted: LiteralDefaulted,
     non_exhaustive_match: NonExhaustiveMatch,
     non_exhaustive_destructure: NonExhaustiveDestructure,
@@ -239,6 +241,16 @@ pub const InvalidNumericLiteral = struct {
 pub const TupleAccessNeedsAnnotation = struct {
     region: base.Region,
     elem_index: u32,
+};
+
+/// Tuple access on a value whose resolved type proves the access is invalid.
+pub const InvalidTupleAccess = struct {
+    region: base.Region,
+    elem_index: u32,
+    reason: union(enum) {
+        not_tuple,
+        index_out_of_bounds: u32,
+    },
 };
 
 /// Warning (the Haskell §4.3.4 / `-Wtype-defaults` analogue): an open literal
@@ -485,5 +497,13 @@ pub const RecursiveAlias = struct {
 /// This syntax was used for abilities which have been removed from the language
 pub const UnsupportedAliasWhereClause = struct {
     alias_name: base.Ident.Idx,
+    region: base.Region,
+};
+
+/// Error when a where clause attempts to add a constraint to a rigid type
+/// variable introduced by a different annotation.
+pub const WhereClauseReceiverNotIntroduced = struct {
+    type_var_name: base.Ident.Idx,
+    method_name: base.Ident.Idx,
     region: base.Region,
 };

@@ -3961,6 +3961,10 @@ fn processDevObjectSnapshot(
         std.log.err("BuildEnv.build failed for {s}: {}", .{ app_path, err });
         return false;
     };
+    if (!build_env.executable_artifacts_finalized) {
+        std.log.err("Compilation did not produce executable artifacts", .{});
+        return false;
+    }
 
     const modules = build_env.getModulesInSerializationOrder(allocator) catch |err| {
         std.log.err("Failed to get compiled modules: {}", .{err});
@@ -4005,15 +4009,7 @@ fn processDevObjectSnapshot(
                 break :target_snapshot;
             }
 
-            const target_usize: base.target.TargetUsize = switch (target.ptrBitWidth()) {
-                32 => .u32,
-                64 => .u64,
-                else => {
-                    hash_results[i].hash_hex = undefined;
-                    hash_results[i].supported = false;
-                    break :target_snapshot;
-                },
-            };
+            const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
             const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(allocator, root_artifact.root_requests.runtime_requests);
             defer allocator.free(build_roots);
 

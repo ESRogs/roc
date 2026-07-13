@@ -78,7 +78,11 @@ const builtins_docs_base_url = "https://roc-lang.org/builtins/main/";
 /// on their own top-level page, mapped to the owning page. Mirrors the builtins'
 /// structure (the numeric types live under `Num`); an external reference to one
 /// of these resolves to `…/Num#U8`. Types not listed here are assumed to have
-/// their own page. Keep in sync with the builtins.
+/// their own page. The canonical roster of numeric types is the type system's
+/// `types.Int.Precision`/`types.Frac.Precision` enums; the
+/// "builtin_nested_type_owners lists every numeric type under Num" test asserts
+/// every variant appears here, so adding a numeric precision fails CI until it
+/// is listed. `Numeral` has no precision variant and is listed by hand.
 const builtin_nested_type_owners = [_]struct { name: []const u8, owner: []const u8 }{
     .{ .name = "U8", .owner = "Num" },   .{ .name = "U16", .owner = "Num" },
     .{ .name = "U32", .owner = "Num" },  .{ .name = "U64", .owner = "Num" },
@@ -145,6 +149,10 @@ const RenderContext = struct {
     /// When true, renderDocTypeHtml emits plain <span> instead of <a> for type
     /// references. Used inside search entries to avoid invalid nested <a> tags.
     suppress_type_links: bool = false,
+    /// When true, where clauses render on a single line instead of the
+    /// multi-line layout. Used inside inline search entries, which must stay on
+    /// one line.
+    single_line_signatures: bool = false,
     /// True when the package being documented is Builtin itself, so references
     /// to builtin types stay local instead of pointing at roc-lang.org.
     documenting_builtin: bool = false,
@@ -678,6 +686,11 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
                 try w.writeAll("</code>\n");
                 try writeDocsStreamChunk(w);
             }
+        } else if (entry.kind == .@"opaque") {
+            try w.writeAll("        <code class=\"entry-type-def\">");
+            try writeHtmlEscaped(w, entry.type_header orelse entry.name);
+            try w.writeAll(" :: # (opaque)</code>\n");
+            try writeDocsStreamChunk(w);
         }
     }
 
@@ -1108,7 +1121,8 @@ fn renderEntryTree(
                 try w.writeAll("</a>");
                 try w.print("</h{d}>\n", .{heading_level});
 
-                // Nominal types also show their type definition below the heading
+                // Type definitions appear below their heading. Opaque types expose
+                // their public header but not their backing representation.
                 if (entry.kind == .nominal) {
                     if (entry.type_signature) |sig| {
                         try writeIndent(w, base + 1);
@@ -1117,6 +1131,11 @@ fn renderEntryTree(
                         try renderDocTypeHtml(w, ctx, gpa, sig, false);
                         try w.writeAll("</code>\n");
                     }
+                } else if (entry.kind == .@"opaque") {
+                    try writeIndent(w, base + 1);
+                    try w.writeAll("<code class=\"entry-type-def\">");
+                    try writeHtmlEscaped(w, entry.type_header orelse entry.name);
+                    try w.writeAll(" :: # (opaque)</code>\n");
                 }
             } else {
                 // Signature block - styled as code, not a heading
@@ -1558,6 +1577,7 @@ fn renderSearchTree(
             // nested <a> tags (the entire entry is already wrapped in <a>).
             var no_links_ctx = ctx.*;
             no_links_ctx.suppress_type_links = true;
+            no_links_ctx.single_line_signatures = true;
             const sig_ctx: *const RenderContext = &no_links_ctx;
 
             try w.writeAll(" <span class=\"type-ahead-signature\">");
@@ -1778,9 +1798,9 @@ fn writeDocText(w: Writer, ctx: *const RenderContext, text: []const u8) (Allocat
                 } else {
                     try writeMissingDocRefHref(w, ctx, ref.label, bracket_offset);
                 }
-                try w.writeAll("\">");
+                try w.writeAll("\"><code>");
                 try writeHtmlEscaped(w, ref.label);
-                try w.writeAll("</a>");
+                try w.writeAll("</code></a>");
                 i = ref.end;
                 plain_start = i;
             } else {
@@ -1930,6 +1950,141 @@ fn validateAnchor(
     try ctx.reportBrokenLink(label, anchor, bracket_offset);
 }
 
+const MultilineLayoutSet = struct {
+    values: std.AutoHashMapUnmanaged(*const DocType, void) = .empty,
+
+    fn init(gpa: Allocator, root: *const DocType) Allocator.Error!MultilineLayoutSet {
+        const Frame = struct {
+            value: *const DocType,
+            children_visited: bool,
+        };
+
+        var result = MultilineLayoutSet{};
+        errdefer result.deinit(gpa);
+
+        var frames = std.ArrayList(Frame).empty;
+        defer frames.deinit(gpa);
+        try frames.append(gpa, .{ .value = root, .children_visited = false });
+
+        while (frames.pop()) |frame| {
+            if (frame.children_visited) {
+                if (result.nodeIsMultiline(frame.value)) {
+                    try result.values.put(gpa, frame.value, {});
+                }
+                continue;
+            }
+
+            try frames.append(gpa, .{ .value = frame.value, .children_visited = true });
+            switch (frame.value.*) {
+                .type_ref, .type_var, .wildcard, .@"error" => {},
+                .function => |func| {
+                    try frames.append(gpa, .{ .value = func.ret, .children_visited = false });
+                    for (func.args) |arg| {
+                        try frames.append(gpa, .{ .value = arg, .children_visited = false });
+                    }
+                },
+                .record => |rec| {
+                    if (rec.ext) |ext| try frames.append(gpa, .{ .value = ext, .children_visited = false });
+                    for (rec.fields) |field| {
+                        try frames.append(gpa, .{ .value = field.type, .children_visited = false });
+                    }
+                },
+                .tag_union => |tu| {
+                    if (tu.ext) |ext| try frames.append(gpa, .{ .value = ext, .children_visited = false });
+                    for (tu.tags) |tag| {
+                        for (tag.args) |arg| {
+                            try frames.append(gpa, .{ .value = arg, .children_visited = false });
+                        }
+                    }
+                },
+                .tuple => |tup| {
+                    for (tup.elems) |elem| {
+                        try frames.append(gpa, .{ .value = elem, .children_visited = false });
+                    }
+                },
+                .apply => |app| {
+                    try frames.append(gpa, .{ .value = app.constructor, .children_visited = false });
+                    for (app.args) |arg| {
+                        try frames.append(gpa, .{ .value = arg, .children_visited = false });
+                    }
+                },
+                .where_clause => |wc| {
+                    try frames.append(gpa, .{ .value = wc.type, .children_visited = false });
+                    for (wc.constraints) |constraint| {
+                        try frames.append(gpa, .{ .value = constraint.signature, .children_visited = false });
+                    }
+                },
+            }
+        }
+
+        return result;
+    }
+
+    fn deinit(self: *MultilineLayoutSet, gpa: Allocator) void {
+        self.values.deinit(gpa);
+    }
+
+    fn contains(self: *const MultilineLayoutSet, value: *const DocType) bool {
+        return self.values.contains(value);
+    }
+
+    fn tagIsMultiline(self: *const MultilineLayoutSet, tag: DocType.Tag) bool {
+        if (tag.layout == .multiline and tag.args.len > 0) return true;
+        for (tag.args) |arg| {
+            if (self.contains(arg)) return true;
+        }
+        return false;
+    }
+
+    fn nodeIsMultiline(self: *const MultilineLayoutSet, value: *const DocType) bool {
+        return switch (value.*) {
+            .type_ref, .type_var, .wildcard, .@"error" => false,
+            .function => |func| blk: {
+                for (func.args) |arg| {
+                    if (self.contains(arg)) break :blk true;
+                }
+                break :blk self.contains(func.ret);
+            },
+            .record => |rec| blk: {
+                if (rec.layout == .multiline and (rec.fields.len > 0 or rec.is_open)) break :blk true;
+                for (rec.fields) |field| {
+                    if (self.contains(field.type)) break :blk true;
+                }
+                break :blk if (rec.ext) |ext| self.contains(ext) else false;
+            },
+            .tag_union => |tu| blk: {
+                if (tu.layout == .multiline and (tu.tags.len > 0 or tu.is_open)) break :blk true;
+                for (tu.tags) |tag| {
+                    if (self.tagIsMultiline(tag)) break :blk true;
+                }
+                break :blk if (tu.ext) |ext| self.contains(ext) else false;
+            },
+            .tuple => |tup| blk: {
+                if (tup.layout == .multiline and tup.elems.len > 0) break :blk true;
+                for (tup.elems) |elem| {
+                    if (self.contains(elem)) break :blk true;
+                }
+                break :blk false;
+            },
+            .apply => |app| blk: {
+                if (app.layout == .multiline and app.args.len > 0) break :blk true;
+                for (app.args) |arg| {
+                    if (self.contains(arg)) break :blk true;
+                }
+                break :blk false;
+            },
+            .where_clause => |wc| blk: {
+                if (wc.layout == .multiline and wc.constraints.len > 0) break :blk true;
+                if (self.contains(wc.type)) break :blk true;
+                for (wc.constraints) |constraint| {
+                    if (self.contains(constraint.signature)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+};
+
 fn renderDocTypeHtml(
     w: Writer,
     ctx: *const RenderContext,
@@ -1941,19 +2096,33 @@ fn renderDocTypeHtml(
         doc_type: struct {
             value: *const DocType,
             needs_parens: bool,
+            indent: usize,
         },
+        tag: struct {
+            value: DocType.Tag,
+            indent: usize,
+        },
+        indent: usize,
         html: []const u8,
         escaped: []const u8,
         type_ref: DocType.TypeRef,
     };
 
+    var multiline_layouts = try MultilineLayoutSet.init(gpa, doc_type);
+    defer multiline_layouts.deinit(gpa);
+
     var frames = std.ArrayList(RenderFrame).empty;
     defer frames.deinit(gpa);
 
-    try frames.append(gpa, .{ .doc_type = .{ .value = doc_type, .needs_parens = needs_parens } });
+    try frames.append(gpa, .{ .doc_type = .{
+        .value = doc_type,
+        .needs_parens = needs_parens,
+        .indent = 0,
+    } });
     while (frames.pop()) |frame| {
         switch (frame) {
             .html => |html| try w.writeAll(html),
+            .indent => |level| for (0..level) |_| try w.writeAll("    "),
             .escaped => |text| try writeHtmlEscaped(w, text),
             .type_ref => |ref| {
                 const display_name = if (std.mem.findScalarLast(u8, ref.type_name, '.')) |idx|
@@ -1985,7 +2154,11 @@ fn renderDocTypeHtml(
                     },
                     .function => |func| {
                         if (item.needs_parens) try frames.append(gpa, .{ .html = ")" });
-                        try frames.append(gpa, .{ .doc_type = .{ .value = func.ret, .needs_parens = false } });
+                        try frames.append(gpa, .{ .doc_type = .{
+                            .value = func.ret,
+                            .needs_parens = false,
+                            .indent = item.indent,
+                        } });
                         try frames.append(gpa, .{ .html = if (func.effectful)
                             "<span class=\"sig-arrow\"> =&gt; </span>"
                         else
@@ -1993,98 +2166,257 @@ fn renderDocTypeHtml(
                         var i = func.args.len;
                         while (i > 0) {
                             i -= 1;
-                            try frames.append(gpa, .{ .doc_type = .{ .value = func.args[i], .needs_parens = true } });
+                            try frames.append(gpa, .{ .doc_type = .{
+                                .value = func.args[i],
+                                .needs_parens = true,
+                                .indent = item.indent,
+                            } });
                             if (i > 0) try frames.append(gpa, .{ .html = ", " });
                         }
                         if (item.needs_parens) try frames.append(gpa, .{ .html = "(" });
                     },
                     .record => |rec| {
-                        try frames.append(gpa, .{ .html = " }" });
-                        var i = rec.fields.len;
-                        while (i > 0) {
-                            i -= 1;
-                            const field = rec.fields[i];
-                            try frames.append(gpa, .{ .doc_type = .{ .value = field.type, .needs_parens = false } });
-                            try frames.append(gpa, .{ .html = " : " });
-                            try frames.append(gpa, .{ .escaped = field.name });
-                            if (i > 0) try frames.append(gpa, .{ .html = ", " });
-                        }
-                        if (rec.is_open) {
-                            if (rec.fields.len > 0) try frames.append(gpa, .{ .html = ", " });
-                            if (rec.ext) |ext| {
-                                try frames.append(gpa, .{ .doc_type = .{ .value = ext, .needs_parens = false } });
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
+                        if (multiline) {
+                            try frames.append(gpa, .{ .html = "}" });
+                            try frames.append(gpa, .{ .indent = item.indent });
+                            if (rec.is_open) {
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                if (rec.ext) |ext| {
+                                    try frames.append(gpa, .{ .doc_type = .{
+                                        .value = ext,
+                                        .needs_parens = false,
+                                        .indent = item.indent + 1,
+                                    } });
+                                }
+                                try frames.append(gpa, .{ .html = ".." });
+                                try frames.append(gpa, .{ .indent = item.indent + 1 });
                             }
-                            try frames.append(gpa, .{ .html = ".." });
+                            var i = rec.fields.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const field = rec.fields[i];
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = field.type,
+                                    .needs_parens = false,
+                                    .indent = item.indent + 1,
+                                } });
+                                try frames.append(gpa, .{ .html = " : " });
+                                try frames.append(gpa, .{ .escaped = field.name });
+                                try frames.append(gpa, .{ .indent = item.indent + 1 });
+                            }
+                            try frames.append(gpa, .{ .html = "{\n" });
+                        } else {
+                            try frames.append(gpa, .{ .html = " }" });
+                            var i = rec.fields.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const field = rec.fields[i];
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = field.type,
+                                    .needs_parens = false,
+                                    .indent = item.indent,
+                                } });
+                                try frames.append(gpa, .{ .html = " : " });
+                                try frames.append(gpa, .{ .escaped = field.name });
+                                if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                            }
+                            if (rec.is_open) {
+                                if (rec.fields.len > 0) try frames.append(gpa, .{ .html = ", " });
+                                if (rec.ext) |ext| {
+                                    try frames.append(gpa, .{ .doc_type = .{
+                                        .value = ext,
+                                        .needs_parens = false,
+                                        .indent = item.indent,
+                                    } });
+                                }
+                                try frames.append(gpa, .{ .html = ".." });
+                            }
+                            try frames.append(gpa, .{ .html = "{ " });
                         }
-                        try frames.append(gpa, .{ .html = "{ " });
                     },
                     .tag_union => |tu| {
-                        try frames.append(gpa, .{ .html = "]" });
-                        if (tu.is_open) {
-                            if (tu.ext) |ext| {
-                                try frames.append(gpa, .{ .doc_type = .{ .value = ext, .needs_parens = false } });
-                            }
-                            try frames.append(gpa, .{ .html = ".." });
-                            if (tu.tags.len > 0) try frames.append(gpa, .{ .html = ", " });
-                        }
-                        var i = tu.tags.len;
-                        while (i > 0) {
-                            i -= 1;
-                            const tag = tu.tags[i];
-                            if (tag.args.len > 0) {
-                                try frames.append(gpa, .{ .html = ")" });
-                                var j = tag.args.len;
-                                while (j > 0) {
-                                    j -= 1;
-                                    try frames.append(gpa, .{ .doc_type = .{ .value = tag.args[j], .needs_parens = false } });
-                                    if (j > 0) try frames.append(gpa, .{ .html = ", " });
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
+                        if (multiline) {
+                            try frames.append(gpa, .{ .html = "]" });
+                            try frames.append(gpa, .{ .indent = item.indent });
+                            if (tu.is_open) {
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                if (tu.ext) |ext| {
+                                    try frames.append(gpa, .{ .doc_type = .{
+                                        .value = ext,
+                                        .needs_parens = false,
+                                        .indent = item.indent + 1,
+                                    } });
                                 }
-                                try frames.append(gpa, .{ .html = "(" });
+                                try frames.append(gpa, .{ .html = ".." });
+                                try frames.append(gpa, .{ .indent = item.indent + 1 });
                             }
-                            try frames.append(gpa, .{ .html = "</span>" });
-                            try frames.append(gpa, .{ .escaped = tag.name });
-                            try frames.append(gpa, .{ .html = "<span class=\"type\">" });
-                            if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                            var i = tu.tags.len;
+                            while (i > 0) {
+                                i -= 1;
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                try frames.append(gpa, .{ .tag = .{
+                                    .value = tu.tags[i],
+                                    .indent = item.indent + 1,
+                                } });
+                                try frames.append(gpa, .{ .indent = item.indent + 1 });
+                            }
+                            try frames.append(gpa, .{ .html = "[\n" });
+                        } else {
+                            try frames.append(gpa, .{ .html = "]" });
+                            if (tu.is_open) {
+                                if (tu.ext) |ext| {
+                                    try frames.append(gpa, .{ .doc_type = .{
+                                        .value = ext,
+                                        .needs_parens = false,
+                                        .indent = item.indent,
+                                    } });
+                                }
+                                try frames.append(gpa, .{ .html = ".." });
+                                if (tu.tags.len > 0) try frames.append(gpa, .{ .html = ", " });
+                            }
+                            var i = tu.tags.len;
+                            while (i > 0) {
+                                i -= 1;
+                                try frames.append(gpa, .{ .tag = .{
+                                    .value = tu.tags[i],
+                                    .indent = item.indent,
+                                } });
+                                if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                            }
+                            try frames.append(gpa, .{ .html = "[" });
                         }
-                        try frames.append(gpa, .{ .html = "[" });
                     },
                     .tuple => |tup| {
                         try frames.append(gpa, .{ .html = ")" });
-                        var i = tup.elems.len;
-                        while (i > 0) {
-                            i -= 1;
-                            try frames.append(gpa, .{ .doc_type = .{ .value = tup.elems[i], .needs_parens = false } });
-                            if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
+                        if (multiline) {
+                            try frames.append(gpa, .{ .indent = item.indent });
+                            var i = tup.elems.len;
+                            while (i > 0) {
+                                i -= 1;
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = tup.elems[i],
+                                    .needs_parens = false,
+                                    .indent = item.indent + 1,
+                                } });
+                                try frames.append(gpa, .{ .indent = item.indent + 1 });
+                            }
+                            try frames.append(gpa, .{ .html = "(\n" });
+                        } else {
+                            var i = tup.elems.len;
+                            while (i > 0) {
+                                i -= 1;
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = tup.elems[i],
+                                    .needs_parens = false,
+                                    .indent = item.indent,
+                                } });
+                                if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                            }
+                            try frames.append(gpa, .{ .html = "(" });
                         }
-                        try frames.append(gpa, .{ .html = "(" });
                     },
                     .apply => |app| {
                         try frames.append(gpa, .{ .html = ")" });
-                        var i = app.args.len;
-                        while (i > 0) {
-                            i -= 1;
-                            try frames.append(gpa, .{ .doc_type = .{ .value = app.args[i], .needs_parens = false } });
-                            if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
+                        if (multiline) {
+                            try frames.append(gpa, .{ .indent = item.indent });
+                            var i = app.args.len;
+                            while (i > 0) {
+                                i -= 1;
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = app.args[i],
+                                    .needs_parens = false,
+                                    .indent = item.indent + 1,
+                                } });
+                                try frames.append(gpa, .{ .indent = item.indent + 1 });
+                            }
+                            try frames.append(gpa, .{ .html = "(\n" });
+                        } else {
+                            var i = app.args.len;
+                            while (i > 0) {
+                                i -= 1;
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = app.args[i],
+                                    .needs_parens = false,
+                                    .indent = item.indent,
+                                } });
+                                if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                            }
+                            try frames.append(gpa, .{ .html = "(" });
                         }
-                        try frames.append(gpa, .{ .html = "(" });
-                        try frames.append(gpa, .{ .doc_type = .{ .value = app.constructor, .needs_parens = false } });
+                        try frames.append(gpa, .{ .doc_type = .{
+                            .value = app.constructor,
+                            .needs_parens = false,
+                            .indent = item.indent,
+                        } });
                     },
                     .where_clause => |wc| {
-                        try frames.append(gpa, .{ .html = " }" });
-                        var i = wc.constraints.len;
-                        while (i > 0) {
-                            i -= 1;
-                            const constraint = wc.constraints[i];
-                            try frames.append(gpa, .{ .doc_type = .{ .value = constraint.signature, .needs_parens = false } });
-                            try frames.append(gpa, .{ .html = " : " });
-                            try frames.append(gpa, .{ .escaped = constraint.method_name });
-                            try frames.append(gpa, .{ .html = "</span>." });
-                            try frames.append(gpa, .{ .escaped = constraint.type_var });
-                            try frames.append(gpa, .{ .html = "<span class=\"type-var\">" });
-                            if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
+                        if (!multiline) {
+                            // Inline layout keeps the whole where clause on one
+                            // line, matching the nowrap search entries.
+                            try frames.append(gpa, .{ .html = "]" });
+                            var i = wc.constraints.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const constraint = wc.constraints[i];
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = constraint.signature,
+                                    .needs_parens = false,
+                                    .indent = item.indent,
+                                } });
+                                try frames.append(gpa, .{ .html = " : " });
+                                try frames.append(gpa, .{ .escaped = constraint.method_name });
+                                try frames.append(gpa, .{ .html = "</span>." });
+                                try frames.append(gpa, .{ .escaped = constraint.type_var });
+                                try frames.append(gpa, .{ .html = "<span class=\"type-var\">" });
+                                if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                            }
+                            try frames.append(gpa, .{ .html = " <span class=\"kw\">where</span> [" });
+                            try frames.append(gpa, .{ .doc_type = .{
+                                .value = wc.type,
+                                .needs_parens = item.needs_parens,
+                                .indent = item.indent,
+                            } });
+                        } else {
+                            // Multi-line layout mirrors how `roc format` lays
+                            // out where clauses; the enclosing block uses
+                            // white-space: pre-wrap so the literal newlines and
+                            // indentation render as written.
+                            try frames.append(gpa, .{ .html = "]" });
+                            try frames.append(gpa, .{ .indent = item.indent + 1 });
+                            var i = wc.constraints.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const constraint = wc.constraints[i];
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                try frames.append(gpa, .{ .doc_type = .{
+                                    .value = constraint.signature,
+                                    .needs_parens = false,
+                                    .indent = item.indent + 2,
+                                } });
+                                try frames.append(gpa, .{ .html = " : " });
+                                try frames.append(gpa, .{ .escaped = constraint.method_name });
+                                try frames.append(gpa, .{ .html = "</span>." });
+                                try frames.append(gpa, .{ .escaped = constraint.type_var });
+                                try frames.append(gpa, .{ .html = "<span class=\"type-var\">" });
+                                try frames.append(gpa, .{ .indent = item.indent + 2 });
+                            }
+                            try frames.append(gpa, .{ .html = "<span class=\"kw\">where</span> [\n" });
+                            try frames.append(gpa, .{ .indent = item.indent + 1 });
+                            try frames.append(gpa, .{ .html = "\n" });
+                            try frames.append(gpa, .{ .doc_type = .{
+                                .value = wc.type,
+                                .needs_parens = item.needs_parens,
+                                .indent = item.indent,
+                            } });
                         }
-                        try frames.append(gpa, .{ .html = " <span class=\"kw\">where</span> { " });
-                        try frames.append(gpa, .{ .doc_type = .{ .value = wc.type, .needs_parens = item.needs_parens } });
                     },
                     .wildcard => {
                         try frames.append(gpa, .{ .html = "_" });
@@ -2093,6 +2425,42 @@ fn renderDocTypeHtml(
                         try frames.append(gpa, .{ .html = "?" });
                     },
                 }
+            },
+            .tag => |item| {
+                const multiline = !ctx.single_line_signatures and multiline_layouts.tagIsMultiline(item.value);
+                if (item.value.args.len > 0) {
+                    try frames.append(gpa, .{ .html = ")" });
+                    if (multiline) {
+                        try frames.append(gpa, .{ .indent = item.indent });
+                        var i = item.value.args.len;
+                        while (i > 0) {
+                            i -= 1;
+                            try frames.append(gpa, .{ .html = ",\n" });
+                            try frames.append(gpa, .{ .doc_type = .{
+                                .value = item.value.args[i],
+                                .needs_parens = false,
+                                .indent = item.indent + 1,
+                            } });
+                            try frames.append(gpa, .{ .indent = item.indent + 1 });
+                        }
+                        try frames.append(gpa, .{ .html = "(\n" });
+                    } else {
+                        var i = item.value.args.len;
+                        while (i > 0) {
+                            i -= 1;
+                            try frames.append(gpa, .{ .doc_type = .{
+                                .value = item.value.args[i],
+                                .needs_parens = false,
+                                .indent = item.indent,
+                            } });
+                            if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                        }
+                        try frames.append(gpa, .{ .html = "(" });
+                    }
+                }
+                try frames.append(gpa, .{ .html = "</span>" });
+                try frames.append(gpa, .{ .escaped = item.value.name });
+                try frames.append(gpa, .{ .html = "<span class=\"type\">" });
             },
         }
     }
@@ -2371,6 +2739,7 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
 
     const string_entry = DocModel.DocEntry{
         .name = try gpa.dupe(u8, "String"),
+        .type_header = try gpa.dupe(u8, "String(item)"),
         .kind = .@"opaque",
         .type_signature = null,
         .doc_comment = try gpa.dupe(u8, "Parse a [Str] using a parser."),
@@ -2430,6 +2799,166 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
 
     try testing.expect(std.mem.find(u8, html, "href=\"https://roc-lang.org/builtins/main/Str\"") != null);
     try testing.expect(std.mem.find(u8, html, "href=\"#String.Utf8\"") != null);
+
+    // Shorthand `[Name]` refs wrap their label in <code>.
+    try testing.expect(std.mem.find(u8, html, "href=\"https://roc-lang.org/builtins/main/Str\"><code>Str</code></a>") != null);
+    try testing.expect(std.mem.find(u8, html, "href=\"#String.Utf8\"><code>Utf8</code></a>") != null);
+    try testing.expect(std.mem.find(u8, html, "String(item) :: # (opaque)") != null);
+}
+
+test "renderDocTypeHtml renders where clause multi-line with square brackets" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root = try buildWhereClauseFixture(gpa);
+    defer {
+        root.deinit(gpa);
+        gpa.destroy(root);
+    }
+
+    const package_docs = DocModel.PackageDocs{
+        .name = "Test",
+        .modules = &[_]DocModel.ModuleDocs{},
+    };
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+    ctx.suppress_type_links = true;
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
+    try testing.expectEqualStrings(
+        "<span class=\"type\">Bool</span>\n" ++
+            "    <span class=\"kw\">where</span> [\n" ++
+            "        <span class=\"type-var\">k</span>.is_eq : <span class=\"type-var\">k</span>,\n" ++
+            "        <span class=\"type-var\">v</span>.to_hash : <span class=\"type-var\">v</span>,\n" ++
+            "    ]",
+        output.written(),
+    );
+}
+
+test "renderDocTypeHtml renders where clause single-line when single_line_signatures set" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root = try buildWhereClauseFixture(gpa);
+    defer {
+        root.deinit(gpa);
+        gpa.destroy(root);
+    }
+
+    const package_docs = DocModel.PackageDocs{
+        .name = "Test",
+        .modules = &[_]DocModel.ModuleDocs{},
+    };
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+    ctx.suppress_type_links = true;
+    ctx.single_line_signatures = true;
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
+    try testing.expectEqualStrings(
+        "<span class=\"type\">Bool</span> <span class=\"kw\">where</span> [" ++
+            "<span class=\"type-var\">k</span>.is_eq : <span class=\"type-var\">k</span>, " ++
+            "<span class=\"type-var\">v</span>.to_hash : <span class=\"type-var\">v</span>]",
+        output.written(),
+    );
+}
+
+test "renderDocTypeHtml expands trailing-comma collections and their parents" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const list_constructor = try gpa.create(DocType);
+    list_constructor.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "List"),
+    } };
+    const u8_type = try gpa.create(DocType);
+    u8_type.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "U8"),
+    } };
+    const list_args = try gpa.alloc(*const DocType, 1);
+    list_args[0] = u8_type;
+    const list_type = try gpa.create(DocType);
+    list_type.* = .{ .apply = .{
+        .constructor = list_constructor,
+        .args = list_args,
+        .layout = .multiline,
+    } };
+    const tuple_elems = try gpa.alloc(*const DocType, 1);
+    tuple_elems[0] = list_type;
+    const root = try gpa.create(DocType);
+    root.* = .{ .tuple = .{
+        .elems = tuple_elems,
+        .layout = .compact,
+    } };
+    defer {
+        root.deinit(gpa);
+        gpa.destroy(root);
+    }
+
+    const package_docs = DocModel.PackageDocs{
+        .name = "Test",
+        .modules = &[_]DocModel.ModuleDocs{},
+    };
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+    ctx.suppress_type_links = true;
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
+    try testing.expectEqualStrings(
+        "(\n" ++
+            "    <span class=\"type\">List</span>(\n" ++
+            "        <span class=\"type\">U8</span>,\n" ++
+            "    ),\n" ++
+            ")",
+        output.written(),
+    );
+}
+
+/// Builds a heap-allocated `where` clause DocType for the rendering tests:
+/// `Bool where [ k.is_eq : k, v.to_hash : v ]`.
+fn buildWhereClauseFixture(gpa: Allocator) Allocator.Error!*const DocType {
+    const bool_type = try gpa.create(DocType);
+    bool_type.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "Bool"),
+    } };
+
+    const k_sig = try gpa.create(DocType);
+    k_sig.* = .{ .type_var = try gpa.dupe(u8, "k") };
+
+    const v_sig = try gpa.create(DocType);
+    v_sig.* = .{ .type_var = try gpa.dupe(u8, "v") };
+
+    const constraints = try gpa.alloc(DocType.Constraint, 2);
+    constraints[0] = .{
+        .type_var = try gpa.dupe(u8, "k"),
+        .method_name = try gpa.dupe(u8, "is_eq"),
+        .signature = k_sig,
+    };
+    constraints[1] = .{
+        .type_var = try gpa.dupe(u8, "v"),
+        .method_name = try gpa.dupe(u8, "to_hash"),
+        .signature = v_sig,
+    };
+
+    const root = try gpa.create(DocType);
+    root.* = .{ .where_clause = .{
+        .type = bool_type,
+        .constraints = constraints,
+        .layout = .multiline,
+    } };
+    return root;
 }
 
 test "builtin_nested_type_owners lists every numeric type under Num" {

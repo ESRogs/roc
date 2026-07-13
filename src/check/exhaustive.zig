@@ -33,6 +33,7 @@ const builtins = @import("builtins");
 const i128h = builtins.compiler_rt_128;
 const Can = @import("can");
 const types = @import("types");
+const reporting = @import("reporting");
 const problem = @import("problem.zig");
 
 const Ident = base.Ident;
@@ -424,13 +425,10 @@ pub const Literal = union(enum) {
     }
 };
 
-/// Severity of exhaustiveness errors
-pub const Severity = enum {
-    /// Will crash at runtime if reached
-    runtime_error,
-    /// Suspicious but won't crash
-    warning,
-};
+/// Severity of exhaustiveness errors. The canonical severity enum lives in
+/// `reporting.Severity`; exhaustiveness only ever produces `runtime_error`
+/// (an incomplete match crashes if reached) or `warning`.
+pub const Severity = reporting.Severity;
 
 /// Errors detected during exhaustiveness checking
 pub const Error = union(enum) {
@@ -1147,6 +1145,11 @@ const WorkItem = union(enum) {
     /// Pop result; if false and extension is open (flex/rigid), push true; else push original.
     /// The Var is the extension variable to check.
     check_open_extension: Var,
+
+    /// Leave a nominal declaration after checking its instantiated backing.
+    /// This makes non-regular recursive applications converge even when each
+    /// application has fresh type argument roots.
+    leave_nominal: types.NominalDecl.Idx,
 };
 
 /// Check if a type is inhabited (has at least one possible value).
@@ -1184,6 +1187,9 @@ fn isTypeInhabitedWithKnownEmpty(
     // Use a seen set to detect cycles in recursive types
     var seen: std.AutoHashMapUnmanaged(Var, void) = .empty;
     defer seen.deinit(type_store.gpa);
+
+    var active_nominals: std.AutoHashMapUnmanaged(types.NominalDecl.Idx, void) = .empty;
+    defer active_nominals.deinit(type_store.gpa);
 
     const gpa = type_store.gpa;
 
@@ -1254,12 +1260,22 @@ fn isTypeInhabitedWithKnownEmpty(
                             // These have [] as backing type but are inhabited primitives.
                             if (builtin_idents.isBuiltinNumericType(nominal)) {
                                 try results.append(gpa, true);
-                            } else if (try openNominalBacking(type_store, builtin_idents, nominal)) |backing_var| {
-                                // For other nominal types, check the opened backing
-                                try work_list.append(gpa, .{ .check_type = backing_var });
                             } else {
-                                // Unresolvable/invalid declaration: treat as inhabited
-                                try results.append(gpa, true);
+                                const decl_idx = type_store.lookupNominalDecl(nominal) orelse
+                                    exhaustiveInvariant("inhabitedness referenced a missing nominal declaration", .{});
+                                const active = try active_nominals.getOrPut(gpa, decl_idx);
+                                if (active.found_existing) {
+                                    // Match the variable-cycle rule above: a recursive
+                                    // path is treated as inhabited.
+                                    try results.append(gpa, true);
+                                } else if (try openNominalBacking(type_store, builtin_idents, nominal)) |backing_var| {
+                                    try work_list.append(gpa, .{ .leave_nominal = decl_idx });
+                                    try work_list.append(gpa, .{ .check_type = backing_var });
+                                } else {
+                                    _ = active_nominals.remove(decl_idx);
+                                    // Unresolvable/invalid declaration: treat as inhabited
+                                    try results.append(gpa, true);
+                                }
                             }
                         },
 
@@ -1325,6 +1341,11 @@ fn isTypeInhabitedWithKnownEmpty(
                     const is_open = try isExtensionOpen(type_store, ext_var);
                     try results.append(gpa, is_open);
                 }
+            },
+
+            .leave_nominal => |decl_idx| {
+                const removed = active_nominals.remove(decl_idx);
+                std.debug.assert(removed);
             },
         }
     }

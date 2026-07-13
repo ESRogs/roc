@@ -85,7 +85,7 @@ const longjmp = sljmp.longjmp;
 /// Failed inline `expect` observed during one interpreter evaluation.
 pub const ExpectFailure = struct {
     message: []const u8,
-    loc: base.SourceLoc,
+    region: base.Region,
 };
 
 /// Environment for interpreter-managed RocOps forwarding.
@@ -168,12 +168,12 @@ const InterpreterRocEnv = struct {
         self.expect_failures.clearRetainingCapacity();
     }
 
-    fn recordExpectFailure(self: *InterpreterRocEnv, msg: []const u8, loc: base.SourceLoc) Allocator.Error!void {
+    fn recordExpectFailure(self: *InterpreterRocEnv, msg: []const u8, region: base.Region) Allocator.Error!void {
         const owned_msg = try self.allocator.dupe(u8, msg);
         errdefer self.allocator.free(owned_msg);
         try self.expect_failures.append(self.allocator, .{
             .message = owned_msg,
-            .loc = loc,
+            .region = region,
         });
     }
 
@@ -1494,6 +1494,22 @@ pub const Interpreter = struct {
                         @intFromEnum(self.store.getLocal(assign.target).layout_idx),
                     },
                 ),
+                .store_struct => |assign| debugPrint(
+                    "  stmt {d}: {any} store_layout={d}\n",
+                    .{
+                        @intFromEnum(current),
+                        stmt,
+                        @intFromEnum(assign.struct_layout),
+                    },
+                ),
+                .store_tag => |assign| debugPrint(
+                    "  stmt {d}: {any} store_layout={d}\n",
+                    .{
+                        @intFromEnum(current),
+                        stmt,
+                        @intFromEnum(assign.tag_layout),
+                    },
+                ),
                 .set_local => |assign| debugPrint(
                     "  stmt {d}: {any} target_layout={d} target_layout_data={any}\n",
                     .{
@@ -1516,6 +1532,8 @@ pub const Interpreter = struct {
                 .assign_list => |assign| assign.next,
                 .assign_struct => |assign| assign.next,
                 .assign_tag => |assign| assign.next,
+                .store_struct => |assign| assign.next,
+                .store_tag => |assign| assign.next,
                 .set_local => |assign| assign.next,
                 .debug => |stmt_next| stmt_next.next,
                 .expect => |stmt_next| stmt_next.next,
@@ -1897,6 +1915,24 @@ pub const Interpreter = struct {
                     ));
                     current = assign.next;
                 },
+                .store_struct => |assign| {
+                    const dest = try self.getLocalChecked(frame, assign.dest);
+                    const value = try self.evalStructLiteral(frame, assign.fields, assign.struct_layout);
+                    _ = try self.evalPtrStore(dest, value, assign.struct_layout);
+                    current = assign.next;
+                },
+                .store_tag => |assign| {
+                    const dest = try self.getLocalChecked(frame, assign.dest);
+                    const value = try self.evalTagLiteral(
+                        frame,
+                        assign.variant_index,
+                        assign.discriminant,
+                        assign.payload,
+                        assign.tag_layout,
+                    );
+                    _ = try self.evalPtrStore(dest, value, assign.tag_layout);
+                    current = assign.next;
+                },
                 .set_local => |assign| {
                     const target_layout = self.store.getLocal(assign.target).layout_idx;
                     const normalized = try self.coerceExplicitRefValueToLayout(
@@ -1923,7 +1959,7 @@ pub const Interpreter = struct {
                         self.store.getLocal(cond_local).layout_idx,
                     );
                     if (cond_value == 0) {
-                        try self.roc_env.recordExpectFailure("expect failed", self.store.stmtLoc(current));
+                        try self.roc_env.recordExpectFailure("expect failed", self.store.stmtRegion(current));
                         self.roc_ops.expectFailed("expect failed");
                     }
                     current = expect_stmt.next;
@@ -2243,9 +2279,11 @@ pub const Interpreter = struct {
                     stack.append(self.evalAllocator(), assign.next) catch return;
                 },
                 .assign_packed_erased_fn => |assign| {
-                    debugPrint("    {d}: assign_packed_erased_fn target={d} next={d}\n", .{
+                    debugPrint("    {d}: assign_packed_erased_fn target={d} reuse={?d} unique={} next={d}\n", .{
                         @intFromEnum(stmt_id),
                         @intFromEnum(assign.target),
+                        if (assign.reuse) |reuse| @intFromEnum(reuse) else null,
+                        assign.reuse_unique,
                         @intFromEnum(assign.next),
                     });
                     stack.append(self.evalAllocator(), assign.next) catch return;
@@ -2291,6 +2329,31 @@ pub const Interpreter = struct {
                     debugPrint("    {d}: assign_tag target={d} variant={d} discrim={d} next={d}\n", .{
                         @intFromEnum(stmt_id),
                         @intFromEnum(assign.target),
+                        assign.variant_index,
+                        assign.discriminant,
+                        @intFromEnum(assign.next),
+                    });
+                    stack.append(self.evalAllocator(), assign.next) catch return;
+                },
+                .store_struct => |assign| {
+                    debugPrint("    {d}: store_struct dest={d} fields=", .{
+                        @intFromEnum(stmt_id),
+                        @intFromEnum(assign.dest),
+                    });
+                    const fields = self.store.getLocalSpan(assign.fields);
+                    for (0..fields.len) |index| {
+                        const field_local = GuardedList.at(fields, index);
+                        debugPrint("{d} ", .{@intFromEnum(field_local)});
+                    }
+                    debugPrint("next={d}\n", .{
+                        @intFromEnum(assign.next),
+                    });
+                    stack.append(self.evalAllocator(), assign.next) catch return;
+                },
+                .store_tag => |assign| {
+                    debugPrint("    {d}: store_tag dest={d} variant={d} discrim={d} next={d}\n", .{
+                        @intFromEnum(stmt_id),
+                        @intFromEnum(assign.dest),
                         assign.variant_index,
                         assign.discriminant,
                         @intFromEnum(assign.next),
@@ -2713,6 +2776,10 @@ pub const Interpreter = struct {
             .f32_literal => |value| self.evalF32Literal(value),
             .dec_literal => |value| self.evalDecLiteral(value),
             .str_literal => |idx| self.evalStrLiteral(idx),
+            .static_data => self.invariantFailed(
+                "LIR/interpreter invariant violated: static data literal reached compile-time execution",
+                .{},
+            ),
             .bytes_literal => |idx| self.evalBytesLiteral(idx, target_layout),
             .null_ptr => self.evalNullPtrLiteral(),
             .proc_ref => |proc_id| self.evalProcRefLiteral(proc_id),
@@ -2969,7 +3036,27 @@ pub const Interpreter = struct {
             }
         }
         const capture_size = erased_callable_context_capture_offset + capture_value_size;
-        const data_ptr = try self.allocRocDataWithRc(
+        const data_ptr = if (assign.reuse) |reuse_local| blk: {
+            const reuse_value = try self.getLocalChecked(frame, reuse_local);
+            const reuse_ptr = self.readBoxedDataPointer(reuse_value) orelse {
+                return self.invariantFailedError(
+                    "LIR/interpreter invariant violated: erased callable repack reuse had null payload",
+                    .{},
+                );
+            };
+            if (assign.reuse_unique or builtins.utils.isUnique(reuse_ptr, &self.roc_ops)) {
+                self.performErasedCallableFinalDrop(reuse_ptr, .decref, 1);
+                break :blk reuse_ptr;
+            }
+
+            const fresh = try self.allocRocDataWithRc(
+                builtins.erased_callable.payloadSize(capture_size),
+                builtins.erased_callable.payload_alignment,
+                builtins.erased_callable.allocation_has_refcounted_children,
+            );
+            builtins.erased_callable.decref(reuse_ptr, &self.roc_ops);
+            break :blk fresh;
+        } else try self.allocRocDataWithRc(
             builtins.erased_callable.payloadSize(capture_size),
             builtins.erased_callable.payload_alignment,
             builtins.erased_callable.allocation_has_refcounted_children,
@@ -4119,8 +4206,29 @@ pub const Interpreter = struct {
         }
     }
 
-    /// Iterate through list elements and recursively decref each child.
-    /// This mirrors the element cleanup logic in RocList.decref.
+    /// Carries the interpreter state a list element decref needs through the
+    /// C-callconv `dec` callback that `RocList.decrefElements` invokes. The
+    /// pointer travels as the traversal's `dec_context`.
+    const ListElementDecContext = struct {
+        interp: *LirInterpreter,
+        child_plan: layout_mod.RcHelperPlan,
+        count: u16,
+        atomicity: RcAtomicity,
+    };
+
+    /// Executes one list element's RC plan. Bridges the shared
+    /// `RocList.decrefElements` element walk to the interpreter's own
+    /// per-element cleanup.
+    fn decrefListElementCallback(dec_context: ?*anyopaque, element: ?[*]u8) callconv(.c) void {
+        const ctx: *ListElementDecContext = @ptrCast(@alignCast(dec_context.?));
+        const element_val = Value{ .ptr = element.? };
+        ctx.interp.performRawRcPlan(ctx.child_plan, element_val, ctx.count, ctx.atomicity);
+    }
+
+    /// Decref each refcounted child of a dying unique list. The element walk
+    /// itself lives once in `RocList.decrefElements`; this routes the
+    /// interpreter's per-element cleanup through it so the traversal policy
+    /// cannot drift between interpreted and compiled runs.
     fn decrefListElements(
         self: *LirInterpreter,
         rl: builtins.list.RocList,
@@ -4129,16 +4237,13 @@ pub const Interpreter = struct {
         count: u16,
         atomicity: RcAtomicity,
     ) void {
-        if (rl.getAllocationDataPtr(&self.roc_ops)) |source| {
-            const elem_count = rl.getAllocationElementCount(true, &self.roc_ops);
-            const child_plan = self.cachedRcPlan(child_key);
-            var i: usize = 0;
-            while (i < elem_count) : (i += 1) {
-                const element_ptr = source + i * list_plan.elem_width;
-                const element_val = Value{ .ptr = element_ptr };
-                self.performRawRcPlan(child_plan, element_val, count, atomicity);
-            }
-        }
+        var ctx = ListElementDecContext{
+            .interp = self,
+            .child_plan = self.cachedRcPlan(child_key),
+            .count = count,
+            .atomicity = atomicity,
+        };
+        rl.decrefElements(list_plan.elem_width, &ctx, decrefListElementCallback, &self.roc_ops);
     }
 
     fn performErasedCallableFinalDropIfUnique(
@@ -4436,49 +4541,6 @@ pub const Interpreter = struct {
         const val = try self.alloc(ret_layout);
         val.write(u64, seed);
         return val;
-    }
-
-    fn hasherDomain(op: LIR.LowLevel) builtins.hash.HasherDomain {
-        return switch (op) {
-            .hasher_write_bool => .bool,
-            .hasher_write_u8 => .u8,
-            .hasher_write_u16 => .u16,
-            .hasher_write_u32 => .u32,
-            .hasher_write_u64 => .u64,
-            .hasher_write_u128 => .u128,
-            .hasher_write_i8 => .i8,
-            .hasher_write_i16 => .i16,
-            .hasher_write_i32 => .i32,
-            .hasher_write_i64 => .i64,
-            .hasher_write_i128 => .i128,
-            .hasher_write_f32 => .f32,
-            .hasher_write_f64 => .f64,
-            .hasher_write_dec => .dec,
-            .hasher_write_bytes => .bytes,
-            .hasher_write_str => .str,
-            else => unreachable,
-        };
-    }
-
-    fn hasherU64Width(op: LIR.LowLevel) u8 {
-        return switch (op) {
-            .hasher_write_bool,
-            .hasher_write_u8,
-            .hasher_write_i8,
-            => 1,
-            .hasher_write_u16,
-            .hasher_write_i16,
-            => 2,
-            .hasher_write_u32,
-            .hasher_write_i32,
-            .hasher_write_f32,
-            => 4,
-            .hasher_write_u64,
-            .hasher_write_i64,
-            .hasher_write_f64,
-            => 8,
-            else => unreachable,
-        };
     }
 
     fn byteListSlice(self: *LirInterpreter, list_val: Value, list_layout: layout_mod.Idx) Error![]const u8 {
@@ -5393,7 +5455,7 @@ pub const Interpreter = struct {
             .hasher_write_bool => blk: {
                 const seed = args[0].read(u64);
                 const value: u64 = if (try self.readBoolValue(args[1], try self.lowLevelArgLayout(ll, 1))) 1 else 0;
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), value, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), value, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_u8,
@@ -5417,21 +5479,21 @@ pub const Interpreter = struct {
                     .hasher_write_i64 => @bitCast(args[1].read(i64)),
                     else => unreachable,
                 };
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), value, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), value, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_f32 => blk: {
                 const seed = args[0].read(u64);
                 const value = args[1].read(f32);
                 const bits: u64 = if (value == 0.0) 0 else @as(u64, @as(u32, @bitCast(value)));
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), bits, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), bits, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_f64 => blk: {
                 const seed = args[0].read(u64);
                 const value = args[1].read(f64);
                 const bits: u64 = if (value == 0.0) 0 else @bitCast(value);
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), bits, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), bits, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_u128,
@@ -5442,20 +5504,20 @@ pub const Interpreter = struct {
                 const bits: u128 = @bitCast(args[1].read(i128));
                 const low: u64 = @truncate(bits);
                 const high: u64 = @truncate(bits >> 64);
-                const next = builtins.hash.hasher_write_u128(seed, @intFromEnum(hasherDomain(ll.op)), low, high);
+                const next = builtins.hash.hasher_write_u128(seed, @intFromEnum(lir.hasherDomain(ll.op)), low, high);
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_bytes => blk: {
                 const seed = args[0].read(u64);
                 const bytes = try self.byteListSlice(args[1], try self.lowLevelArgLayout(ll, 1));
-                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(hasherDomain(ll.op)), bytes.ptr, bytes.len);
+                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(lir.hasherDomain(ll.op)), bytes.ptr, bytes.len);
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_str => blk: {
                 const seed = args[0].read(u64);
                 var str = valueToRocStr(args[1]);
                 const bytes = str.asSlice();
-                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(hasherDomain(ll.op)), bytes.ptr, bytes.len);
+                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(lir.hasherDomain(ll.op)), bytes.ptr, bytes.len);
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
 
@@ -5836,6 +5898,7 @@ pub const Interpreter = struct {
             // ── Box ops ──
             .box_box => try self.evalBoxBox(args[0], ll.ret_layout),
             .box_unbox => try self.evalBoxUnbox(args[0], ll.ret_layout),
+            .box_prepare_update => try self.evalBoxPrepareUpdate(args[0], ll.ret_layout, ll.unique_args),
             .erased_capture_load => try self.evalErasedCaptureLoad(args[0], ll.ret_layout),
             .ptr_alloca => try self.evalPtrAlloca(ll.ret_layout),
             .box_alloc_zeroed => try self.evalBoxAllocZeroed(ll.ret_layout),
@@ -6588,7 +6651,7 @@ pub const Interpreter = struct {
     fn intToDec(self: *LirInterpreter, comptime Src: type, arg: Value, ret_layout: layout_mod.Idx) Error!Value {
         const val = try self.alloc(ret_layout);
         const sv = arg.read(Src);
-        const scale: i128 = 1_000_000_000_000_000_000; // 10^18
+        const scale: i128 = RocDec.one_point_zero_i128;
         val.write(i128, @as(i128, @intCast(sv)) *% scale);
         return val;
     }
@@ -7099,31 +7162,12 @@ pub const Interpreter = struct {
                 break :blk builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
             },
             .rem => blk: {
-                // Dec rem: a - trunc(a/b) * b
                 if (bv == 0) break :blk @as(i128, 0);
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                const div_result = builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-                const mul_result = RocDec.mulWithOverflow(RocDec{ .num = div_result }, RocDec{ .num = bv });
-                break :blk av -% mul_result.value.num;
+                break :blk builtins.dec.remC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
             },
             .mod => blk: {
                 if (bv == 0) break :blk @as(i128, 0);
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                const div_result = builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-                const mul_result = RocDec.mulWithOverflow(RocDec{ .num = div_result }, RocDec{ .num = bv });
-                const remainder = av -% mul_result.value.num;
-                // Mod adjusts sign to match divisor
-                if (remainder == 0) break :blk @as(i128, 0);
-                if ((remainder > 0) != (bv > 0))
-                    break :blk remainder +% bv
-                else
-                    break :blk remainder;
+                break :blk builtins.dec.modC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
             },
         };
     }
@@ -7479,6 +7523,57 @@ pub const Interpreter = struct {
         }
 
         return result;
+    }
+
+    fn evalBoxPrepareUpdate(self: *LirInterpreter, boxed: Value, ret_layout: layout_mod.Idx, unique_args: u64) Error!Value {
+        const ret_layout_val = self.layout_store.getLayout(ret_layout);
+        switch (ret_layout_val.tag) {
+            .box_of_zst => return try self.allocBoxOfZstValue(ret_layout),
+            .box => {
+                const box_info = self.boxAllocInfo(ret_layout_val);
+                const data_ptr = self.readBoxedDataPointer(boxed) orelse {
+                    const result = try self.alloc(ret_layout);
+                    self.writeBoxedDataPointer(result, null);
+                    return result;
+                };
+
+                if (box_info.elem_size == 0 or (unique_args & 1) != 0 or builtins.utils.isUnique(data_ptr, &self.roc_ops)) {
+                    const result = try self.alloc(ret_layout);
+                    self.writeBoxedDataPointer(result, data_ptr);
+                    return result;
+                }
+
+                const fresh = try self.allocRocDataWithRc(
+                    box_info.elem_size,
+                    box_info.elem_alignment,
+                    box_info.contains_rc,
+                );
+                @memcpy(fresh[0..box_info.elem_size], data_ptr[0..box_info.elem_size]);
+
+                if (box_info.contains_rc) {
+                    self.performBuiltinInternalRc(
+                        "interpreter.box_prepare_update.payload_incref",
+                        .incref,
+                        .{ .ptr = fresh },
+                        box_info.elem_layout,
+                        1,
+                    );
+                }
+
+                self.performBuiltinInternalRc(
+                    "interpreter.box_prepare_update.input_decref",
+                    .decref,
+                    boxed,
+                    ret_layout,
+                    1,
+                );
+
+                const result = try self.alloc(ret_layout);
+                self.writeBoxedDataPointer(result, fresh);
+                return result;
+            },
+            else => return error.RuntimeError,
+        }
     }
 
     fn evalErasedCaptureLoad(self: *LirInterpreter, capture_ptr: Value, ret_layout: layout_mod.Idx) Error!Value {

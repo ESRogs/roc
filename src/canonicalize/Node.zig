@@ -502,7 +502,7 @@ pub const Payload = extern union {
     pub const StatementTypeAnno = extern struct {
         anno: u32,
         name: u32,
-        where_span2_idx_plus_one: u32, // 0 means no where clause, else index+1 into span2_data
+        where_span2_idx_plus_one: u32, // 0 means no where clause, else index+1 into span_with_node_data
     };
 
     /// statement_type_var_alias: alias_name + type_var_name + type_var_anno
@@ -1008,6 +1008,7 @@ pub const Payload = extern union {
         var_idx: u32,
         name: u32,
         args_ret_idx: u32, // Index into span_with_node_data: (args.start, args.len, ret)
+        effectful: u32,
     };
 
     pub const WhereMalformed = extern struct {

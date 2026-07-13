@@ -100,7 +100,19 @@ pub const BuiltinOwner = enum(u8) {
     crypto_sha256_hasher,
     crypto_blake3_digest,
     crypto_blake3_hasher,
+    iter,
+    stream,
 };
+
+/// The builtin `Iter`/`Stream` nominals hold their step closure by value inside
+/// a finite backing record. Later stages consult this to keep that closure a
+/// lambda set (inline captures) instead of erasing it to a boxed callable.
+pub fn isIteratorOwner(owner: BuiltinOwner) bool {
+    return switch (owner) {
+        .iter, .stream => true,
+        else => false,
+    };
+}
 
 /// Public `MethodKey` declaration.
 pub const MethodKey = struct {
@@ -769,6 +781,21 @@ pub const StructuralKind = enum(u8) {
     hash,
     parser,
     encoder,
+};
+
+/// Public `structural_method_kinds` declaration.
+///
+/// The one table mapping the method names that can discharge structurally to
+/// their `StructuralKind`. Each `name` matches the corresponding
+/// `CommonIdents` field name, so the evidence pass compares interned idents
+/// via `@field` over this table while monotype lowering's component synthesis
+/// classifies its view-local method names by text — both from this single
+/// source.
+pub const structural_method_kinds = [_]struct { name: [:0]const u8, kind: StructuralKind }{
+    .{ .name = "is_eq", .kind = .equality },
+    .{ .name = "to_hash", .kind = .hash },
+    .{ .name = "parser_for", .kind = .parser },
+    .{ .name = "encoder_for", .kind = .encoder },
 };
 
 /// Public `EvidenceNodeId` declaration. Index into
@@ -1641,54 +1668,6 @@ fn checkedTypeIsBuiltinBool(checked_types: anytype, ty: CheckedTypeId) bool {
     };
 }
 
-/// Public `methodOwnerForCheckedType` declaration: the method owner of a
-/// published checked type, walking alias chains transparently.
-pub fn methodOwnerForCheckedType(checked_types: anytype, ty: CheckedTypeId) ?MethodOwner {
-    var current = ty;
-    // Aliases are transparent for static dispatch: an alias's method owner is its
-    // backing's owner. Walk the (finite) alias chain so an alias-over-nominal,
-    // alias-over-alias, or alias-over-builtin resolves to the underlying owner
-    // rather than the alias's own identity, where no methods are registered. The
-    // bound on iterations is the store size, so a cyclic chain cannot loop here.
-    var remaining = checked_types.store.payloads.items.len;
-    while (true) {
-        const raw = @intFromEnum(current);
-        if (raw >= checked_types.store.payloads.items.len) {
-            if (@import("builtin").mode == .Debug) {
-                std.debug.panic("checked static dispatch invariant violated: dispatcher type root was outside the checked type store", .{});
-            }
-            unreachable;
-        }
-        switch (checked_types.store.payloads.items[raw]) {
-            .alias => |alias| {
-                if (remaining == 0) {
-                    if (@import("builtin").mode == .Debug) {
-                        std.debug.panic("checked static dispatch invariant violated: checked type alias chain was cyclic", .{});
-                    }
-                    unreachable;
-                }
-                remaining -= 1;
-                current = alias.backing;
-            },
-            else => |payload| return methodOwnerForCheckedPayload(payload),
-        }
-    }
-}
-
-fn methodOwnerForCheckedPayload(payload: anytype) ?MethodOwner {
-    return switch (payload) {
-        .nominal => |nominal| if (nominal.builtin) |builtin|
-            .{ .builtin = builtinOwnerForCheckedBuiltin(builtin) }
-        else
-            .{ .nominal = .{
-                .module = nominal.origin_module,
-                .type_name = nominal.name,
-                .source_decl = nominal.source_decl,
-            } },
-        else => null,
-    };
-}
-
 /// Public `builtinOwnerForCheckedBuiltin` declaration: the registry owner key
 /// for a checked builtin nominal.
 pub fn builtinOwnerForCheckedBuiltin(builtin: anytype) BuiltinOwner {
@@ -1754,7 +1733,7 @@ pub fn lookupCheckedMethodTarget(
 /// component crosses by 32-byte content identity (one map probe, full-value
 /// comparison), the type-name component by declared-name interning. This is
 /// the single cross-artifact owner resolution point — no module name text.
-fn methodOwnerInImportedStore(
+pub fn methodOwnerInImportedStore(
     source_names: *const canonical.CanonicalNameStore,
     imported_names: *const canonical.CanonicalNameStore,
     owner: MethodOwner,

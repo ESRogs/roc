@@ -12,6 +12,7 @@ const interpreter_style_tests = @import("eval_interpreter_style_tests.zig");
 const low_level_tests = @import("eval_low_level_tests.zig");
 const polymorphism_tests = @import("eval_polymorphism_tests.zig");
 const recursive_data_tests = @import("eval_recursive_data_tests.zig");
+const iter_alloc_tests = @import("eval_iter_alloc_tests.zig");
 
 /// All eval test cases, consumed by the parallel runner.
 ///
@@ -3649,6 +3650,108 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "Known(4)" },
     },
     .{
+        .name = "inspect: Iter.next steps appended iterator in order",
+        .source =
+        \\{
+        \\    first = Iter.next([1.I64, 2].iter().append(3))
+        \\    match first {
+        \\        One({ item, rest }) => [item].concat(Iter.fold(rest, [], |acc, n| acc.append(n)))
+        \\        _ => []
+        \\    }
+        \\}
+        ,
+        .expected = .{ .inspect_str = "[1, 2, 3]" },
+    },
+    .{
+        .name = "inspect: Iter.next reuses public iterator values",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2].iter()
+        \\
+        \\    first = match Iter.next(iter) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\
+        \\    second = match Iter.next(iter) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\
+        \\    (first, second)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(1, 1)" },
+    },
+    .{
+        .name = "inspect: for loop does not mutate aliased public iterator",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2].iter()
+        \\    saved = iter
+        \\
+        \\    var $sum = 0.I64
+        \\    for item in iter {
+        \\        $sum = $sum + item
+        \\    }
+        \\
+        \\    saved_first = match Iter.next(saved) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\
+        \\    ($sum, saved_first)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(3, 1)" },
+    },
+    .{
+        .name = "inspect: escaped Iter.next rest keeps public meaning",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2, 3].iter()
+        \\
+        \\    rest = match Iter.next(iter) {
+        \\        One({ rest, .. }) => rest
+        \\        _ => iter
+        \\    }
+        \\
+        \\    match Iter.next(rest) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "for loop over appended iterator",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2].iter().append(3).append(4)
+        \\    var $sum = 0.I64
+        \\    for item in iter {
+        \\        $sum = $sum + item
+        \\    }
+        \\    $sum
+        \\}
+        ,
+        .expected = .{ .inspect_str = "10" },
+    },
+    .{
+        .name = "for loop over inline appended iterator",
+        .source =
+        \\{
+        \\    var $sum = 0.I64
+        \\    for item in [1.I64, 2].iter().append(3).append(4) {
+        \\        $sum = $sum + item
+        \\    }
+        \\    $sum
+        \\}
+        ,
+        .expected = .{ .inspect_str = "10" },
+    },
+    .{
         .name = "inspect: Iter.keep_if emits skip with rest iterator",
         .source =
         \\match Iter.next(Iter.keep_if([1.I64, 2].iter(), |item| item > 1)) {
@@ -4245,6 +4348,29 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "((Ok(126), Err(Overflow), Ok(-127), Err(Overflow), Ok(127), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(32766), Err(Overflow), Ok(-32767), Err(Overflow), Ok(32767), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(2147483646), Err(Overflow), Ok(-2147483647), Err(Overflow), Ok(2147483647), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(9223372036854775806), Err(Overflow), Ok(-9223372036854775807), Err(Overflow), Ok(9223372036854775807), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(170141183460469231731687303715884105726), Err(Overflow), Ok(-170141183460469231731687303715884105727), Err(Overflow), Ok(170141183460469231731687303715884105727), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)))" },
     },
     .{
+        .name = "inspect: div_floor_by covers every numeric type",
+        .source =
+        \\{
+        \\    (
+        \\        U8.div_floor_by(7, 2) == 3 and U8.div_floor_by(8, 2) == 4,
+        \\        I8.div_floor_by(7, 2) == 3 and I8.div_floor_by(-7, 2) == -4 and I8.div_floor_by(7, -2) == -4 and I8.div_floor_by(-7, -2) == 3 and I8.div_floor_by(-8, 2) == -4,
+        \\        U16.div_floor_by(7, 2) == 3 and U16.div_floor_by(8, 2) == 4,
+        \\        I16.div_floor_by(7, 2) == 3 and I16.div_floor_by(-7, 2) == -4 and I16.div_floor_by(7, -2) == -4 and I16.div_floor_by(-7, -2) == 3 and I16.div_floor_by(-8, 2) == -4,
+        \\        U32.div_floor_by(7, 2) == 3 and U32.div_floor_by(8, 2) == 4,
+        \\        I32.div_floor_by(7, 2) == 3 and I32.div_floor_by(-7, 2) == -4 and I32.div_floor_by(7, -2) == -4 and I32.div_floor_by(-7, -2) == 3 and I32.div_floor_by(-8, 2) == -4,
+        \\        U64.div_floor_by(7, 2) == 3 and U64.div_floor_by(8, 2) == 4,
+        \\        I64.div_floor_by(7, 2) == 3 and I64.div_floor_by(-7, 2) == -4 and I64.div_floor_by(7, -2) == -4 and I64.div_floor_by(-7, -2) == 3 and I64.div_floor_by(-8, 2) == -4,
+        \\        U128.div_floor_by(7, 2) == 3 and U128.div_floor_by(8, 2) == 4,
+        \\        I128.div_floor_by(7, 2) == 3 and I128.div_floor_by(-7, 2) == -4 and I128.div_floor_by(7, -2) == -4 and I128.div_floor_by(-7, -2) == 3 and I128.div_floor_by(-8, 2) == -4,
+        \\        Dec.div_floor_by(7.5, 2.0) == 3.0 and Dec.div_floor_by(-7.5, 2.0) == -4.0 and Dec.div_floor_by(7.5, -2.0) == -4.0 and Dec.div_floor_by(-7.5, -2.0) == 3.0 and Dec.div_floor_by(-8.0, 2.0) == -4.0,
+        \\        F32.div_floor_by(7.5.F32, 2.0.F32).to_str() == "3" and F32.div_floor_by(-7.5.F32, 2.0.F32).to_str() == "-4" and F32.div_floor_by(7.5.F32, -2.0.F32).to_str() == "-4" and F32.div_floor_by(-7.5.F32, -2.0.F32).to_str() == "3" and F32.div_floor_by(-8.0.F32, 2.0.F32).to_str() == "-4",
+        \\        F64.div_floor_by(7.5.F64, 2.0.F64).to_str() == "3" and F64.div_floor_by(-7.5.F64, 2.0.F64).to_str() == "-4" and F64.div_floor_by(7.5.F64, -2.0.F64).to_str() == "-4" and F64.div_floor_by(-7.5.F64, -2.0.F64).to_str() == "3" and F64.div_floor_by(-8.0.F64, 2.0.F64).to_str() == "-4",
+        \\    )
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(True, True, True, True, True, True, True, True, True, True, True, True, True)" },
+    },
+    .{
         .name = "inspect: try APIs unify with open error rows",
         .source =
         \\{
@@ -4449,28 +4575,31 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "(1, 1, 1, 1, 1, 1, 1, 1, 1, 1)" },
     },
     .{
-        // Directly exercises the steps_between length primitive: ascending ->
-        // Known(count); descending and equal -> Known(0) (the lower guard
-        // branch the range boundary tests never hit); and the U128/I128
-        // over-U64-width + Dec cases -> Unknown (the fallback that feeds the
-        // from_iter grow path).
-        .name = "inspect: steps_between reports Known counts, Known(0) descending, Unknown on overflow",
+        // Directly exercises the range length computation via size_hint:
+        // ascending -> Known(count); descending and empty -> Known(0) (the
+        // lower guard branch the range boundary tests never hit); inclusive
+        // singleton -> Known(1); the U128/I128 over-U64-width, the inclusive
+        // full-width count that exceeds U64, and Dec -> Unknown (which feeds
+        // the from_iter grow path).
+        .name = "inspect: range size_hint reports Known counts, Known(0) descending, Unknown on overflow",
         .source =
         \\{
         \\    (
-        \\        U8.steps_between(5, 10),
-        \\        U8.steps_between(10, 5),
-        \\        U8.steps_between(5, 5),
-        \\        I8.steps_between(-3, 2),
-        \\        I8.steps_between(2, -3),
-        \\        U128.steps_between(0, 100),
-        \\        U128.steps_between(0, U128.highest),
-        \\        I128.steps_between(0, I128.highest),
-        \\        Dec.steps_between(1.0, 5.0),
+        \\        Iter.size_hint(U8.range_exclusive(5, 10)),
+        \\        Iter.size_hint(U8.range_exclusive(10, 5)),
+        \\        Iter.size_hint(U8.range_exclusive(5, 5)),
+        \\        Iter.size_hint(U8.range_inclusive(5, 5)),
+        \\        Iter.size_hint(I8.range_exclusive(-3, 2)),
+        \\        Iter.size_hint(I8.range_exclusive(2, -3)),
+        \\        Iter.size_hint(U128.range_exclusive(0, 100)),
+        \\        Iter.size_hint(U128.range_exclusive(0, U128.highest)),
+        \\        Iter.size_hint(I128.range_exclusive(0, I128.highest)),
+        \\        Iter.size_hint(U64.range_inclusive(0, U64.highest)),
+        \\        Iter.size_hint(Dec.range_exclusive(1.0, 5.0)),
         \\    )
         \\}
         ,
-        .expected = .{ .inspect_str = "(Known(5), Known(0), Known(0), Known(5), Known(0), Known(100), Unknown, Unknown, Unknown)" },
+        .expected = .{ .inspect_str = "(Known(5), Known(0), Known(0), Known(1), Known(5), Known(0), Known(100), Unknown, Unknown, Unknown, Unknown)" },
     },
     .{
         // Collecting a range whose length is Unknown (Dec ranges always report
@@ -5000,4 +5129,4 @@ const core_tests = [_]TestCase{
     },
 };
 
-pub const tests = core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests;
+pub const tests = core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests ++ iter_alloc_tests.tests;

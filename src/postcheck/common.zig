@@ -28,8 +28,13 @@ pub const RootRequests = struct {
 
 /// Checked const data that must produce a runtime layout and callable entries.
 pub const StaticDataRequest = struct {
-    data: checked.ProvidedDataExport,
+    const_locator: checked.ConstLocator,
+    node: ?checked.ConstNodeId = null,
+    checked_type: checked.CheckedTypeId,
 };
+
+/// Stage-local readonly static-data value id.
+pub const StaticDataId = enum(u32) { _ };
 
 /// Optional command-level test-plan metadata for a checked root request.
 pub const RootTestPlanMetadata = struct {
@@ -105,6 +110,14 @@ pub fn hasherWriteOp(primitive: MonoType.Primitive) LIR.LowLevel {
 pub fn invariant(comptime message: []const u8) noreturn {
     if (@import("builtin").mode == .Debug) {
         std.debug.panic("postcheck invariant violated: {s}", .{message});
+    }
+    unreachable;
+}
+
+/// `invariant` with runtime context formatted into the panic message.
+pub fn invariantFmt(comptime fmt: []const u8, args: anytype) noreturn {
+    if (@import("builtin").mode == .Debug) {
+        std.debug.panic("postcheck invariant violated: " ++ fmt, args);
     }
     unreachable;
 }
