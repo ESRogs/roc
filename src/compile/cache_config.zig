@@ -49,7 +49,8 @@ pub const Constants = struct {
     /// 23: Stored nested functions carry durable local-procedure context identity.
     /// 24: CommonIdents carries the range_exclusive/range_inclusive method idents.
     /// 25: Canonical node storage records where-clause rigid ownership.
-    pub const CACHE_VERSION = 25;
+    /// 26: ModuleEnv scheme instantiation evidence was renamed to scheme-use evidence.
+    pub const CACHE_VERSION = 26;
 };
 
 /// Configuration for the Roc cache system.

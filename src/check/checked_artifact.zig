@@ -13004,7 +13004,7 @@ fn sealCheckedProcedureTemplateRefs(
 /// canonical evidence-param list. Concrete dispatchers resolve through the
 /// checked registry; where-var dispatchers resolve to their param index;
 /// evidence for call edges comes from the checker's persisted
-/// `SchemeInstantiationRecord`s, whose fresh vars are resolved against the
+/// `SchemeUseRecord`s, whose fresh vars are resolved against the
 /// settled type store.
 const EvidencePass = struct {
     allocator: Allocator,
@@ -13024,15 +13024,12 @@ const EvidencePass = struct {
 
     types: *const types.Store,
 
-    /// value_use record index by source node.
+    /// Value-use record index by source node, including explicit shared uses.
     value_use_by_node: std.AutoHashMap(u32, u32),
     /// dispatch_target record index by the discharged constraint's raw fn var.
     target_by_fn_var: std.AutoHashMap(u32, u32),
     /// Source node by checked expr (reverse of `exprIdForSource`).
     source_by_checked_expr: std.AutoHashMap(u32, u32),
-    /// Top-level def by its pattern (for self/SCC-recursive lookups that were
-    /// checked without instantiation).
-    def_by_pattern: std.AutoHashMap(u32, CIR.Def.Idx),
     /// Generalized local VALUE decls (non-lambda exprs, e.g. an `if` choosing
     /// between closures): scheme param var root -> decl pattern. Monotype
     /// lowers such decls inline at the single type their uses unify to, so a
@@ -13064,9 +13061,9 @@ const EvidencePass = struct {
     /// sweep resolves whatever no template reached (chain-free).
     plan_resolved: []bool = &.{},
     iterator_plan_resolved: []bool = &.{},
-    /// Shared-var use sites deferred during template walks (their chains did
-    /// not bind every obligation); the final sweep re-emits leftovers.
-    deferred_use_sites: std.ArrayListUnmanaged(struct { source_node: u32, site_key: u32 }) = .empty,
+    /// Explicit shared-var use records deferred during template walks because
+    /// the current chain did not bind every obligation.
+    deferred_use_sites: std.ArrayListUnmanaged(struct { record_idx: u32, site_key: u32 }) = .empty,
     /// The param chain in scope while resolving a site's evidence entries, so
     /// a fresh var that settled onto an enclosing where-var forwards as
     /// `constraint(depth, k)`. Index 0 is the innermost generalized callable.
@@ -13109,7 +13106,6 @@ const EvidencePass = struct {
             .value_use_by_node = std.AutoHashMap(u32, u32).init(allocator),
             .target_by_fn_var = std.AutoHashMap(u32, u32).init(allocator),
             .source_by_checked_expr = std.AutoHashMap(u32, u32).init(allocator),
-            .def_by_pattern = std.AutoHashMap(u32, CIR.Def.Idx).init(allocator),
             .local_value_scheme_by_var = std.AutoHashMap(u32, u32).init(allocator),
             .value_use_record_by_pattern = std.AutoHashMap(u32, u32).init(allocator),
             .node_by_record = std.AutoHashMap(u32, static_dispatch.EvidenceNodeId).init(allocator),
@@ -13133,7 +13129,6 @@ const EvidencePass = struct {
         self.value_use_by_node.deinit();
         self.target_by_fn_var.deinit();
         self.source_by_checked_expr.deinit();
-        self.def_by_pattern.deinit();
         self.local_value_scheme_by_var.deinit();
         self.value_use_record_by_pattern.deinit();
         self.node_by_record.deinit();
@@ -13268,16 +13263,19 @@ const EvidencePass = struct {
             try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
         }
 
-        // Shared-var use sites no template's chain fully bound: emit their
-        // evidence chain-free (concrete targets, defaults, structural,
-        // vacuous). A site an intervening walk already emitted (overlapping
-        // spans) is skipped by `site_seen`.
+        // Explicit shared-var use sites no template chain fully bound resolve
+        // chain-free here. A site an overlapping template already emitted is
+        // skipped by `site_seen`.
         {
             var i: usize = 0;
             while (i < self.deferred_use_sites.items.len) : (i += 1) {
                 const deferred = self.deferred_use_sites.items[i];
                 if (self.site_seen.contains(deferred.site_key)) continue;
-                try self.emitRecursiveUseEvidence(deferred.source_node, deferred.site_key, &.{}, true);
+                self.current_chain = &.{};
+                const span = (try self.evidenceRefsForRecord(deferred.record_idx, true)).?;
+                if (span.len == 0) continue;
+                try self.site_seen.put(deferred.site_key, {});
+                try self.site_evidence.append(self.allocator, .{ .key = deferred.site_key, .start = span.start, .len = span.len });
             }
         }
 
@@ -13304,9 +13302,9 @@ const EvidencePass = struct {
 
     fn buildIndexes(self: *EvidencePass) Allocator.Error!void {
         const module_env = self.module.moduleEnvConst();
-        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
-            switch (@as(ModuleEnv.SchemeInstantiationRecord.Slot, @enumFromInt(record.slot_kind))) {
-                .value_use => {
+        for (module_env.scheme_uses.items.items, 0..) |record, i| {
+            switch (@as(ModuleEnv.SchemeUseRecord.Slot, @enumFromInt(record.slot_kind))) {
+                .value_use, .shared_value_use => {
                     // Re-checks can record the same instantiation twice; keep
                     // the first.
                     const entry = try self.value_use_by_node.getOrPut(record.node_idx);
@@ -13331,15 +13329,11 @@ const EvidencePass = struct {
         }
 
         const global_value_defs = module_env.store.sliceDefs(module_env.global_value_defs);
-        for (global_value_defs) |def_idx| {
-            const def = module_env.store.getDef(def_idx);
-            try self.def_by_pattern.put(@intFromEnum(def.pattern), def_idx);
-        }
 
         // Generalized local VALUE decls and one representative use record per
         // looked-up pattern (see `local_value_scheme_by_var`).
-        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
-            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.value_use)) continue;
+        for (module_env.scheme_uses.items.items, 0..) |record, i| {
+            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.value_use)) continue;
             if (self.module.nodeTag(@enumFromInt(record.node_idx)) != .expr_var) continue;
             const lookup = self.module.expr(@enumFromInt(record.node_idx)).data.e_lookup_local;
             const entry = try self.value_use_record_by_pattern.getOrPut(@intFromEnum(lookup.pattern_idx));
@@ -13561,8 +13555,8 @@ const EvidencePass = struct {
         if (self.local_value_scheme_by_var.get(@intFromEnum(resolved.var_))) |pattern_raw| {
             if (self.value_use_record_by_pattern.get(pattern_raw)) |record_idx| {
                 const module_env = self.module.moduleEnvConst();
-                const record = module_env.scheme_instantiations.items.items[record_idx];
-                const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+                const record = module_env.scheme_uses.items.items[record_idx];
+                const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
                 if (self.pairForResolved(pairs, resolved.var_)) |fresh| {
                     if (self.types.resolveVar(fresh).var_ != resolved.var_) {
                         const fresh_fn: ?Var = if (constraint_fn_var) |fn_var| self.pairForResolved(pairs, self.types.resolveVar(fn_var).var_) else null;
@@ -13719,26 +13713,27 @@ const EvidencePass = struct {
             }
             defer _ = self.record_in_progress.remove(idx);
 
-            const nested = try self.evidenceRefsForRecord(idx);
+            const nested = (try self.evidenceRefsForRecord(idx, true)).?;
             const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
             try self.evidence_nodes.append(self.allocator, .{ .target = target, .nested = nested });
             try self.node_by_record.put(idx, node_id);
             return node_id;
         }
 
-        // Monomorphic target (or a discharge this pass has no record for —
-        // e.g. a recursion-cycle placeholder): no nested obligations.
+        // A monomorphic target with no constrained scheme has no nested
+        // obligations. Shared constrained targets have explicit zero-pair
+        // dispatch-target records and take the branch above.
         const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
         try self.evidence_nodes.append(self.allocator, .{ .target = target });
         return node_id;
     }
 
-    /// Resolve one instantiation record's obligations (in the scheme's
-    /// canonical order) into a contiguous `evidence_refs` range.
-    fn evidenceRefsForRecord(self: *EvidencePass, record_idx: u32) Allocator.Error!artifact_serialize.Span {
+    /// Resolve one scheme-use record's obligations (in the scheme's canonical
+    /// order) into a contiguous `evidence_refs` range.
+    fn evidenceRefsForRecord(self: *EvidencePass, record_idx: u32, commit_unpinned: bool) Allocator.Error!?artifact_serialize.Span {
         const module_env = self.module.moduleEnvConst();
-        const record = module_env.scheme_instantiations.items.items[record_idx];
-        const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+        const record = module_env.scheme_uses.items.items[record_idx];
+        const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
 
         var params = std.ArrayListUnmanaged(EvidenceParam).empty;
         defer params.deinit(self.allocator);
@@ -13749,26 +13744,28 @@ const EvidencePass = struct {
         try entries.ensureTotalCapacity(self.allocator, params.items.len);
 
         for (params.items) |param| {
-            entries.appendAssumeCapacity(try self.evidenceForRecordParam(pairs, param));
+            const evidence = (try self.evidenceForRecordParam(pairs, param, commit_unpinned)) orelse return null;
+            entries.appendAssumeCapacity(evidence);
         }
 
-        return self.appendEvidenceRefs(entries.items);
+        return @as(?artifact_serialize.Span, try self.appendEvidenceRefs(entries.items));
     }
 
     fn evidenceForRecordParam(
         self: *EvidencePass,
-        pairs: []const ModuleEnv.SchemeInstantiationPair,
+        pairs: []const ModuleEnv.SchemeUsePair,
         param: EvidenceParam,
-    ) Allocator.Error!static_dispatch.CheckedEvidence {
+        commit_unpinned: bool,
+    ) Allocator.Error!?static_dispatch.CheckedEvidence {
         const dispatcher_root = self.types.resolveVar(param.dispatcher_var).var_;
         const fresh_dispatcher = self.pairForResolved(pairs, dispatcher_root) orelse {
             // The scheme var was not copied at this instantiation (it was
             // already monomorphic there); resolve the pristine var directly.
-            return (try self.evidenceForVar(param, param.dispatcher_var, null, true)).?;
+            return try self.evidenceForVar(param, param.dispatcher_var, null, commit_unpinned);
         };
         const fn_root = self.types.resolveVar(param.constraint.fn_var).var_;
         const fresh_fn = self.pairForResolved(pairs, fn_root);
-        return (try self.evidenceForVar(param, fresh_dispatcher, fresh_fn, true)).?;
+        return try self.evidenceForVar(param, fresh_dispatcher, fresh_fn, commit_unpinned);
     }
 
     /// Resolve one obligation of an instantiated scheme: the fresh dispatcher
@@ -13837,65 +13834,27 @@ const EvidencePass = struct {
         defer self.current_chain = &.{};
 
         if (self.value_use_by_node.get(source_node)) |record_idx| {
-            const span = try self.evidenceRefsForRecord(record_idx);
+            const record = self.module.moduleEnvConst().scheme_uses.items.items[record_idx];
+            const shared = record.slot_kind == @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.shared_value_use);
+            const span = (try self.evidenceRefsForRecord(record_idx, !shared)) orelse {
+                try self.deferred_use_sites.append(self.allocator, .{ .record_idx = record_idx, .site_key = site_key });
+                return;
+            };
             if (span.len == 0) return;
             try self.site_seen.put(site_key, {});
             try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
             return;
         }
 
-        // No instantiation record: a self- or SCC-recursive use of a local
-        // generic def is checked against the shared pre-generalization vars,
-        // so its obligations forward to the enclosing template's own params
-        // by var identity.
-        try self.emitRecursiveUseEvidence(source_node, site_key, chain, false);
-    }
-
-    /// Emit evidence for a shared-var (recursive/SCC) use. With
-    /// `commit_unpinned = false`, a site whose obligations this chain does
-    /// not fully bind is skipped so a template whose scheme binds them (spans
-    /// can overlap) or the deferred-site sweep emits it instead.
-    fn emitRecursiveUseEvidence(self: *EvidencePass, source_node: u32, site_key: u32, chain: []const []const EvidenceParam, commit_unpinned: bool) Allocator.Error!void {
-        if (self.module.nodeTag(@enumFromInt(source_node)) != .expr_var) return;
-        const lookup = self.module.expr(@enumFromInt(source_node)).data.e_lookup_local;
-        const callee_def = self.def_by_pattern.get(@intFromEnum(lookup.pattern_idx)) orelse return;
-
-        var callee_params = std.ArrayListUnmanaged(EvidenceParam).empty;
-        defer callee_params.deinit(self.allocator);
-        try self.enumerateParams(ModuleEnv.varFrom(callee_def), &callee_params);
-        if (callee_params.items.len == 0) return;
-
-        var entries = std.ArrayListUnmanaged(static_dispatch.CheckedEvidence).empty;
-        defer entries.deinit(self.allocator);
-        try entries.ensureTotalCapacity(self.allocator, callee_params.items.len);
-
-        const idents = self.module.identStoreConst();
-        for (callee_params.items) |callee_param| {
-            const dispatcher_root = self.types.resolveVar(callee_param.dispatcher_var).var_;
-            const method = try self.names.internMethodIdent(idents, callee_param.constraint.fn_name);
-            if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
-                entries.appendAssumeCapacity(.{ .constraint = ref });
-            } else if (try self.evidenceForVar(callee_param, callee_param.dispatcher_var, callee_param.constraint.fn_var, commit_unpinned)) |evidence| {
-                // The use shares the definition's vars (no instantiation
-                // record), so the obligation resolves exactly like a plan on
-                // those vars: concrete targets, defaulting, structural, or
-                // vacuous classification.
-                entries.appendAssumeCapacity(evidence);
-            } else {
-                // Not bound by this chain: defer the whole site.
-                try self.deferred_use_sites.append(self.allocator, .{ .source_node = source_node, .site_key = site_key });
-                return;
-            }
-        }
-
-        const span = try self.appendEvidenceRefs(entries.items);
-        try self.site_seen.put(site_key, {});
-        try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
+        // References that do not become specialization edges intentionally
+        // have no site evidence. Shared recursive uses are explicit records
+        // and therefore returned through the branch above.
+        return;
     }
 
     /// `pairFor`, but comparing RESOLVED roots on both sides: finalization
     /// after record time can move the pristine var's root.
-    fn pairForResolved(self: *EvidencePass, pairs: []const ModuleEnv.SchemeInstantiationPair, old_root: Var) ?Var {
+    fn pairForResolved(self: *EvidencePass, pairs: []const ModuleEnv.SchemeUsePair, old_root: Var) ?Var {
         for (pairs) |pair| {
             if (self.types.resolveVar(@enumFromInt(pair.old_var)).var_ == old_root) return @enumFromInt(pair.fresh_var);
         }
