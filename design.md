@@ -2785,8 +2785,9 @@ constraints to guess a target.
 Totality is enforced at the boundary: `validateDispatchEvidence`, run by the
 checked module's `verifyComplete`, asserts that every dispatch-bearing
 checked expression names a plan and that every plan and evidence reference
-lands inside the checked module data's evidence tables. A missing or corrupt
-record is a compiler bug reported at the boundary, not a lowering panic.
+lands inside the checked module data's evidence tables. In debug builds —
+where the boundary verifiers run — a missing or corrupt record is a compiler
+bug reported at the boundary, not a lowering panic.
 
 **Evidence params.** Every type scheme with dispatch requirements has one
 deterministic ordered list of (dispatcher var, constraint) pairs —
