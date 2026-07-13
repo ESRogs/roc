@@ -491,6 +491,8 @@ const Lowerer = struct {
     }
 
     fn lower(self: *Lowerer) Common.LowerError!void {
+        try self.result.const_evidence_pool.appendSlice(self.allocator, self.solved.lifted.const_evidence_pool.unsafeRawItemsForView());
+        try self.result.const_evidence_chain_pool.appendSlice(self.allocator, self.solved.lifted.const_evidence_chain_pool.unsafeRawItemsForView());
         try self.indexSourceFns();
 
         try self.roots.ensureTotalCapacity(self.allocator, self.solved.lifted.rootCount());
@@ -7434,6 +7436,8 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
         .stmt_ids = try clonedLiftedProgramList(Lifted.StmtId, "stmt_ids", allocator, view.stmt_ids),
         .field_exprs = try clonedLiftedProgramList(Lifted.FieldExpr, "field_exprs", allocator, view.field_exprs),
         .fn_def_captures = try clonedLiftedProgramList(Lifted.FnDefCapture, "fn_def_captures", allocator, view.fn_def_captures),
+        .const_evidence_pool = try clonedLiftedProgramList(check.ConstStore.ConstEvidence, "const_evidence_pool", allocator, view.const_evidence_pool),
+        .const_evidence_chain_pool = try clonedLiftedProgramList(check.ConstStore.ConstRange, "const_evidence_chain_pool", allocator, view.const_evidence_chain_pool),
         .capture_operands = try clonedLiftedProgramList(Lifted.CaptureOperand, "capture_operands", allocator, view.capture_operands),
         .record_destructs = try clonedLiftedProgramList(Lifted.RecordDestruct, "record_destructs", allocator, view.record_destructs),
         .str_pattern_steps = try clonedLiftedProgramList(Lifted.StrPatternStep, "str_pattern_steps", allocator, view.str_pattern_steps),
@@ -7644,6 +7648,7 @@ fn constFnTemplateFromMono(template: Mono.FnTemplate) LirProgram.FnTemplate {
         .fn_def = constFnDefFromMono(template.fn_def),
         .source_fn_ty = template.source_fn_ty,
         .source_fn_key = template.source_fn_key,
+        .const_evidence_chain = template.const_evidence_chain,
     };
 }
 
