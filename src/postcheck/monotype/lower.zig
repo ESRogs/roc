@@ -83,6 +83,14 @@ pub const Options = struct {
 /// Deterministic counters used by specialization-shape tests.
 pub const SpecializationCounters = specialize.Counters;
 
+/// One memoized generated-evidence answer, valid only while the type store's
+/// digest generation and the TypeId's allocation epoch are unchanged.
+const EvidenceCacheEntry = struct {
+    generation: u64,
+    type_epoch: u64,
+    has_evidence: bool,
+};
+
 /// Lower checked modules and explicit roots into Monotype IR.
 pub fn run(
     allocator: Allocator,
@@ -638,6 +646,14 @@ const Builder = struct {
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
+    /// Memoized `monoTypeHasGeneratedOpaqueEvidence` answers. An entry is
+    /// valid only at the type store's current digest generation, which bumps
+    /// whenever a graph view refills in place, so a mutable view can never
+    /// return a stale answer. The TypeId allocation epoch separately rejects
+    /// ids recycled after the interner restores a discarded candidate.
+    evidence_cache: std.AutoHashMap(Type.TypeId, EvidenceCacheEntry),
+    /// Reused visited set for the evidence walk itself.
+    evidence_walk_visited: std.AutoHashMap(Type.TypeId, void),
     hosted_catalog: []HostedCatalogEntry = &.{},
     /// Demand-filled method lookup results keyed by the checked module whose
     /// registry scope applies. Checked modules output the ordered registry
@@ -686,6 +702,8 @@ const Builder = struct {
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
+            .evidence_cache = std.AutoHashMap(Type.TypeId, EvidenceCacheEntry).init(allocator),
+            .evidence_walk_visited = std.AutoHashMap(Type.TypeId, void).init(allocator),
             .batched_requester_drain_graph = null,
             .batched_requester_drain_needed = false,
             .evidence_arena = std.heap.ArenaAllocator.init(allocator),
@@ -715,6 +733,8 @@ const Builder = struct {
     fn deinit(self: *Builder) void {
         self.scoped_method_targets.deinit(self.allocator);
         self.allocator.free(self.hosted_catalog);
+        self.evidence_walk_visited.deinit();
+        self.evidence_cache.deinit();
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
@@ -2090,10 +2110,30 @@ const Builder = struct {
         };
     }
 
+    /// Whether a Monotype's structure reaches generated opaque evidence.
+    /// Answers memoize per type id at the store's current digest generation
+    /// and the id's allocation epoch. The generation bumps whenever any graph
+    /// view refills in place, and the epoch changes when a restored id is
+    /// reused, so no mutable or recycled type serves a stale answer. Repeated
+    /// walks between either change collapse into lookups.
     fn monoTypeHasGeneratedOpaqueEvidence(self: *Builder, ty: Type.TypeId) Allocator.Error!bool {
-        var visited = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
-        defer visited.deinit();
-        return try self.monoTypeHasGeneratedOpaqueEvidenceInner(ty, &visited);
+        self.count("evidence_walks");
+        const generation = self.program.types.digest_cache_generation;
+        const type_epoch = self.program.types.typeEpoch(ty);
+        if (self.evidence_cache.get(ty)) |entry| {
+            if (entry.generation == generation and entry.type_epoch == type_epoch) {
+                self.count("evidence_walk_memo_hits");
+                return entry.has_evidence;
+            }
+        }
+        self.evidence_walk_visited.clearRetainingCapacity();
+        const has_evidence = try self.monoTypeHasGeneratedOpaqueEvidenceInner(ty, &self.evidence_walk_visited);
+        try self.evidence_cache.put(ty, .{
+            .generation = generation,
+            .type_epoch = type_epoch,
+            .has_evidence = has_evidence,
+        });
+        return has_evidence;
     }
 
     fn monoTypeHasGeneratedOpaqueEvidenceInner(
@@ -8714,8 +8754,10 @@ const BodyContext = struct {
     ) Allocator.Error!NodeId {
         const declaration_id: u32 = @intFromEnum(source.declaration.id);
         if (self.graph.nominalBackingNode(source.view.key.bytes, declaration_id, args)) |cached| {
+            self.builder.count("nominal_backing_reuses");
             return cached;
         }
+        self.builder.count("nominal_backing_instantiations");
 
         const placeholder = try self.graph.newNode(.{ .unresolved = InstVariable.placeholder() });
         try self.graph.putNominalBackingNode(source.view.key.bytes, declaration_id, args, placeholder);
