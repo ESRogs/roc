@@ -100,7 +100,19 @@ pub const BuiltinOwner = enum(u8) {
     crypto_sha256_hasher,
     crypto_blake3_digest,
     crypto_blake3_hasher,
+    iter,
+    stream,
 };
+
+/// The builtin `Iter`/`Stream` nominals hold their step closure by value inside
+/// a finite backing record. Later stages consult this to keep that closure a
+/// lambda set (inline captures) instead of erasing it to a boxed callable.
+pub fn isIteratorOwner(owner: BuiltinOwner) bool {
+    return switch (owner) {
+        .iter, .stream => true,
+        else => false,
+    };
+}
 
 /// Public `MethodKey` declaration.
 pub const MethodKey = struct {
@@ -1721,7 +1733,7 @@ pub fn lookupCheckedMethodTarget(
 /// component crosses by 32-byte content identity (one map probe, full-value
 /// comparison), the type-name component by declared-name interning. This is
 /// the single cross-artifact owner resolution point — no module name text.
-fn methodOwnerInImportedStore(
+pub fn methodOwnerInImportedStore(
     source_names: *const canonical.CanonicalNameStore,
     imported_names: *const canonical.CanonicalNameStore,
     owner: MethodOwner,

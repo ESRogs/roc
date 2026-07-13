@@ -12,7 +12,9 @@ const literal_defaulting = types_mod.literal_defaulting;
 const exact_numeral = types_mod.numeral;
 const can = @import("can");
 
+const canonical_type_keys = @import("canonical_type_keys.zig");
 const copy_import = @import("copy_import.zig");
+const requirement_solution = @import("requirement_solution.zig");
 const unifier = @import("unify.zig");
 const occurs = @import("occurs.zig");
 const problem = @import("problem.zig");
@@ -82,6 +84,13 @@ const PlatformRequiredDef = struct {
     required_ident: Ident.Idx,
     /// Where the platform's requires clause declares this requirement.
     platform_region: Region,
+};
+
+/// A platform requirement type instantiated into this module's store, plus
+/// its identity variables in canonical slot order (checker-owned slice).
+const InstantiatedRequirement = struct {
+    expected_var: Var,
+    identity_vars: []Var,
 };
 
 gpa: std.mem.Allocator,
@@ -190,6 +199,12 @@ top_level_ptrns: std.ArrayListUnmanaged(?DefProcessed),
 platform_requirements: ?PlatformRequirementInput,
 /// App defs constrained by platform requirements before their bodies are checked.
 platform_required_defs: std.AutoHashMapUnmanaged(CIR.Def.Idx, PlatformRequiredDef),
+/// One row per platform requirement that resolved to an exported app def, in
+/// requires-clause order. The solved correspondence (requirement type and its
+/// identity bindings, as vars in this module's store) that publication
+/// materializes into the app artifact's `PlatformRequirementSolutionTable`.
+/// Each row's `identity_vars` slice is checker-owned.
+platform_requirement_solutions: std.ArrayListUnmanaged(requirement_solution.SolutionInput),
 /// Local block-statement (`s_decl`) function patterns whose body is currently
 /// being type-checked. Used to detect self-recursion (and references to an
 /// enclosing in-flight def) of LOCAL function defs: an unannotated in-flight
@@ -1441,6 +1456,7 @@ fn initAssumePrepared(
         .top_level_ptrns = try initNodeSlots(?DefProcessed, gpa, node_count, null),
         .platform_requirements = null,
         .platform_required_defs = .{},
+        .platform_requirement_solutions = .empty,
         .enclosing_func_name = null,
         .def_group = try initNodeSlots(u32, gpa, node_count, no_def_group),
         .predeclared_scheme_vars = try initNodeSlots(?Var, gpa, node_count, null),
@@ -1579,6 +1595,10 @@ pub fn deinit(self: *Self) void {
     self.reported_effectful_expect.deinit();
     self.top_level_ptrns.deinit(self.gpa);
     self.platform_required_defs.deinit(self.gpa);
+    for (self.platform_requirement_solutions.items) |solution| {
+        self.gpa.free(@constCast(solution.identity_vars));
+    }
+    self.platform_requirement_solutions.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
     self.local_binding_roots.deinit(self.gpa);
     self.type_writer.deinit();
@@ -2974,14 +2994,14 @@ fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_hosted_lambda,
         => false,
         .e_str => |str| self.stringHasInterpolation(str.span),
+        .e_method_call => |call| !self.methodNameIs(call.method_name, "iter"),
+        .e_dispatch_call => |call| !self.methodNameIs(call.method_name, "iter"),
         .e_list,
         .e_tuple,
         .e_block,
         .e_match,
         .e_if,
         .e_call,
-        .e_method_call,
-        .e_dispatch_call,
         .e_record,
         .e_tag,
         .e_nominal,
@@ -3049,14 +3069,14 @@ fn exprCanCoverHoistedChildren(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_run_low_level,
         => false,
         .e_str => |str| self.stringHasInterpolation(str.span),
+        .e_method_call => |call| !self.methodNameIs(call.method_name, "iter"),
+        .e_dispatch_call => |call| !self.methodNameIs(call.method_name, "iter"),
         .e_list,
         .e_tuple,
         .e_block,
         .e_match,
         .e_if,
         .e_call,
-        .e_method_call,
-        .e_dispatch_call,
         .e_record,
         .e_tag,
         .e_nominal,
@@ -3082,11 +3102,11 @@ fn exprCanBeHoistedBindingRoot(self: *Self, expr: CIR.Expr.Idx) bool {
     return switch (self.cir.store.getExpr(expr)) {
         .e_lookup_local => true,
         .e_call,
-        .e_method_call,
         .e_type_method_call,
         .e_type_dispatch_call,
-        .e_dispatch_call,
         => true,
+        .e_method_call => |call| !self.methodNameIs(call.method_name, "iter"),
+        .e_dispatch_call => |call| !self.methodNameIs(call.method_name, "iter"),
         .e_for,
         .e_run_low_level,
         .e_lookup_required,
@@ -3140,6 +3160,10 @@ fn exprCanBeHoistedBindingRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_str,
         => !self.exprHasDedicatedLiteralConversionRoot(expr),
     };
+}
+
+fn methodNameIs(self: *const Self, method_name: Ident.Idx, comptime text: []const u8) bool {
+    return Ident.textEql(self.cir.getIdentText(method_name), text);
 }
 
 fn stringHasInterpolation(self: *Self, span: CIR.Expr.Span) bool {
@@ -8343,9 +8367,19 @@ fn processAppPlatformRequirements(self: *Self, env: *Env) std.mem.Allocator.Erro
         else => return,
     }
 
-    for (input.env.requires_types.items.items) |required_type| {
+    // For-clause aliases live in the platform root's module-level scope, so a
+    // requirement other than the declaring one can reference an alias by name;
+    // bind each alias once for the whole requires clause and share the app's
+    // instantiated declaration across every requirement that mentions it.
+    var alias_bindings = std.ArrayListUnmanaged(ForClauseAliasBinding).empty;
+    defer alias_bindings.deinit(self.gpa);
+    try self.collectForClauseAliasBindings(input, env, &alias_bindings);
+
+    for (input.env.requires_types.items.items, 0..) |required_type, requires_idx| {
         const required_ident = try self.copyPlatformIdent(input.env, required_type.ident);
-        const expected_var = (try self.instantiatePlatformRequiredType(input, required_type, env)) orelse continue;
+        const instantiated = (try self.instantiatePlatformRequiredType(input, required_type, env, alias_bindings.items)) orelse continue;
+        var identity_vars_owned = true;
+        defer if (identity_vars_owned) self.gpa.free(instantiated.identity_vars);
 
         const def_idx = self.exposedAppDefByIdent(required_ident) orelse {
             const top_level_def = self.topLevelDefByIdent(required_ident);
@@ -8362,12 +8396,60 @@ fn processAppPlatformRequirements(self: *Self, env: *Env) std.mem.Allocator.Erro
             continue;
         };
 
-        try self.platform_required_defs.put(self.gpa, def_idx, .{
-            .expected_var = expected_var,
-            .required_ident = required_ident,
-            .platform_region = required_type.region,
+        const map_entry = try self.platform_required_defs.getOrPut(self.gpa, def_idx);
+        if (map_entry.found_existing) {
+            // One def satisfying several requirements (a platform declaring one
+            // name twice): the def unifies against the retained entry, so tie
+            // this requirement's instance to that entry to enforce both.
+            _ = try self.unifyInContext(
+                map_entry.value_ptr.expected_var,
+                instantiated.expected_var,
+                env,
+                .{ .platform_requirement = .{ .required_ident = required_ident, .platform_region = required_type.region } },
+            );
+        } else {
+            map_entry.value_ptr.* = .{
+                .expected_var = instantiated.expected_var,
+                .required_ident = required_ident,
+                .platform_region = required_type.region,
+            };
+        }
+
+        try self.platform_requirement_solutions.append(self.gpa, .{
+            .requires_idx = @intCast(requires_idx),
+            .def = def_idx,
+            .solved_var = instantiated.expected_var,
+            .is_function = input.env.types.varResolvesToFunction(ModuleEnv.varFrom(required_type.type_anno)),
+            .identity_vars = instantiated.identity_vars,
         });
+        identity_vars_owned = false;
     }
+}
+
+/// The platform requirement solutions recorded while checking this app root,
+/// in requires-clause order. The rows and their identity slices are
+/// checker-owned and remain valid until `deinit`.
+pub fn platformRequirementSolutions(self: *const Self) []const requirement_solution.SolutionInput {
+    return self.platform_requirement_solutions.items;
+}
+
+/// Whether any of this module's requires-clause type annotations still carry
+/// erroneous type content after checking. A platform root in that state keeps
+/// its check-time publication: the env-derived requirement context a deferred
+/// publication needs is a canonical key digest, and erroneous content has no
+/// canonical key.
+pub fn requiresTypesContainError(self: *Self) std.mem.Allocator.Error!bool {
+    for (self.cir.requires_types.items.items) |required_type| {
+        if (try canonical_type_keys.containsError(
+            self.gpa,
+            self.types,
+            self.cir,
+            ModuleEnv.varFrom(required_type.type_anno),
+        )) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn instantiatePlatformRequiredType(
@@ -8375,38 +8457,184 @@ fn instantiatePlatformRequiredType(
     input: PlatformRequirementInput,
     required_type: ModuleEnv.RequiredType,
     env: *Env,
-) std.mem.Allocator.Error!?Var {
+    bindings: []const ForClauseAliasBinding,
+) std.mem.Allocator.Error!?InstantiatedRequirement {
     self.rigid_var_substitutions.clearRetainingCapacity();
     defer self.rigid_var_substitutions.clearRetainingCapacity();
 
     const aliases = input.env.for_clause_aliases.sliceRange(required_type.type_aliases);
     for (aliases) |alias| {
-        const alias_ident = try self.copyPlatformIdent(input.env, alias.alias_name);
-        const app_type_stmt = self.appTypeDeclByIdent(alias_ident) orelse {
-            const value_region = self.topLevelValueRegionByIdent(alias_ident);
-            const app_region = value_region orelse self.appModuleRegion();
-            _ = try self.problems.appendProblem(self.gpa, .{ .platform_alias_not_found = .{
-                .expected_alias_ident = alias_ident,
-                .app_region = app_region,
-                .platform_region = input.env.store.getNodeRegion(ModuleEnv.nodeIdxFrom(alias.alias_stmt_idx)),
-                .ctx = if (value_region == null) .not_found else .found_but_not_type,
-            } });
-            return null;
+        const binding = forClauseAliasBinding(bindings, alias.alias_stmt_idx) orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("platform requirement for-clause alias was not collected for the requires clause", .{});
+            }
+            unreachable;
         };
-
-        const app_type_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(app_type_stmt));
-        const app_type_var = try self.instantiateVar(ModuleEnv.varFrom(app_type_stmt), env, .{ .explicit = app_type_region });
+        // The alias's app declaration was not found; the diagnostic was
+        // emitted when the clause's bindings were collected.
+        const app_type_var = binding.app_type_var orelse return null;
         const rigid_ident = try self.copyPlatformIdent(input.env, alias.rigid_name);
         try self.rigid_var_substitutions.put(self.gpa, rigid_ident, app_type_var);
     }
 
+    // Enumerate the requirement type's identity variables (flex/rigid) in the
+    // platform's store, in canonical slot order — the same first-encounter
+    // order the platform's published requirement payload assigns them.
+    const platform_identity_vars = try canonical_type_keys.identityVarsFromVar(
+        self.gpa,
+        &input.env.types,
+        input.env,
+        ModuleEnv.varFrom(required_type.type_anno),
+    );
+    defer self.gpa.free(platform_identity_vars);
+
     const copied = try self.copyVar(ModuleEnv.varFrom(required_type.type_anno), input.env, required_type.region);
-    return try self.instantiateVarWithPartialSubs(
+
+    // `copyVar` keyed `var_map` by the platform store's resolved vars — the
+    // same roots the identity enumeration returned — so each identity slot
+    // maps to its copied var here, then to its instantiated var below.
+    const identity_vars = try self.gpa.alloc(Var, platform_identity_vars.len);
+    errdefer self.gpa.free(identity_vars);
+    for (platform_identity_vars, identity_vars) |platform_var, *slot_var| {
+        slot_var.* = self.var_map.get(platform_var) orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("platform requirement identity var was not copied into the app store", .{});
+            }
+            unreachable;
+        };
+    }
+
+    try self.resolveForClauseAliasOccurrences(input, bindings);
+
+    const expected_var = try self.instantiateVarWithPartialSubs(
         copied,
         &self.rigid_var_substitutions,
         env,
         .{ .explicit = required_type.region },
     );
+
+    // `instantiateVarWithPartialSubs` keyed `var_map` by the copied store's
+    // resolved vars; a var it never instantiated resolves to itself — except a
+    // for-clause rigid whose only occurrences sat beneath alias uses that
+    // resolved to the app's declaration above: instantiation never visits it,
+    // and its solution is that same substitution target.
+    for (identity_vars) |*slot_var| {
+        const resolved = self.types.resolveVar(slot_var.*);
+        slot_var.* = self.var_map.get(resolved.var_) orelse switch (resolved.desc.content) {
+            .rigid => |rigid| self.rigid_var_substitutions.get(rigid.name) orelse resolved.var_,
+            else => resolved.var_,
+        };
+    }
+
+    return .{ .expected_var = expected_var, .identity_vars = identity_vars };
+}
+
+/// An app type declaration bound to a requires clause's for-clause alias
+/// (`[Model : model]` binds `Model` to the app's own `Model` declaration).
+/// A null `app_type_var` records that the app declares no such type; the
+/// diagnostic was emitted when the binding was collected.
+const ForClauseAliasBinding = struct {
+    /// Exact declaration locator in the platform root. Names are consulted
+    /// only while resolving the app-side declaration at the language boundary;
+    /// copied occurrences match this declaration identity thereafter.
+    platform_alias_stmt_idx: CIR.Statement.Idx,
+    app_type_var: ?Var,
+};
+
+fn forClauseAliasBinding(bindings: []const ForClauseAliasBinding, platform_alias_stmt_idx: CIR.Statement.Idx) ?ForClauseAliasBinding {
+    for (bindings) |binding| {
+        if (binding.platform_alias_stmt_idx == platform_alias_stmt_idx) return binding;
+    }
+    return null;
+}
+
+/// Bind every for-clause alias of the platform's requires clause to the app's
+/// own type declaration, instantiating each declaration once so all
+/// requirements that mention an alias share one binder.
+fn collectForClauseAliasBindings(
+    self: *Self,
+    input: PlatformRequirementInput,
+    env: *Env,
+    bindings: *std.ArrayListUnmanaged(ForClauseAliasBinding),
+) std.mem.Allocator.Error!void {
+    for (input.env.requires_types.items.items) |required_type| {
+        const aliases = input.env.for_clause_aliases.sliceRange(required_type.type_aliases);
+        for (aliases) |alias| {
+            if (forClauseAliasBinding(bindings.items, alias.alias_stmt_idx) != null) continue;
+            const alias_ident = try self.copyPlatformIdent(input.env, alias.alias_name);
+
+            const app_type_stmt = self.appTypeDeclByIdent(alias_ident) orelse {
+                const value_region = self.topLevelValueRegionByIdent(alias_ident);
+                const app_region = value_region orelse self.appModuleRegion();
+                _ = try self.problems.appendProblem(self.gpa, .{ .platform_alias_not_found = .{
+                    .expected_alias_ident = alias_ident,
+                    .app_region = app_region,
+                    .platform_region = input.env.store.getNodeRegion(ModuleEnv.nodeIdxFrom(alias.alias_stmt_idx)),
+                    .ctx = if (value_region == null) .not_found else .found_but_not_type,
+                } });
+                try bindings.append(self.gpa, .{
+                    .platform_alias_stmt_idx = alias.alias_stmt_idx,
+                    .app_type_var = null,
+                });
+                continue;
+            };
+
+            const app_type_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(app_type_stmt));
+            const app_type_var = try self.instantiateVar(ModuleEnv.varFrom(app_type_stmt), env, .{ .explicit = app_type_region });
+            try bindings.append(self.gpa, .{
+                .platform_alias_stmt_idx = alias.alias_stmt_idx,
+                .app_type_var = app_type_var,
+            });
+        }
+    }
+}
+
+/// Resolve copied occurrences of a requirement's for-clause aliases to the
+/// app's own type declarations. A for-clause alias is a binder over an
+/// app-supplied type — the requirement's `Model` IS the app's `Model` by the
+/// for-clause's own definition — so identity provenance follows meaning
+/// provenance: the app's checked output references its own declaration, never
+/// a platform-root-owned named type. This is what lets an app build's platform
+/// root defer publication: nothing the app publishes needs the platform root's
+/// checked module as a type owner.
+fn resolveForClauseAliasOccurrences(
+    self: *Self,
+    input: PlatformRequirementInput,
+    bindings: []const ForClauseAliasBinding,
+) std.mem.Allocator.Error!void {
+    var any_bound = false;
+    for (bindings) |binding| {
+        if (binding.app_type_var != null) {
+            any_bound = true;
+            break;
+        }
+    }
+    if (!any_bound) return;
+    // The platform root's env-local identity, rebased into the app's identity
+    // table the same way `copyVar` rebased each copied type's origin. Absent
+    // entries mean no copied type originates in the platform root.
+    if (input.env.self_module_identity.isNone()) return;
+    const platform_identity_hash = input.env.moduleIdentityHash(input.env.self_module_identity);
+    const platform_origin = self.cir.lookupModuleIdentity(platform_identity_hash) orelse return;
+
+    var it = self.var_map.iterator();
+    while (it.next()) |entry| {
+        const resolved = self.types.resolveVar(entry.value_ptr.*);
+        const alias = switch (resolved.desc.content) {
+            .alias => |alias| alias,
+            else => continue,
+        };
+        if (alias.origin_module != platform_origin) continue;
+        const source_decl = alias.source_decl.toOptional() orelse continue;
+        for (bindings) |binding| {
+            if (source_decl == @intFromEnum(binding.platform_alias_stmt_idx)) {
+                if (binding.app_type_var) |app_type_var| {
+                    try self.types.dangerousSetVarRedirect(resolved.var_, app_type_var);
+                }
+                break;
+            }
+        }
+    }
 }
 
 fn copyPlatformIdent(self: *Self, platform_env: *const ModuleEnv, ident: Ident.Idx) std.mem.Allocator.Error!Ident.Idx {
@@ -8831,7 +9059,10 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         } });
         try self.unifyWith(expr_var, .err, env);
     }
-    if (def.annotation == null and self.exprAlwaysCrashes(def.expr)) {
+    // A platform requirement is the def's explicit expected type even when the
+    // source has no annotation. Only truly unconstrained crashing defs default
+    // to unit; otherwise this would overwrite the requirement type with `{}`.
+    if (def.annotation == null and platform_required == null and self.exprAlwaysCrashes(def.expr)) {
         try self.unifyWith(expr_var, .{ .structure = .empty_record }, env);
     }
     if (def.annotation == null and self.erroneous_value_exprs.contains(def.expr)) {
@@ -14508,6 +14739,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 self.markCurrentHoistObservableEffect();
                 statement_blocks_later_hoists = true;
                 const for_region = self.cir.store.getStatementRegion(stmt_idx);
+                const for_expected = if (blocks_later_hoists) base_statement_expected else statement_expected;
                 does_fx = try self.checkIteratorForLoop(
                     ModuleEnv.nodeIdxFrom(stmt_idx),
                     for_stmt.patt,
@@ -14515,7 +14747,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     for_stmt.body,
                     env,
                     for_region,
-                    statement_expected,
+                    for_expected,
                 ) or does_fx;
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, for_region);
                 _ = try self.unify(stmt_var, empty_rec, env);
@@ -22787,7 +23019,10 @@ fn varContainsError(self: *Self, var_: Var, visited: *std.AutoHashMap(Var, void)
     return switch (resolved.desc.content) {
         .err => true,
         .flex, .rigid => false,
-        .alias => |alias| try self.varContainsError(self.types.getAliasBackingVar(alias), visited),
+        .alias => |alias| blk: {
+            if (try self.varContainsError(self.types.getAliasBackingVar(alias), visited)) break :blk true;
+            break :blk try self.varsContainError(self.types.sliceAliasArgs(alias), visited);
+        },
         .structure => |flat_type| try self.flatTypeContainsError(flat_type, visited),
     };
 }

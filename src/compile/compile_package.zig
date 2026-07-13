@@ -336,12 +336,16 @@ pub const SemanticModuleData = struct {
 /// Owned output from type checking before module state takes retained facts.
 pub const TypeCheckOutput = struct {
     checker: Check,
+    checker_owned: bool = true,
     checked_artifact: ?CheckedArtifact.CheckedModuleArtifact = null,
     user_errors_allow_lowering: bool = false,
+    /// True when a clean check intentionally skipped publishing a checked
+    /// artifact because publication was deferred to finalization.
+    publication_deferred: bool = false,
 
     pub fn deinit(self: *TypeCheckOutput) void {
         if (self.checked_artifact) |*artifact| artifact.deinit(artifact.canonical_names.allocator);
-        self.checker.deinit();
+        if (self.checker_owned) self.checker.deinit();
     }
 
     pub fn takeCheckedArtifact(self: *TypeCheckOutput) CheckedArtifact.CheckedModuleArtifact {
@@ -349,6 +353,12 @@ pub const TypeCheckOutput = struct {
             std.debug.panic("compile.typeCheckOutput missing checked artifact", .{});
         self.checked_artifact = null;
         return artifact;
+    }
+
+    pub fn takeChecker(self: *TypeCheckOutput) Check {
+        std.debug.assert(self.checker_owned);
+        self.checker_owned = false;
+        return self.checker;
     }
 };
 
@@ -367,6 +377,7 @@ pub const ArtifactPublicationInputs = struct {
     relation_artifacts: []const CheckedArtifact.ImportedModuleView = &.{},
     platform_requirement_context: ?CheckedArtifact.PlatformRequirementContextKey = null,
     platform_app_relation: ?CheckedArtifact.PlatformAppRelation = null,
+    platform_requirement_solutions: []const check.RequirementSolution.SolutionInput = &.{},
     explicit_roots: []const CheckedArtifact.ExplicitRootRequestInput = &.{},
     hoisted_roots: []const check.HoistRoots.SelectedHoistedRoot = &.{},
     problem_store: ?*check.problem.Store = null,
@@ -1886,6 +1897,7 @@ pub const PackageEnv = struct {
         platform_requirement_context: ?CheckedArtifact.PlatformRequirementContextKey,
         explicit_roots: []const CheckedArtifact.ExplicitRootRequestInput,
         ctfe_options: eval.CompileTimeFinalization.Options,
+        defer_publication: bool,
     ) TypeCheckModuleError!TypeCheckOutput {
         const builtin_indices = compiled_builtins.builtinIndices(can.CIR);
 
@@ -1950,6 +1962,22 @@ pub const PackageEnv = struct {
             };
         }
 
+        // The platform root of an app build does not publish here: finalization
+        // publishes the relation-bearing platform root once, so a check-time
+        // publish would be immediately superseded. The one exception is a
+        // requires signature that still carries erroneous type content — the
+        // env-derived requirement context a deferred root needs is a canonical
+        // key digest, and erroneous content has no canonical key, so those
+        // shapes keep the check-time publish and its diagnostics.
+        if (defer_publication and !(try checker.requiresTypesContainError())) {
+            return .{
+                .checker = checker,
+                .checked_artifact = null,
+                .user_errors_allow_lowering = user_errors_allow_lowering,
+                .publication_deferred = true,
+            };
+        }
+
         var checked_artifact = publishCheckedArtifactFromCheckedModule(
             artifact_alloc,
             env,
@@ -1958,6 +1986,7 @@ pub const PackageEnv = struct {
             .{
                 .platform_requirement_context = platform_requirement_context,
                 .platform_app_relation = null,
+                .platform_requirement_solutions = checker.platformRequirementSolutions(),
                 .explicit_roots = explicit_roots,
                 .hoisted_roots = checker.selectedHoistedRoots(),
                 .available_artifacts = available_artifacts,
@@ -2038,6 +2067,7 @@ pub const PackageEnv = struct {
                 .relation_artifacts = publication.relation_artifacts,
                 .platform_requirement_context = publication.platform_requirement_context,
                 .platform_app_relation = publication.platform_app_relation,
+                .platform_requirement_solutions = publication.platform_requirement_solutions,
                 .explicit_roots = publication.explicit_roots,
                 .hoisted_roots = publication.hoisted_roots,
                 .compile_time_finalizer = eval.CompileTimeFinalization.finalizerWithOptions(&ctfe_options),
@@ -2126,6 +2156,7 @@ pub const PackageEnv = struct {
             null,
             &.{},
             compileTimeFinalizationOptions(self.max_threads, &self.roc_ctx),
+            false,
         );
         defer typecheck_output.deinit();
         if (typecheck_output.checked_artifact != null) {
@@ -2186,6 +2217,7 @@ pub const PackageEnv = struct {
         var seen = std.AutoHashMap(CheckedArtifact.CheckedModuleArtifactKey, void).init(self.gpa);
         defer seen.deinit();
 
+        try pending.append(self.gpa, CheckedArtifact.importedView(&self.builtin_modules.checked_artifact));
         for (imported_artifacts) |imported| {
             try pending.append(self.gpa, imported.view);
         }

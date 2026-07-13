@@ -136,9 +136,8 @@ const PathUtils = struct {
 pub const PostCheckPublicationMode = enum {
     /// No post-check work (diagnostics only).
     none,
-    /// Validate platform/app type-level relations (for `roc check`).
-    platform_relations,
-    /// Full executable artifact publication including MIR/LIR lowering (for `roc build`).
+    /// Publish the relation-bearing platform root once at finalization (for
+    /// `roc check` and `roc build`).
     executable_artifacts,
     /// Executable artifact publication that tolerates user errors when every
     /// erroring module still permits lowering (checked runtime-error nodes
@@ -178,6 +177,9 @@ pub const BuildEnv = struct {
 
     // Actor model coordinator (owns all mutable compilation state)
     coordinator: ?*Coordinator = null,
+    /// Exact older checked outputs referenced by content-addressed ids in
+    /// current artifacts after coordinator republishing.
+    retired_checked_artifacts: std.ArrayList(coordinator_mod.RetiredCheckedArtifact) = .empty,
 
     // Cache manager for compiled modules
     cache_manager: ?*CacheManager = null,
@@ -195,11 +197,12 @@ pub const BuildEnv = struct {
     /// Controls which checked-artifact publication work runs after ordinary
     /// checking has completed.
     ///
-    /// Executable builds need the full platform/app relation because post-check
-    /// lowering consumes it as input. `roc check` needs the type-level
-    /// platform/app validation, but must not republish runnable platform roots;
-    /// diagnostic-only checking must not force post-check lowering of
-    /// declarations that are not part of a valid executable program.
+    /// Checking is not complete until the platform/app relation output completes,
+    /// so `roc check` and `roc build` both finalize the relation-bearing platform
+    /// root once (`.executable_artifacts`): finalization builds the platform/app
+    /// relation and publishes the platform root, which also resolves the platform
+    /// target config constants both flows depend on. `.none` runs no post-check
+    /// work, for diagnostic-only embeddings that never link an executable.
     post_check_publication_mode: PostCheckPublicationMode = .executable_artifacts,
 
     /// Whether executable artifacts were published for this build AND every
@@ -356,6 +359,8 @@ pub const BuildEnv = struct {
             coord.deinit();
             self.gpa.destroy(coord);
         }
+        for (self.retired_checked_artifacts.items) |*retired| retired.deinit();
+        self.retired_checked_artifacts.deinit(self.gpa);
 
         if (comptime trace_build) {
             std.debug.print("[DEINIT] coordinator done\n", .{});
@@ -500,10 +505,12 @@ pub const BuildEnv = struct {
 
     pub fn setFinalizeExecutableArtifacts(self: *BuildEnv, enabled: bool) void {
         self.post_check_publication_mode = if (enabled) .executable_artifacts else .none;
+        if (self.coordinator) |coord| coord.setExecutableFinalizationEnabled(enabled);
     }
 
     pub fn setPostCheckPublicationMode(self: *BuildEnv, mode: PostCheckPublicationMode) void {
         self.post_check_publication_mode = mode;
+        if (self.coordinator) |coord| coord.setExecutableFinalizationEnabled(mode != .none);
     }
 
     pub fn setRootModuleRole(self: *BuildEnv, role: ModuleEnv.ModuleRole) void {
@@ -621,6 +628,7 @@ pub const BuildEnv = struct {
         // This is required for roc build so that hosted functions can be called at runtime
         coord.enable_hosted_transform = true;
         coord.setWatchInputTracking(self.track_watch_inputs);
+        coord.setExecutableFinalizationEnabled(self.post_check_publication_mode != .none);
         self.coordinator = coord;
     }
 
@@ -867,10 +875,6 @@ pub const BuildEnv = struct {
         if (!coord.hasUserErrors()) {
             switch (self.post_check_publication_mode) {
                 .none => {},
-                .platform_relations => coord.validatePlatformAppRelationsForCheck() catch |err| {
-                    self.emitAccumulatedReportsForError();
-                    return err;
-                },
                 .executable_artifacts, .executable_artifacts_allow_user_errors => {
                     coord.finalizeExecutableArtifacts() catch |err| {
                         self.emitAccumulatedReportsForError();
@@ -1106,6 +1110,7 @@ pub const BuildEnv = struct {
                 }
             }
         }
+        try coord.transferRetiredCheckedArtifacts(&self.retired_checked_artifacts, self.gpa);
     }
 
     const ResolverCtx = struct { ws: *BuildEnv };
@@ -3099,7 +3104,7 @@ pub const BuildEnv = struct {
 
         for (root_artifact.lowering_visibility.module_ids) |key| {
             if (rootRelationContainsArtifact(root_artifact, key)) continue;
-            const artifact = artifactByKey(modules, key) orelse {
+            const artifact = self.artifactByKey(modules, key) orelse {
                 if (builtin.mode == .Debug) {
                     std.debug.panic("build env invariant violated: missing lowering visibility artifact", .{});
                 }
@@ -3123,7 +3128,7 @@ pub const BuildEnv = struct {
         errdefer views.deinit(allocator);
 
         for (root_artifact.platform_required_bindings.bindings) |binding| {
-            const artifact = artifactByKey(modules, binding.app_value.artifact) orelse {
+            const artifact = self.artifactByKey(modules, binding.app_value.artifact) orelse {
                 if (builtin.mode == .Debug) {
                     std.debug.panic("build env invariant violated: missing relation artifact", .{});
                 }
@@ -3173,12 +3178,16 @@ pub const BuildEnv = struct {
     }
 
     fn artifactByKey(
+        self: *const BuildEnv,
         modules: []const CompiledModuleInfo,
         key: check.CheckedArtifact.CheckedModuleArtifactKey,
     ) ?*const check.CheckedArtifact.CheckedModuleArtifact {
         for (modules) |module| {
             const artifact = module.semantic.checked_artifact orelse continue;
             if (checkedArtifactKeysEqual(artifact.key, key)) return artifact;
+        }
+        for (self.retired_checked_artifacts.items) |retired| {
+            if (checkedArtifactKeysEqual(retired.artifact.key, key)) return retired.artifact;
         }
         return null;
     }

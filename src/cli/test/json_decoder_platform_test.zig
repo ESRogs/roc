@@ -39,6 +39,9 @@ const status_scores = [_]u64{ 11, 17 };
 const mode_values = [_][]const u8{ "Warm", "Cold" };
 const mode_scores = [_]u64{ 19, 23 };
 const top_level_string_value = "top-level-json";
+// Each check contributes its score to one summed total, so scores must be
+// unique: two checks with equal scores are indistinguishable when exactly one
+// of them fails.
 const empty_record_score: u64 = 29;
 const invalid_empty_record_score: u64 = 37;
 const pair_score: u64 = 31;
@@ -57,6 +60,7 @@ const invalid_unknown_array_scalar_score: u64 = 89;
 const invalid_u64_plus_score: u64 = 97;
 const invalid_u64_leading_zero_score: u64 = 101;
 const invalid_missing_tag_payload_score: u64 = 103;
+const escaped_string_score: u64 = 107;
 
 const optional_fields = [_]OptionalField{
     .{ .name = "explicit_optional", .value = "abc" },
@@ -444,6 +448,7 @@ fn expectedJsonLength(optional_mask: u8, status_index: usize, mode_index: usize)
         invalid_u64_plus_score +
         invalid_u64_leading_zero_score +
         invalid_missing_tag_payload_score +
+        escaped_string_score +
         status_scores[status_index] +
         mode_scores[mode_index];
     for (optional_fields, 0..) |field, index| {
