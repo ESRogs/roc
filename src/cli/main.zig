@@ -13523,7 +13523,11 @@ fn checkFileWithBuildEnv(
         .resolution_config = resolution_config,
         .source_dir_override = source_dir_override,
         .synthetic_default_app = synthetic_default_app,
-        .post_check_publication_mode = .platform_relations,
+        // Checking is not complete until the platform/app relation output
+        // completes, so `roc check` finalizes the relation-bearing platform
+        // root once (which also resolves the platform target config constants
+        // the check flow depends on).
+        .post_check_publication_mode = .executable_artifacts,
         .builtin_role_path = filepath,
     });
     defer build_env.deinit();
