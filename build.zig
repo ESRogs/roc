@@ -958,6 +958,80 @@ const CheckWasmBuiltinRoutingStep = struct {
     }
 };
 
+/// Build step that fails when tracked snapshots differ from the freshly regenerated
+/// output. Detects whether the build root is backed by Git or JJ and invokes the
+/// matching diff command directly. This deliberately avoids shelling out through
+/// `sh -c`, which is not available on Windows (it fails to spawn with FileNotFound).
+const CheckSnapshotDiffStep = struct {
+    step: Step,
+
+    const regen_hint = "Tracked snapshots changed after regeneration. Run 'zig build run-snapshot-tool' and commit the result.\n{s}";
+
+    fn create(b: *std.Build) *CheckSnapshotDiffStep {
+        const self = b.allocator.create(CheckSnapshotDiffStep) catch @panic("OOM");
+        self.* = .{
+            .step = Step.init(.{
+                .id = Step.Id.custom,
+                .name = "check-snapshot-diff",
+                .owner = b,
+                .makeFn = make,
+            }),
+        };
+        return self;
+    }
+
+    fn make(step: *Step, _: Step.MakeOptions) !void {
+        const b = step.owner;
+        const io = b.graph.io;
+
+        // Prefer Git when the working directory is inside a Git work tree.
+        const in_git = blk: {
+            const probe = std.process.run(b.allocator, io, .{
+                .argv = &.{ "git", "rev-parse", "--is-inside-work-tree" },
+            }) catch break :blk false;
+            defer b.allocator.free(probe.stdout);
+            defer b.allocator.free(probe.stderr);
+            break :blk probe.term == .exited and probe.term.exited == 0 and
+                std.mem.eql(u8, std.mem.trim(u8, probe.stdout, " \n\r\t"), "true");
+        };
+
+        if (in_git) {
+            const result = try std.process.run(b.allocator, io, .{
+                .argv = &.{ "git", "diff", "--exit-code", "test/snapshots" },
+            });
+            defer b.allocator.free(result.stdout);
+            defer b.allocator.free(result.stderr);
+            if (!(result.term == .exited and result.term.exited == 0)) {
+                return step.fail(regen_hint, .{result.stdout});
+            }
+            return;
+        }
+
+        // Fall back to JJ for a standalone JJ workspace (no Git backing).
+        const in_jj = blk: {
+            std.Io.Dir.cwd().access(io, ".jj", .{}) catch break :blk false;
+            break :blk true;
+        };
+
+        if (in_jj) {
+            const result = try std.process.run(b.allocator, io, .{
+                .argv = &.{ "jj", "diff", "--summary", "test/snapshots" },
+            });
+            defer b.allocator.free(result.stdout);
+            defer b.allocator.free(result.stderr);
+            if (!(result.term == .exited and result.term.exited == 0)) {
+                return step.fail("jj diff --summary test/snapshots failed:\n{s}", .{result.stderr});
+            }
+            if (std.mem.trim(u8, result.stdout, " \n\r\t").len != 0) {
+                return step.fail(regen_hint, .{result.stdout});
+            }
+            return;
+        }
+
+        return step.fail("run-check-snapshots requires a Git or JJ workspace", .{});
+    }
+};
+
 /// Build step that checks for @panic and std.debug.panic usage in interpreter and builtins.
 ///
 /// In Roc's design philosophy, compile-time errors become runtime errors with helpful messages.
@@ -3220,11 +3294,7 @@ pub fn build(b: *std.Build) void {
         run_snapshot_tool_step,
         run_args,
     );
-    const check_snapshot_diff = b.addSystemCommand(&.{
-        "sh",
-        "-c",
-        "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git diff --exit-code test/snapshots; elif test -d .jj; then test -z \"$(jj diff --summary test/snapshots)\"; else echo 'run-check-snapshots requires a Git or JJ workspace' >&2; exit 1; fi",
-    });
+    const check_snapshot_diff = CheckSnapshotDiffStep.create(b);
     check_snapshot_diff.step.dependOn(run_snapshot_tool_step);
     run_check_snapshots_step.dependOn(&check_snapshot_diff.step);
 
