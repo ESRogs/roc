@@ -1530,6 +1530,7 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
     }
     return switch (checked_types.payload(@enumFromInt(index))) {
         .pending => checkedArtifactInvariant("compile-time root checked type was pending", .{}),
+        .err => false,
         .flex => false,
         .rigid => walk == .decl_template,
         .empty_record,
@@ -1612,6 +1613,93 @@ fn checkedTagsAreConcreteCompileTimeRoots(
         if (!try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, tag.argsSlice(checked_types), active)) return false;
     }
     return true;
+}
+
+fn checkedTypeContainsError(
+    allocator: Allocator,
+    checked_types: *const CheckedTypeStore,
+    root: CheckedTypeId,
+) Allocator.Error!bool {
+    var active = std.AutoHashMap(CheckedTypeId, void).init(allocator);
+    defer active.deinit();
+    return checkedTypeContainsErrorInner(checked_types, root, &active);
+}
+
+fn checkedTypeContainsErrorInner(
+    checked_types: *const CheckedTypeStore,
+    root: CheckedTypeId,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    if (active.contains(root)) return false;
+    try active.put(root, {});
+    defer _ = active.remove(root);
+
+    return switch (checked_types.payload(root)) {
+        .pending => checkedArtifactInvariant("checked error-type scan reached pending payload", .{}),
+        .err => true,
+        .empty_record, .empty_tag_union => false,
+        .flex => |variable| checkedConstraintsContainError(checked_types, variable.constraints, active),
+        .rigid => |variable| checkedConstraintsContainError(checked_types, variable.constraints, active),
+        .alias => |alias| (try checkedTypeContainsErrorInner(checked_types, alias.backing, active)) or
+            try checkedTypeSliceContainsError(checked_types, alias.args, active),
+        .record => |record| (try checkedFieldsContainError(checked_types, record.fields, active)) or
+            try checkedTypeContainsErrorInner(checked_types, record.ext, active),
+        .record_unbound => |fields| checkedFieldsContainError(checked_types, fields, active),
+        .tuple => |items| checkedTypeSliceContainsError(checked_types, items, active),
+        .nominal => |nominal| blk: {
+            if (try checkedTypeSliceContainsError(checked_types, nominal.args, active)) break :blk true;
+            const backing = checked_types.nominalBackingTemplateForPayload(nominal) orelse break :blk false;
+            break :blk try checkedTypeContainsErrorInner(checked_types, backing, active);
+        },
+        .function => |function| (try checkedTypeSliceContainsError(checked_types, function.args, active)) or
+            try checkedTypeContainsErrorInner(checked_types, function.ret, active),
+        .tag_union => |tag_union| (try checkedTagsContainError(checked_types, tag_union.tags, active)) or
+            try checkedTypeContainsErrorInner(checked_types, tag_union.ext, active),
+    };
+}
+
+fn checkedConstraintsContainError(
+    checked_types: *const CheckedTypeStore,
+    constraints: []const CheckedStaticDispatchConstraint,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (constraints) |constraint| {
+        if (try checkedTypeContainsErrorInner(checked_types, constraint.fn_ty, active)) return true;
+    }
+    return false;
+}
+
+fn checkedTypeSliceContainsError(
+    checked_types: *const CheckedTypeStore,
+    roots: []const CheckedTypeId,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (roots) |root| {
+        if (try checkedTypeContainsErrorInner(checked_types, root, active)) return true;
+    }
+    return false;
+}
+
+fn checkedFieldsContainError(
+    checked_types: *const CheckedTypeStore,
+    fields: []const CheckedRecordField,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (fields) |field| {
+        if (try checkedTypeContainsErrorInner(checked_types, field.ty, active)) return true;
+    }
+    return false;
+}
+
+fn checkedTagsContainError(
+    checked_types: *const CheckedTypeStore,
+    tags: []const CheckedTag,
+    active: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!bool {
+    for (tags) |tag| {
+        if (try checkedTypeSliceContainsError(checked_types, tag.argsSlice(checked_types), active)) return true;
+    }
+    return false;
 }
 
 fn compileTimeRootHasRootRequest(
@@ -1955,11 +2043,13 @@ fn appendPublishedEntrypointRoots(
                 unreachable;
             };
             const main_def: CIR.Def.Idx = @enumFromInt(@as(u32, @intCast(main_node_idx)));
+            const checked_type = try checkedTypeIdForRootSource(allocator, module, checked_types, .{ .def = main_def });
+            if (try checkedTypeContainsError(allocator, &checked_types.store, checked_type)) return;
             try appendRoot(requests, allocator, .{
                 .module_idx = module.moduleIndex(),
                 .kind = .runtime_entrypoint,
                 .source = .{ .def = main_def },
-                .checked_type = try checkedTypeIdForRootSource(allocator, module, checked_types, .{ .def = main_def }),
+                .checked_type = checked_type,
                 .abi = .roc,
                 .exposure = .exported,
                 .procedure_template = requiredProcedureTemplateForRootSource(procedure_templates, .{ .def = main_def }),
@@ -2088,6 +2178,7 @@ const PlatformRelationSubstitutionCollector = struct {
 
         switch (platform_payload) {
             .pending => checkedArtifactInvariant("platform relation substitution reached pending platform payload", .{}),
+            .err => checkedArtifactInvariant("platform relation substitution reached erroneous platform payload", .{}),
             .flex, .rigid => unreachable,
             .alias => |platform_alias| return try self.collectAlias(platform_alias, resolved_root, resolved_payload, context),
             .record, .record_unbound, .empty_record => return try self.collectRecord(platform_payload, resolved_payload),
@@ -3059,6 +3150,7 @@ test "checked nominal payloads do not carry instantiated backing roots" {
 /// `StoredCheckedTypePayload` (POD ranges into the pools).
 pub const CheckedTypePayload = union(enum) {
     pending,
+    err,
     flex: CheckedTypeVariable,
     rigid: CheckedTypeVariable,
     alias: CheckedAliasType,
@@ -3077,6 +3169,7 @@ pub const CheckedTypePayload = union(enum) {
 /// store's commit path copies it into the pools (freeing the build memory).
 pub const CheckedTypePayloadBuild = union(enum) {
     pending,
+    err,
     flex: CheckedTypeVariable,
     rigid: CheckedTypeVariable,
     alias: CheckedAliasType,
@@ -3153,6 +3246,7 @@ pub const StoredTagUnion = struct {
 /// `CheckedTypePayload` (with slices) is reconstructed on demand by `payload`.
 pub const StoredCheckedTypePayload = union(enum) {
     pending,
+    err,
     flex: StoredTypeVariable,
     rigid: StoredTypeVariable,
     alias: StoredAlias,
@@ -3183,6 +3277,7 @@ pub const StoredCheckedTypePayload = union(enum) {
 fn reconstructCheckedTypePayload(pool_owner: anytype, stored: StoredCheckedTypePayload) CheckedTypePayload {
     return switch (stored) {
         .pending => .pending,
+        .err => .err,
         .empty_record => .empty_record,
         .empty_tag_union => .empty_tag_union,
         .flex => |v| .{ .flex = reconstructCheckedTypeVariable(pool_owner, v) },
@@ -3813,6 +3908,7 @@ pub const CheckedTypeStore = struct {
     fn commitPayload(self: *CheckedTypeStore, allocator: Allocator, build: CheckedTypePayloadBuild) Allocator.Error!StoredCheckedTypePayload {
         return switch (build) {
             .pending => .pending,
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |v| .{ .flex = try self.commitVariable(allocator, v) },
@@ -4453,6 +4549,7 @@ pub const CheckedTypeStore = struct {
         const read = reconstructCheckedTypePayload(self, stored);
         return switch (read) {
             .pending => .pending,
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |v| .{ .flex = try snapshotCheckedTypeVariable(allocator, v) },
@@ -4514,6 +4611,7 @@ pub const CheckedTypeStore = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (build_payload) {
             .pending => checkedArtifactInvariant("checked type substitution reached pending payload", .{}),
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |flex| .{ .flex = .{
@@ -4747,6 +4845,7 @@ fn deinitCheckedTagsBuild(allocator: Allocator, tags: []const CheckedTagBuild) v
 fn deinitCheckedTypePayloadBuild(allocator: Allocator, payload: *CheckedTypePayloadBuild) void {
     switch (payload.*) {
         .pending,
+        .err,
         .empty_record,
         .empty_tag_union,
         => {},
@@ -6043,6 +6142,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
     fn writePayload(self: *SubstitutedCheckedTypeKeyBuilder, payload: CheckedTypePayload) Allocator.Error!void {
         switch (payload) {
             .pending => checkedArtifactInvariant("checked type substitution key reached pending payload", .{}),
+            .err => self.writeTag("err"),
             .flex,
             .rigid,
             => checkedArtifactInvariant("checked type substitution key reached identity payload without root identity", .{}),
@@ -6105,6 +6205,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
                 try self.writeNormalizedTagUnionFromHead(tags.items, tag_union.ext);
             },
             inline .pending,
+            .err,
             .flex,
             .rigid,
             .alias,
@@ -6682,12 +6783,7 @@ fn copyCheckedTypePayload(
     content: types.Content,
 ) Allocator.Error!CheckedTypePayloadBuild {
     return switch (content) {
-        .err => {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("checked artifact invariant violated: erroneous checked type reached artifact publication", .{});
-            }
-            unreachable;
-        },
+        .err => .err,
         .flex => |flex| .{ .flex = .{
             .name = try copyOptionalIdentText(allocator, module, flex.name),
             .constraints = try copyCheckedStaticDispatchConstraints(allocator, module, names, imports, store, active, flex.constraints),
@@ -13014,7 +13110,7 @@ fn sealCheckedProcedureTemplateRefs(
 /// canonical evidence-param list. Concrete dispatchers resolve through the
 /// checked registry; where-var dispatchers resolve to their param index;
 /// evidence for call edges comes from the checker's persisted
-/// `SchemeInstantiationRecord`s, whose fresh vars are resolved against the
+/// `SchemeUseRecord`s, whose fresh vars are resolved against the
 /// settled type store.
 const EvidencePass = struct {
     allocator: Allocator,
@@ -13034,15 +13130,12 @@ const EvidencePass = struct {
 
     types: *const types.Store,
 
-    /// value_use record index by source node.
+    /// Value-use record index by source node, including explicit shared uses.
     value_use_by_node: std.AutoHashMap(u32, u32),
     /// dispatch_target record index by the discharged constraint's raw fn var.
     target_by_fn_var: std.AutoHashMap(u32, u32),
     /// Source node by checked expr (reverse of `exprIdForSource`).
     source_by_checked_expr: std.AutoHashMap(u32, u32),
-    /// Top-level def by its pattern (for self/SCC-recursive lookups that were
-    /// checked without instantiation).
-    def_by_pattern: std.AutoHashMap(u32, CIR.Def.Idx),
     /// Generalized local VALUE decls (non-lambda exprs, e.g. an `if` choosing
     /// between closures): scheme param var root -> decl pattern. Monotype
     /// lowers such decls inline at the single type their uses unify to, so a
@@ -13074,9 +13167,9 @@ const EvidencePass = struct {
     /// sweep resolves whatever no template reached (chain-free).
     plan_resolved: []bool = &.{},
     iterator_plan_resolved: []bool = &.{},
-    /// Shared-var use sites deferred during template walks (their chains did
-    /// not bind every obligation); the final sweep re-emits leftovers.
-    deferred_use_sites: std.ArrayListUnmanaged(struct { source_node: u32, site_key: u32 }) = .empty,
+    /// Explicit shared-var use records deferred during template walks because
+    /// the current chain did not bind every obligation.
+    deferred_use_sites: std.ArrayListUnmanaged(struct { record_idx: u32, site_key: u32 }) = .empty,
     /// The param chain in scope while resolving a site's evidence entries, so
     /// a fresh var that settled onto an enclosing where-var forwards as
     /// `constraint(depth, k)`. Index 0 is the innermost generalized callable.
@@ -13119,7 +13212,6 @@ const EvidencePass = struct {
             .value_use_by_node = std.AutoHashMap(u32, u32).init(allocator),
             .target_by_fn_var = std.AutoHashMap(u32, u32).init(allocator),
             .source_by_checked_expr = std.AutoHashMap(u32, u32).init(allocator),
-            .def_by_pattern = std.AutoHashMap(u32, CIR.Def.Idx).init(allocator),
             .local_value_scheme_by_var = std.AutoHashMap(u32, u32).init(allocator),
             .value_use_record_by_pattern = std.AutoHashMap(u32, u32).init(allocator),
             .node_by_record = std.AutoHashMap(u32, static_dispatch.EvidenceNodeId).init(allocator),
@@ -13143,7 +13235,6 @@ const EvidencePass = struct {
         self.value_use_by_node.deinit();
         self.target_by_fn_var.deinit();
         self.source_by_checked_expr.deinit();
-        self.def_by_pattern.deinit();
         self.local_value_scheme_by_var.deinit();
         self.value_use_record_by_pattern.deinit();
         self.node_by_record.deinit();
@@ -13278,16 +13369,19 @@ const EvidencePass = struct {
             try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
         }
 
-        // Shared-var use sites no template's chain fully bound: emit their
-        // evidence chain-free (concrete targets, defaults, structural,
-        // vacuous). A site an intervening walk already emitted (overlapping
-        // spans) is skipped by `site_seen`.
+        // Explicit shared-var use sites no template chain fully bound resolve
+        // chain-free here. A site an overlapping template already emitted is
+        // skipped by `site_seen`.
         {
             var i: usize = 0;
             while (i < self.deferred_use_sites.items.len) : (i += 1) {
                 const deferred = self.deferred_use_sites.items[i];
                 if (self.site_seen.contains(deferred.site_key)) continue;
-                try self.emitRecursiveUseEvidence(deferred.source_node, deferred.site_key, &.{}, true);
+                self.current_chain = &.{};
+                const span = (try self.evidenceRefsForRecord(deferred.record_idx, true)).?;
+                if (span.len == 0) continue;
+                try self.site_seen.put(deferred.site_key, {});
+                try self.site_evidence.append(self.allocator, .{ .key = deferred.site_key, .start = span.start, .len = span.len });
             }
         }
 
@@ -13314,9 +13408,9 @@ const EvidencePass = struct {
 
     fn buildIndexes(self: *EvidencePass) Allocator.Error!void {
         const module_env = self.module.moduleEnvConst();
-        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
-            switch (@as(ModuleEnv.SchemeInstantiationRecord.Slot, @enumFromInt(record.slot_kind))) {
-                .value_use => {
+        for (module_env.scheme_uses.items.items, 0..) |record, i| {
+            switch (@as(ModuleEnv.SchemeUseRecord.Slot, @enumFromInt(record.slot_kind))) {
+                .value_use, .shared_value_use => {
                     // Re-checks can record the same instantiation twice; keep
                     // the first.
                     const entry = try self.value_use_by_node.getOrPut(record.node_idx);
@@ -13341,15 +13435,11 @@ const EvidencePass = struct {
         }
 
         const global_value_defs = module_env.store.sliceDefs(module_env.global_value_defs);
-        for (global_value_defs) |def_idx| {
-            const def = module_env.store.getDef(def_idx);
-            try self.def_by_pattern.put(@intFromEnum(def.pattern), def_idx);
-        }
 
         // Generalized local VALUE decls and one representative use record per
         // looked-up pattern (see `local_value_scheme_by_var`).
-        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
-            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.value_use)) continue;
+        for (module_env.scheme_uses.items.items, 0..) |record, i| {
+            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.value_use)) continue;
             if (self.module.nodeTag(@enumFromInt(record.node_idx)) != .expr_var) continue;
             const lookup = self.module.expr(@enumFromInt(record.node_idx)).data.e_lookup_local;
             const entry = try self.value_use_record_by_pattern.getOrPut(@intFromEnum(lookup.pattern_idx));
@@ -13581,8 +13671,8 @@ const EvidencePass = struct {
         if (self.local_value_scheme_by_var.get(@intFromEnum(resolved.var_))) |pattern_raw| {
             if (self.value_use_record_by_pattern.get(pattern_raw)) |record_idx| {
                 const module_env = self.module.moduleEnvConst();
-                const record = module_env.scheme_instantiations.items.items[record_idx];
-                const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+                const record = module_env.scheme_uses.items.items[record_idx];
+                const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
                 if (self.pairForResolved(pairs, resolved.var_)) |fresh| {
                     if (self.types.resolveVar(fresh).var_ != resolved.var_) {
                         const fresh_fn: ?Var = if (constraint_fn_var) |fn_var| self.pairForResolved(pairs, self.types.resolveVar(fn_var).var_) else null;
@@ -13739,26 +13829,27 @@ const EvidencePass = struct {
             }
             defer _ = self.record_in_progress.remove(idx);
 
-            const nested = try self.evidenceRefsForRecord(idx);
+            const nested = (try self.evidenceRefsForRecord(idx, true)).?;
             const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
             try self.evidence_nodes.append(self.allocator, .{ .target = target, .nested = nested });
             try self.node_by_record.put(idx, node_id);
             return node_id;
         }
 
-        // Monomorphic target (or a discharge this pass has no record for —
-        // e.g. a recursion-cycle placeholder): no nested obligations.
+        // A monomorphic target with no constrained scheme has no nested
+        // obligations. Shared constrained targets have explicit zero-pair
+        // dispatch-target records and take the branch above.
         const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
         try self.evidence_nodes.append(self.allocator, .{ .target = target });
         return node_id;
     }
 
-    /// Resolve one instantiation record's obligations (in the scheme's
-    /// canonical order) into a contiguous `evidence_refs` range.
-    fn evidenceRefsForRecord(self: *EvidencePass, record_idx: u32) Allocator.Error!artifact_serialize.Span {
+    /// Resolve one scheme-use record's obligations (in the scheme's canonical
+    /// order) into a contiguous `evidence_refs` range.
+    fn evidenceRefsForRecord(self: *EvidencePass, record_idx: u32, commit_unpinned: bool) Allocator.Error!?artifact_serialize.Span {
         const module_env = self.module.moduleEnvConst();
-        const record = module_env.scheme_instantiations.items.items[record_idx];
-        const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+        const record = module_env.scheme_uses.items.items[record_idx];
+        const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
 
         var params = std.ArrayListUnmanaged(EvidenceParam).empty;
         defer params.deinit(self.allocator);
@@ -13769,26 +13860,28 @@ const EvidencePass = struct {
         try entries.ensureTotalCapacity(self.allocator, params.items.len);
 
         for (params.items) |param| {
-            entries.appendAssumeCapacity(try self.evidenceForRecordParam(pairs, param));
+            const evidence = (try self.evidenceForRecordParam(pairs, param, commit_unpinned)) orelse return null;
+            entries.appendAssumeCapacity(evidence);
         }
 
-        return self.appendEvidenceRefs(entries.items);
+        return @as(?artifact_serialize.Span, try self.appendEvidenceRefs(entries.items));
     }
 
     fn evidenceForRecordParam(
         self: *EvidencePass,
-        pairs: []const ModuleEnv.SchemeInstantiationPair,
+        pairs: []const ModuleEnv.SchemeUsePair,
         param: EvidenceParam,
-    ) Allocator.Error!static_dispatch.CheckedEvidence {
+        commit_unpinned: bool,
+    ) Allocator.Error!?static_dispatch.CheckedEvidence {
         const dispatcher_root = self.types.resolveVar(param.dispatcher_var).var_;
         const fresh_dispatcher = self.pairForResolved(pairs, dispatcher_root) orelse {
             // The scheme var was not copied at this instantiation (it was
             // already monomorphic there); resolve the pristine var directly.
-            return (try self.evidenceForVar(param, param.dispatcher_var, null, true)).?;
+            return try self.evidenceForVar(param, param.dispatcher_var, null, commit_unpinned);
         };
         const fn_root = self.types.resolveVar(param.constraint.fn_var).var_;
         const fresh_fn = self.pairForResolved(pairs, fn_root);
-        return (try self.evidenceForVar(param, fresh_dispatcher, fresh_fn, true)).?;
+        return try self.evidenceForVar(param, fresh_dispatcher, fresh_fn, commit_unpinned);
     }
 
     /// Resolve one obligation of an instantiated scheme: the fresh dispatcher
@@ -13857,65 +13950,27 @@ const EvidencePass = struct {
         defer self.current_chain = &.{};
 
         if (self.value_use_by_node.get(source_node)) |record_idx| {
-            const span = try self.evidenceRefsForRecord(record_idx);
+            const record = self.module.moduleEnvConst().scheme_uses.items.items[record_idx];
+            const shared = record.slot_kind == @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.shared_value_use);
+            const span = (try self.evidenceRefsForRecord(record_idx, !shared)) orelse {
+                try self.deferred_use_sites.append(self.allocator, .{ .record_idx = record_idx, .site_key = site_key });
+                return;
+            };
             if (span.len == 0) return;
             try self.site_seen.put(site_key, {});
             try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
             return;
         }
 
-        // No instantiation record: a self- or SCC-recursive use of a local
-        // generic def is checked against the shared pre-generalization vars,
-        // so its obligations forward to the enclosing template's own params
-        // by var identity.
-        try self.emitRecursiveUseEvidence(source_node, site_key, chain, false);
-    }
-
-    /// Emit evidence for a shared-var (recursive/SCC) use. With
-    /// `commit_unpinned = false`, a site whose obligations this chain does
-    /// not fully bind is skipped so a template whose scheme binds them (spans
-    /// can overlap) or the deferred-site sweep emits it instead.
-    fn emitRecursiveUseEvidence(self: *EvidencePass, source_node: u32, site_key: u32, chain: []const []const EvidenceParam, commit_unpinned: bool) Allocator.Error!void {
-        if (self.module.nodeTag(@enumFromInt(source_node)) != .expr_var) return;
-        const lookup = self.module.expr(@enumFromInt(source_node)).data.e_lookup_local;
-        const callee_def = self.def_by_pattern.get(@intFromEnum(lookup.pattern_idx)) orelse return;
-
-        var callee_params = std.ArrayListUnmanaged(EvidenceParam).empty;
-        defer callee_params.deinit(self.allocator);
-        try self.enumerateParams(ModuleEnv.varFrom(callee_def), &callee_params);
-        if (callee_params.items.len == 0) return;
-
-        var entries = std.ArrayListUnmanaged(static_dispatch.CheckedEvidence).empty;
-        defer entries.deinit(self.allocator);
-        try entries.ensureTotalCapacity(self.allocator, callee_params.items.len);
-
-        const idents = self.module.identStoreConst();
-        for (callee_params.items) |callee_param| {
-            const dispatcher_root = self.types.resolveVar(callee_param.dispatcher_var).var_;
-            const method = try self.names.internMethodIdent(idents, callee_param.constraint.fn_name);
-            if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
-                entries.appendAssumeCapacity(.{ .constraint = ref });
-            } else if (try self.evidenceForVar(callee_param, callee_param.dispatcher_var, callee_param.constraint.fn_var, commit_unpinned)) |evidence| {
-                // The use shares the definition's vars (no instantiation
-                // record), so the obligation resolves exactly like a plan on
-                // those vars: concrete targets, defaulting, structural, or
-                // vacuous classification.
-                entries.appendAssumeCapacity(evidence);
-            } else {
-                // Not bound by this chain: defer the whole site.
-                try self.deferred_use_sites.append(self.allocator, .{ .source_node = source_node, .site_key = site_key });
-                return;
-            }
-        }
-
-        const span = try self.appendEvidenceRefs(entries.items);
-        try self.site_seen.put(site_key, {});
-        try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
+        // References that do not become specialization edges intentionally
+        // have no site evidence. Shared recursive uses are explicit records
+        // and therefore returned through the branch above.
+        return;
     }
 
     /// `pairFor`, but comparing RESOLVED roots on both sides: finalization
     /// after record time can move the pristine var's root.
-    fn pairForResolved(self: *EvidencePass, pairs: []const ModuleEnv.SchemeInstantiationPair, old_root: Var) ?Var {
+    fn pairForResolved(self: *EvidencePass, pairs: []const ModuleEnv.SchemeUsePair, old_root: Var) ?Var {
         for (pairs) |pair| {
             if (self.types.resolveVar(@enumFromInt(pair.old_var)).var_ == old_root) return @enumFromInt(pair.fresh_var);
         }
@@ -17325,6 +17380,7 @@ const PlatformRequirementTypeCompatibilityChecker = struct {
 
         return switch (expected_payload) {
             .pending => checkedArtifactInvariant("platform requirement type compatibility reached pending expected payload", .{}),
+            .err => false,
             .flex, .rigid, .alias => unreachable,
             .empty_record => self.compatibleRecord(expected_payload, actual_payload),
             .record, .record_unbound => self.compatibleRecord(expected_payload, actual_payload),
@@ -18070,6 +18126,7 @@ const PlatformAppRelationTypeResolver = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (platform_payload) {
             .pending => checkedArtifactInvariant("platform/app relation merge reached pending platform payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation merge reached erroneous platform payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .record, .record_unbound => try self.mergeRecordPayload(platform_root, app_root),
             .tag_union => try self.mergeTagUnionPayload(platform_root, app_root),
@@ -18294,6 +18351,7 @@ const PlatformAppRelationTypeResolver = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (root_payload) {
             .pending => checkedArtifactInvariant("platform/app relation finalization reached pending payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation finalization reached erroneous payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .tuple => |items| blk: {
                 const finalized = try self.finalizeRootSlice(items);
@@ -19199,6 +19257,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         const app_payload = self.payload(app_root);
         return switch (platform_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending platform payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation digest reached erroneous platform payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .record, .record_unbound => try self.writeMergeRecord(platform_root, app_root),
             .tag_union => try self.writeMergeTagUnion(platform_root, app_root),
@@ -19338,6 +19397,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         const root_payload = self.payload(root);
         return switch (root_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending payload", .{}),
+            .err => checkedArtifactInvariant("platform/app relation digest reached erroneous payload", .{}),
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .tuple => |items| {
                 self.writeTag("tuple");
@@ -19399,6 +19459,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     fn writeSourcePayload(self: *PlatformAppRelationTypeDigestBuilder, source_payload: CheckedTypePayload) Allocator.Error!void {
         switch (source_payload) {
             .pending => checkedArtifactInvariant("platform/app relation digest reached pending source payload", .{}),
+            .err => self.writeTag("err"),
             .flex,
             .rigid,
             => checkedArtifactInvariant("platform/app relation digest reached identity source payload without root", .{}),
@@ -20298,6 +20359,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     ) Allocator.Error!bool {
         return switch (self.payload(root)) {
             .pending => true,
+            .err => false,
             .flex,
             .rigid,
             => true,
@@ -20373,6 +20435,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
     ) Allocator.Error!bool {
         return switch (self.payload(root)) {
             .pending => true,
+            .err => false,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .tuple => |items| try self.finalizeSliceIdentityRec(traversal, items),
             .function => |function| try self.finalizeSliceIdentityRec(traversal, function.args) or
@@ -20494,6 +20557,7 @@ const PlatformAppRelationTypeDigestBuilder = struct {
         const app_payload = self.payload(app_root);
         return switch (platform_payload) {
             .pending => true,
+            .err => false,
             .flex, .rigid, .empty_record, .empty_tag_union => unreachable,
             .record, .record_unbound => try self.mergeRecordIdentityRec(traversal, platform_root, app_root),
             .tag_union => try self.mergeTagIdentityRec(traversal, platform_root, app_root),
@@ -21510,6 +21574,7 @@ fn checkedTypeHasNoReachableCallableSlotsInner(
 
     return switch (checked_types.payload(@enumFromInt(index))) {
         .pending => checkedArtifactInvariant("callable-slot proof reached pending checked type", .{}),
+        .err => true,
         .flex,
         .rigid,
         .function,
@@ -22302,6 +22367,20 @@ fn publishCheckedExhaustivenessSites(
     errdefer sites.deinit(allocator);
 
     for (problem_store.pending_static_exhaustiveness.items) |pending| {
+        const source_is_published = switch (pending.source) {
+            .match_expr => |source_expr| checked_bodies.exprIdForSource(source_expr) != null,
+            .destructure_pattern => |source_pattern| checked_bodies.patternIdForSource(source_pattern) != null,
+        };
+        if (!source_is_published) {
+            // Checking may replace an erroneous enclosing expression with a
+            // runtime-error node. Its child source occurrences are then
+            // intentionally absent from the checked body graph. Leave the
+            // diagnostic pending: static failures are flushed after
+            // compile-time finalization, while an empirical-only site under a
+            // runtime error can never execute and needs no publication.
+            continue;
+        }
+
         const id: CheckedExhaustivenessSiteId = @enumFromInt(@as(u32, @intCast(sites.items.len)));
         const owner_template = exhaustivenessOwnerTemplateForSource(checked_bodies, pending.source);
         const replacing_root = exhaustivenessReplacingRootForSource(checked_bodies, compile_time_roots, pending.source);
@@ -24048,7 +24127,7 @@ fn appendPublicApiTypeDependencies(
 
     switch (checked_types.payload(@enumFromInt(index))) {
         .pending => checkedArtifactInvariant("public API dependency scan reached pending checked type payload", .{}),
-        .empty_record, .empty_tag_union => {},
+        .err, .empty_record, .empty_tag_union => {},
         .flex => |flex| try appendPublicApiConstraintDependencies(
             allocator,
             names,
@@ -24608,7 +24687,7 @@ const LoweringVisibilityBuilder = struct {
         }
         switch (store.payload(root)) {
             .pending => checkedArtifactInvariant("lowering visibility type traversal reached pending payload", .{}),
-            .empty_record, .empty_tag_union => {},
+            .err, .empty_record, .empty_tag_union => {},
             .flex => |flex| try self.appendConstraintTypes(artifact, flex.constraints),
             .rigid => |rigid| try self.appendConstraintTypes(artifact, rigid.constraints),
             .alias => |alias| {
@@ -28382,6 +28461,7 @@ const CheckedTypeStoreImportProjector = struct {
     ) Allocator.Error!CheckedTypePayloadBuild {
         return switch (payload) {
             .pending => checkedArtifactInvariant("platform for-clause projection reached pending app checked type payload", .{}),
+            .err => .err,
             .empty_record => .empty_record,
             .empty_tag_union => .empty_tag_union,
             .flex => |flex| .{ .flex = try self.projectVariable(flex) },
@@ -31461,8 +31541,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x62, 0x1D, 0x69, 0x1B, 0x0D, 0xF3, 0xDB, 0xF9, 0xBB, 0x43, 0xEE, 0x77, 0x80, 0x98, 0x83, 0xB5,
-        0x7D, 0x51, 0xCF, 0xB0, 0x6E, 0xC1, 0x92, 0x16, 0x7D, 0xFD, 0x3C, 0x66, 0xB9, 0x4C, 0xFC, 0xAC,
+        0xCA, 0x6D, 0x3B, 0xF6, 0xC1, 0x6C, 0x35, 0x55, 0xA9, 0x6E, 0x76, 0x64, 0x82, 0xD2, 0x1C, 0x58,
+        0x5A, 0xCB, 0xDB, 0xC0, 0xF0, 0xC4, 0xE0, 0x8F, 0xA5, 0xCD, 0x25, 0x01, 0xEC, 0x8D, 0x1A, 0x82,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
