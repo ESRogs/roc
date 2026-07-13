@@ -39,8 +39,8 @@ const windows_cross_targets = [_]CrossTarget{
 const linux_cross_targets = musl_cross_targets ++ glibc_cross_targets;
 
 /// Test platform directories that need host libraries built
-const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive" };
-const glibc_test_platform_dirs = [_][]const u8{ "str", "int", "dylib", "archive" };
+const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive", "alloc-count" };
+const glibc_test_platform_dirs = [_][]const u8{ "str", "int", "dylib", "archive", "alloc-count" };
 
 fn mustUseLlvm(target: ResolvedTarget) bool {
     return target.result.os.tag == .macos and target.result.cpu.arch == .x86_64;
