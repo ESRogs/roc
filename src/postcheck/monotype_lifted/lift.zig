@@ -35,6 +35,8 @@ pub fn run(
     var stmt_ids = owned.stmt_ids.takeArrayList();
     var field_exprs = owned.field_exprs.takeArrayList();
     var fn_def_captures = owned.fn_def_captures.takeArrayList();
+    var const_evidence_pool = owned.const_evidence_pool.takeArrayList();
+    var const_evidence_chain_pool = owned.const_evidence_chain_pool.takeArrayList();
     var record_destructs = owned.record_destructs.takeArrayList();
     var str_pattern_steps = owned.str_pattern_steps.takeArrayList();
     var branches = owned.branches.takeArrayList();
@@ -112,6 +114,10 @@ pub fn run(
     comptime_sites = undefined;
     program.runtime_schema_requests = Ast.ProgramList(Ast.RuntimeSchemaRequest, "runtime_schema_requests").fromArrayList(runtime_schema_requests);
     runtime_schema_requests = undefined;
+    program.const_evidence_pool = Ast.ProgramList(@import("check").ConstStore.ConstEvidence, "const_evidence_pool").fromArrayList(const_evidence_pool);
+    const_evidence_pool = undefined;
+    program.const_evidence_chain_pool = Ast.ProgramList(@import("check").ConstStore.ConstRange, "const_evidence_chain_pool").fromArrayList(const_evidence_chain_pool);
+    const_evidence_chain_pool = undefined;
     errdefer program.deinit();
 
     const source_view = movedMonoView(&owned, &program);
@@ -151,6 +157,8 @@ fn movedMonoView(source: *const Mono.Program, moved: *const Ast.Program) Mono.Pr
         .stmt_ids = moved_view.stmt_ids,
         .field_exprs = moved_view.field_exprs,
         .fn_def_captures = moved_view.fn_def_captures,
+        .const_evidence_pool = moved_view.const_evidence_pool,
+        .const_evidence_chain_pool = moved_view.const_evidence_chain_pool,
         .capture_operands = moved_view.capture_operands,
         .record_destructs = moved_view.record_destructs,
         .str_pattern_steps = moved_view.str_pattern_steps,

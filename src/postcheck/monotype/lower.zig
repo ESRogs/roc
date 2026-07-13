@@ -763,6 +763,45 @@ const Builder = struct {
         }
     }
 
+    /// Freeze one fully materialized evidence vector into target-independent
+    /// Monotype side data. Concrete targets retain checked module identity and
+    /// nested evidence for direct consumption by every later stage.
+    fn persistEvidenceVector(self: *Builder, vector: []const SpecEvidence) Allocator.Error!check.ConstStore.ConstRange {
+        const stored = try self.allocator.alloc(check.ConstStore.ConstEvidence, vector.len);
+        defer self.allocator.free(stored);
+
+        for (vector, 0..) |evidence, index| {
+            stored[index] = switch (evidence) {
+                .target => |target| .{ .target = .{
+                    .module = moduleDigestFromId(target.view.key),
+                    .method = target.target,
+                    .nested = switch (target.nested) {
+                        .resolved => |nested| .{ .resolved = try self.persistEvidenceVector(nested) },
+                        .synthesize => .synthesize,
+                    },
+                } },
+                .structural => |kind| .{ .structural = kind },
+                .unreachable_value => .unreachable_value,
+                .checked_error => .checked_error,
+            };
+        }
+        return try self.program.addConstEvidenceSpan(stored);
+    }
+
+    /// Persist every vector in a function body's lexical evidence chain,
+    /// ordered from the innermost scope to its parents.
+    fn persistEvidenceChain(self: *Builder, chain: EvidenceChain) Allocator.Error!check.ConstStore.ConstRange {
+        if (chain.vector.len == 0 and chain.parent == null) return .{};
+
+        var vectors = std.ArrayList(check.ConstStore.ConstRange).empty;
+        defer vectors.deinit(self.allocator);
+        var current: ?*const EvidenceChain = &chain;
+        while (current) |entry| : (current = entry.parent) {
+            try vectors.append(self.allocator, try self.persistEvidenceVector(entry.vector));
+        }
+        return try self.program.addConstEvidenceChain(vectors.items);
+    }
+
     fn specializationTypeDigest(self: *Builder, ty: Type.TypeId) names.TypeDigest {
         if (self.counters != null) {
             self.count("specialization_type_digest_requests");
@@ -1381,7 +1420,7 @@ const Builder = struct {
 
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const template = view.templates.get(template_ref.template);
-        const fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, lower_fn_ty);
+        var fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, lower_fn_ty);
 
         const Reservation = struct {
             def: Ast.DefId,
@@ -1537,6 +1576,7 @@ const Builder = struct {
                 Common.invariant("intrinsic wrapper specialization request supplied fewer evidence entries than its scheme's params");
             }
         }
+        fn_template.const_evidence_chain = try self.persistEvidenceChain(body_ctx.evidence);
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
         const root_fn_key = Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names);
@@ -3077,13 +3117,15 @@ const Builder = struct {
             parent.* = source_ctx.evidence;
             nested_ctx.evidence = .{ .vector = vector, .parent = parent };
         }
+        var stored_template = fn_template;
+        stored_template.const_evidence_chain = try self.persistEvidenceChain(nested_ctx.evidence);
         // Nested functions share the requester's graph, and an inferred local
         // procedure's body pins signature variables (its own evidence) that
         // the requester's remaining body relies on, so the body lowers now.
         return try self.lowerNestedFnRequest(.{
             .ctx = nested_ctx,
             .expr_id = expr_id,
-            .fn_template = fn_template,
+            .fn_template = stored_template,
         });
     }
 
@@ -3143,6 +3185,7 @@ const Builder = struct {
                 .source_fn_ty = def_template.source_fn_ty,
                 .source_fn_key = def_template.source_fn_key,
                 .mono_fn_ty = try DraftTypeCell.fromActiveType(request.ctx.graph, def_template.mono_fn_ty),
+                .const_evidence_chain = def_template.const_evidence_chain,
             },
             .fn_id = draftFinalFn(fn_id),
             .args = lowered.args,
@@ -5270,6 +5313,7 @@ const DraftFnTemplate = struct {
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     mono_fn_ty: DraftTypeCell,
+    const_evidence_chain: check.ConstStore.ConstRange = .{},
 };
 
 const DraftFn = struct {
@@ -6287,6 +6331,7 @@ const BodyDraftStore = struct {
             .source_fn_ty = template.source_fn_ty,
             .source_fn_key = template.source_fn_key,
             .mono_fn_ty = try template.mono_fn_ty.seal(graph, sealer),
+            .const_evidence_chain = template.const_evidence_chain,
         };
     }
 
@@ -6771,11 +6816,6 @@ const BodyContext = struct {
     /// restored from the constant lower their bodies against this chain
     /// (their plans' `constraint(k)` refs index the constant's scheme).
     restore_evidence: EvidenceChain = .{},
-    /// While recursively restoring a stored constant, the concrete type of the
-    /// whole restored value. Nested stored closures use this to instantiate the
-    /// owner callable's return when synthesizing the constant scheme's evidence.
-    restore_const_result_ty: ?Type.TypeId = null,
-
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
         ty: Type.TypeId,
@@ -7328,6 +7368,7 @@ const BodyContext = struct {
                 .source_fn_ty = source.source_fn_ty,
                 .source_fn_key = source.source_fn_key,
                 .mono_fn_ty = try self.draftTypeCellPreservingGenerated(source.mono_fn_ty),
+                .const_evidence_chain = source.const_evidence_chain,
             },
         });
     }
@@ -7803,7 +7844,6 @@ const BodyContext = struct {
         child.generated_encoder_lambda_index = self.generated_encoder_lambda_index;
         child.source_region_override = self.source_region_override;
         child.current_entry_root = self.current_entry_root;
-        child.restore_const_result_ty = self.restore_const_result_ty;
         child.restored_local_proc_context_digest = self.restored_local_proc_context_digest;
         child.restored_local_proc_base_key = self.restored_local_proc_base_key;
 
@@ -17400,10 +17440,6 @@ const BodyContext = struct {
         ty: Type.TypeId,
         static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftExprId {
-        const previous_restore_const_result_ty = self.restore_const_result_ty;
-        if (previous_restore_const_result_ty == null) self.restore_const_result_ty = ty;
-        defer self.restore_const_result_ty = previous_restore_const_result_ty;
-
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
@@ -17764,6 +17800,58 @@ const BodyContext = struct {
         return self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(ty));
     }
 
+    fn restoreStoredEvidenceChain(
+        self: *BodyContext,
+        store_view: ModuleView,
+        stored_chain: []const check.ConstStore.ConstRange,
+    ) Allocator.Error!EvidenceChain {
+        if (stored_chain.len == 0) return .{};
+
+        const arena = self.builder.evidence_arena.allocator();
+        var parent: ?*const EvidenceChain = null;
+        var index = stored_chain.len;
+        while (index > 0) {
+            index -= 1;
+            const node = try arena.create(EvidenceChain);
+            node.* = .{
+                .vector = try self.restoreStoredEvidenceVector(store_view, stored_chain[index]),
+                .parent = parent,
+            };
+            parent = node;
+        }
+        return parent.?.*;
+    }
+
+    fn restoreStoredEvidenceVector(
+        self: *BodyContext,
+        store_view: ModuleView,
+        range: check.ConstStore.ConstRange,
+    ) Allocator.Error![]const SpecEvidence {
+        const stored = store_view.const_store.evidenceSlice(range);
+        const arena = self.builder.evidence_arena.allocator();
+        const restored = try arena.alloc(SpecEvidence, stored.len);
+        for (stored, 0..) |evidence, index| {
+            restored[index] = switch (evidence) {
+                .target => |target| blk: {
+                    const restored_target = try arena.create(SpecEvidenceTarget);
+                    restored_target.* = .{
+                        .view = self.builder.moduleForDigest(target.module),
+                        .target = target.method,
+                        .nested = switch (target.nested) {
+                            .resolved => |nested| .{ .resolved = try self.restoreStoredEvidenceVector(store_view, nested) },
+                            .synthesize => .synthesize,
+                        },
+                    };
+                    break :blk .{ .target = restored_target };
+                },
+                .structural => |kind| .{ .structural = kind },
+                .unreachable_value => .unreachable_value,
+                .checked_error => .checked_error,
+            };
+        }
+        return restored;
+    }
+
     fn restoreConstFn(
         self: *BodyContext,
         store_view: ModuleView,
@@ -17784,7 +17872,7 @@ const BodyContext = struct {
         if (fn_value.captures.len != 0) {
             return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty, static_data_const_locator);
         }
-        const mono_fn_id = try self.restoreConstFnTemplate(fn_value, template);
+        const mono_fn_id = try self.restoreConstFnTemplate(store_view, fn_value, template);
         return try self.addExpr(.{
             .ty = self.builder.program.fnSource(mono_fn_id).mono_fn_ty,
             .data = .{ .fn_def = .{ .fn_id = draftFinalFn(mono_fn_id) } },
@@ -17793,44 +17881,39 @@ const BodyContext = struct {
 
     fn restoreConstFnTemplate(
         self: *BodyContext,
+        store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
     ) Allocator.Error!Ast.FnId {
+        const stored_evidence = if (fn_value.evidence_chain.len > 0)
+            try self.restoreStoredEvidenceChain(store_view, fn_value.evidence_chain)
+        else
+            self.restore_evidence;
         return switch (template.fn_def) {
             .nested => {
                 const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
                 var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
                 defer fn_ctx.deinit();
-                try self.prepareRestoredFnEvidence(&fn_ctx, fn_view, fn_value, template);
+                try self.prepareRestoredFnEvidence(&fn_ctx, stored_evidence, fn_value, template);
                 return try self.builder.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def), template, null);
             },
-            else => try self.builder.lowerFnTemplateDefFromContext(self, template, self.restore_evidence.vector),
+            else => try self.builder.lowerFnTemplateDefFromContext(self, template, stored_evidence.vector),
         };
     }
 
     fn prepareRestoredFnEvidence(
-        self: *BodyContext,
+        _: *BodyContext,
         fn_ctx: *BodyContext,
-        fn_view: ModuleView,
+        stored_evidence: EvidenceChain,
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
     ) Allocator.Error!void {
-        fn_ctx.evidence = self.restore_evidence;
+        fn_ctx.evidence = stored_evidence;
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, template.mono_fn_ty);
 
-        if (self.restore_evidence.vector.len == 0) {
-            const nested = switch (template.fn_def) {
-                .nested => |nested| nested,
-                else => Common.invariant("stored function evidence preparation requires a nested function identity"),
-            };
-            if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, template.mono_fn_ty, null)) |synthesized| {
-                fn_ctx.evidence = .{ .vector = synthesized };
-            }
-        }
-
         // Captured ConstStore values belong to the same restored constant.
-        // Propagate the explicit use-edge or synthesized owner evidence before
-        // recursively restoring them.
+        // Propagate the stored producer evidence before recursively restoring
+        // them.
         fn_ctx.restore_evidence = fn_ctx.evidence;
     }
 
@@ -17845,8 +17928,11 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
-        fn_ctx.evidence = self.restore_evidence;
-        fn_ctx.restore_evidence = self.restore_evidence;
+        fn_ctx.evidence = if (fn_value.evidence_chain.len > 0)
+            try self.restoreStoredEvidenceChain(store_view, fn_value.evidence_chain)
+        else
+            self.restore_evidence;
+        fn_ctx.restore_evidence = fn_ctx.evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
         fn_ctx.restored_local_proc_context_digest = fn_value.fn_def.nested.local_proc_context_digest;
@@ -17917,16 +18003,7 @@ const BodyContext = struct {
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
                     .local_proc_context_digest = nested.local_proc_context_digest,
                 } };
-                // A compile-time-evaluated closure keeps its dispatch evidence
-                // params even when the outer scheme is concrete. Capture types
-                // and the enclosing constant result together instantiate the
-                // owner callable before its checked evidence paths are read.
-                if (self.restore_evidence.vector.len == 0) {
-                    const result_ty = self.restore_const_result_ty orelse ty;
-                    if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty, result_ty)) |synthesized| {
-                        fn_ctx.evidence = .{ .vector = synthesized };
-                    }
-                }
+                capture_template.const_evidence_chain = try self.builder.persistEvidenceChain(fn_ctx.evidence);
                 fn_ctx.restore_evidence = fn_ctx.evidence;
             },
             else => Common.invariant("capturing stored function had no nested function identity"),
@@ -20289,45 +20366,6 @@ const BodyContext = struct {
     ) Allocator.Error![]const SpecEvidence {
         const template = lookup.view.templates.get(template_ref.template);
         return try self.synthesizeParamsEvidence(lookup.view, template, callable_mono_ty);
-    }
-
-    /// Evidence vector for a compile-time-evaluated closure restored without a
-    /// use-site vector: resolve the owner scheme's evidence params from its
-    /// checked dispatcher paths over the closure's concrete restored callable.
-    ///
-    /// The owner scheme's evidence-param paths run over the owner's whole
-    /// callable (a `constraint(0, k)` in the closure body forwards to the
-    /// owner's `k`th param). Instantiate the owner root, pin its return to the
-    /// result value that created this stored closure, and synthesize each param's
-    /// target over the resulting concrete owner callable. When the owner returns
-    /// the closure directly, that result is the restored closure type itself; an
-    /// ambient restored constant result only applies when the owner returns an
-    /// aggregate that contains this closure.
-    fn synthesizeRestoredClosureEvidence(
-        self: *BodyContext,
-        owner_view: ModuleView,
-        owner_ref: names.ProcTemplate,
-        ty: Type.TypeId,
-        owner_result_ty: ?Type.TypeId,
-    ) Allocator.Error!?[]const SpecEvidence {
-        const owner_template = owner_view.templates.get(owner_ref.template);
-        if (owner_template.evidence_params.len == 0) return null;
-
-        const owner_node = try self.instNode(owner_template.checked_fn_root);
-        const owner_mono_ty = try self.activeTypeFromNode(owner_node);
-        const owner_ret = self.functionReturnType(owner_mono_ty);
-        switch (self.builder.shapeContent(ty)) {
-            .func => {},
-            else => Common.invariant("stored capturing function had a non-function restored type"),
-        }
-        const restored_owner_result_ty = switch (self.builder.shapeContent(owner_ret)) {
-            .func => ty,
-            else => owner_result_ty orelse owner_ret,
-        };
-        try self.graph.unify(try self.graph.importMono(owner_ret), try self.graph.importMono(restored_owner_result_ty));
-        try self.graph.drainDirty();
-        const owner_callable_ty = try self.activeTypeFromNode(owner_node);
-        return try self.synthesizeParamsEvidence(owner_view, owner_template, owner_callable_ty);
     }
 
     /// Resolve a template's requirements from its checked dispatcher paths
