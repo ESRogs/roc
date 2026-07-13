@@ -683,7 +683,11 @@ const ValueInfo = struct {
 /// One forked ownership state along a control-flow path.
 const State = struct {
     allocator: Allocator,
-    /// Value bound to each store local; `no_value` when unbound.
+    /// Dense proc-local position per store local, owned by the certifier and
+    /// stable for the lifetime of every state for the current proc.
+    local_dense: []const u32,
+    /// Value bound to each reference-counted local used by this proc;
+    /// `no_value` when unbound.
     local_value: []ValueId,
     /// Ownership units per value. Values created after a fork are absent in
     /// sibling states; absent means zero.
@@ -698,11 +702,12 @@ const State = struct {
     conditional_condition: std.ArrayList(u32),
     conditional_condition_mask: std.ArrayList(u64),
 
-    fn init(allocator: Allocator, local_count: usize) Allocator.Error!State {
-        const local_value = try allocator.alloc(ValueId, local_count);
+    fn init(allocator: Allocator, local_dense: []const u32, proc_local_count: usize) Allocator.Error!State {
+        const local_value = try allocator.alloc(ValueId, proc_local_count);
         @memset(local_value, no_value);
         return .{
             .allocator = allocator,
+            .local_dense = local_dense,
             .local_value = local_value,
             .balance = .empty,
             .holder = .empty,
@@ -731,6 +736,7 @@ const State = struct {
         const conditional_condition_mask = try self.conditional_condition_mask.clone(self.allocator);
         return .{
             .allocator = self.allocator,
+            .local_dense = self.local_dense,
             .local_value = local_value,
             .balance = balance,
             .holder = holder,
@@ -739,12 +745,24 @@ const State = struct {
         };
     }
 
+    fn denseIndex(self: *const State, local: LIR.LocalId) usize {
+        const raw = @intFromEnum(local);
+        if (raw >= self.local_dense.len or self.local_dense[raw] == no_dense) {
+            std.debug.panic("ARC certifier invariant violated: local {d} is outside the current proc-local map", .{raw});
+        }
+        return @intCast(self.local_dense[raw]);
+    }
+
     fn valueOf(self: *const State, local: LIR.LocalId) ValueId {
-        return self.local_value[@intFromEnum(local)];
+        return self.local_value[self.denseIndex(local)];
+    }
+
+    fn valueAtDense(self: *const State, dense: usize) ValueId {
+        return self.local_value[dense];
     }
 
     fn bindValue(self: *State, local: LIR.LocalId, value: ValueId) void {
-        self.local_value[@intFromEnum(local)] = value;
+        self.local_value[self.denseIndex(local)] = value;
     }
 
     fn balanceOf(self: *const State, value: ValueId) i32 {
@@ -825,10 +843,9 @@ const LocalClass = enum(u8) {
 const JoinRecord = struct {
     body: LIR.CFStmtId,
     params: LIR.LocalSpan,
-    /// Locals whose entry state the join body relies on: the join's
-    /// parameters plus every local the body subtree reads before rebinding.
-    /// Jump states must agree only on these; everything else was settled
-    /// before the jump.
+    /// Dense proc-local positions whose entry state the join body relies on:
+    /// every local the body subtree reads before rebinding. Jump states must
+    /// agree only on these; everything else was settled before the jump.
     relevant: std.bit_set.DynamicBitSetUnmanaged,
     maybe_uninitialized_params: LIR.LocalSpan,
     maybe_uninitialized_conditions: LIR.LocalSpan,
@@ -900,17 +917,18 @@ const Certifier = struct {
     memo: std.AutoHashMap(MemoEntry, void),
     summary_scratch: std.ArrayList(LocalSummary) = .empty,
     repr_scratch: std.AutoHashMap(ValueId, u32),
-    /// Dense position per store local for the proc being certified, or
-    /// `no_dense` for locals the proc never mentions.
+    /// Dense position per reference-counted store local used by the proc
+    /// being certified, or `no_dense` otherwise.
     local_dense: std.ArrayList(u32) = .empty,
-    /// Store local id per dense position.
+    /// Reference-counted store local id per dense position.
     proc_locals: std.ArrayList(LIR.LocalId) = .empty,
     /// Join bodies of the proc being certified, for jump-following scans.
     join_bodies: std.AutoHashMap(LIR.JoinPointId, LIR.CFStmtId),
     /// Per-proc cache for join-body read-before-rebind sets. These bitsets use
     /// dense proc-local positions, so the cache is cleared at each proc boundary.
     reads_before_rebind_cache: std.AutoHashMap(LIR.CFStmtId, std.bit_set.DynamicBitSetUnmanaged),
-    /// Scratch bitset over store locals, reused by join-relevance extension.
+    /// Scratch bitset over dense proc-local positions, reused by
+    /// join-relevance extension.
     relevant_scratch: std.bit_set.DynamicBitSetUnmanaged = .{},
     /// Scratch bitset over values, reused by the liveness and borrow-anchor
     /// chain walks. Both walks unset every bit they set on the way out, so
@@ -1163,44 +1181,41 @@ const Certifier = struct {
         self.summary_scratch.clearRetainingCapacity();
         try self.summary_scratch.ensureTotalCapacity(self.allocator, self.proc_locals.items.len);
 
-        for (self.proc_locals.items, 0..) |local, dense| {
-            if (!self.isRc(local)) continue;
-            const value = state.valueOf(local);
+        for (0..self.proc_locals.items.len) |dense| {
+            const value = state.valueAtDense(dense);
             if (value == no_value) continue;
             const entry = try self.repr_scratch.getOrPut(value);
             if (!entry.found_existing) entry.value_ptr.* = @intCast(dense);
         }
 
-        for (self.proc_locals.items) |local| {
+        for (0..self.proc_locals.items.len) |dense| {
             var summary = LocalSummary{ .class = .unbound, .repr = 0, .balance = 0, .lender_repr = 0, .condition = no_dense, .condition_mask = 0 };
-            if (self.isRc(local)) {
-                const value = state.valueOf(local);
-                if (value != no_value) {
-                    const repr = self.repr_scratch.get(value) orelse 0;
-                    const units = state.balanceOf(value);
-                    if (units > 0) {
-                        if (state.conditionalConditionOf(value)) |condition| {
-                            summary = .{
-                                .class = .conditional_owned,
-                                .repr = repr,
-                                .balance = @intCast(units),
-                                .lender_repr = 0,
-                                .condition = @intFromEnum(condition.local),
-                                .condition_mask = condition.mask,
-                            };
-                        } else {
-                            summary = .{ .class = .owned, .repr = repr, .balance = @intCast(units), .lender_repr = 0, .condition = no_dense, .condition_mask = 0 };
-                        }
-                    } else if (try self.valueIsLive(state, value)) {
+            const value = state.valueAtDense(dense);
+            if (value != no_value) {
+                const repr = self.repr_scratch.get(value) orelse 0;
+                const units = state.balanceOf(value);
+                if (units > 0) {
+                    if (state.conditionalConditionOf(value)) |condition| {
                         summary = .{
-                            .class = .borrowed,
+                            .class = .conditional_owned,
                             .repr = repr,
-                            .balance = 0,
-                            .lender_repr = try self.borrowSummaryAnchorRepr(state, value),
-                            .condition = no_dense,
-                            .condition_mask = 0,
+                            .balance = @intCast(units),
+                            .lender_repr = 0,
+                            .condition = @intFromEnum(condition.local),
+                            .condition_mask = condition.mask,
                         };
+                    } else {
+                        summary = .{ .class = .owned, .repr = repr, .balance = @intCast(units), .lender_repr = 0, .condition = no_dense, .condition_mask = 0 };
                     }
+                } else if (try self.valueIsLive(state, value)) {
+                    summary = .{
+                        .class = .borrowed,
+                        .repr = repr,
+                        .balance = 0,
+                        .lender_repr = try self.borrowSummaryAnchorRepr(state, value),
+                        .condition = no_dense,
+                        .condition_mask = 0,
+                    };
                 }
             }
             self.summary_scratch.appendAssumeCapacity(summary);
@@ -1275,7 +1290,7 @@ const Certifier = struct {
     /// share one fresh value; borrows are re-linked to the fresh value of the
     /// local their liveness anchored on.
     fn stateFromSummary(self: *Certifier, summary: []const LocalSummary) CertifyError!State {
-        var state = try State.init(self.allocator, self.store.localCount());
+        var state = try State.init(self.allocator, self.local_dense.items, self.proc_locals.items.len);
         errdefer state.deinit();
 
         for (summary, 0..) |entry, dense| {
@@ -1292,12 +1307,12 @@ const Certifier = struct {
         for (summary, 0..) |entry, dense| {
             if (entry.class != .owned or entry.repr == dense) continue;
             const local = self.proc_locals.items[dense];
-            state.bindValue(local, state.valueOf(self.proc_locals.items[entry.repr]));
+            state.bindValue(local, state.valueAtDense(entry.repr));
         }
         for (summary, 0..) |entry, dense| {
             if (entry.class != .conditional_owned or entry.repr == dense) continue;
             const local = self.proc_locals.items[dense];
-            state.bindValue(local, state.valueOf(self.proc_locals.items[entry.repr]));
+            state.bindValue(local, state.valueAtDense(entry.repr));
         }
         for (summary, 0..) |entry, dense| {
             if (entry.class != .borrowed or entry.repr != dense) continue;
@@ -1314,8 +1329,7 @@ const Certifier = struct {
             if (anchor_dense >= self.proc_locals.items.len) {
                 return self.fail("borrowed local {d} crossed a join without a live owner local", .{@intFromEnum(local)});
             }
-            const anchor_local = self.proc_locals.items[anchor_dense];
-            const lender = state.valueOf(anchor_local);
+            const lender = state.valueAtDense(anchor_dense);
             if (lender == no_value) {
                 return self.fail("borrowed local {d} crossed a join without a live owner local", .{@intFromEnum(local)});
             }
@@ -1324,7 +1338,7 @@ const Certifier = struct {
         for (summary, 0..) |entry, dense| {
             if (entry.class != .borrowed or entry.repr == dense) continue;
             const local = self.proc_locals.items[dense];
-            state.bindValue(local, state.valueOf(self.proc_locals.items[entry.repr]));
+            state.bindValue(local, state.valueAtDense(entry.repr));
         }
         return state;
     }
@@ -2145,17 +2159,8 @@ const Certifier = struct {
         self: *Certifier,
         body: LIR.CFStmtId,
     ) CertifyError!std.bit_set.DynamicBitSetUnmanaged {
-        var relevant = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.store.localCount());
-        errdefer relevant.deinit(self.allocator);
         const reads = try self.computeReadsBeforeRebind(body);
-        for (self.proc_locals.items, 0..) |local, dense| {
-            if (!self.isRc(local)) continue;
-            if (relevant.isSet(@intFromEnum(local))) continue;
-            if (reads.isSet(dense)) {
-                relevant.set(@intFromEnum(local));
-            }
-        }
-        return relevant;
+        return reads.clone(self.allocator);
     }
 
     fn maybeUninitializedCondition(record: *const JoinRecord, store: *const LirStore, local: LIR.LocalId) ?PresenceCondition {
@@ -2185,30 +2190,26 @@ const Certifier = struct {
         join_id: LIR.JoinPointId,
     ) CertifyError![]const LocalSummary {
         // Seed the working relevant set from the record.
-        var index: usize = 0;
-        while (index < self.relevant_scratch.capacity()) : (index += 1) {
-            self.relevant_scratch.setValue(index, record.relevant.isSet(index));
-        }
+        self.relevant_scratch.unsetAll();
+        self.relevant_scratch.setUnion(record.relevant);
 
         // Extend through borrow anchors: a relevant borrowed local keeps its
         // lender's carrier local live, so the carrier joins the agreement.
         var changed = true;
         while (changed) {
             changed = false;
-            for (self.proc_locals.items) |local| {
-                const local_index = @intFromEnum(local);
-                if (!self.relevant_scratch.isSet(local_index)) continue;
-                if (!self.isRc(local)) continue;
-                const value = state.valueOf(local);
+            for (0..self.proc_locals.items.len) |dense| {
+                if (!self.relevant_scratch.isSet(dense)) continue;
+                const value = state.valueAtDense(dense);
                 if (value == no_value) continue;
                 if (state.balanceOf(value) > 0) continue;
                 const anchor = try self.borrowSummaryAnchorValue(state, value);
                 if (anchor == no_value) continue;
                 // Find a carrier local for the anchor value.
                 var carrier: u32 = no_dense;
-                for (self.proc_locals.items) |candidate| {
-                    if (state.valueOf(candidate) == anchor) {
-                        carrier = @intFromEnum(candidate);
+                for (0..self.proc_locals.items.len) |candidate_dense| {
+                    if (state.valueAtDense(candidate_dense) == anchor) {
+                        carrier = @intCast(candidate_dense);
                         break;
                     }
                 }
@@ -2225,18 +2226,17 @@ const Certifier = struct {
         self.summary_scratch.clearRetainingCapacity();
         try self.summary_scratch.ensureTotalCapacity(self.allocator, self.proc_locals.items.len);
 
-        for (self.proc_locals.items, 0..) |local, dense| {
-            if (!self.isRc(local)) continue;
-            if (!self.relevant_scratch.isSet(@intFromEnum(local))) continue;
-            const value = state.valueOf(local);
+        for (0..self.proc_locals.items.len) |dense| {
+            if (!self.relevant_scratch.isSet(dense)) continue;
+            const value = state.valueAtDense(dense);
             if (value == no_value) continue;
             const entry = try self.repr_scratch.getOrPut(value);
             if (!entry.found_existing) entry.value_ptr.* = @intCast(dense);
         }
 
-        for (self.proc_locals.items) |local| {
+        for (self.proc_locals.items, 0..) |local, dense| {
             var summary = LocalSummary{ .class = .unbound, .repr = 0, .balance = 0, .lender_repr = 0, .condition = no_dense, .condition_mask = 0 };
-            if (self.isRc(local) and self.relevant_scratch.isSet(@intFromEnum(local))) {
+            if (self.relevant_scratch.isSet(dense)) {
                 if (maybeUninitializedCondition(record, self.store, local)) |condition| {
                     summary = .{
                         .class = .conditional_owned,
@@ -2247,7 +2247,7 @@ const Certifier = struct {
                         .condition_mask = condition.mask,
                     };
                 } else {
-                    const value = state.valueOf(local);
+                    const value = state.valueAtDense(dense);
                     if (value != no_value) {
                         const repr = self.repr_scratch.get(value) orelse 0;
                         const units = state.balanceOf(value);
@@ -2337,9 +2337,9 @@ const Certifier = struct {
         self.join_bodies.clearRetainingCapacity();
         self.clearReadsBeforeRebindCache();
         try self.collectProcLocals(proc, body);
-        try self.relevant_scratch.resize(self.allocator, self.store.localCount(), false);
+        try self.relevant_scratch.resize(self.allocator, self.proc_locals.items.len, false);
 
-        var state = try State.init(self.allocator, self.store.localCount());
+        var state = try State.init(self.allocator, self.local_dense.items, self.proc_locals.items.len);
         {
             errdefer state.deinit();
             const proc_args = self.store.getLocalSpan(proc.args);
@@ -2971,6 +2971,26 @@ test "certifier declarations are referenced" {
 }
 
 const testing = std.testing;
+
+test "certifier state indexes explicit proc locals" {
+    const first: LIR.LocalId = @enumFromInt(1);
+    const second: LIR.LocalId = @enumFromInt(3);
+    const local_dense = [_]u32{ no_dense, 0, no_dense, 1 };
+
+    var state = try State.init(testing.allocator, &local_dense, 2);
+    defer state.deinit();
+    state.bindValue(first, 7);
+    state.bindValue(second, 11);
+
+    try testing.expectEqual(@as(ValueId, 7), state.valueOf(first));
+    try testing.expectEqual(@as(ValueId, 11), state.valueOf(second));
+
+    var cloned = try state.clone();
+    defer cloned.deinit();
+    cloned.bindValue(first, 13);
+    try testing.expectEqual(@as(ValueId, 13), cloned.valueOf(first));
+    try testing.expectEqual(@as(ValueId, 7), state.valueOf(first));
+}
 
 const CertifyTest = struct {
     allocator: Allocator,
