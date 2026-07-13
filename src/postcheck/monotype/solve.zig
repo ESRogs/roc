@@ -98,6 +98,7 @@ pub const Stats = struct {
     public_opaque_calls: u64 = 0,
     public_opaque_clones: u64 = 0,
     evidence_walk_calls: u64 = 0,
+    evidence_walk_hits: u64 = 0,
     evidence_seals: u64 = 0,
 
     pub fn dump(self: *const Stats) void {
@@ -430,13 +431,13 @@ pub const InstGraph = struct {
             stats.nominal_backing_misses += 1;
             return null;
         };
-        instance: for (bucket.items) |*instance| {
+        instances: for (bucket.items) |*instance| {
             if (instance.args.len != args.len) continue;
             for (instance.args, args) |*stored, wanted| {
                 // Repoint the stored cell at its current root so repeated
                 // lookups after heavy unification stay cheap.
                 stored.* = self.find(stored.*);
-                if (stored.* != self.find(wanted)) continue :instance;
+                if (stored.* != self.find(wanted)) continue :instances;
             }
             stats.nominal_backing_hits += 1;
             return instance.node;

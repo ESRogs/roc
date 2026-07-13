@@ -912,6 +912,11 @@ const Certifier = struct {
     reads_before_rebind_cache: std.AutoHashMap(LIR.CFStmtId, std.bit_set.DynamicBitSetUnmanaged),
     /// Scratch bitset over store locals, reused by join-relevance extension.
     relevant_scratch: std.bit_set.DynamicBitSetUnmanaged = .{},
+    /// Scratch bitset over values, reused by the liveness and borrow-anchor
+    /// chain walks. Both walks unset every bit they set on the way out, so
+    /// the set is all zero between top-level calls and only ever needs to
+    /// track the value count.
+    value_walk_scratch: std.bit_set.DynamicBitSetUnmanaged = .{},
     diag: *Diagnostic,
     /// Proc and statement being certified; written by `certifyProc` and
     /// `runSegment` before any read.
@@ -936,6 +941,7 @@ const Certifier = struct {
         self.clearReadsBeforeRebindCache();
         self.reads_before_rebind_cache.deinit();
         self.relevant_scratch.deinit(self.allocator);
+        self.value_walk_scratch.deinit(self.allocator);
     }
 
     fn clearRecords(self: *Certifier) void {
@@ -1015,9 +1021,18 @@ const Certifier = struct {
     /// allocation alive, and live lenders keep the borrowed-from allocation
     /// alive.
     fn valueIsLive(self: *Certifier, state: *const State, value: ValueId) Allocator.Error!bool {
-        var seen = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.values.items.len);
-        defer seen.deinit(self.allocator);
-        return self.valueIsLiveSeen(state, value, &seen);
+        const seen = try self.valueWalkScratch();
+        return self.valueIsLiveSeen(state, value, seen);
+    }
+
+    /// The shared chain-walk scratch, grown to the current value count. The
+    /// walks' unset-on-exit discipline keeps it all zero between top-level
+    /// calls, so growing (zero-filled) is the only maintenance it needs.
+    fn valueWalkScratch(self: *Certifier) Allocator.Error!*std.bit_set.DynamicBitSetUnmanaged {
+        if (self.value_walk_scratch.bit_length < self.values.items.len) {
+            try self.value_walk_scratch.resize(self.allocator, self.values.items.len, false);
+        }
+        return &self.value_walk_scratch;
     }
 
     fn valueIsLiveSeen(self: *Certifier, state: *const State, value: ValueId, seen: *std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!bool {
@@ -1209,9 +1224,8 @@ const Certifier = struct {
     }
 
     fn borrowSummaryAnchorValue(self: *Certifier, state: *const State, value: ValueId) Allocator.Error!ValueId {
-        var seen = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.values.items.len);
-        defer seen.deinit(self.allocator);
-        return self.borrowSummaryAnchorValueSeen(state, value, &seen);
+        const seen = try self.valueWalkScratch();
+        return self.borrowSummaryAnchorValueSeen(state, value, seen);
     }
 
     fn borrowSummaryAnchorValueSeen(self: *Certifier, state: *const State, value: ValueId, seen: *std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!ValueId {
