@@ -85,6 +85,19 @@ expect {
 
 # --- invalid escapes are rejected ---
 
+# a valid escape does not permit a later raw control byte in the same string
+expect {
+	document = Str.from_utf8([34, 92, 116, 1, 34])
+
+	result : Try(Str, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
 # unknown escape character
 expect {
 	result : Try({ s : Str }, Json.ParseErr)

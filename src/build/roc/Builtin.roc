@@ -17155,7 +17155,12 @@ scan_json_string_tail = |tail| {
 			}
 			# For any other character besides a quote or a backslash, we continue.
 			_ => {
-				$index = $index + 1
+				# JSON requires U+0000 through U+001F to be escaped inside strings.
+				if byte < 32 {
+					return Err(Json.invalid_json)
+				} else {
+					$index = $index + 1
+				}
 			}
 		}
 	}
