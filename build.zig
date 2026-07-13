@@ -2253,6 +2253,22 @@ fn setupTestPlatforms(
                 omit_frame_pointer,
             );
             clear_cache_step.dependOn(copy_step);
+
+            // test/alloc-count declares fx's musl runtime objects (crt1.o,
+            // libc.a) as link inputs; copy them alongside its host library
+            // rather than committing more copies of the same binaries.
+            if (std.mem.eql(u8, platform_dir, "alloc-count") and std.mem.endsWith(u8, cross_target.name, "musl")) {
+                const copy_musl_runtime = b.addUpdateSourceFiles();
+                copy_musl_runtime.addCopyFileToSource(
+                    b.path(b.pathJoin(&.{ "test/fx/platform/targets", cross_target.name, "crt1.o" })),
+                    b.pathJoin(&.{ "test/alloc-count/platform/targets", cross_target.name, "crt1.o" }),
+                );
+                copy_musl_runtime.addCopyFileToSource(
+                    b.path(b.pathJoin(&.{ "test/fx/platform/targets", cross_target.name, "libc.a" })),
+                    b.pathJoin(&.{ "test/alloc-count/platform/targets", cross_target.name, "libc.a" }),
+                );
+                clear_cache_step.dependOn(&copy_musl_runtime.step);
+            }
         }
     }
 
