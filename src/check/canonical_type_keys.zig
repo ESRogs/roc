@@ -129,7 +129,7 @@ pub fn containsError(
 ) Allocator.Error!bool {
     var builder = Builder.init(allocator, store, env);
     defer builder.deinit();
-    builder.error_behavior = .detect;
+    builder.detect_errors = true;
     try builder.writeVar(var_);
     return builder.contains_error;
 }
@@ -144,7 +144,7 @@ const Builder = struct {
     identity_variables: std.ArrayList(Var),
     require_concrete: bool = false,
     contains_identity_variables: bool = false,
-    error_behavior: enum { invariant, detect } = .invariant,
+    detect_errors: bool = false,
     contains_error: bool = false,
 
     fn init(allocator: Allocator, store: *const TypeStore, env: *const ModuleEnv) Builder {
@@ -233,12 +233,9 @@ const Builder = struct {
 
     fn writeContent(self: *Builder, content: types.Content) Allocator.Error!void {
         switch (content) {
-            .err => switch (self.error_behavior) {
-                .invariant => invariantViolation("canonical type key requested for erroneous checked type"),
-                .detect => {
-                    self.contains_error = true;
-                    self.writeTag("err");
-                },
+            .err => {
+                if (self.detect_errors) self.contains_error = true;
+                self.writeTag("err");
             },
             .flex => |flex| {
                 if (self.require_concrete) {
@@ -330,7 +327,7 @@ const Builder = struct {
                 try self.writeVarRange(tuple.elems);
             },
             .nominal_type => |nominal| {
-                if (self.error_behavior == .detect and self.store.nominalDeclIsInvalid(nominal)) {
+                if (self.detect_errors and self.store.nominalDeclIsInvalid(nominal)) {
                     self.contains_error = true;
                 }
                 self.writeTag("nominal");
@@ -702,6 +699,21 @@ fn invariantViolation(comptime message: []const u8) noreturn {
 
 test "canonical type key declarations are referenced" {
     std.testing.refAllDecls(@This());
+}
+
+test "erroneous checked types have a canonical key" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+
+    var store = try TypeStore.initCapacity(allocator, 1, 0);
+    defer store.deinit();
+    const err_var = try store.freshFromContent(.err);
+
+    const first = try fromVar(allocator, &store, &env, err_var);
+    const second = try fromVar(allocator, &store, &env, err_var);
+    try std.testing.expectEqual(first, second);
 }
 
 test "concrete keys default open literal flex vars per kind (numeral -> Dec, quote -> Str)" {
