@@ -81,7 +81,6 @@ export fn roc_default_echo_line(str: RocStr) callconv(.c) void {
     var owned = str;
     const message = owned.asSlice();
     writeAll(stdout_fd, message);
-    writeLiteral(stdout_fd, "\n");
     owned.decref(roc_dealloc);
 }
 

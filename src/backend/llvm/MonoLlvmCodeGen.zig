@@ -8216,17 +8216,15 @@ pub const MonoLlvmCodeGen = struct {
             return error.CompilationFailed;
         }
 
-        try self.emitDefaultPlatformWriteLine(arg_ptrs[0]);
+        try self.emitDefaultPlatformWrite(arg_ptrs[0]);
 
         return true;
     }
 
-    fn emitDefaultPlatformWriteLine(self: *MonoLlvmCodeGen, str_ptr: LlvmBuilder.Value) Error!void {
+    fn emitDefaultPlatformWrite(self: *MonoLlvmCodeGen, str_ptr: LlvmBuilder.Value) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const wip = self.wip orelse return error.CompilationFailed;
         const usize_ty = self.ptrSizedIntType();
-        const static_newline = try self.staticBytes("\n");
-        const static_newline_len = builder.intValue(usize_ty, 1) catch return error.OutOfMemory;
 
         const raw_len = try self.loadUsize(try self.offsetPtr(str_ptr, self.rocStrLenOffset()));
         const is_small = wip.icmp(.slt, raw_len, builder.intValue(usize_ty, 0) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
@@ -8240,57 +8238,15 @@ pub const MonoLlvmCodeGen = struct {
         const last_byte = wip.load(.normal, .i8, try self.offsetPtr(str_ptr, last_byte_offset), LlvmBuilder.Alignment.fromByteUnits(1), "") catch return error.OutOfMemory;
         const small_len_byte = wip.bin(.@"and", last_byte, builder.intValue(.i8, 0x7f) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
         const small_len = try self.coerceScalar(small_len_byte, usize_ty, false);
-        const small_has_spare = wip.icmp(.ult, small_len, builder.intValue(usize_ty, self.targetWordSize() * 3 - 1) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
-        try self.emitDefaultPlatformWriteLineFromBuffer(str_ptr, small_len, small_has_spare, static_newline, static_newline_len, after);
+        try self.emitDefaultPlatformWriteStdout(str_ptr, small_len);
+        _ = wip.br(after) catch return error.OutOfMemory;
 
         wip.cursor = .{ .block = heap_block };
         const big_ptr = try self.loadPointer(str_ptr);
-        const cap_or_alloc = try self.loadUsize(try self.offsetPtr(str_ptr, self.rocStrCapacityOffset()));
-        const slice_tag = wip.bin(.@"and", cap_or_alloc, builder.intValue(usize_ty, 1) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
-        const not_slice = wip.icmp(.eq, slice_tag, builder.intValue(usize_ty, 0) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
-        const capacity = wip.bin(.lshr, cap_or_alloc, builder.intValue(usize_ty, 1) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
-        const has_spare = wip.icmp(.ugt, capacity, raw_len, "") catch return error.OutOfMemory;
-        const data_ptr = try self.loadStrDataPtrForRc(str_ptr);
-        const rc_offset: i64 = -@as(i64, @intCast(self.targetWordSize()));
-        const rc_ptr = wip.gep(.inbounds, .i8, data_ptr, &.{builder.intValue(.i32, rc_offset) catch return error.OutOfMemory}, "") catch return error.OutOfMemory;
-        const refcount = wip.load(.normal, usize_ty, rc_ptr, self.targetPointerAlignment(), "") catch return error.OutOfMemory;
-        const is_unique = wip.icmp(.eq, refcount, builder.intValue(usize_ty, 1) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
-        const writable_heap = wip.bin(.@"and", not_slice, is_unique, "") catch return error.OutOfMemory;
-        const heap_can_append = wip.bin(.@"and", writable_heap, has_spare, "") catch return error.OutOfMemory;
-        try self.emitDefaultPlatformWriteLineFromBuffer(big_ptr, raw_len, heap_can_append, static_newline, static_newline_len, after);
+        try self.emitDefaultPlatformWriteStdout(big_ptr, raw_len);
+        _ = wip.br(after) catch return error.OutOfMemory;
 
         wip.cursor = .{ .block = after };
-    }
-
-    fn emitDefaultPlatformWriteLineFromBuffer(
-        self: *MonoLlvmCodeGen,
-        ptr: LlvmBuilder.Value,
-        len: LlvmBuilder.Value,
-        can_append_newline: LlvmBuilder.Value,
-        static_newline: LlvmBuilder.Value,
-        static_newline_len: LlvmBuilder.Value,
-        after: LlvmBuilder.Function.Block.Index,
-    ) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
-        const usize_ty = self.ptrSizedIntType();
-
-        const append_block = wip.block(0, "echo_append_newline") catch return error.OutOfMemory;
-        const separate_block = wip.block(0, "echo_separate_newline") catch return error.OutOfMemory;
-        _ = wip.brCond(can_append_newline, append_block, separate_block, .then_likely) catch return error.OutOfMemory;
-
-        wip.cursor = .{ .block = append_block };
-        const newline_ptr = wip.gep(.inbounds, .i8, ptr, &.{len}, "") catch return error.OutOfMemory;
-        _ = wip.store(.normal, builder.intValue(.i8, '\n') catch return error.OutOfMemory, newline_ptr, LlvmBuilder.Alignment.fromByteUnits(1)) catch return error.OutOfMemory;
-        const len_with_newline = wip.bin(.add, len, builder.intValue(usize_ty, 1) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
-        try self.emitDefaultPlatformWriteStdout(ptr, len_with_newline);
-        _ = wip.store(.normal, builder.intValue(.i8, 0) catch return error.OutOfMemory, newline_ptr, LlvmBuilder.Alignment.fromByteUnits(1)) catch return error.OutOfMemory;
-        _ = wip.br(after) catch return error.OutOfMemory;
-
-        wip.cursor = .{ .block = separate_block };
-        try self.emitDefaultPlatformWriteStdout(ptr, len);
-        try self.emitDefaultPlatformWriteStdout(static_newline, static_newline_len);
-        _ = wip.br(after) catch return error.OutOfMemory;
     }
 
     fn emitDefaultPlatformWriteStdout(self: *MonoLlvmCodeGen, ptr: LlvmBuilder.Value, len: LlvmBuilder.Value) Error!void {

@@ -4,7 +4,7 @@
 //! functions that capture output into in-process buffers, and drives the
 //! exported API (init / allocateBuffer / addFile / compileAndRun) the same
 //! way `www/app.js` does. Validates that the tutorial example produces
-//! "Hello from the Greeting module!" as its single echo line.
+//! "Hello from the Greeting module!" as raw echo output.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -26,7 +26,6 @@ fn hostJsEcho(_: ?*anyopaque, _: *bytebox.ModuleInstance, params: [*]const byteb
     const mem = memory_instance.buffer();
     if (@as(usize, ptr) + @as(usize, len) > mem.len) return;
     capture_ctx.echoed.appendSlice(capture_ctx.gpa, mem[ptr .. ptr + len]) catch return;
-    capture_ctx.echoed.append(capture_ctx.gpa, '\n') catch return;
 }
 
 fn hostJsStderr(_: ?*anyopaque, _: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
@@ -198,7 +197,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     ;
     const exit_code = try compileAndRunSource(module_instance, alloc_handle, run_handle, main_src);
 
-    const expected_output = "Hello from the Greeting module!\n";
+    const expected_output = "Hello from the Greeting module!";
     const got_output = capture_ctx.echoed.items;
     const got_stderr = capture_ctx.stderr.items;
 
