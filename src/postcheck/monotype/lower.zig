@@ -115,6 +115,14 @@ pub fn run(
     program.next_symbol = builder.symbols.next;
     program.freeze();
 
+    if (comptime @import("builtin").link_libc) {
+        if (std.c.getenv("ROC_MONOTYPE_STATS") != null) {
+            solve.stats.dump();
+            std.debug.print("monotype_stat program_types {d}\n", .{program.types.types.len()});
+            std.debug.print("monotype_stat program_specs {d}\n", .{program.specsView().len});
+        }
+    }
+
     if (@import("builtin").mode == .Debug) {
         verifyMonotypeTypeStore(&program);
         verifyMonotypeCompletedTypeIds(&program);
@@ -2091,6 +2099,7 @@ const Builder = struct {
     }
 
     fn monoTypeHasGeneratedOpaqueEvidence(self: *Builder, ty: Type.TypeId) Allocator.Error!bool {
+        solve.stats.evidence_walk_calls += 1;
         var visited = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
         defer visited.deinit();
         return try self.monoTypeHasGeneratedOpaqueEvidenceInner(ty, &visited);
@@ -8358,6 +8367,7 @@ const BodyContext = struct {
         checked_ty: checked.CheckedTypeId,
         mono_ty: Type.TypeId,
     ) Allocator.Error!void {
+        solve.stats.constrain_calls += 1;
         self.builder.constrain_depth += 1;
         defer self.builder.constrain_depth -= 1;
         try self.graph.unify(try self.instNode(checked_ty), try self.graph.importMono(try self.publicOpaqueUnificationType(mono_ty)));
@@ -8497,6 +8507,7 @@ const BodyContext = struct {
     /// checked identity so every occurrence of the same checked root resolves
     /// to the same node within this instantiation context.
     fn instNode(self: *BodyContext, checked_ty: checked.CheckedTypeId) Allocator.Error!NodeId {
+        solve.stats.inst_node_calls += 1;
         // A checked empty tag union carries no identity worth sharing: it
         // records that nothing reaches a slot, and the slot yields to sibling
         // descriptions. One checked id serves many unrelated slots, so each
@@ -8506,7 +8517,10 @@ const BodyContext = struct {
             else => {},
         }
         const address = self.typeAddress(checked_ty);
-        if (self.scopedNode(address)) |existing| return existing;
+        if (self.scopedNode(address)) |existing| {
+            solve.stats.inst_node_hits += 1;
+            return existing;
+        }
         const placeholder = try self.graph.newNode(.{ .unresolved = InstVariable.placeholder() });
         try self.putScopedNode(address, placeholder);
         const built = try self.instNodeContent(checked_ty);
@@ -10763,6 +10777,7 @@ const BodyContext = struct {
     }
 
     fn publicOpaqueUnificationType(self: *BodyContext, ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        solve.stats.public_opaque_calls += 1;
         if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) return ty;
         var cache = std.AutoHashMap(Type.TypeId, Type.TypeId).init(self.allocator);
         defer cache.deinit();
@@ -10803,6 +10818,7 @@ const BodyContext = struct {
             cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
 
             fn fill(ctx: @This(), public_ty: Type.TypeId) Allocator.Error!Type.Content {
+                solve.stats.public_opaque_clones += 1;
                 try ctx.cache.put(ctx.source, public_ty);
                 return try ctx.body.clonePublicOpaqueUnificationContent(ctx.source, ctx.cache);
             }
@@ -16396,6 +16412,7 @@ const BodyContext = struct {
         checked_args: []const checked.CheckedExprId,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
+        solve.stats.call_instantiations += 1;
         const function = self.checkedFunctionType(source_fn_ty);
         if (function.args.len != checked_args.len) {
             Common.invariant("checked direct call arity differs from its function type");
@@ -16469,6 +16486,7 @@ const BodyContext = struct {
         operands: []const static_dispatch.StaticDispatchOperand,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
+        solve.stats.dispatch_instantiations += 1;
         const function = self.checkedFunctionType(source_fn_ty);
         if (function.args.len != operands.len) {
             Common.invariant("checked dispatch plan arity differs from its function type");
@@ -16721,6 +16739,7 @@ const BodyContext = struct {
         checked_arg: checked.CheckedExprId,
         expected_ty: ?Type.TypeId,
     ) Allocator.Error!?Type.TypeId {
+        solve.stats.call_arg_mono_types += 1;
         const expr = self.view.bodies.expr(checked_arg);
         switch (expr.data) {
             .call => |call| return try self.callResultMonoType(expr.ty, call, expected_ty),
@@ -16771,10 +16790,10 @@ const BodyContext = struct {
         }
         if (self.currentLocalForResolvedValue(ref_id)) |local_id| {
             const local_ty = try self.localType(local_id);
-            const generated_snapshot = if (self.isGeneratedSpecializationEvidenceType(local_ty))
-                try self.graph.sealType(local_ty)
-            else
-                null;
+            const generated_snapshot = if (self.isGeneratedSpecializationEvidenceType(local_ty)) blk: {
+                solve.stats.evidence_seals += 1;
+                break :blk try self.graph.sealType(local_ty);
+            } else null;
             try self.constrainTypeToMono(checked_ty, try self.publicOpaqueUnificationType(local_ty));
             return generated_snapshot orelse local_ty;
         }
