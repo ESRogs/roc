@@ -3921,13 +3921,12 @@ const Lowerer = struct {
                 .next = err_tag,
             } });
 
-        const switch_stmt = try self.discriminantBranchResultSwitch(
+        const switch_stmt = try self.discriminantSwitchNoContinuation(
             input_try_local,
             ok_variant,
             ok_start,
             err_start,
             sequence.err_is_cold,
-            next,
         );
         return try self.lowerExprInto(input_try_local, sequence.try_expr, switch_stmt);
     }
@@ -3995,13 +3994,12 @@ const Lowerer = struct {
                 .next = err_tag,
             } });
 
-        const switch_stmt = try self.discriminantBranchResultSwitch(
+        const switch_stmt = try self.discriminantSwitchNoContinuation(
             input_try_local,
             ok_variant,
             ok_start,
             err_start,
             sequence.err_is_cold,
-            next,
         );
         return try self.lowerExprInto(input_try_local, sequence.try_expr, switch_stmt);
     }
@@ -6025,8 +6023,8 @@ const Lowerer = struct {
     }
 
     /// Build a structured switch whose result paths flow to one exact shared
-    /// suffix. Requiring the suffix here prevents lowering from silently
-    /// discarding the control-flow provenance ARC needs.
+    /// suffix within the same control-flow region. Requiring the suffix here
+    /// prevents lowering from silently discarding the provenance ARC needs.
     fn branchResultSwitch(
         self: *Lowerer,
         cond: LIR.LocalId,
@@ -6044,9 +6042,9 @@ const Lowerer = struct {
         } });
     }
 
-    /// Build a switch whose branches dispatch to distinct control-flow exits
-    /// rather than producing a result for one shared suffix.
-    fn nonRejoiningSwitch(
+    /// Build a switch with no same-region shared suffix. Its branches may be
+    /// terminal, dispatch to distinct exits, or converge only across a join.
+    fn switchWithoutContinuation(
         self: *Lowerer,
         cond: LIR.LocalId,
         branches: []const LIR.CFSwitchBranch,
@@ -6075,29 +6073,7 @@ const Lowerer = struct {
 
     fn boolSwitchNoContinuation(self: *Lowerer, cond: LIR.LocalId, true_body: LIR.CFStmtId, false_body: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
         const branches = [_]LIR.CFSwitchBranch{.{ .value = 1, .body = true_body }};
-        return try self.nonRejoiningSwitch(cond, &branches, false_body, false);
-    }
-
-    fn discriminantBranchResultSwitch(
-        self: *Lowerer,
-        source: LIR.LocalId,
-        discriminant: u16,
-        body: LIR.CFStmtId,
-        default_branch: LIR.CFStmtId,
-        default_is_cold: bool,
-        continuation: LIR.CFStmtId,
-    ) Common.LowerError!LIR.CFStmtId {
-        if (self.isZstLocal(source)) return body;
-        const disc_local = try self.addLocalForLayout(.u16);
-        const branches = [_]LIR.CFSwitchBranch{.{ .value = discriminant, .body = body }};
-        const switch_stmt = try self.branchResultSwitch(
-            disc_local,
-            &branches,
-            default_branch,
-            default_is_cold,
-            continuation,
-        );
-        return try self.discriminantRead(source, disc_local, switch_stmt);
+        return try self.switchWithoutContinuation(cond, &branches, false_body, false);
     }
 
     fn discriminantSwitchNoContinuation(
@@ -6111,7 +6087,7 @@ const Lowerer = struct {
         if (self.isZstLocal(source)) return body;
         const disc_local = try self.addLocalForLayout(.u16);
         const branches = [_]LIR.CFSwitchBranch{.{ .value = discriminant, .body = body }};
-        const switch_stmt = try self.nonRejoiningSwitch(
+        const switch_stmt = try self.switchWithoutContinuation(
             disc_local,
             &branches,
             default_branch,
