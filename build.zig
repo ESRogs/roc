@@ -3617,6 +3617,7 @@ pub fn build(b: *std.Build) void {
         });
         configureBackend(echo_wasm_test_exe, target);
         echo_wasm_test_exe.root_module.addImport("bytebox", bytebox.module("bytebox"));
+        echo_wasm_test_exe.root_module.addImport("build_options", roc_modules.build_options);
 
         const run_test_echo_wasm_step = b.step("run-test-echo-wasm", "Run echo.wasm tutorial example through bytebox");
         const run_echo_wasm_test = b.addRunArtifact(echo_wasm_test_exe);
