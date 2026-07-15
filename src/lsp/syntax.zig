@@ -68,6 +68,12 @@ pub const SyntaxChecker = struct {
     builtin_modules: ?*eval.BuiltinModules = null,
     /// Dependency graph for tracking module relationships and invalidation.
     dependency_graph: DependencyGraph,
+    /// Absolute workspace root from LSP initialize (`rootUri`), used to prefer
+    /// `{workspace_root}/main.roc` for package-alias resolution.
+    workspace_root: ?[]u8 = null,
+    /// URIs for which we last published a non-empty diagnostic set. Used to
+    /// emit empty clears when those diagnostics are no longer valid.
+    published_diagnostic_uris: std.StringHashMapUnmanaged(void) = .{},
     cache_config: CacheConfig,
     log_file: ?std.Io.File = null,
     debug: DebugFlags,
@@ -148,6 +154,13 @@ pub const SyntaxChecker = struct {
         // Free hashmap allocations
         self.snapshot_envs.deinit(self.allocator);
 
+        if (self.workspace_root) |root| {
+            self.allocator.free(root);
+            self.workspace_root = null;
+        }
+        self.clearPublishedDiagnosticUris();
+        self.published_diagnostic_uris.deinit(self.allocator);
+
         if (self.builtin_modules) |builtin_modules| {
             builtin_modules.deinit();
             self.allocator.destroy(builtin_modules);
@@ -155,6 +168,36 @@ pub const SyntaxChecker = struct {
         }
 
         self.dependency_graph.deinit();
+    }
+
+    fn clearPublishedDiagnosticUris(self: *SyntaxChecker) void {
+        var it = self.published_diagnostic_uris.keyIterator();
+        while (it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.published_diagnostic_uris.clearRetainingCapacity();
+    }
+
+    /// Test helper: record a URI as having published non-empty diagnostics.
+    pub fn seedPublishedDiagnosticUriForTesting(self: *SyntaxChecker, uri: []const u8) Allocator.Error!void {
+        const owned = try self.allocator.dupe(u8, uri);
+        const gop = try self.published_diagnostic_uris.getOrPut(self.allocator, owned);
+        if (gop.found_existing) self.allocator.free(owned);
+    }
+
+    /// Test helper: whether a URI is tracked as having published non-empty diagnostics.
+    pub fn hasPublishedDiagnosticUriForTesting(self: *SyntaxChecker, uri: []const u8) bool {
+        return self.published_diagnostic_uris.contains(uri);
+    }
+
+    fn updateWorkspaceRoot(self: *SyntaxChecker, workspace_root: ?[]const u8) Allocator.Error!void {
+        if (self.workspace_root) |old| {
+            self.allocator.free(old);
+            self.workspace_root = null;
+        }
+        if (workspace_root) |root| {
+            self.workspace_root = try self.allocator.dupe(u8, root);
+        }
     }
 
     fn documentIdentityFromText(self: *SyntaxChecker, uri: []const u8, text: []const u8) Allocator.Error!DocumentIdentity {
@@ -228,7 +271,7 @@ pub const SyntaxChecker = struct {
         const env_handle = try self.createFreshBuildEnv();
         const env = env_handle.envPtr();
 
-        var session = try BuildSession.init(self.allocator, self.std_io, env, uri, override_text);
+        var session = try BuildSession.init(self.allocator, self.std_io, env, uri, override_text, self.workspace_root);
         errdefer session.deinit();
 
         const has_reports = self.documentHasReports(session.absolute_path, session.drained_reports);
@@ -253,10 +296,10 @@ pub const SyntaxChecker = struct {
 
     /// Check the file referenced by the URI and return diagnostics grouped by URI.
     pub fn check(self: *SyntaxChecker, uri: []const u8, override_text: ?[]const u8, workspace_root: ?[]const u8) CheckError![]Diagnostics.PublishDiagnostics {
-        _ = workspace_root; // Reserved for future use
-
         self.mutex.lockUncancelable(self.std_io);
         defer self.mutex.unlock(self.std_io);
+
+        try self.updateWorkspaceRoot(workspace_root);
 
         // Check if content has changed using hash comparison BEFORE building.
         // This avoids unnecessary rebuilds on focus/blur events.
@@ -301,7 +344,7 @@ pub const SyntaxChecker = struct {
         const env_handle = try self.createFreshBuildEnv();
         const env = env_handle.envPtr();
 
-        var session = try BuildSession.init(self.allocator, self.std_io, env, uri, override_text);
+        var session = try BuildSession.init(self.allocator, self.std_io, env, uri, override_text, self.workspace_root);
         defer session.deinit();
 
         const absolute_path = session.absolute_path;
@@ -363,6 +406,7 @@ pub const SyntaxChecker = struct {
                 });
             }
 
+            try self.finishDiagnosticPublishes(&publish_list, uri);
             return publish_list.toOwnedSlice(self.allocator);
         } else {
             // No reports drained, return a diagnostic showing the failure to get diagnostics
@@ -380,7 +424,61 @@ pub const SyntaxChecker = struct {
                     },
                 }),
             });
+            try self.finishDiagnosticPublishes(&publish_list, uri);
             return publish_list.toOwnedSlice(self.allocator);
+        }
+    }
+
+    fn publishListContainsUri(publish_list: *const std.ArrayList(Diagnostics.PublishDiagnostics), uri: []const u8) bool {
+        for (publish_list.items) |set| {
+            if (std.mem.eql(u8, set.uri, uri)) return true;
+        }
+        return false;
+    }
+
+    /// Ensure the checked URI is published, clear stale URIs from prior publishes,
+    /// and refresh the set of URIs that currently have non-empty diagnostics.
+    fn finishDiagnosticPublishes(
+        self: *SyntaxChecker,
+        publish_list: *std.ArrayList(Diagnostics.PublishDiagnostics),
+        checked_uri: []const u8,
+    ) Allocator.Error!void {
+        if (!publishListContainsUri(publish_list, checked_uri)) {
+            try publish_list.append(self.allocator, .{
+                .uri = try self.allocator.dupe(u8, checked_uri),
+                .diagnostics = &.{},
+            });
+        }
+
+        var stale_uris: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (stale_uris.items) |stale_uri| self.allocator.free(stale_uri);
+            stale_uris.deinit(self.allocator);
+        }
+
+        var it = self.published_diagnostic_uris.keyIterator();
+        while (it.next()) |prev| {
+            if (!publishListContainsUri(publish_list, prev.*)) {
+                try stale_uris.append(self.allocator, try self.allocator.dupe(u8, prev.*));
+            }
+        }
+        for (stale_uris.items) |stale_uri| {
+            try publish_list.append(self.allocator, .{
+                .uri = try self.allocator.dupe(u8, stale_uri),
+                .diagnostics = &.{},
+            });
+        }
+
+        self.clearPublishedDiagnosticUris();
+        for (publish_list.items) |set| {
+            if (set.diagnostics.len == 0) continue;
+            const owned = try self.allocator.dupe(u8, set.uri);
+            const gop = try self.published_diagnostic_uris.getOrPut(self.allocator, owned);
+            if (gop.found_existing) {
+                self.allocator.free(owned);
+            } else {
+                gop.key_ptr.* = owned;
+            }
         }
     }
 

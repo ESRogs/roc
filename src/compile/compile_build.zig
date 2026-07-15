@@ -597,6 +597,108 @@ pub const BuildEnv = struct {
         try self.compileDiscovered();
     }
 
+    /// Walk `start_dir` and its parents for a file named `main.roc`.
+    /// Returns an owned absolute path the caller must free, or null if none exists.
+    pub fn findOwningMainRoc(gpa: Allocator, filesystem: CoreCtx, start_dir: []const u8) Allocator.Error!?[]u8 {
+        var current = try std.fs.path.resolve(gpa, &.{start_dir});
+        errdefer gpa.free(current);
+
+        while (true) {
+            const candidate = try std.fs.path.join(gpa, &.{ current, "main.roc" });
+            defer gpa.free(candidate);
+
+            if (filesystem.fileExists(candidate)) {
+                const abs = try std.fs.path.resolve(gpa, &.{candidate});
+                gpa.free(current);
+                return abs;
+            }
+
+            const parent = std.fs.path.dirname(current) orelse {
+                gpa.free(current);
+                return null;
+            };
+            if (parent.len == 0 or std.mem.eql(u8, parent, current)) {
+                gpa.free(current);
+                return null;
+            }
+            const next = try gpa.dupe(u8, parent);
+            gpa.free(current);
+            current = next;
+        }
+    }
+
+    /// Build `root_file`, using package aliases from an owning app/package/platform
+    /// `main.roc` when the checked file is a child module.
+    ///
+    /// `preferred_main` (e.g. LSP workspace `{root}/main.roc` or CLI `--main`) wins
+    /// when set and different from `root_file`. Otherwise module/type_module/hosted
+    /// roots walk ancestor directories for `main.roc` (same convention as #6538).
+    pub fn buildResolvingMain(self: *BuildEnv, root_file: []const u8, preferred_main: ?[]const u8) BuildWithMainError!void {
+        const root_abs = try self.makeAbsolute(root_file);
+        defer self.gpa.free(root_abs);
+
+        if (preferred_main) |main_path| {
+            const main_abs = try self.makeAbsolute(main_path);
+            defer self.gpa.free(main_abs);
+            if (std.mem.eql(u8, root_abs, main_abs)) {
+                try self.build(root_file);
+            } else {
+                try self.buildWithMain(root_file, main_path);
+            }
+            return;
+        }
+
+        const kind = self.peekPackageKind(root_abs) catch null;
+        const carries_packages = kind == .app or kind == .default_app or kind == .package or kind == .platform;
+        if (carries_packages) {
+            try self.build(root_file);
+            return;
+        }
+
+        const start_dir = std.fs.path.dirname(root_abs) orelse ".";
+        if (try findOwningMainRoc(self.gpa, self.filesystem, start_dir)) |main_abs| {
+            defer self.gpa.free(main_abs);
+            if (!std.mem.eql(u8, root_abs, main_abs)) {
+                try self.buildWithMain(root_file, main_abs);
+                return;
+            }
+        }
+
+        try self.build(root_file);
+    }
+
+    /// Silently read the package/header kind of `file_abs` without emitting reports.
+    /// Returns null when the file cannot be read or parsed.
+    fn peekPackageKind(self: *BuildEnv, file_abs: []const u8) Allocator.Error!?PackageKind {
+        const src = self.readFile(file_abs) catch return null;
+        defer self.gpa.free(src);
+
+        var env = try ModuleEnv.init(self.gpa, src);
+        defer env.deinit();
+
+        try env.common.calcLineStarts(self.gpa);
+
+        const ast = try parse.file(self.gpa, &env.common);
+        defer ast.deinit();
+
+        if (ast.tokenize_diagnostics.items.len > 0 or ast.parse_diagnostics.items.len > 0) {
+            return null;
+        }
+
+        const file = ast.store.getFile();
+        const header = ast.store.getHeader(file.header);
+        return switch (header) {
+            .app => .app,
+            .package => .package,
+            .platform => .platform,
+            .module => .module,
+            .hosted => .hosted,
+            .type_module => if (ast.hasMainBangDecl()) .default_app else .type_module,
+            .default_app => .default_app,
+            else => null,
+        };
+    }
+
     fn setDiscoveredEntryModule(self: *BuildEnv, root_file: []const u8) BuildError!void {
         _ = self.discovered_pkg_name orelse return error.Internal;
         const root_abs = try self.makeAbsolute(root_file);
