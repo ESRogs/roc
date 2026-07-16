@@ -13357,12 +13357,7 @@ const CheckResultWithBuildEnv = struct {
 };
 
 fn buildForCheckWithOptionalMain(build_env: *BuildEnv, filepath: []const u8, main_filepath: ?[]const u8) CheckFileWithBuildEnvPreservedError!void {
-    if (main_filepath) |main_path| {
-        try build_env.buildWithMain(filepath, main_path);
-    } else {
-        try build_env.discoverDependencies(filepath);
-        try build_env.compileDiscovered();
-    }
+    try build_env.buildResolvingMain(filepath, main_filepath);
 }
 
 /// Returns true when `filepath` is the compiler-owned builtin module (`Builtin.roc`).
