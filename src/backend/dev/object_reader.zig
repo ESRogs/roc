@@ -835,6 +835,8 @@ fn resolveBuiltinWrapper(name: []const u8) ?usize {
         .{ .name = "incref_rc_ptr", .addr = @intFromPtr(&utils.increfRcPtrC) },
         .{ .name = "decref_rc_ptr", .addr = @intFromPtr(&utils.decrefRcPtrC) },
         .{ .name = "roc_builtins_str_to_utf8", .addr = @intFromPtr(&dev_wrappers.roc_builtins_str_to_utf8) },
+        .{ .name = "roc_builtins_str_get_utf8_byte_unsafe", .addr = @intFromPtr(&dev_wrappers.roc_builtins_str_get_utf8_byte_unsafe) },
+        .{ .name = "roc_builtins_str_substring_unsafe", .addr = @intFromPtr(&dev_wrappers.roc_builtins_str_substring_unsafe) },
         .{ .name = "roc_builtins_str_concat", .addr = @intFromPtr(&dev_wrappers.roc_builtins_str_concat) },
         .{ .name = "roc_builtins_str_contains", .addr = @intFromPtr(&dev_wrappers.roc_builtins_str_contains) },
         .{ .name = "roc_builtins_str_starts_with", .addr = @intFromPtr(&dev_wrappers.roc_builtins_str_starts_with) },

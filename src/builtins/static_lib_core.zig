@@ -45,6 +45,8 @@ comptime {
     @export(&dw.roc_builtins_str_static_small_word_eq, .{ .name = "roc_builtins_str_static_small_word_eq" });
     @export(&dw.roc_builtins_str_static_small_word_caseless_eq, .{ .name = "roc_builtins_str_static_small_word_caseless_eq" });
     @export(&dw.roc_builtins_str_count_utf8_bytes, .{ .name = "roc_builtins_str_count_utf8_bytes" });
+    @export(&dw.roc_builtins_str_get_utf8_byte_unsafe, .{ .name = "roc_builtins_str_get_utf8_byte_unsafe" });
+    @export(&dw.roc_builtins_str_substring_unsafe, .{ .name = "roc_builtins_str_substring_unsafe" });
     @export(&dw.roc_builtins_str_find_first, .{ .name = "roc_builtins_str_find_first" });
     @export(&dw.roc_builtins_str_drop_prefix_caseless_ascii, .{ .name = "roc_builtins_str_drop_prefix_caseless_ascii" });
     @export(&dw.roc_builtins_str_caseless_ascii_equals, .{ .name = "roc_builtins_str_caseless_ascii_equals" });

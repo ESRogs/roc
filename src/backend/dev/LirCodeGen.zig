@@ -58,6 +58,8 @@ const strContains = builtins.str.strContains;
 const strStartsWith = builtins.str.startsWith;
 const strEndsWith = builtins.str.endsWith;
 const strCountUtf8Bytes = builtins.str.countUtf8Bytes;
+const strGetUtf8ByteUnsafe = builtins.str.getUnsafeC;
+const strSubstringUnsafe = builtins.str.substringUnsafeC;
 const strCaselessAsciiEquals = builtins.str.strCaselessAsciiEquals;
 const strEqual = builtins.str.strEqual;
 const strEqualStaticSmall = builtins.str.strEqualStaticSmall;
@@ -210,6 +212,8 @@ pub const BuiltinFn = enum {
     str_static_small_word_eq,
     str_static_small_word_caseless_eq,
     str_count_utf8_bytes,
+    str_get_utf8_byte_unsafe,
+    str_substring_unsafe,
     str_find_first,
     str_drop_prefix_caseless_ascii,
     str_caseless_ascii_equals,
@@ -366,6 +370,8 @@ pub const BuiltinFn = enum {
             .str_static_small_word_eq => "roc_builtins_str_static_small_word_eq",
             .str_static_small_word_caseless_eq => "roc_builtins_str_static_small_word_caseless_eq",
             .str_count_utf8_bytes => "roc_builtins_str_count_utf8_bytes",
+            .str_get_utf8_byte_unsafe => "roc_builtins_str_get_utf8_byte_unsafe",
+            .str_substring_unsafe => "roc_builtins_str_substring_unsafe",
             .str_find_first => "roc_builtins_str_find_first",
             .str_drop_prefix_caseless_ascii => "roc_builtins_str_drop_prefix_caseless_ascii",
             .str_caseless_ascii_equals => "roc_builtins_str_caseless_ascii_equals",
@@ -603,6 +609,16 @@ fn wrapStrStaticSmallWordCaselessEq(a_bytes: ?[*]u8, a_len: usize, a_cap: usize,
 fn wrapStrCountUtf8Bytes(str_bytes: ?[*]u8, str_len: usize, str_cap: usize) callconv(.c) u64 {
     const s = RocStr{ .bytes = str_bytes, .length = str_len, .capacity_or_alloc_ptr = str_cap };
     return strCountUtf8Bytes(s);
+}
+
+fn wrapStrGetUtf8ByteUnsafe(str_bytes: ?[*]u8, str_len: usize, str_cap: usize, index: u64) callconv(.c) u8 {
+    const s = RocStr{ .bytes = str_bytes, .length = str_len, .capacity_or_alloc_ptr = str_cap };
+    return strGetUtf8ByteUnsafe(s, index);
+}
+
+fn wrapStrSubstringUnsafe(out: *RocStr, str_bytes: ?[*]u8, str_len: usize, str_cap: usize, start: u64, length: u64, roc_ops: *RocOps) callconv(.c) void {
+    const s = RocStr{ .bytes = str_bytes, .length = str_len, .capacity_or_alloc_ptr = str_cap };
+    out.* = strSubstringUnsafe(s, start, length, roc_ops);
 }
 
 fn wrapStrFindFirst(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, find_layout: *const dev_wrappers.StrFindFirstLayout, roc_ops: *RocOps) callconv(.c) void {
@@ -3102,6 +3118,24 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const str_off = try self.ensureOnStack(str_loc, roc_str_size);
                     return try self.callStr1ToScalar(str_off, @intFromPtr(&wrapStrCountUtf8Bytes), .str_count_utf8_bytes);
                 },
+                .str_get_utf8_byte_unsafe => {
+                    if (args.len != 2) unreachable;
+                    const str_loc = try self.emitValueLocal(GuardedList.at(args, 0));
+                    const index_loc = try self.emitValueLocal(GuardedList.at(args, 1));
+                    const str_off = try self.ensureOnStack(str_loc, roc_str_size);
+                    const index_off = try self.ensureOnStack(index_loc, 8);
+                    return try self.callStr1U64ToByte(str_off, index_off, @intFromPtr(&wrapStrGetUtf8ByteUnsafe), .str_get_utf8_byte_unsafe);
+                },
+                .str_substring_unsafe => {
+                    if (args.len != 3) unreachable;
+                    const str_loc = try self.emitValueLocal(GuardedList.at(args, 0));
+                    const start_loc = try self.emitValueLocal(GuardedList.at(args, 1));
+                    const length_loc = try self.emitValueLocal(GuardedList.at(args, 2));
+                    const str_off = try self.ensureOnStack(str_loc, roc_str_size);
+                    const start_off = try self.ensureOnStack(start_loc, 8);
+                    const length_off = try self.ensureOnStack(length_loc, 8);
+                    return try self.callStr2U64RocOpsToStr(str_off, start_off, length_off, @intFromPtr(&wrapStrSubstringUnsafe), .str_substring_unsafe);
+                },
                 .str_find_first => {
                     if (args.len != 2) unreachable;
                     const a_loc = try self.emitValueLocal(GuardedList.at(args, 0));
@@ -5017,6 +5051,26 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return .{ .general_reg = result_reg };
         }
 
+        fn callStr1U64ToByte(self: *Self, str_off: i32, u64_off: i32, fn_addr: usize, builtin_fn: BuiltinFn) Allocator.Error!ValueLocation {
+            var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+            try builder.addMemArg(frame_ptr, str_off);
+            try builder.addMemArg(frame_ptr, str_off + 16);
+            try builder.addMemArg(frame_ptr, str_off + 8);
+            try builder.addMemArg(frame_ptr, u64_off);
+            try self.callBuiltin(&builder, fn_addr, builtin_fn);
+
+            const result_reg = try self.allocTempGeneral();
+            if (comptime target.toCpuArch() == .aarch64) {
+                try self.codegen.emit.movRegReg(.w64, result_reg, .X0);
+            } else {
+                try self.codegen.emit.movRegReg(.w64, result_reg, .RAX);
+            }
+            if (comptime target.toCpuArch() == .x86_64) {
+                try self.codegen.emit.andRegImm32(result_reg, 0xff);
+            }
+            return .{ .general_reg = result_reg };
+        }
+
         /// Call a C wrapper: fn(a_f0, a_f1, a_f2, b_f0, b_f1, b_f2) -> bool
         /// Used for (str, str) -> bool comparison ops (equal, contains, starts_with, etc.)
         fn callStr2ToScalar(self: *Self, a_off: i32, b_off: i32, fn_addr: usize, builtin_fn: BuiltinFn) Allocator.Error!ValueLocation {
@@ -5142,6 +5196,23 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try builder.addMemArg(base_ptr, str_off + 8);
             try builder.addMemArg(base_ptr, u64_off);
             if (update_mode_imm) |imm| try builder.addImmArg(imm);
+            try builder.addRegArg(roc_ops_reg);
+            try self.callBuiltin(&builder, fn_addr, builtin_fn);
+
+            return .{ .stack_str = result_offset };
+        }
+
+        fn callStr2U64RocOpsToStr(self: *Self, str_off: i32, first_off: i32, second_off: i32, fn_addr: usize, builtin_fn: BuiltinFn) Allocator.Error!ValueLocation {
+            const roc_ops_reg = self.roc_ops_reg orelse unreachable;
+            const result_offset = self.codegen.allocStackSlot(roc_str_size);
+
+            var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+            try builder.addLeaArg(frame_ptr, result_offset);
+            try builder.addMemArg(frame_ptr, str_off);
+            try builder.addMemArg(frame_ptr, str_off + 16);
+            try builder.addMemArg(frame_ptr, str_off + 8);
+            try builder.addMemArg(frame_ptr, first_off);
+            try builder.addMemArg(frame_ptr, second_off);
             try builder.addRegArg(roc_ops_reg);
             try self.callBuiltin(&builder, fn_addr, builtin_fn);
 
