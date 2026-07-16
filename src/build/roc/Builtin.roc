@@ -2934,6 +2934,42 @@ Builtin :: [].{
 				One({ item, rest }) => Iter.fold(rest, step(acc, item), step)
 			}
 
+		## The first item that satisfies the predicate.
+		## ```
+		## expect Iter.find_first(List.iter([1, 4, 9]), |n| n > 3) == Ok(4)
+		## expect Iter.find_first(List.iter([1, 2]), |n| n > 3) == Err(NotFound)
+		## ```
+		find_first : Iter(a), (a -> Bool) -> Try(a, [NotFound])
+		find_first = |iterator, predicate|
+			match Iter.next(iterator) {
+				Done => Err(NotFound)
+				Skip({ rest }) => Iter.find_first(rest, predicate)
+				One({ item, rest }) =>
+					if predicate(item) {
+						Ok(item)
+					} else {
+						Iter.find_first(rest, predicate)
+					}
+			}
+
+		## The position of the first item that satisfies the predicate. Positions
+		## count the items this iterator yields, starting from 0 — after filtering
+		## earlier in the chain, they are positions in the yielded sequence, not
+		## in the original collection.
+		## ```
+		## expect Iter.find_first_index(List.iter([1, 4, 9]), |n| n > 3) == Ok(1)
+		## ```
+		find_first_index : Iter(a), (a -> Bool) -> Try(U64, [NotFound])
+		find_first_index = |iterator, predicate| iter_find_first_index_from(iterator, predicate, 0)
+
+		## Pair each item with its position among the items this iterator yields,
+		## starting from 0.
+		## ```
+		## expect Iter.fold(Iter.enumerate(List.iter(["a", "b"])), [], |acc, pair| acc.append(pair)) == [(0, "a"), (1, "b")]
+		## ```
+		enumerate : Iter(item) -> Iter((U64, item))
+		enumerate = |iterator| iter_enumerate_from(iterator, 0)
+
 		## Returns the iterator's length if it is known up front, so collections
 		## can pre-size their allocation.
 		size_hint : Iter(item) -> [Known(U64), Unknown]
@@ -17181,6 +17217,34 @@ iter_from_step = |len_if_known, step| {
 	len_if_known,
 	step,
 }
+
+## enumerate's engine: pair yielded items with positions starting at `idx`.
+iter_enumerate_from : Iter(item), U64 -> Iter((U64, item))
+iter_enumerate_from = |iterator, idx|
+	iter_from_step(
+		Iter.size_hint(iterator),
+		||
+			match Iter.next(iterator) {
+				Done => Done
+				Skip({ rest }) => Skip({ rest: iter_enumerate_from(rest, idx) })
+				One({ item, rest }) => One({ item: (idx, item), rest: iter_enumerate_from(rest, idx + 1) })
+			},
+	)
+
+## find_first_index's engine: the position of the first match, counting yielded
+## items from `idx`.
+iter_find_first_index_from : Iter(a), (a -> Bool), U64 -> Try(U64, [NotFound])
+iter_find_first_index_from = |iterator, predicate, idx|
+	match Iter.next(iterator) {
+		Done => Err(NotFound)
+		Skip({ rest }) => iter_find_first_index_from(rest, predicate, idx)
+		One({ item, rest }) =>
+			if predicate(item) {
+				Ok(idx)
+			} else {
+				iter_find_first_index_from(rest, predicate, idx + 1)
+			}
+	}
 
 range_done : () -> Iter(item)
 range_done = || iter_from_step(
