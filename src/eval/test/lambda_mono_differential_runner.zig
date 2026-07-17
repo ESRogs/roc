@@ -50,6 +50,10 @@ const Case = struct {
     /// pre-existing bug tracked in the generated corpus). Such a child
     /// failure is reported but does not fail the run.
     known_panic: bool = false,
+    /// Generated case with a known pre-existing interpreter-vs-dev backend
+    /// disagreement; the dev comparison is skipped, the tree-evaluator
+    /// comparison still runs.
+    skip_dev: bool = false,
 };
 
 const CaseStatus = enum {
@@ -425,6 +429,7 @@ fn runPool(
     }
 }
 
+/// Entry point for the Lambda Mono differential harness.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
@@ -477,6 +482,7 @@ pub fn main(init: std.process.Init) !void {
                 .source_kind = if (case.module) .module else .expr,
                 .origin = .generated,
                 .known_panic = case.known_panic,
+                .skip_dev = case.skip_dev,
             });
         }
     }
@@ -693,7 +699,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, case: Case) !CaseResult {
 
     // Cross-backend agreement for the sweep corpus: the dev JIT must agree
     // with the interpreter on the same compile.
-    if (case.origin == .generated) {
+    if (case.origin == .generated and !case.skip_dev) {
         if (try compareDevBackend(gpa, case, &compiled.lowered, &transcript)) |detail| {
             return CaseResult{ .status = .dev_diverged, .detail = detail };
         }
@@ -789,7 +795,7 @@ fn compareDevBackend(
         error.OutOfMemory => return error.OutOfMemory,
         error.Crash => switch (transcript.outcome) {
             .aborted => return null,
-            .output => |interp_bytes| return try divergence(gpa, case, "dev backend termination", interp_bytes, "(crash)"),
+            .output => |interp_bytes| return try devDivergence(gpa, case, "dev backend termination", interp_bytes, "(crash)"),
         },
         else => return try std.fmt.allocPrint(
             gpa,
@@ -802,16 +808,34 @@ fn compareDevBackend(
     switch (transcript.outcome) {
         .output => |interp_bytes| {
             if (!std.mem.eql(u8, interp_bytes, dev_output)) {
-                return try divergence(gpa, case, "dev backend output", interp_bytes, dev_output);
+                return try devDivergence(gpa, case, "dev backend output", interp_bytes, dev_output);
             }
         },
         .aborted => |interp_abort| {
             const interp_text = try abortSummary(gpa, @tagName(interp_abort.kind), interp_abort.message);
             defer gpa.free(interp_text);
-            return try divergence(gpa, case, "dev backend termination", interp_text, dev_output);
+            return try devDivergence(gpa, case, "dev backend termination", interp_text, dev_output);
         },
     }
     return null;
+}
+
+fn devDivergence(
+    gpa: std.mem.Allocator,
+    case: Case,
+    what: []const u8,
+    interp: []const u8,
+    dev: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "  case:        {s}\n" ++
+            "  differs on:  {s}\n" ++
+            "  interpreter: {s}\n" ++
+            "  dev backend: {s}\n" ++
+            "  source:\n{s}\n",
+        .{ case.name, what, interp, dev, case.source },
+    );
 }
 
 fn abortSummary(gpa: std.mem.Allocator, kind_name: []const u8, message: ?[]const u8) ![]u8 {

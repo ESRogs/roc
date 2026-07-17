@@ -11,6 +11,17 @@
 //! Constructs that this version does not model return `error.Unsupported` with
 //! the `unsupported` field set to a static description, so the harness skips
 //! those roots rather than comparing an approximation.
+//!
+//! Stated coverage gaps (each fails loudly, and the harness reports the
+//! affected cases per reason): crypto ops (`crypto_*`), hasher ops
+//! (`hasher_*`), `structural_hash`, Dec transcendentals
+//! (pow/sqrt/trig/log) and Dec floor/ceiling, `str_from_utf8` invalid-UTF-8
+//! error details, imported function calls, hosted function bodies, roots
+//! with runtime arguments, and recursion beyond the depth cap. Everything
+//! else in the Lambda Mono IR — every expression, statement, and pattern
+//! form, callable and erased dispatch, capture records, try sequencing,
+//! loops, the numeric op and conversion matrix, string and list op
+//! families — executes and is compared.
 
 const std = @import("std");
 const base = @import("base");
@@ -103,6 +114,18 @@ fn truthy(value: Value) bool {
 /// Interpret a boolean-typed value as a 0/1 byte for numeric comparison.
 fn boolBit(value: Value) u8 {
     return @intFromBool(truthy(value));
+}
+
+/// View a value as a tag: a `.tag` directly, or a boolean (which a two-variant
+/// tag union `[False, True]` encodes with False = 0, True = 1). Comparisons and
+/// structural equality can materialize a boolean as `bool_` while the static
+/// type is that tag union, so tag-directed consumers tolerate both encodings.
+fn tagView(value: Value) ?TagValue {
+    return switch (value) {
+        .tag => |t| t,
+        .bool_ => |b| .{ .discriminant = @intFromBool(b), .payloads = &.{} },
+        else => null,
+    };
 }
 
 /// Per-call binding scope from `LocalId` to `Value`.
@@ -478,6 +501,16 @@ pub const Evaluator = struct {
         return null;
     }
 
+    /// A callable value carries a lambda-set variant id, but the same lambda-set
+    /// member can be assigned different `FnVariantId`s across variant spans (a
+    /// narrowed match re-indexes them). The stable identity is the variant's
+    /// source symbol, so callable matching compares that.
+    fn sameVariant(self: *Evaluator, a: Type.FnVariantId, b: Type.FnVariantId) bool {
+        if (a == b) return true;
+        const variants = self.program.types.view().fn_variants;
+        return std.meta.eql(variants[@intFromEnum(a)].source, variants[@intFromEnum(b)].source);
+    }
+
     fn tagPayloadArity(self: *Evaluator, ty: Type.TypeId, index: usize) usize {
         const tags = switch (self.structural(ty)) {
             .tag_union => |span| span,
@@ -803,10 +836,7 @@ pub const Evaluator = struct {
             },
             .list => |list_pat| return try self.matchListPattern(frame, list_pat, value),
             .tag => |tag_pat| {
-                const tag = switch (value) {
-                    .tag => |t| t,
-                    else => return self.unsupported_("tag pattern on non-tag value"),
-                };
+                const tag = tagView(value) orelse return self.unsupported_("tag pattern on non-tag value");
                 const index = self.tagIndex(pat.ty, tag_pat.name) orelse return self.unsupported_("tag pattern tag not found");
                 if (tag.discriminant != index) return false;
                 const pats = self.program.patSpan(tag_pat.payloads);
@@ -821,7 +851,7 @@ pub const Evaluator = struct {
                     .callable => |c| c,
                     else => return self.unsupported_("callable pattern on non-callable value"),
                 };
-                if (callable.variant != callable_pat.variant) return false;
+                if (!self.sameVariant(callable.variant, callable_pat.variant)) return false;
                 if (callable_pat.payload) |payload_pat| {
                     const payload = callable.payload orelse return false;
                     return self.bindPattern(frame, payload_pat, payload.*);
@@ -1023,8 +1053,8 @@ pub const Evaluator = struct {
                 return true;
             },
             .tag_union => |tags| {
-                const lhs_tag = lhs.tag;
-                const rhs_tag = rhs.tag;
+                const lhs_tag = tagView(lhs) orelse return self.unsupported_("structural eq on non-tag value");
+                const rhs_tag = tagView(rhs) orelse return self.unsupported_("structural eq on non-tag value");
                 if (lhs_tag.discriminant != rhs_tag.discriminant) return false;
                 const tag_slice = self.program.types.tagSpan(tags);
                 const payload_tys = self.program.types.span(GuardedList.at(tag_slice, lhs_tag.discriminant).payloads);
@@ -1099,16 +1129,16 @@ pub const Evaluator = struct {
             .num_is_gt => self.numCompare(args, arg_types, .gt),
             .num_is_gte => self.numCompare(args, arg_types, .gte),
 
-            .num_plus, .num_plus_checked => self.numArith(args, arg_types, .add),
-            .num_minus, .num_minus_checked => self.numArith(args, arg_types, .sub),
-            .num_times, .num_times_checked => self.numArith(args, arg_types, .mul),
-            .num_div_by, .num_div_by_checked => self.numArith(args, arg_types, .div),
-            .num_div_trunc_by, .num_div_trunc_by_checked => self.numArith(args, arg_types, .div_trunc),
-            .num_rem_by, .num_rem_by_checked => self.numArith(args, arg_types, .rem),
-            .num_mod_by, .num_mod_by_checked => self.numArith(args, arg_types, .mod),
-            .num_negate, .num_negate_checked => self.numArith(args, arg_types, .negate),
-            .num_abs, .num_abs_checked => self.numArith(args, arg_types, .abs),
-            .num_abs_diff => self.numArith(args, arg_types, .abs_diff),
+            .num_plus, .num_plus_checked => self.numArith(args, arg_types, result_ty, .add),
+            .num_minus, .num_minus_checked => self.numArith(args, arg_types, result_ty, .sub),
+            .num_times, .num_times_checked => self.numArith(args, arg_types, result_ty, .mul),
+            .num_div_by, .num_div_by_checked => self.numArith(args, arg_types, result_ty, .div),
+            .num_div_trunc_by, .num_div_trunc_by_checked => self.numArith(args, arg_types, result_ty, .div_trunc),
+            .num_rem_by, .num_rem_by_checked => self.numArith(args, arg_types, result_ty, .rem),
+            .num_mod_by, .num_mod_by_checked => self.numArith(args, arg_types, result_ty, .mod),
+            .num_negate, .num_negate_checked => self.numArith(args, arg_types, result_ty, .negate),
+            .num_abs, .num_abs_checked => self.numArith(args, arg_types, result_ty, .abs),
+            .num_abs_diff => self.numArith(args, arg_types, result_ty, .abs_diff),
 
             .num_pow => self.numFloatMath2(args, arg_types, .pow),
             .num_sqrt => self.numFloatMath1(args, arg_types, .sqrt),
@@ -1306,12 +1336,13 @@ pub const Evaluator = struct {
 
     const ArithOp = enum { add, sub, mul, div, div_trunc, rem, mod, negate, abs, abs_diff };
 
-    fn numArith(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, op: ArithOp) EvalError!Value {
+    fn numArith(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, result_ty: Type.TypeId, op: ArithOp) EvalError!Value {
         const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("arithmetic operand without primitive type");
+        const result_prim = self.primitiveOf(result_ty) orelse prim;
         // Negate and abs are unary; every other arithmetic op is binary.
         const rhs = if (op == .negate or op == .abs) args[0] else args[1];
         return switch (prim) {
-            inline .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => |p| self.intArith(intType(p), p, op, args[0], rhs),
+            inline .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => |p| self.intArith(intType(p), p, result_prim, op, args[0], rhs),
             .f32 => self.floatArith(f32, op, args[0], rhs),
             .f64 => self.floatArith(f64, op, args[0], rhs),
             .dec => self.decArith(op, args[0], rhs),
@@ -1319,55 +1350,58 @@ pub const Evaluator = struct {
         };
     }
 
-    fn intArith(self: *Evaluator, comptime T: type, comptime prim: Primitive, op: ArithOp, va: Value, vb: Value) EvalError!Value {
+    fn intArith(self: *Evaluator, comptime T: type, comptime prim: Primitive, result_prim: Primitive, op: ArithOp, va: Value, vb: Value) EvalError!Value {
         const signed = @typeInfo(T).int.signedness == .signed;
         const a = readAs(T, va);
         const b = readAs(T, vb);
+        // The bit pattern is computed in the operand type and then re-canonicalized
+        // for the result primitive, which differs in signedness for `abs_diff`
+        // (signed operands, unsigned result).
         switch (op) {
             .add => {
                 const r = @addWithOverflow(a, b);
                 if (r[1] == 1) return self.crashAbort("Integer addition overflowed");
-                return makeInt(T, r[0]);
+                return self.canonicalInt(result_prim, bitsOf(T, r[0]));
             },
             .sub => {
                 const r = @subWithOverflow(a, b);
                 if (r[1] == 1) return self.crashAbort("Integer subtraction overflowed");
-                return makeInt(T, r[0]);
+                return self.canonicalInt(result_prim, bitsOf(T, r[0]));
             },
             .mul => {
                 const r = @mulWithOverflow(a, b);
                 if (r[1] == 1) return self.crashAbort("Integer multiplication overflowed");
-                return makeInt(T, r[0]);
+                return self.canonicalInt(result_prim, bitsOf(T, r[0]));
             },
             .negate => {
-                if (!signed) return makeInt(T, -%a);
+                if (!signed) return self.canonicalInt(result_prim, bitsOf(T, -%a));
                 if (a == std.math.minInt(T)) return self.crashAbort("Integer negation overflowed");
-                return makeInt(T, -a);
+                return self.canonicalInt(result_prim, bitsOf(T, -a));
             },
             .abs => {
-                if (!signed) return makeInt(T, a);
-                if (a >= 0) return makeInt(T, a);
+                if (!signed) return self.canonicalInt(result_prim, bitsOf(T, a));
+                if (a >= 0) return self.canonicalInt(result_prim, bitsOf(T, a));
                 if (a == std.math.minInt(T)) return self.crashAbort("Integer absolute value overflowed");
-                return makeInt(T, -a);
+                return self.canonicalInt(result_prim, bitsOf(T, -a));
             },
             .div, .div_trunc => {
                 if (b == 0) return self.crashAbort(comptime divByZeroMessage(prim));
                 if (signed and a == std.math.minInt(T) and b == -1) return self.crashAbort("Integer division overflowed");
-                return makeInt(T, @divTrunc(a, b));
+                return self.canonicalInt(result_prim, bitsOf(T, @divTrunc(a, b)));
             },
             .rem => {
                 if (b == 0) return self.crashAbort(comptime remByZeroMessage(prim));
-                if (signed and a == std.math.minInt(T) and b == -1) return makeInt(T, 0);
-                return makeInt(T, @rem(a, b));
+                if (signed and a == std.math.minInt(T) and b == -1) return self.canonicalInt(result_prim, 0);
+                return self.canonicalInt(result_prim, bitsOf(T, @rem(a, b)));
             },
             .mod => {
                 if (b == 0) return self.crashAbort(comptime modByZeroMessage(prim));
-                if (signed and a == std.math.minInt(T) and b == -1) return makeInt(T, 0);
-                return makeInt(T, @mod(a, b));
+                if (signed and a == std.math.minInt(T) and b == -1) return self.canonicalInt(result_prim, 0);
+                return self.canonicalInt(result_prim, bitsOf(T, @mod(a, b)));
             },
             .abs_diff => {
-                if (signed) return makeInt(T, if (a > b) a -% b else b -% a);
-                return makeInt(T, if (a > b) a - b else b - a);
+                if (signed) return self.canonicalInt(result_prim, bitsOf(T, if (a > b) a -% b else b -% a));
+                return self.canonicalInt(result_prim, bitsOf(T, if (a > b) a - b else b - a));
             },
         }
     }
@@ -1404,7 +1438,22 @@ pub const Evaluator = struct {
             .negate => return .{ .dec = -%a },
             .abs => return .{ .dec = if (a < 0) -%a else a },
             .abs_diff => return .{ .dec = if (a > b) a -% b else b -% a },
-            .div, .div_trunc, .rem, .mod => return self.unsupported_("dec division op"),
+            // The interpreter runs these through a crash boundary that yields 0
+            // on any divide-by-zero or overflow, so the observable result is 0
+            // in every failing case; this mirrors that outcome without a crash.
+            .div => return .{ .dec = decDivRaw(a, b) },
+            .div_trunc => return .{ .dec = decTrunc(decDivRaw(a, b)) },
+            .rem => {
+                if (b == 0) return .{ .dec = 0 };
+                return .{ .dec = @rem(a, b) };
+            },
+            .mod => {
+                if (b == 0) return .{ .dec = 0 };
+                const remainder = @rem(a, b);
+                if (remainder == 0) return .{ .dec = 0 };
+                if ((remainder > 0) != (b > 0)) return .{ .dec = remainder +% b };
+                return .{ .dec = remainder };
+            },
         }
     }
 
@@ -1649,7 +1698,14 @@ pub const Evaluator = struct {
             .str_drop_prefix_caseless_ascii => return try self.strDropPrefixCaseless(result_ty, args[0].str, args[1].str),
             .str_find_first => return try self.strFindFirst(result_ty, args[0].str, args[1].str),
             .str_from_utf8 => return try self.strFromUtf8(result_ty, args[0]),
-            .str_from_utf8_lossy => return self.unsupported_("str_from_utf8_lossy"),
+            .str_from_utf8_lossy => {
+                const elems = args[0].list;
+                const buf = arena.alloc(u8, elems.len) catch return error.OutOfMemory;
+                for (elems, 0..) |e, i| buf[i] = @truncate(@as(u128, @bitCast(e.int)));
+                const list = builtins.list.RocList{ .bytes = buf.ptr, .length = elems.len, .capacity_or_alloc_ptr = elems.len << 1 };
+                var rs = builtins.str.fromUtf8Lossy(list, self.getOps());
+                return .{ .str = arena.dupe(u8, rs.asSlice()) catch return error.OutOfMemory };
+            },
             .str_is_eq_static_small,
             .str_static_small_word_eq,
             .str_static_small_word_caseless_eq,
@@ -2150,8 +2206,12 @@ pub const Evaluator = struct {
     /// placing the bool-typed field with `ok` and the other field with `value`.
     fn buildTryRecord(self: *Evaluator, result_ty: Type.TypeId, comptime value_prim: Primitive, ok: bool, value: Value) EvalError!Value {
         _ = value_prim;
+        // A checked conversion result is bit-identical whether the front end
+        // typed it as a `{ value, is_ok }` record or a `Result` tag union: the
+        // `is_ok` flag is the Ok/Err discriminant. Build whichever the type says.
         const type_fields = switch (self.structural(result_ty)) {
             .record => |span| self.program.types.fieldSpan(span),
+            .tag_union => return self.buildResultTag(result_ty, ok, value),
             else => return self.unsupported_("expected try-record result type"),
         };
         if (type_fields.len != 2) return self.unsupported_("expected two-field try record");
@@ -2270,6 +2330,44 @@ fn intType(comptime prim: Primitive) type {
         .i128 => i128,
         else => @compileError("intType requires an integer primitive"),
     };
+}
+
+fn absU128(x: i128) u128 {
+    return if (x < 0) @bitCast(-%x) else @intCast(x);
+}
+
+/// Divide two Dec fixed-point values, mirroring `RocDec.div`. The production
+/// path catches every divide-by-zero and overflow crash and yields 0, so this
+/// returns 0 in exactly those cases and the scaled quotient otherwise.
+fn decDivRaw(a: i128, b: i128) i128 {
+    if (b == 0 or a == 0) return 0;
+    const one = RocDec.one_point_zero_i128;
+    const max_i128: u128 = @intCast(std.math.maxInt(i128));
+    const neg = (a < 0) != (b < 0);
+    const num_u = absU128(a);
+    if (num_u > max_i128) return if (b == one) a else 0;
+    const den_u = absU128(b);
+    if (den_u > max_i128) return if (a == one) b else 0;
+    const scaled: u256 = @as(u256, num_u) * @as(u256, @intCast(one));
+    const quotient: u256 = scaled / @as(u256, den_u);
+    if (quotient > @as(u256, max_i128)) return 0;
+    const magnitude: i128 = @intCast(quotient);
+    return if (neg) -magnitude else magnitude;
+}
+
+/// Truncate a Dec fixed-point value toward zero, mirroring `RocDec.trunc`.
+fn decTrunc(x: i128) i128 {
+    const one: u128 = @intCast(RocDec.one_point_zero_i128);
+    const frac_magnitude: i128 = @intCast(absU128(x) % one);
+    const fract = if (x < 0) -frac_magnitude else frac_magnitude;
+    return x - fract;
+}
+
+/// Zero-extend the operand-width bit pattern of `x` into an i128 so a result
+/// primitive of a different signedness can re-canonicalize it.
+fn bitsOf(comptime T: type, x: T) i128 {
+    const U = std.meta.Int(.unsigned, @typeInfo(T).int.bits);
+    return @bitCast(@as(u128, @as(U, @bitCast(x))));
 }
 
 fn makeInt(comptime T: type, x: T) Value {

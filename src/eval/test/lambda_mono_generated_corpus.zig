@@ -28,6 +28,12 @@ pub const Case = struct {
     /// from a container). Kept in the sweep so the harness reports them
     /// loudly; they stop counting as expected once the compiler bug is fixed.
     known_panic: bool = false,
+    /// True for programs where the dev backend is known to disagree with the
+    /// LIR interpreter (a pre-existing backend divergence, not a Lambda Mono
+    /// lowering concern): the interpreter returns 0.0 for Dec division by
+    /// zero while the dev backend crashes. The interpreter-vs-tree-evaluator
+    /// comparison still runs for these.
+    skip_dev: bool = false,
 };
 
 /// All generated sweep cases.
@@ -600,6 +606,25 @@ pub const cases = [_]Case{
         \\{
         \\    f = |a, b| a // b
         \\    f(10.I64, 0.I64)
+        \\}
+        ,
+    },
+    .{
+        .name = "gen: dec division by zero agreement",
+        .source =
+        \\{
+        \\    f = |a, b| a / b
+        \\    f(1.0.Dec, 0.0.Dec)
+        \\}
+        ,
+        .skip_dev = true,
+    },
+    .{
+        .name = "gen: dec division result agreement",
+        .source =
+        \\{
+        \\    f = |a, b| a / b
+        \\    f(7.5.Dec, 2.5.Dec)
         \\}
         ,
     },
