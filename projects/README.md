@@ -117,9 +117,6 @@ Small:
   lists, ending the one-local-per-element explosion behind issue 9898.
 
 Big:
-- [big/single-source-builtin-registration.md](big/single-source-builtin-registration.md)
-  — collapses the seven hand-typed `roc_builtins_*` symbol/ABI tables onto
-  one comptime-generated registry.
 - [big/decision-tree-match-compiler.md](big/decision-tree-match-compiler.md)
   — benefits from the coverage-parity harness landing first.
 
@@ -139,5 +136,4 @@ front-loads leverage and keeps prerequisites satisfied:
 9. `big/platform-relation-from-checking.md`
 10. `small/frame-partitioned-checker-state.md`
 11. `small/compact-constant-aggregates.md`
-12. `big/single-source-builtin-registration.md`
-13. `big/decision-tree-match-compiler.md`
+12. `big/decision-tree-match-compiler.md`
