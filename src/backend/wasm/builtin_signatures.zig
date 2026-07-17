@@ -106,6 +106,13 @@ pub const BuiltinKind = enum {
     crypto_blake3_hasher_finish,
 };
 
+/// The BuiltinKind for a registry member selected by the shared
+/// LowLevel-to-builtin table; a member wasm codegen has no signature for
+/// is a compile error.
+pub fn kindOf(comptime f: builtin_registry.BuiltinFn) BuiltinKind {
+    return @field(BuiltinKind, @tagName(f));
+}
+
 /// Wasm call signature and symbol name for a builtin wrapper.
 pub const Sig = struct {
     name: []const u8,

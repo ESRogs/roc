@@ -2859,6 +2859,7 @@ pub fn build(b: *std.Build) void {
     const llvm_codegen_module = b.addModule("llvm_codegen", .{
         .root_source_file = b.path("src/backend/llvm/MonoLlvmCodeGen.zig"),
     });
+    llvm_codegen_module.addImport("base", roc_modules.base);
     llvm_codegen_module.addImport("layout", roc_modules.layout);
     llvm_codegen_module.addImport("lir", roc_modules.lir);
     llvm_codegen_module.addImport("ctx", roc_modules.ctx);

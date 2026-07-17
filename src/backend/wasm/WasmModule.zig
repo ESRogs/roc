@@ -7370,6 +7370,24 @@ test "encode — reloc.CODE section NOT present in output" {
     }
 }
 
+test "builtins payload defines exactly the registry's linkable members" {
+    const allocator = std.testing.allocator;
+    const registry = @import("builtins").builtin_registry;
+
+    const wasm32_builtins = @import("wasm32_builtins");
+    var builtins_module = try preload(allocator, wasm32_builtins.bytes, false);
+    defer builtins_module.deinit();
+
+    inline for (comptime std.enums.values(registry.BuiltinFn)) |f| {
+        const found = builtins_module.findDefinedFunctionSymbolExact(f.symbolName());
+        if (comptime f.payload() == .jit_only) {
+            try std.testing.expectError(error.MissingSymbol, found);
+        } else {
+            _ = try found;
+        }
+    }
+}
+
 test "preload + merge + encode roundtrip with real builtins" {
     const allocator = std.testing.allocator;
 

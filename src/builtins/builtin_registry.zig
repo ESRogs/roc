@@ -68,7 +68,6 @@ pub const BuiltinFn = enum {
     str_from_utf8,
     str_from_utf8_result,
     str_from_utf8_parts,
-    roc_dbg,
     str_escape_and_quote,
     dbg_str,
     expect_err_str,
@@ -311,7 +310,6 @@ pub const BuiltinFn = enum {
             .num_shl_u128,
             .num_shr_i128,
             .num_shr_u128,
-            .roc_dbg,
             => .jit_only,
 
             else => .full,
