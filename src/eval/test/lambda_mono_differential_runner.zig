@@ -34,9 +34,18 @@ const test_harness = @import("test_harness");
 const helpers = eval.test_helpers;
 const eval_tests = @import("eval_tests.zig");
 const generated = @import("lambda_mono_generated_corpus.zig");
-const TestCase = @import("parallel_runner.zig").TestCase;
 const LambdaMonoEval = postcheck.LambdaMono.Eval;
 const LambdaMonoProgram = postcheck.LambdaMono.Ast.Program;
+
+/// Errors the runner's entry point can surface.
+const RunnerError = std.mem.Allocator.Error || test_harness.Timer.Error || std.fmt.ParseIntError || error{
+    RequiresDebugBuild,
+    InvalidArgument,
+    Diverged,
+    NothingExecuted,
+    UnexpectedChildFailure,
+    Unexpected,
+};
 
 const CaseOrigin = enum { corpus, generated };
 
@@ -107,7 +116,7 @@ const Report = struct {
     executed: usize = 0,
     saw_failure: bool = false,
 
-    fn record(self: *Report, case: Case, result: *CaseResult) !void {
+    fn record(self: *Report, case: Case, result: *CaseResult) std.mem.Allocator.Error!void {
         const gpa = self.gpa;
         self.executed += 1;
         if (!verbose_logging and self.executed % 200 == 0) {
@@ -235,7 +244,7 @@ fn spawnCase(
     case: Case,
     timeout_ms: u64,
     siblings: []const PendingChild,
-) !?PendingChild {
+) std.mem.Allocator.Error!?PendingChild {
     if (comptime !has_fork) return null;
 
     const pipe_fds = test_harness.pipe() catch return null;
@@ -281,7 +290,7 @@ fn spawnCase(
 
 /// Reap a finished (or timed-out) child and turn its payload into a result.
 /// Closes the pipe and frees the payload buffer.
-fn finalizeChild(gpa: std.mem.Allocator, child: *PendingChild, timed_out: bool) !CaseResult {
+fn finalizeChild(gpa: std.mem.Allocator, child: *PendingChild, timed_out: bool) std.mem.Allocator.Error!CaseResult {
     if (timed_out) {
         posix.kill(-child.pid, posix.SIG.KILL) catch {
             posix.kill(child.pid, posix.SIG.KILL) catch {};
@@ -337,7 +346,7 @@ fn runPool(
     timeout_ms: u64,
     fail_fast: bool,
     report: *Report,
-) !void {
+) std.mem.Allocator.Error!void {
     var pending: std.ArrayList(PendingChild) = .empty;
     defer {
         for (pending.items) |*child| {
@@ -430,7 +439,7 @@ fn runPool(
 }
 
 /// Entry point for the Lambda Mono differential harness.
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) RunnerError!void {
     const io = init.io;
 
     if (builtin.mode != .Debug) {
@@ -632,7 +641,7 @@ fn printHelp() void {
     );
 }
 
-fn runCase(gpa: std.mem.Allocator, io: std.Io, case: Case) !CaseResult {
+fn runCase(gpa: std.mem.Allocator, io: std.Io, case: Case) std.mem.Allocator.Error!CaseResult {
     var materialized: ?LambdaMonoProgram = null;
 
     // On compile failure the pipeline's shared-memory arena is already gone,
@@ -714,7 +723,7 @@ fn compareOutcomes(
     transcript: *const helpers.InterpreterTranscript,
     evaluator: *const LambdaMonoEval.Evaluator,
     outcome: LambdaMonoEval.RunOutcome,
-) !?[]u8 {
+) std.mem.Allocator.Error!?[]u8 {
     switch (transcript.outcome) {
         .output => |interp_bytes| switch (outcome) {
             .value => |value| {
@@ -790,7 +799,7 @@ fn compareDevBackend(
     case: Case,
     lowered: *const helpers.LoweredProgram,
     transcript: *const helpers.InterpreterTranscript,
-) !?[]u8 {
+) std.mem.Allocator.Error!?[]u8 {
     const dev_output = helpers.devEvaluatorInspectedStr(gpa, lowered) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Crash => switch (transcript.outcome) {
@@ -826,7 +835,7 @@ fn devDivergence(
     what: []const u8,
     interp: []const u8,
     dev: []const u8,
-) ![]u8 {
+) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(
         gpa,
         "  case:        {s}\n" ++
@@ -838,7 +847,7 @@ fn devDivergence(
     );
 }
 
-fn abortSummary(gpa: std.mem.Allocator, kind_name: []const u8, message: ?[]const u8) ![]u8 {
+fn abortSummary(gpa: std.mem.Allocator, kind_name: []const u8, message: ?[]const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa, "{s}: {s}", .{ kind_name, message orelse "(no message)" });
 }
 
@@ -848,7 +857,7 @@ fn divergence(
     what: []const u8,
     interp: []const u8,
     lambda_mono: []const u8,
-) ![]u8 {
+) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(
         gpa,
         "  case:        {s}\n" ++
@@ -866,7 +875,7 @@ fn divergenceCounts(
     what: []const u8,
     interp: usize,
     lambda_mono: usize,
-) ![]u8 {
+) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(
         gpa,
         "  case:        {s}\n" ++

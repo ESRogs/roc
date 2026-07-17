@@ -2,8 +2,8 @@
 //!
 //! This is an oracle executor for a differential harness: it derives runtime
 //! behavior from the Lambda Mono tree (`ast.zig` + `type.zig`) alone, sharing
-//! only runtime-semantics code (`src/builtins/`) with the production path. It
-//! never consults LIR lowering. Numeric, string, list, and box semantics mirror
+//! only runtime-behavior code (`src/builtins/`) with the production path. It
+//! never consults LIR lowering. Numeric, string, list, and box behavior mirrors
 //! the LIR interpreter (`src/eval/interpreter.zig`) exactly so that results can
 //! be compared byte-for-byte against the direct solved-to-LIR lowering executed
 //! by that interpreter.
@@ -25,13 +25,10 @@
 
 const std = @import("std");
 const base = @import("base");
-const can = @import("can");
-const check = @import("check");
 const builtins = @import("builtins");
 const collections = @import("collections");
 const lir_core = @import("lir_core");
 
-const Common = @import("../common.zig");
 const MonoType = @import("../monotype/type.zig");
 const Ast = @import("ast.zig");
 const Type = @import("type.zig");
@@ -222,7 +219,7 @@ pub const Evaluator = struct {
         return RunOutcome{ .value = value };
     }
 
-    // --- error and abort helpers ---------------------------------------------
+    // error and abort helpers
 
     fn unsup(self: *Evaluator, comptime message: []const u8) Error {
         self.unsupported = message;
@@ -252,7 +249,7 @@ pub const Evaluator = struct {
         return self.raiseAbort(.comptime_exhaustiveness, "comptime exhaustiveness failed");
     }
 
-    // --- type resolution ------------------------------------------------------
+    // type resolution
 
     /// Resolve `ty` through named backings to its structural content.
     fn structural(self: *Evaluator, ty: Type.TypeId) Type.Content {
@@ -283,11 +280,7 @@ pub const Evaluator = struct {
         };
     }
 
-    fn primitiveOfExpr(self: *Evaluator, id: Ast.ExprId) ?Primitive {
-        return self.primitiveOf(self.exprType(id));
-    }
-
-    // --- value helpers --------------------------------------------------------
+    // value helpers
 
     fn boxValue(self: *Evaluator, value: Value) EvalError!Value {
         const cell = self.alloc().create(Value) catch return error.OutOfMemory;
@@ -301,7 +294,7 @@ pub const Evaluator = struct {
         return cell;
     }
 
-    // --- expression evaluation ------------------------------------------------
+    // expression evaluation
 
     fn evalExpr(self: *Evaluator, frame: *Frame, id: Ast.ExprId) EvalError!Value {
         const expr = self.program.getExpr(id);
@@ -511,15 +504,6 @@ pub const Evaluator = struct {
         return std.meta.eql(variants[@intFromEnum(a)].source, variants[@intFromEnum(b)].source);
     }
 
-    fn tagPayloadArity(self: *Evaluator, ty: Type.TypeId, index: usize) usize {
-        const tags = switch (self.structural(ty)) {
-            .tag_union => |span| span,
-            else => return 0,
-        };
-        const tag_slice = self.program.types.tagSpan(tags);
-        return GuardedList.at(tag_slice, index).payloads.len;
-    }
-
     fn evalFieldAccess(self: *Evaluator, frame: *Frame, receiver: Ast.ExprId, field: Type.names.RecordFieldNameId) EvalError!Value {
         const value = try self.evalExpr(frame, receiver);
         const type_fields = switch (self.structural(self.exprType(receiver))) {
@@ -554,7 +538,7 @@ pub const Evaluator = struct {
         };
     }
 
-    // --- calls ----------------------------------------------------------------
+    // calls
 
     fn evalDirectCall(self: *Evaluator, frame: *Frame, call: Ast.DirectCall) EvalError!Value {
         const fn_id = switch (call.target) {
@@ -610,7 +594,7 @@ pub const Evaluator = struct {
         };
     }
 
-    // --- control flow ---------------------------------------------------------
+    // control flow
 
     fn evalMatch(
         self: *Evaluator,
@@ -748,7 +732,7 @@ pub const Evaluator = struct {
             return self.evalExpr(frame, seq.ok_body);
         }
         if (tag.discriminant == err_index) {
-            // Reconstruct the Err in the enclosing expression's result type.
+            // Build the Err in the enclosing expression's result type.
             return self.rebuildErr(result_ty, tag.payloads);
         }
         return self.unsupported_("try sequence scrutinee tag neither Ok nor Err");
@@ -804,10 +788,9 @@ pub const Evaluator = struct {
         return GuardedList.at(payload_span, 0);
     }
 
-    // --- pattern matching -----------------------------------------------------
+    // pattern matching
 
-    fn bindLocal(self: *Evaluator, frame: *Frame, local: Ast.LocalId, value: Value) EvalError!bool {
-        _ = self;
+    fn bindLocal(_: *Evaluator, frame: *Frame, local: Ast.LocalId, value: Value) EvalError!bool {
         frame.put(local, value) catch return error.OutOfMemory;
         return true;
     }
@@ -1012,7 +995,7 @@ pub const Evaluator = struct {
         }
     }
 
-    // --- structural equality --------------------------------------------------
+    // structural equality
 
     fn evalStructuralEq(self: *Evaluator, frame: *Frame, lhs_expr: Ast.ExprId, rhs_expr: Ast.ExprId, negated: bool) EvalError!Value {
         const lhs = try self.evalExpr(frame, lhs_expr);
@@ -1073,8 +1056,7 @@ pub const Evaluator = struct {
         }
     }
 
-    fn primitiveEqual(self: *Evaluator, prim: Primitive, lhs: Value, rhs: Value) bool {
-        _ = self;
+    fn primitiveEqual(_: *Evaluator, prim: Primitive, lhs: Value, rhs: Value) bool {
         return switch (prim) {
             .bool => boolBit(lhs) == boolBit(rhs),
             .str => std.mem.eql(u8, lhs.str, rhs.str),
@@ -1085,12 +1067,11 @@ pub const Evaluator = struct {
         };
     }
 
-    // --- integer canonicalization ---------------------------------------------
+    // integer canonicalization
 
     /// Re-canonicalize `bits` for `prim`: sign-extend for signed primitives,
     /// zero-extend for unsigned primitives, so raw `i128` equality is exact.
-    fn canonicalInt(self: *Evaluator, prim: Primitive, bits: i128) Value {
-        _ = self;
+    fn canonicalInt(_: *Evaluator, prim: Primitive, bits: i128) Value {
         return switch (prim) {
             inline .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => |p| blk: {
                 const T = intType(p);
@@ -1104,7 +1085,7 @@ pub const Evaluator = struct {
         };
     }
 
-    // --- low level ops --------------------------------------------------------
+    // low level ops
 
     fn evalLowLevel(
         self: *Evaluator,
@@ -1277,7 +1258,7 @@ pub const Evaluator = struct {
         };
     }
 
-    // --- numeric comparisons --------------------------------------------------
+    // numeric comparisons
 
     const CmpOp = enum { eq, lt, lte, gt, gte };
 
@@ -1307,7 +1288,7 @@ pub const Evaluator = struct {
         };
     }
 
-    fn evalCompareOp(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, result_ty: Type.TypeId) EvalError!Value {
+    fn evalCompareOp(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, _: Type.TypeId) EvalError!Value {
         const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("compare operand without primitive type");
         const a = args[0];
         const b = args[1];
@@ -1322,7 +1303,6 @@ pub const Evaluator = struct {
         };
         // Result ordering tag union sorts as EQ, GT, LT (alphabetical), matching
         // the interpreter's runtime discriminants EQ=0, GT=1, LT=2.
-        _ = result_ty;
         return .{ .tag = .{ .discriminant = order, .payloads = &.{} } };
     }
 
@@ -1332,7 +1312,7 @@ pub const Evaluator = struct {
         return 2; // LT
     }
 
-    // --- numeric arithmetic ---------------------------------------------------
+    // numeric arithmetic
 
     const ArithOp = enum { add, sub, mul, div, div_trunc, rem, mod, negate, abs, abs_diff };
 
@@ -1406,7 +1386,7 @@ pub const Evaluator = struct {
         }
     }
 
-    fn floatArith(self: *Evaluator, comptime F: type, op: ArithOp, va: Value, vb: Value) EvalError!Value {
+    fn floatArith(_: *Evaluator, comptime F: type, op: ArithOp, va: Value, vb: Value) EvalError!Value {
         const a = if (F == f32) va.float32 else va.float64;
         const b = if (F == f32) vb.float32 else vb.float64;
         const res: F = switch (op) {
@@ -1420,7 +1400,6 @@ pub const Evaluator = struct {
             .abs => @abs(a),
             .abs_diff => @abs(a - b),
         };
-        _ = self;
         return if (F == f32) .{ .float32 = res } else .{ .float64 = res };
     }
 
@@ -1457,7 +1436,7 @@ pub const Evaluator = struct {
         }
     }
 
-    // --- transcendental / rounding --------------------------------------------
+    // transcendental / rounding
 
     const FloatMath1 = enum { sqrt, sin, cos, tan, asin, acos, atan, log };
 
@@ -1484,8 +1463,7 @@ pub const Evaluator = struct {
         };
     }
 
-    fn numFloatMath2(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, op: enum { pow }) EvalError!Value {
-        _ = op;
+    fn numFloatMath2(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, _: enum { pow }) EvalError!Value {
         const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("pow operand without primitive type");
         switch (prim) {
             .f32 => return .{ .float32 = std.math.pow(f32, args[0].float32, args[1].float32) },
@@ -1518,7 +1496,7 @@ pub const Evaluator = struct {
         }
     }
 
-    // --- bitwise / shift ------------------------------------------------------
+    // bitwise / shift
 
     const BitwiseOp = enum { @"and", @"or", xor, not };
 
@@ -1574,7 +1552,7 @@ pub const Evaluator = struct {
         };
     }
 
-    // --- to_str ---------------------------------------------------------------
+    // to_str
 
     fn evalToStr(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId) EvalError!Value {
         const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("to_str operand without primitive type");
@@ -1602,7 +1580,7 @@ pub const Evaluator = struct {
         }
     }
 
-    // --- from_str parse ops ---------------------------------------------------
+    // from_str parse ops
 
     /// Parse a numeric value from a string. The result is a `Result value [..]`
     /// tag union: on success `Ok value`, otherwise the `Err` variant. Parsing is
@@ -1641,7 +1619,7 @@ pub const Evaluator = struct {
         return .{ .tag = .{ .discriminant = @intCast(err_index), .payloads = try self.zeroPayloadsForTag(result_ty, err_index) } };
     }
 
-    // --- string ops -----------------------------------------------------------
+    // string ops
 
     fn evalStrOp(self: *Evaluator, op: base.LowLevel, args: []const Value, result_ty: Type.TypeId) EvalError!Value {
         const arena = self.alloc();
@@ -1653,7 +1631,7 @@ pub const Evaluator = struct {
                 @memcpy(out[args[0].str.len..], args[1].str);
                 return .{ .str = out };
             },
-            .str_contains => return .{ .bool_ = std.mem.indexOf(u8, args[0].str, args[1].str) != null },
+            .str_contains => return .{ .bool_ = std.mem.find(u8, args[0].str, args[1].str) != null },
             .str_starts_with => return .{ .bool_ = std.mem.startsWith(u8, args[0].str, args[1].str) },
             .str_ends_with => return .{ .bool_ = std.mem.endsWith(u8, args[0].str, args[1].str) },
             .str_caseless_ascii_equals => return .{ .bool_ = caselessAsciiEqual(args[0].str, args[1].str) },
@@ -1793,7 +1771,7 @@ pub const Evaluator = struct {
         if (delimiter.len == 0) {
             found = true;
             after = source;
-        } else if (std.mem.indexOf(u8, source, delimiter)) |index| {
+        } else if (std.mem.find(u8, source, delimiter)) |index| {
             found = true;
             before = source[0..index];
             after = source[index + delimiter.len ..];
@@ -1840,7 +1818,7 @@ pub const Evaluator = struct {
         return .{ .record = out };
     }
 
-    // --- list ops -------------------------------------------------------------
+    // list ops
 
     fn evalListOp(self: *Evaluator, op: base.LowLevel, args: []const Value, arg_types: []const Type.TypeId, result_ty: Type.TypeId) EvalError!Value {
         const arena = self.alloc();
@@ -2044,7 +2022,7 @@ pub const Evaluator = struct {
         return out;
     }
 
-    /// Construct a canonical zero value for `ty`, chasing named backings. Tag
+    /// Construct the zero value for `ty`, chasing named backings. Tag
     /// unions take their first (discriminant-0) variant with zeroed payloads.
     fn zeroValueOfType(self: *Evaluator, ty: Type.TypeId) EvalError!Value {
         switch (self.structural(ty)) {
@@ -2093,16 +2071,15 @@ pub const Evaluator = struct {
         return self.alloc().dupe(Value, values) catch return error.OutOfMemory;
     }
 
-    // --- conversions ----------------------------------------------------------
+    // conversions
 
     fn evalConversionOrUnsupported(
         self: *Evaluator,
         comptime op: base.LowLevel,
         args: []const Value,
-        arg_types: []const Type.TypeId,
+        _: []const Type.TypeId,
         result_ty: Type.TypeId,
     ) EvalError!Value {
-        _ = arg_types;
         const spec = comptime parseConversion(@tagName(op));
         if (comptime spec) |s| {
             return self.convert(s.src, s.dst, s.kind, args[0], result_ty);
@@ -2192,8 +2169,7 @@ pub const Evaluator = struct {
         };
     }
 
-    fn decToIntWrap(self: *Evaluator, comptime dst: Primitive, dec_num: i128) EvalError!Value {
-        _ = self;
+    fn decToIntWrap(_: *Evaluator, comptime dst: Primitive, dec_num: i128) EvalError!Value {
         const T = intType(dst);
         return makeInt(T, builtins.dec.toIntWrap(T, .{ .num = dec_num }));
     }
@@ -2204,8 +2180,7 @@ pub const Evaluator = struct {
 
     /// Build a two-field try record `{ value, is_ok }` for a conversion result,
     /// placing the bool-typed field with `ok` and the other field with `value`.
-    fn buildTryRecord(self: *Evaluator, result_ty: Type.TypeId, comptime value_prim: Primitive, ok: bool, value: Value) EvalError!Value {
-        _ = value_prim;
+    fn buildTryRecord(self: *Evaluator, result_ty: Type.TypeId, comptime _: Primitive, ok: bool, value: Value) EvalError!Value {
         // A checked conversion result is bit-identical whether the front end
         // typed it as a `{ value, is_ok }` record or a `Result` tag union: the
         // `is_ok` flag is the Ok/Err discriminant. Build whichever the type says.
@@ -2227,7 +2202,7 @@ pub const Evaluator = struct {
         return .{ .record = out };
     }
 
-    // --- host ops for builtins that require RocOps ----------------------------
+    // host ops for builtins that require RocOps
 
     fn getOps(self: *Evaluator) *RocOps {
         if (self.roc_ops == null) {
@@ -2271,14 +2246,10 @@ pub const Evaluator = struct {
         return @ptrCast(new_ptr);
     }
 
-    fn rocNoopBytesFn(ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
-        _ = ops;
-        _ = bytes;
-        _ = len;
-    }
+    fn rocNoopBytesFn(_: *RocOps, _: [*]const u8, _: usize) callconv(.c) void {}
 };
 
-// --- free helpers -------------------------------------------------------------
+// free helpers
 
 /// Success flag plus the parsed value for a numeric `from_str` op.
 const ParseOutcome = struct { ok: bool, payload: Value };
@@ -2598,7 +2569,7 @@ fn primTypeName(comptime prim: Primitive) []const u8 {
 /// numeric conversion op.
 fn parseConversion(comptime name: []const u8) ?Evaluator.ConvSpec {
     const marker = "_to_";
-    const idx = std.mem.indexOf(u8, name, marker) orelse return null;
+    const idx = std.mem.find(u8, name, marker) orelse return null;
     const left: []const u8 = name[0..idx];
     var rest: []const u8 = name[idx + marker.len ..];
 

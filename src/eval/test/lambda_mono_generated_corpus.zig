@@ -38,7 +38,7 @@ pub const Case = struct {
 
 /// All generated sweep cases.
 pub const cases = [_]Case{
-    // ── Capture-count sweep ──────────────────────────────────────────────
+    // Capture-count sweep
     .{
         .name = "gen: capture count 0",
         .source =
@@ -115,7 +115,7 @@ pub const cases = [_]Case{
         ,
     },
 
-    // ── Capture-type sweep ───────────────────────────────────────────────
+    // Capture-type sweep
     .{
         .name = "gen: heap str captures concat order",
         .source =
@@ -227,7 +227,7 @@ pub const cases = [_]Case{
         ,
     },
 
-    // ── Lambda-set size sweep ────────────────────────────────────────────
+    // Lambda-set size sweep
     .{
         .name = "gen: lambda set size 2 dispatch both ways",
         .source =
@@ -270,7 +270,7 @@ pub const cases = [_]Case{
         ,
     },
 
-    // ── Match shapes ─────────────────────────────────────────────────────
+    // Match shapes
     .{
         .name = "gen: guard failure falls through to later branch",
         .source =
@@ -424,7 +424,7 @@ pub const cases = [_]Case{
         ,
     },
 
-    // ── Evaluation-order probes (dbg transcript ordering) ────────────────
+    // Evaluation-order probes (dbg transcript ordering)
     .{
         .name = "gen: argument evaluation order",
         .source =
@@ -501,7 +501,7 @@ pub const cases = [_]Case{
         ,
     },
 
-    // ── Try sequencing and loops ─────────────────────────────────────────
+    // Try sequencing and loops
     .{
         .name = "gen: try sequence ok and err paths",
         .source =
