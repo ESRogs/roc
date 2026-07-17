@@ -1,6 +1,5 @@
-# Companion for ./Main.roc, reproducing issue #10156.
-# Splits a list that begins with `delimiter`. The record-of-lists return
-# is needed to trigger the bug.
+# Companion for ./Main.roc, preserving the shape of the original report for
+# issue #10156. Splits a list that begins with `delimiter`.
 Split := [].{
     split_on : List(a), List(a) -> Try({ before : List(a), after : List(a) }, [NotFound]) where [a.is_eq : a, a -> Bool]
     split_on = |list, delimiter|

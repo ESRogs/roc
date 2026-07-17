@@ -8987,7 +8987,13 @@ const BodyContext = struct {
         const typed_rhs = BodyTypedLocal{ .local = rhs_local, .ty = arg_tys[1] };
         const lhs_expr = try self.addExpr(.{ .ty = arg_tys[0], .data = .{ .local = lhs_local } });
         const rhs_expr = try self.addExpr(.{ .ty = arg_tys[1], .data = .{ .local = rhs_local } });
-        const body = try self.lowerEqualityExpr(arg_tys[0], lhs_expr, rhs_expr, "is_eq", ret_ty);
+        // This wrapper IS its type's `is_eq` method target, so the body must
+        // expand the top layer structurally: `lowerEqualityExpr` would resolve
+        // the method lookup back to this wrapper and emit an infinite self-call.
+        const body = try self.lowerDerivationExpansion(EqDeriver, arg_tys[0], .{ .lhs = lhs_expr, .rhs = rhs_expr }, .{
+            .method_name = "is_eq",
+            .result_ty = ret_ty,
+        });
         return .{
             .args = try self.addTypedLocalSpan(&.{ typed_lhs, typed_rhs }),
             .body = body,
@@ -23469,6 +23475,23 @@ const BodyContext = struct {
             else => {},
         }
 
+        return try self.lowerDerivationExpansion(D, ty, operand, ctx);
+    }
+
+    /// Expands `ty` structurally without consulting its exact method target.
+    /// Components still derive through `lowerDerivation`, so only the top
+    /// layer skips method dispatch. This is the entry point for lowering the
+    /// body of a procedure that IS the type's method (the structural_eq
+    /// intrinsic wrapper): routing it through `lowerDerivation` would resolve
+    /// the method lookup straight back to that procedure and emit a self-call.
+    fn lowerDerivationExpansion(
+        self: *BodyContext,
+        comptime D: type,
+        ty: Type.TypeId,
+        operand: D.Operand,
+        ctx: DerivationCtx,
+    ) Allocator.Error!DraftExprId {
+        const shape = self.builder.program.types.get(ty);
         const expands_structurally = structurallyExpands(shape);
         var remove_active_expansion = false;
         const stack = D.expansionStack(self);
@@ -23484,7 +23507,7 @@ const BodyContext = struct {
         }
 
         return switch (shape) {
-            .list => unreachable,
+            .list => Common.invariant("structural derivation expansion reached a List; List derivations dispatch to a method target"),
             .record => |fields| try self.derivationRecord(D, self.builder.program.types.fieldSpan(fields), operand, ctx),
             .tuple => |items| try self.derivationTuple(D, self.builder.program.types.span(items), operand, ctx),
             .tag_union => |tags| try D.tagUnion(self, ty, tags, operand, ctx),
