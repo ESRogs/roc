@@ -4605,6 +4605,19 @@ Builtin :: [].{
 			Ok(ok) => ok_transform!(ok)
 		}
 
+		## Returns whichever value this result holds, for a result whose `Ok` and `Err`
+		## hold the same type. This is [Try.catch] with two identity functions.
+		## ```roc
+		## expect Try.Ok(5.I64).collapse() == 5
+		##
+		## expect Try.Err(7.I64).collapse() == 7
+		## ```
+		collapse : Try(a, a) -> a
+		collapse = |try| match try {
+			Err(a) => a
+			Ok(a) => a
+		}
+
 		## Returns `Bool.True` if the two `Try` values are the same variant (`Ok` or `Err`) and their contents are pairwise equal. Otherwise, returns `Bool.False`.
 		is_eq : Try(ok, err), Try(ok, err) -> Bool
 			where [
