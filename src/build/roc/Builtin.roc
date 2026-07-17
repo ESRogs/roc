@@ -4476,6 +4476,40 @@ Builtin :: [].{
 			Ok(ok) => Ok(ok)
 		}
 
+		## Transforms whichever value this result holds, by running one conversion
+		## function on an `Ok` and a different one on an `Err`. Only the function
+		## matching the variant is run. Use [Try.map_ok] or [Try.map_err] to transform
+		## just one variant, and [Try.catch] when both should produce the same type.
+		## ```roc
+		## expect {
+		## 	ok : Try(I64, Str)
+		## 	ok = Ok(12)
+		## 	ok.map_both(|n| -n, |_| Failed) == Ok(-12)
+		## }
+		##
+		## expect {
+		## 	err : Try(I64, Str)
+		## 	err = Err("uh oh")
+		## 	err.map_both(|n| -n, |_| Failed) == Err(Failed)
+		## }
+		## ```
+		map_both : Try(a, b), (a -> c), (b -> d) -> Try(c, d)
+		map_both = |try, ok_transform, err_transform| match try {
+			Err(b) => Err(err_transform(b))
+			Ok(a) => Ok(ok_transform(a))
+		}
+
+		## Like [Try.map_both], but the transform functions are effectful. Only the
+		## effect matching the variant this result holds is run; the other is not.
+		## ```roc
+		## request.map_both!(|ok| Log.info!("succeeded: ${ok}"), |e| Log.warn!("failed: ${e}"))
+		## ```
+		map_both! : Try(a, b), (a => c), (b => d) => Try(c, d)
+		map_both! = |try, ok_transform!, err_transform!| match try {
+			Err(b) => Err(err_transform!(b))
+			Ok(a) => Ok(ok_transform!(a))
+		}
+
 		## Returns `Bool.True` if the two `Try` values are the same variant (`Ok` or `Err`) and their contents are pairwise equal. Otherwise, returns `Bool.False`.
 		is_eq : Try(ok, err), Try(ok, err) -> Bool
 			where [
