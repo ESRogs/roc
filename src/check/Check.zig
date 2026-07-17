@@ -23081,6 +23081,7 @@ fn has_can_error_diagnostics(self: *Self) bool {
             .unused_variable,
             .used_underscore_variable,
             .type_shadowed_warning,
+            .builtin_type_shadowed_warning,
             .unused_type_var_name,
             .type_var_marked_unused,
             .underscore_in_type_declaration,
