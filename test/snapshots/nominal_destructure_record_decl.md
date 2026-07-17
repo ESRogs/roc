@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=Nominal-value destructuring (Type.(pat)) on the LHS of a = definition
+description=Nominal-record shorthand destructuring (Type.{ fields }) on the LHS of a = definition
 type=snippet
 ~~~
 # SOURCE
@@ -18,24 +18,7 @@ Distance.{x} = Distance.{ x : 10 }
 # EXPECTED
 NIL
 # PROBLEMS
-
-┌────────────────────────────────────┐
-│ TYPE APPLICATION NEEDS PARENTHESES ├─ I was parsing a type annotation, ─────┐
-└┬───────────────────────────────────┘  and I found a type argument without   │
- │                                      parentheses.                          │
- │                                                                            │
- │  Distance.{x} = Distance.{ x : 10 }                                        │
- │          ‾                                                                 │
- └──────────────────────────────────── nominal_destructure_record_decl.md:9:9 ┘
-
-    Roc type applications use parentheses around their arguments. Write
-    `List(U8)`, not `List U8`.
-
-    For example:
-        List(U8)
-
-    I found `.` here.
-
+NIL
 # TOKENS
 ~~~zig
 UpperIdent,OpColonEqual,OpenCurly,LowerIdent,OpColon,UpperIdent,CloseCurly,
@@ -77,10 +60,10 @@ EndOfFile,
 						(e-binop (op "*")
 							(e-ident (raw "x"))
 							(e-int (raw "2")))))))
-		(s-malformed (tag "expected_colon_after_type_annotation"))
 		(s-decl
-			(p-record
-				(field (name "x") (rest false)))
+			(p-tag (raw "Distance")
+				(p-record
+					(field (name "x") (rest false))))
 			(e-nominal-record
 				(mapper (e-tag (raw "Distance")))
 				(backing (e-record
@@ -96,7 +79,8 @@ double = |d| {
 	Distance.({ x }) = d
 	x * 2
 }
-{ x } = Distance.{ x: 10 }
+
+Distance.{ x } = Distance.{ x: 10 }
 ~~~
 # CANONICALIZE
 ~~~clojure
@@ -116,7 +100,7 @@ double = |d| {
 										(p-assign (ident "x")))))))
 					(e-lookup-local
 						(p-assign (ident "d"))))
-				(e-dispatch-call (method "times") (constraint-fn-var 224)
+				(e-dispatch-call (method "times") (constraint-fn-var 225)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "x"))))
@@ -127,11 +111,12 @@ double = |d| {
 				(ty-lookup (name "Distance") (local))
 				(ty-lookup (name "U64") (builtin)))))
 	(d-let
-		(p-record-destructure
-			(destructs
-				(record-destruct (label "x") (ident "x")
-					(required
-						(p-assign (ident "x"))))))
+		(p-nominal
+			(p-record-destructure
+				(destructs
+					(record-destruct (label "x") (ident "x")
+						(required
+							(p-assign (ident "x")))))))
 		(e-nominal (nominal "Distance")
 			(e-record
 				(fields
