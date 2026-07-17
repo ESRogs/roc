@@ -379,7 +379,7 @@ pub const core_root_symbols: std.StaticStringMap(void) = blk: {
         if (f.payload() == .core) core_count += 1;
     }
     const total = core_count + overflow_root_symbols.len;
-    var kvs: [total]struct { []const u8 }= undefined;
+    var kvs: [total]struct { []const u8 } = undefined;
     var i: usize = 0;
     for (std.enums.values(BuiltinFn)) |f| {
         if (f.payload() == .core) {
@@ -393,6 +393,23 @@ pub const core_root_symbols: std.StaticStringMap(void) = blk: {
     }
     const frozen = kvs;
     break :blk std.StaticStringMap(void).initComptime(frozen);
+};
+
+/// Fully qualified names of annotation-only Builtin.roc declarations that are
+/// compiler intrinsics rather than low-level-op wrappers: checking and
+/// post-check lowering handle them from checked data, so canonicalization
+/// exempts them from the rule that every annotation-only builtin def must map
+/// to a low-level op.
+pub const intrinsic_annotation_names = [_][]const u8{
+    "Builtin.Str.inspect",
+    "Builtin.Str.Utf8Problem.is_eq",
+    "Builtin.Encoding.ParseTagUnionSpec.parse",
+    "Builtin.Encoding.FieldName.FieldNames.rename_fields",
+    "Builtin.Encoding.FieldName.FieldNames.shortest_name",
+    "Builtin.Encoding.FieldName.FieldNames.longest_name",
+    "Builtin.Encoding.FieldName.FieldNames.iter",
+    "Builtin.Encoding.FieldName.FieldNames.for_size",
+    "Builtin.Encoding.FieldName.name",
 };
 
 comptime {

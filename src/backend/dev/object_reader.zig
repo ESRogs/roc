@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const builtins = @import("builtins");
-const dev_wrappers = builtins.dev_wrappers;
 
 /// Errors that can occur during object file parsing.
 pub const Error = error{
@@ -968,22 +967,22 @@ fn getSectionName(strtab: []const u8, name_idx: u32) []const u8 {
 // Tests
 //
 
-test "resolve float rounding wrappers" {
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_floor), resolveBuiltinWrapper("roc_builtins_float_floor").?);
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_ceiling), resolveBuiltinWrapper("roc_builtins_float_ceiling").?);
+test "JIT resolution covers every registry builtin" {
+    const registry = builtins.builtin_registry;
+    inline for (comptime std.enums.values(registry.BuiltinFn)) |f| {
+        try std.testing.expectEqual(f.wrapperAddress(), resolveBuiltinWrapper(f.symbolName()).?);
+    }
 }
 
-test "resolve float pow wrapper" {
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_pow), resolveBuiltinWrapper("roc_builtins_float_pow").?);
+test "non-registry symbols are not resolved as builtins" {
+    const registry = builtins.builtin_registry;
+    try std.testing.expectEqual(@as(?usize, null), resolveBuiltinWrapper(registry.symbol_prefix ++ "no_such_builtin"));
+    try std.testing.expectEqual(@as(?usize, null), resolveBuiltinWrapper(registry.symbol_prefix));
 }
 
-test "resolve float trig wrappers" {
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_sin), resolveBuiltinWrapper("roc_builtins_float_sin").?);
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_cos), resolveBuiltinWrapper("roc_builtins_float_cos").?);
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_tan), resolveBuiltinWrapper("roc_builtins_float_tan").?);
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_asin), resolveBuiltinWrapper("roc_builtins_float_asin").?);
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_acos), resolveBuiltinWrapper("roc_builtins_float_acos").?);
-    try std.testing.expectEqual(@intFromPtr(&dev_wrappers.roc_builtins_float_atan), resolveBuiltinWrapper("roc_builtins_float_atan").?);
+test "bare refcount helper names resolve to utils" {
+    try std.testing.expectEqual(@intFromPtr(&builtins.utils.increfDataPtrC), resolveBuiltinWrapper("incref_data_ptr").?);
+    try std.testing.expectEqual(@intFromPtr(&builtins.utils.decrefRcPtrC), resolveBuiltinWrapper("decref_rc_ptr").?);
 }
 
 test "detect ELF magic" {
