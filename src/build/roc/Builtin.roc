@@ -3325,6 +3325,36 @@ Builtin :: [].{
 		## ```
 		concat : List(item), List(item) -> List(item)
 
+		## Concatenate a list of lists into a single list, preserving order.
+		##
+		## You may know a similar function named `flatten` or `concat_map` in other languages.
+		## ```roc
+		## expect [[1.I64, 2], [3], [], [4, 5]].join() == [1, 2, 3, 4, 5]
+		##
+		## expect List.join([["a", "b"], ["c"]]) == ["a", "b", "c"]
+		## ```
+		join : List(List(item)) -> List(item)
+		join = |lists| {
+			# Sizing the allocation up front keeps this O(n): `$total` counts exactly
+			# the elements appended below, so every unchecked append stays in bounds.
+			# `List.concat` cannot be used to fill the reservation -- it returns its
+			# second argument whenever the accumulator is still empty, which would
+			# free the reservation on the first iteration.
+			var $total = 0
+			for inner in lists {
+				$total = $total + List.len(inner)
+			}
+
+			var $joined = List.with_capacity($total)
+			for inner in lists {
+				for elem in inner {
+					$joined = list_append_unsafe($joined, elem)
+				}
+			}
+
+			$joined
+		}
+
 		## Create a list with space for at least capacity elements
 		with_capacity : U64 -> List(item)
 
