@@ -1589,7 +1589,7 @@ pub const Evaluator = struct {
         if (ok) {
             return .{ .tag = .{ .discriminant = @intCast(ok_index), .payloads = try self.dupeValues(&.{payload}) } };
         }
-        return .{ .tag = .{ .discriminant = @intCast(err_index), .payloads = try self.unitPayloads(result_ty, err_index) } };
+        return .{ .tag = .{ .discriminant = @intCast(err_index), .payloads = try self.zeroPayloadsForTag(result_ty, err_index) } };
     }
 
     // --- string ops -----------------------------------------------------------
@@ -1948,7 +1948,7 @@ pub const Evaluator = struct {
         const ok_index = self.tagIndexByText(result_ty, "Ok") orelse return self.unsupported_("list first/last Ok tag not found");
         const err_index = self.tagIndexByText(result_ty, "Err") orelse return self.unsupported_("list first/last Err tag not found");
         if (list.len == 0) {
-            return .{ .tag = .{ .discriminant = @intCast(err_index), .payloads = try self.unitPayloads(result_ty, err_index) } };
+            return .{ .tag = .{ .discriminant = @intCast(err_index), .payloads = try self.zeroPayloadsForTag(result_ty, err_index) } };
         }
         const elem = if (first) list[0] else list[list.len - 1];
         return .{ .tag = .{ .discriminant = @intCast(ok_index), .payloads = try self.dupeValues(&.{elem}) } };
@@ -1958,7 +1958,7 @@ pub const Evaluator = struct {
         const ok_index = self.tagIndexByText(result_ty, "Ok") orelse return self.unsupported_("list split Ok tag not found");
         const err_index = self.tagIndexByText(result_ty, "Err") orelse return self.unsupported_("list split Err tag not found");
         if (list.len == 0) {
-            return .{ .tag = .{ .discriminant = @intCast(err_index), .payloads = try self.unitPayloads(result_ty, err_index) } };
+            return .{ .tag = .{ .discriminant = @intCast(err_index), .payloads = try self.zeroPayloadsForTag(result_ty, err_index) } };
         }
         const payload_ty = self.okPayloadType(result_ty, ok_index) orelse return self.unsupported_("list split Ok payload type");
         const elem = if (first) list[0] else list[list.len - 1];
@@ -1970,11 +1970,67 @@ pub const Evaluator = struct {
         return .{ .tag = .{ .discriminant = @intCast(ok_index), .payloads = try self.dupeValues(&.{record}) } };
     }
 
-    fn unitPayloads(self: *Evaluator, tag_ty: Type.TypeId, index: usize) EvalError![]const Value {
-        const arity = self.tagPayloadArity(tag_ty, index);
-        const out = self.alloc().alloc(Value, arity) catch return error.OutOfMemory;
-        for (0..arity) |i| out[i] = .unit;
+    /// Build the payload values for tag `index` of `tag_ty` as type-directed
+    /// zero values. A failing `from_str` or an empty-list `Err` carries a real
+    /// payload (typically a zero-arg error tag), not a bare unit, so downstream
+    /// pattern matching on that payload succeeds.
+    fn zeroPayloadsForTag(self: *Evaluator, tag_ty: Type.TypeId, index: usize) EvalError![]const Value {
+        const tags = switch (self.structural(tag_ty)) {
+            .tag_union => |span| span,
+            else => return &.{},
+        };
+        const tag_slice = self.program.types.tagSpan(tags);
+        const payload_tys = self.program.types.span(GuardedList.at(tag_slice, index).payloads);
+        const out = self.alloc().alloc(Value, payload_tys.len) catch return error.OutOfMemory;
+        for (0..payload_tys.len) |i| {
+            out[i] = try self.zeroValueOfType(GuardedList.at(payload_tys, i));
+        }
         return out;
+    }
+
+    /// Construct a canonical zero value for `ty`, chasing named backings. Tag
+    /// unions take their first (discriminant-0) variant with zeroed payloads.
+    fn zeroValueOfType(self: *Evaluator, ty: Type.TypeId) EvalError!Value {
+        switch (self.structural(ty)) {
+            .primitive => |p| return switch (p) {
+                .bool => .{ .bool_ = false },
+                .str => .{ .str = "" },
+                .f32 => .{ .float32 = 0 },
+                .f64 => .{ .float64 = 0 },
+                .dec => .{ .dec = 0 },
+                else => self.canonicalInt(p, 0),
+            },
+            .zst, .erased_capture_ptr => return .unit,
+            .list => return .{ .list = &.{} },
+            .box => |inner| return self.boxValue(try self.zeroValueOfType(inner)),
+            .record => |fields| {
+                const field_slice = self.program.types.fieldSpan(fields);
+                const out = self.alloc().alloc(Value, field_slice.len) catch return error.OutOfMemory;
+                for (0..field_slice.len) |i| out[i] = try self.zeroValueOfType(GuardedList.at(field_slice, i).ty);
+                return .{ .record = out };
+            },
+            .capture_record => |fields| {
+                const field_slice = self.program.types.captureFieldSpan(fields);
+                const out = self.alloc().alloc(Value, field_slice.len) catch return error.OutOfMemory;
+                for (0..field_slice.len) |i| out[i] = try self.zeroValueOfType(GuardedList.at(field_slice, i).ty);
+                return .{ .capture_record = out };
+            },
+            .tuple => |items| {
+                const item_slice = self.program.types.span(items);
+                const out = self.alloc().alloc(Value, item_slice.len) catch return error.OutOfMemory;
+                for (0..item_slice.len) |i| out[i] = try self.zeroValueOfType(GuardedList.at(item_slice, i));
+                return .{ .tuple = out };
+            },
+            .tag_union => |tags| {
+                const tag_slice = self.program.types.tagSpan(tags);
+                if (tag_slice.len == 0) return .unit;
+                const payload_tys = self.program.types.span(GuardedList.at(tag_slice, 0).payloads);
+                const out = self.alloc().alloc(Value, payload_tys.len) catch return error.OutOfMemory;
+                for (0..payload_tys.len) |i| out[i] = try self.zeroValueOfType(GuardedList.at(payload_tys, i));
+                return .{ .tag = .{ .discriminant = 0, .payloads = out } };
+            },
+            .callable, .erased_fn, .named => return .unit,
+        }
     }
 
     fn dupeValues(self: *Evaluator, values: []const Value) EvalError![]const Value {

@@ -92,6 +92,89 @@ const UnsupportedEntry = struct {
     example_count: usize,
 };
 
+/// Aggregates per-case results into totals and printed reporting. `record`
+/// takes ownership of `result.detail`.
+const Report = struct {
+    gpa: std.mem.Allocator,
+    totals: *Totals,
+    unsupported_reasons: *std.StringHashMap(UnsupportedEntry),
+    divergences: *std.ArrayList([]u8),
+    total_cases: usize,
+    executed: usize = 0,
+    saw_failure: bool = false,
+
+    fn record(self: *Report, case: Case, result: *CaseResult) !void {
+        const gpa = self.gpa;
+        self.executed += 1;
+        if (!verbose_logging and self.executed % 200 == 0) {
+            std.debug.print("... {d}/{d} cases\n", .{ self.executed, self.total_cases });
+        }
+        switch (result.status) {
+            .pass => {
+                self.totals.pass += 1;
+                logVerbose("PASS       {s}\n", .{case.name});
+                if (result.detail) |detail| gpa.free(detail);
+            },
+            .diverged, .dev_diverged => {
+                if (result.status == .diverged) self.totals.diverged += 1 else self.totals.dev_diverged += 1;
+                self.saw_failure = true;
+                const detail = result.detail orelse try gpa.dupe(u8, "(no detail)");
+                result.detail = null;
+                std.debug.print("DIVERGED   {s}\n{s}\n", .{ case.name, detail });
+                try self.divergences.append(gpa, detail);
+            },
+            .unsupported => {
+                self.totals.unsupported += 1;
+                const reason = result.detail orelse try gpa.dupe(u8, "(unknown construct)");
+                logVerbose("UNSUPPORTED {s}: {s}\n", .{ case.name, reason });
+                const entry = try self.unsupported_reasons.getOrPut(reason);
+                if (entry.found_existing) {
+                    gpa.free(reason);
+                    entry.value_ptr.count += 1;
+                    if (entry.value_ptr.example_count < entry.value_ptr.examples.len) {
+                        entry.value_ptr.examples[entry.value_ptr.example_count] = case.name;
+                        entry.value_ptr.example_count += 1;
+                    }
+                } else {
+                    entry.value_ptr.* = .{
+                        .count = 1,
+                        .examples = .{ case.name, undefined, undefined },
+                        .example_count = 1,
+                    };
+                }
+            },
+            .compile_skip => {
+                self.totals.compile_skip += 1;
+                logVerbose("NO-COMPILE {s}\n", .{case.name});
+                if (result.detail) |detail| gpa.free(detail);
+            },
+            .interpreter_error => {
+                self.totals.interpreter_error += 1;
+                if (result.detail) |detail| {
+                    std.debug.print("INTERP-ERR {s}: {s}\n", .{ case.name, detail });
+                    gpa.free(detail);
+                }
+            },
+            .child_failed => {
+                self.totals.child_failed += 1;
+                // A generated case that panics unexpectedly is a regression;
+                // known-panic cases and corpus-origin failures are reported
+                // without failing the run.
+                if (case.origin == .generated and !case.known_panic) {
+                    self.totals.unexpected_child_failed += 1;
+                    self.saw_failure = true;
+                }
+                std.debug.print("CHILD-FAIL {s}{s}: {s}\n", .{
+                    case.name,
+                    if (case.known_panic) " (known panic)" else "",
+                    result.detail orelse "(no detail)",
+                });
+                if (result.detail) |detail| gpa.free(detail);
+            },
+        }
+    }
+};
+
 var verbose_logging: bool = false;
 
 fn logVerbose(comptime fmt: []const u8, args: anytype) void {
@@ -129,28 +212,45 @@ fn statusFromByte(byte: u8) ?CaseStatus {
     };
 }
 
-/// Run one case in a forked child so a compiler panic, evaluator crash, or
-/// hang is attributed to that case instead of killing the whole run. The
-/// child writes one status byte plus the detail text and exits.
-fn runCaseIsolated(gpa: std.mem.Allocator, io: std.Io, case: Case, timeout_ms: u64) !CaseResult {
-    if (comptime !has_fork) {
-        return runCase(gpa, io, case);
-    }
+/// One forked case whose result the parent has not yet collected.
+const PendingChild = struct {
+    case: Case,
+    pid: posix.pid_t,
+    fd: posix.fd_t,
+    deadline_ns: u64,
+    payload: std.ArrayList(u8),
+};
 
-    const pipe_fds = test_harness.pipe() catch return runCase(gpa, io, case);
+/// Fork one case into an isolated child so a compiler panic, evaluator
+/// crash, or hang is attributed to that case instead of killing the whole
+/// run. The child writes one status byte plus the detail text and exits.
+/// Returns null when the fork machinery is unavailable (caller runs inline).
+fn spawnCase(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    case: Case,
+    timeout_ms: u64,
+    siblings: []const PendingChild,
+) !?PendingChild {
+    if (comptime !has_fork) return null;
+
+    const pipe_fds = test_harness.pipe() catch return null;
     const pipe_read = pipe_fds[0];
     const pipe_write = pipe_fds[1];
 
     const fork_result = test_harness.fork() catch {
         test_harness.closeFd(pipe_read);
         test_harness.closeFd(pipe_write);
-        return runCase(gpa, io, case);
+        return null;
     };
 
     if (fork_result == 0) {
-        // Child: run the case and serialize the result. The child _exit()s,
-        // so the OS reclaims all memory — no deinit needed.
+        // Child: close inherited pipe ends (ours and every sibling's, so
+        // sibling EOFs are not held open by this process), run the case, and
+        // serialize the result. The child _exit()s, so the OS reclaims all
+        // memory — no deinit needed.
         test_harness.closeFd(pipe_read);
+        for (siblings) |sibling| test_harness.closeFd(sibling.fd);
         _ = std.c.setsid();
         var child_arena = collections.SingleThreadArena.init(gpa);
         const result = runCase(child_arena.allocator(), io, case) catch |err| {
@@ -165,52 +265,35 @@ fn runCaseIsolated(gpa: std.mem.Allocator, io: std.Io, case: Case, timeout_ms: u
         std.c._exit(0);
     }
 
-    // Parent: read the pipe to EOF (before waitpid, to avoid pipe-buffer
-    // deadlock), enforcing the per-case timeout via poll.
     test_harness.closeFd(pipe_write);
-    defer test_harness.closeFd(pipe_read);
+    return .{
+        .case = case,
+        .pid = fork_result,
+        .fd = pipe_read,
+        .deadline_ns = test_harness.monotonicNs() + timeout_ms * 1_000_000,
+        .payload = .empty,
+    };
+}
 
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(gpa);
-    var read_buf: [4096]u8 = undefined;
-    const deadline_ns = test_harness.monotonicNs() + timeout_ms * 1_000_000;
-    var timed_out = false;
-    while (true) {
-        const now_ns = test_harness.monotonicNs();
-        if (now_ns >= deadline_ns) {
-            timed_out = true;
-            break;
-        }
-        const remaining_ms: i32 = @intCast(@min((deadline_ns - now_ns) / 1_000_000 + 1, std.math.maxInt(i32)));
-        var poll_fds = [_]posix.pollfd{.{
-            .fd = pipe_read,
-            .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL,
-            .revents = 0,
-        }};
-        const poll_count = posix.poll(&poll_fds, remaining_ms) catch break;
-        if (poll_count == 0) {
-            timed_out = true;
-            break;
-        }
-        const bytes_read = posix.read(pipe_read, &read_buf) catch break;
-        if (bytes_read == 0) break;
-        try payload.appendSlice(gpa, read_buf[0..bytes_read]);
-    }
-
+/// Reap a finished (or timed-out) child and turn its payload into a result.
+/// Closes the pipe and frees the payload buffer.
+fn finalizeChild(gpa: std.mem.Allocator, child: *PendingChild, timed_out: bool) !CaseResult {
     if (timed_out) {
-        posix.kill(-fork_result, posix.SIG.KILL) catch {
-            posix.kill(fork_result, posix.SIG.KILL) catch {};
+        posix.kill(-child.pid, posix.SIG.KILL) catch {
+            posix.kill(child.pid, posix.SIG.KILL) catch {};
         };
     }
-    const wait_result = test_harness.waitpid(fork_result, 0);
+    const wait_result = test_harness.waitpid(child.pid, 0);
+    test_harness.closeFd(child.fd);
+    defer child.payload.deinit(gpa);
 
     if (timed_out) {
         return CaseResult{
             .status = .child_failed,
-            .detail = try std.fmt.allocPrint(gpa, "timed out after {d} ms", .{timeout_ms}),
+            .detail = try gpa.dupe(u8, "timed out"),
         };
     }
-    if (payload.items.len == 0) {
+    if (child.payload.items.len == 0) {
         return CaseResult{
             .status = .child_failed,
             .detail = try std.fmt.allocPrint(
@@ -220,24 +303,126 @@ fn runCaseIsolated(gpa: std.mem.Allocator, io: std.Io, case: Case, timeout_ms: u
             ),
         };
     }
-    const first = payload.items[0];
+    const first = child.payload.items[0];
     if (first == 'E') {
         return CaseResult{
             .status = .child_failed,
-            .detail = try std.fmt.allocPrint(gpa, "child error: {s}", .{payload.items[1..]}),
+            .detail = try std.fmt.allocPrint(gpa, "child error: {s}", .{child.payload.items[1..]}),
         };
     }
     const status = statusFromByte(first) orelse {
         return CaseResult{
             .status = .child_failed,
-            .detail = try std.fmt.allocPrint(gpa, "malformed child payload ({d} bytes)", .{payload.items.len}),
+            .detail = try std.fmt.allocPrint(gpa, "malformed child payload ({d} bytes)", .{child.payload.items.len}),
         };
     };
-    const detail: ?[]u8 = if (payload.items.len > 1)
-        try gpa.dupe(u8, payload.items[1..])
+    const detail: ?[]u8 = if (child.payload.items.len > 1)
+        try gpa.dupe(u8, child.payload.items[1..])
     else
         null;
     return CaseResult{ .status = status, .detail = detail };
+}
+
+/// Run cases through a pool of forked children, collecting results as each
+/// child finishes. Result ordering follows completion, not submission.
+fn runPool(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    run_list: []const Case,
+    job_limit: usize,
+    timeout_ms: u64,
+    fail_fast: bool,
+    report: *Report,
+) !void {
+    var pending: std.ArrayList(PendingChild) = .empty;
+    defer {
+        for (pending.items) |*child| {
+            posix.kill(-child.pid, posix.SIG.KILL) catch {
+                posix.kill(child.pid, posix.SIG.KILL) catch {};
+            };
+            _ = test_harness.waitpid(child.pid, 0);
+            test_harness.closeFd(child.fd);
+            child.payload.deinit(gpa);
+        }
+        pending.deinit(gpa);
+    }
+
+    var next: usize = 0;
+    var read_buf: [4096]u8 = undefined;
+    while (next < run_list.len or pending.items.len > 0) {
+        const stop_spawning = fail_fast and report.saw_failure;
+        while (next < run_list.len and pending.items.len < job_limit and !stop_spawning) {
+            const case = run_list[next];
+            next += 1;
+            if (try spawnCase(gpa, io, case, timeout_ms, pending.items)) |child| {
+                try pending.append(gpa, child);
+            } else {
+                var result = try runCase(gpa, io, case);
+                try report.record(case, &result);
+            }
+        }
+        if (pending.items.len == 0) {
+            if (stop_spawning) break;
+            continue;
+        }
+
+        const poll_fds = try gpa.alloc(posix.pollfd, pending.items.len);
+        defer gpa.free(poll_fds);
+        var min_deadline: u64 = std.math.maxInt(u64);
+        for (pending.items, poll_fds) |child, *pfd| {
+            pfd.* = .{
+                .fd = child.fd,
+                .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL,
+                .revents = 0,
+            };
+            min_deadline = @min(min_deadline, child.deadline_ns);
+        }
+        const now_ns = test_harness.monotonicNs();
+        const poll_timeout_ms: i32 = if (min_deadline <= now_ns)
+            0
+        else
+            @intCast(@min((min_deadline - now_ns) / 1_000_000 + 1, 60_000));
+        _ = posix.poll(poll_fds, poll_timeout_ms) catch {};
+
+        // Scan with stable indices, then remove finished children from the
+        // highest index down so swapRemove never disturbs a lower index.
+        var finished_buf: [64]struct { index: usize, timed_out: bool } = undefined;
+        var finished_count: usize = 0;
+        const scan_now_ns = test_harness.monotonicNs();
+        for (pending.items, poll_fds, 0..) |*child, pfd, index| {
+            if (finished_count == finished_buf.len) break;
+            const revents = pfd.revents;
+            var eof = false;
+            if (revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                const bytes_read = posix.read(child.fd, &read_buf) catch blk: {
+                    eof = true;
+                    break :blk 0;
+                };
+                if (bytes_read == 0) {
+                    eof = true;
+                } else {
+                    try child.payload.appendSlice(gpa, read_buf[0..bytes_read]);
+                }
+            }
+            if (eof) {
+                finished_buf[finished_count] = .{ .index = index, .timed_out = false };
+                finished_count += 1;
+            } else if (scan_now_ns >= child.deadline_ns) {
+                finished_buf[finished_count] = .{ .index = index, .timed_out = true };
+                finished_count += 1;
+            }
+        }
+
+        var f = finished_count;
+        while (f > 0) {
+            f -= 1;
+            const entry = finished_buf[f];
+            var child = pending.items[entry.index];
+            _ = pending.swapRemove(entry.index);
+            var result = try finalizeChild(gpa, &child, entry.timed_out);
+            try report.record(child.case, &result);
+        }
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -326,10 +511,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var timer = try test_harness.Timer.start();
-    var executed: usize = 0;
+
+    // Select the cases this run executes.
+    var run_list: std.ArrayList(Case) = .empty;
+    defer run_list.deinit(gpa);
     for (cases.items) |case| {
         if (max_cases) |limit| {
-            if (executed >= limit) break;
+            if (run_list.items.len >= limit) break;
         }
         if (cli.filters.len > 0) {
             var matched = false;
@@ -343,73 +531,30 @@ pub fn main(init: std.process.Init) !void {
             }
             if (!matched) continue;
         }
-        executed += 1;
+        try run_list.append(gpa, case);
+    }
 
-        var result = try runCaseIsolated(gpa, io, case, cli.timeout_ms);
+    var report = Report{
+        .gpa = gpa,
+        .totals = &totals,
+        .unsupported_reasons = &unsupported_reasons,
+        .divergences = &divergences,
+        .total_cases = run_list.items.len,
+    };
 
-        switch (result.status) {
-            .pass => {
-                totals.pass += 1;
-                logVerbose("PASS       {s}\n", .{case.name});
-                if (result.detail) |detail| gpa.free(detail);
-            },
-            .diverged, .dev_diverged => {
-                if (result.status == .diverged) totals.diverged += 1 else totals.dev_diverged += 1;
-                const detail = result.detail orelse try gpa.dupe(u8, "(no detail)");
-                result.detail = null;
-                std.debug.print("DIVERGED   {s}\n{s}\n", .{ case.name, detail });
-                try divergences.append(gpa, detail);
-                if (fail_fast) break;
-            },
-            .unsupported => {
-                totals.unsupported += 1;
-                const reason = result.detail orelse try gpa.dupe(u8, "(unknown construct)");
-                logVerbose("UNSUPPORTED {s}: {s}\n", .{ case.name, reason });
-                const entry = try unsupported_reasons.getOrPut(reason);
-                if (entry.found_existing) {
-                    gpa.free(reason);
-                    entry.value_ptr.count += 1;
-                    if (entry.value_ptr.example_count < entry.value_ptr.examples.len) {
-                        entry.value_ptr.examples[entry.value_ptr.example_count] = case.name;
-                        entry.value_ptr.example_count += 1;
-                    }
-                } else {
-                    entry.value_ptr.* = .{
-                        .count = 1,
-                        .examples = .{ case.name, undefined, undefined },
-                        .example_count = 1,
-                    };
-                }
-            },
-            .compile_skip => {
-                totals.compile_skip += 1;
-                logVerbose("NO-COMPILE {s}\n", .{case.name});
-                if (result.detail) |detail| gpa.free(detail);
-            },
-            .interpreter_error => {
-                totals.interpreter_error += 1;
-                if (result.detail) |detail| {
-                    std.debug.print("INTERP-ERR {s}: {s}\n", .{ case.name, detail });
-                    gpa.free(detail);
-                }
-            },
-            .child_failed => {
-                totals.child_failed += 1;
-                // A generated case that panics unexpectedly is a regression;
-                // known-panic cases and corpus-origin failures are reported
-                // without failing the run.
-                if (case.origin == .generated and !case.known_panic) {
-                    totals.unexpected_child_failed += 1;
-                }
-                std.debug.print("CHILD-FAIL {s}{s}: {s}\n", .{
-                    case.name,
-                    if (case.known_panic) " (known panic)" else "",
-                    result.detail orelse "(no detail)",
-                });
-                if (result.detail) |detail| gpa.free(detail);
-            },
+    if (comptime has_fork) {
+        const cpu_count = std.Thread.getCpuCount() catch 4;
+        const default_jobs = @min(@max(cpu_count / 2, 1), 12);
+        const job_limit = @max(cli.max_threads orelse default_jobs, 1);
+        try runPool(gpa, io, run_list.items, job_limit, cli.timeout_ms, fail_fast, &report);
+    } else {
+        for (run_list.items) |case| {
+            var result = try runCase(gpa, io, case);
+            try report.record(case, &result);
+            if (fail_fast and report.saw_failure) break;
         }
     }
+    const executed = report.executed;
 
     const elapsed_ms = timer.read() / 1_000_000;
 
