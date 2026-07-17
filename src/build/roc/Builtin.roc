@@ -4575,6 +4575,36 @@ Builtin :: [].{
 			Ok(ok) => Ok(ok)
 		}
 
+		## Collapses the result into a plain value by converting whichever variant it
+		## holds into a common type: `err_transform` runs on an `Err`, `ok_transform`
+		## on an `Ok`. Unlike [Try.map_both], both functions return the same type, so
+		## the answer is a plain value rather than another result.
+		## ```roc
+		## expect Try.Ok(12.I64).catch(|_| 0, |n| n * 2) == 24
+		##
+		## expect {
+		## 	err : Try(I64, Str)
+		## 	err = Err("uh oh")
+		## 	err.catch(|_| 0, |n| n * 2) == 0
+		## }
+		## ```
+		catch : Try(ok, err), (err -> a), (ok -> a) -> a
+		catch = |try, err_transform, ok_transform| match try {
+			Err(err) => err_transform(err)
+			Ok(ok) => ok_transform(ok)
+		}
+
+		## Like [Try.catch], but the conversion functions are effectful. Only the
+		## effect matching the variant this result holds is run.
+		## ```roc
+		## response.catch!(|e| Log.error!("request failed: ${e}"), |body| Log.info!("got ${body}"))
+		## ```
+		catch! : Try(ok, err), (err => a), (ok => a) => a
+		catch! = |try, err_transform!, ok_transform!| match try {
+			Err(err) => err_transform!(err)
+			Ok(ok) => ok_transform!(ok)
+		}
+
 		## Returns `Bool.True` if the two `Try` values are the same variant (`Ok` or `Err`) and their contents are pairwise equal. Otherwise, returns `Bool.False`.
 		is_eq : Try(ok, err), Try(ok, err) -> Bool
 			where [
