@@ -1,6 +1,6 @@
 # Numbers
 
-Roc ships with several numeric types, on top of which you can make new [custom number types](custom.md).
+Roc ships with several numeric types, on top of which you can make new [custom number types](#custom-number-types).
 
 ## Number Literals
 
@@ -11,7 +11,7 @@ Roc number literals can consist of any combination of the following:
 * **Scientific Notation Suffix** (if the number is base-10 and ends in `e___`, everything before the `e` will be multiplied by 10 to the power of the number in the `___`. This suffix can't be used if any base prefix is specified.)
 * **A decimal point** (can optionally be combined with scientific notation, but cannot be used if a base prefix is specified because uppercase hexadecimal letters after the decimal point would be ambiguous with a [type suffix](type-suffix.md) such as `.F64`.)
 * **Underscores** (the compiler skips over these; they're just for making long numbers easier to read. They can appear in between any digits, including letter digits, and digits after the decimal point, but each underscore must always have a digit on either side of it.)
-* **Minus sign in front** (for negative numbers, not to be confused with [the unary negate operator](operators.md#--negate) which is an operator that applies to expressions. For example, `-x` applies the unary negate operator to `x`, but `-1` is just an ordinary number literal and no negate operation will be executed. This distinction can matter for [custom number types](custom.md).)
+* **Minus sign in front** (for negative numbers, not to be confused with [the unary negate operator](operators.md#--negate) which is an operator that applies to expressions. For example, `-x` applies the unary negate operator to `x`, but `-1` is just an ordinary number literal and no negate operation will be executed. This distinction can matter for [custom number types](#custom-number-types).)
 
 Here are some examples of valid number literals:
 
@@ -40,7 +40,7 @@ If you want to specify an explicit type for the number (perhaps for documentatio
 -12.34.Dec
 ```
 
-This not only works with builtin number types, but also with any [custom number type](custom.md) you might make—the only requirement is that the type name must be in scope (which you can accomplish using [`import`](modules.md#import-statements) as long as it's accessible to your module).
+This not only works with builtin number types, but also with any [custom number type](#custom-number-types) you might make—the only requirement is that the type name must be in scope (which you can accomplish using [`import`](modules.md#import-statements) as long as it's accessible to your module).
 
 ## Defaulting to `Dec`
 
