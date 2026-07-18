@@ -11133,16 +11133,18 @@ const BodyContext = struct {
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
 
+        // Representation-neutral helpers inherit the concrete representation
+        // selected by their enclosing source or adapter. A concrete producer
+        // may reuse expected evidence only for its own producer kind (or the
+        // forced-dynamic fixed point); a sibling kind is only a join constraint
+        // and must never be reinterpreted as this producer's state.
         if (expected_ret_ty) |expected| {
             if (self.isGeneratedIteratorEvidenceType(expected)) {
                 const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
                 if (isBuiltinIterFromStepText(text)) {
                     return try self.generatedIteratorConstructorFunctionType(stable_expected);
                 }
-                if (isBuiltinRangeDoneText(text) or
-                    isBuiltinExclusiveRangeText(text) or
-                    isBuiltinInclusiveRangeText(text))
-                {
+                if (isBuiltinRangeDoneText(text)) {
                     return try self.functionTypeWithReturn(arg_tys, stable_expected);
                 }
             }
@@ -11158,109 +11160,54 @@ const BodyContext = struct {
 
         if (isBuiltinIterCustomText(text)) {
             if (checked_args.len != 3 or arg_tys.len != 3) Common.invariant("Iter.custom reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_components = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_components);
-                    const stable_args = [_]Type.TypeId{ expected_components[0], arg_tys[1], expected_components[1] };
-                    return try self.functionTypeWithReturn(&stable_args, stable_expected);
+            if (try self.stableExpectedGeneratedIteratorProducerType(expected_ret_ty, .custom)) |stable_expected| {
+                if (self.isForcedDynamicIteratorType(stable_expected)) {
+                    return try self.functionTypeWithReturn(arg_tys, stable_expected);
                 }
+                const stable_components = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                defer self.allocator.free(stable_components);
+                const stable_args = [_]Type.TypeId{ stable_components[0], arg_tys[1], stable_components[1] };
+                return try self.functionTypeWithReturn(&stable_args, stable_expected);
             }
-            if (expected_ret_ty == null) {
-                const components = [_]Type.TypeId{ arg_tys[0], arg_tys[2] };
-                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.custom, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[2])));
-            }
+            const components = [_]Type.TypeId{ arg_tys[0], arg_tys[2] };
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.custom, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[2])));
         }
 
         if (isBuiltinListIterText(text)) {
             if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("List.iter reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.list, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             const components = [_]Type.TypeId{arg_tys[0]};
             return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.list, fn_data.ret, &components, null));
         }
 
         if (isBuiltinIterSingleText(text)) {
             if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.single reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
-            if (expected_ret_ty == null) {
-                const components = [_]Type.TypeId{arg_tys[0]};
-                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.single, fn_data.ret, &components, null));
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.single, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
+            const components = [_]Type.TypeId{arg_tys[0]};
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.single, fn_data.ret, &components, null));
         }
 
-        // Mint a fresh range iterator at any producer in a range's construction
-        // chain: the numeric `range_exclusive` / `range_inclusive` method a
-        // `..<` / `..=` dispatches to, the `range_*_with_len` helper, and the
-        // `Iter.exclusive_range` / `Iter.inclusive_range` step producer. The
-        // generated-evidence branch above already returned for a minted expected
-        // type, so reaching here means the expected type is absent or the public
-        // source `Iter` (which a numeric-method or helper body imposes on its
-        // forwarded producer call); minting in both cases keeps a range's state
-        // carried by value instead of leaving it as the recursive public nominal
-        // that boxes under an adapter and mismatches a materialized step
-        // callable. The step producer's self-recursive `rest` and `range_done()`
-        // resolve to the minted self type through the evidence branch, so the
-        // recursion does not re-mint.
-        // Mint a fresh range iterator where a range construction is reached with
-        // no expected type. A `..<` / `..=` binop dispatches to the numeric
-        // `range_exclusive` / `range_inclusive` method, so that method call is
-        // the outermost producer; a direct `Iter.exclusive_range` /
-        // `Iter.inclusive_range` call is the step producer itself. The minted
-        // type then flows down the construction chain (numeric method body ->
-        // `range_*_with_len` -> `Iter.*_range` -> `iter_from_step` /
-        // `range_done`) as generated evidence, so the self-recursive step
-        // closure joins the minted callable set. Without minting here a range
-        // stays the recursive public nominal, which boxes its state whenever an
-        // adapter embeds it.
-        if (expected_ret_ty == null and
-            (isBuiltinExclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_exclusive")))
-        {
+        // Every concrete range producer derives its representation from its own
+        // producer kind. The minted result then flows through the neutral
+        // `iter_from_step` and `range_done` helpers via their expected type, so
+        // the recursive step closes over the exact same representation.
+        if (isBuiltinExclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_exclusive")) {
+            if (try self.stableExpectedGeneratedIteratorProducerType(expected_ret_ty, .range_exclusive)) |stable_expected| {
+                return try self.functionTypeWithReturn(arg_tys, stable_expected);
+            }
             return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_exclusive, fn_data.ret, &.{}, null));
         }
 
-        if (expected_ret_ty == null and
-            (isBuiltinInclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_inclusive")))
-        {
+        if (isBuiltinInclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_inclusive")) {
+            if (try self.stableExpectedGeneratedIteratorProducerType(expected_ret_ty, .range_inclusive)) |stable_expected| {
+                return try self.functionTypeWithReturn(arg_tys, stable_expected);
+            }
             return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_inclusive, fn_data.ret, &.{}, null));
         }
 
         if (isBuiltinIterMapText(text)) {
             if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.map reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.map, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
                 const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
                 const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
@@ -11271,17 +11218,7 @@ const BodyContext = struct {
 
         if (isBuiltinIterKeepIfText(text)) {
             if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.keep_if reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.keep_if, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
                 const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
                 const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
@@ -11292,17 +11229,7 @@ const BodyContext = struct {
 
         if (isBuiltinIterDropIfText(text)) {
             if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.drop_if reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.drop_if, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
                 const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
                 const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
@@ -11313,17 +11240,7 @@ const BodyContext = struct {
 
         if (isBuiltinIterTakeFirstText(text)) {
             if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.take_first reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.take_first, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
                 const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
                 const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
@@ -11334,17 +11251,7 @@ const BodyContext = struct {
 
         if (isBuiltinIterDropFirstText(text)) {
             if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.drop_first reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.drop_first, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
                 const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
                 const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
@@ -11355,17 +11262,7 @@ const BodyContext = struct {
 
         if (isBuiltinIterConcatText(text)) {
             if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.concat reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.concat, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0]) or self.isGeneratedIteratorEvidenceType(arg_tys[1])) {
                 const stable_first = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
                 const stable_second = try self.stableGeneratedIteratorEvidenceType(arg_tys[1]);
@@ -11377,17 +11274,7 @@ const BodyContext = struct {
 
         if (isBuiltinIterAppendText(text)) {
             if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.append reached Monotype with an unexpected arity");
-            if (expected_ret_ty) |expected| {
-                if (self.isGeneratedIteratorEvidenceType(expected)) {
-                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
-                    if (self.isForcedDynamicIteratorType(stable_expected)) {
-                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
-                    }
-                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
-                    defer self.allocator.free(expected_args);
-                    return try self.functionTypeWithReturn(expected_args, stable_expected);
-                }
-            }
+            if (try self.generatedIteratorExpectedProducerFunctionType(.append, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
                 const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
                 const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
@@ -11410,6 +11297,38 @@ const BodyContext = struct {
             .args = try self.builder.program.types.addSpan(copied_args),
             .ret = ret_ty,
         } });
+    }
+
+    fn stableExpectedGeneratedIteratorProducerType(
+        self: *BodyContext,
+        expected_ret_ty: ?Type.TypeId,
+        producer_kind: Type.IteratorKind,
+    ) Allocator.Error!?Type.TypeId {
+        const expected = expected_ret_ty orelse return null;
+        if (!self.isGeneratedIteratorEvidenceType(expected)) return null;
+        const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+        if (self.isForcedDynamicIteratorType(stable_expected)) return stable_expected;
+        const named = switch (self.builder.program.types.get(stable_expected)) {
+            .named => |named| named,
+            else => Common.invariant("generated iterator producer expected a non-named type"),
+        };
+        if (named.def.iterator_kind != producer_kind) return null;
+        return stable_expected;
+    }
+
+    fn generatedIteratorExpectedProducerFunctionType(
+        self: *BodyContext,
+        producer_kind: Type.IteratorKind,
+        arg_tys: []const Type.TypeId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        const stable_expected = (try self.stableExpectedGeneratedIteratorProducerType(expected_ret_ty, producer_kind)) orelse return null;
+        if (self.isForcedDynamicIteratorType(stable_expected)) {
+            return try self.functionTypeWithReturn(arg_tys, stable_expected);
+        }
+        const stable_args = try self.generatedIteratorComponentArgs(stable_expected, arg_tys.len);
+        defer self.allocator.free(stable_args);
+        return try self.functionTypeWithReturn(stable_args, stable_expected);
     }
 
     fn stableGeneratedIteratorEvidenceType(
@@ -11622,7 +11541,7 @@ const BodyContext = struct {
         };
         const args = self.builder.program.types.span(named.args);
         if (args.len != expected_components + 1) {
-            Common.invariant("generated iterator did not contain the expected component count");
+            Common.invariant("generated iterator producer did not contain its component count");
         }
         const out = try self.allocator.alloc(Type.TypeId, expected_components);
         for (0..expected_components) |index| {
