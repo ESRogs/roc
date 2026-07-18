@@ -768,8 +768,40 @@ test "fx platform string interpolation type mismatch (interpreter)" {
 }
 
 test "fx platform string interpolation type mismatch (dev backend)" {
-    // TODO: dev backend exits with code 134
-    return error.SkipZigTest;
+    const allocator = testing.allocator;
+
+    // Run an app that tries to interpolate a U8 (non-Str) type in a string.
+    // This should fail with a type error because string interpolation only accepts Str.
+    const run_result = try util.runRocCommand(std.testing.io, allocator, &.{
+        "--opt=dev",
+        "test/fx/num_method_call.roc",
+        "--allow-errors",
+    });
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    // `--allow-errors` may exit successfully after reporting diagnostics, but
+    // it must not publish checked artifacts or run LIR for an erroneous graph.
+    switch (run_result.term) {
+        .exited => |code| {
+            try testing.expectEqual(@as(u8, 0), code);
+        },
+        else => {
+            std.debug.print("Run terminated abnormally: {}\n", .{run_result.term});
+            std.debug.print("STDOUT: {s}\n", .{run_result.stdout});
+            std.debug.print("STDERR: {s}\n", .{run_result.stderr});
+            return error.RunFailed;
+        },
+    }
+
+    try testing.expectEqualStrings("", run_result.stdout);
+
+    // Verify the error output contains proper diagnostic info
+    // Should show TYPE MISMATCH error with the type information
+    try testing.expect(std.mem.find(u8, run_result.stderr, "TYPE MISMATCH") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "U8") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "Str") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "Found 1 error") != null);
 }
 
 test "fx platform run from different cwd" {
@@ -1303,8 +1335,22 @@ test "fx platform inline expect fails as expected (interpreter)" {
 }
 
 test "fx platform inline expect fails as expected (dev backend)" {
-    // TODO: dev backend succeeds when it should fail (inline expect not evaluated)
-    return error.SkipZigTest;
+    // Regression test: inline expect inside main! must be evaluated by the
+    // dev backend and fail via the expect-failed host callback, matching the
+    // interpreter's behavior.
+    const allocator = testing.allocator;
+    const run_result = try util.runRoc(std.testing.io, allocator, &.{"--opt=dev"}, "test/fx/issue8517.roc");
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    // Expect a clean failure (non-zero exit code, no signal)
+    try util.checkFailure(run_result);
+
+    const stderr = run_result.stderr;
+
+    // The platform receives failed expectations through the expect-failed host
+    // callback, not through the crash callback.
+    try testing.expect(std.mem.find(u8, stderr, "Expect failed: expect failed") != null);
 }
 
 test "fx platform inline expect succeeds as expected" {
