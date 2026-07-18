@@ -42,8 +42,8 @@ Shape : {
 }
 
 NullableShape : {
-	missing_nullable : Try(Str, [Missing, Null]),
-	optional_nullable : Try(Str, [Missing, Null]),
+	missing_nullable : Try(Try(Str, [Null]), [Missing]),
+	optional_nullable : Try(Try(Str, [Null]), [Missing]),
 	required_nullable : Try(Str, [Null]),
 }
 
@@ -242,28 +242,20 @@ nullable_str_eq = |left, right|
 			}
 		}
 
-optional_nullable_str_eq : Try(Str, [Missing, Null]), Try(Str, [Missing, Null]) -> Bool
+optional_nullable_str_eq : Try(Try(Str, [Null]), [Missing]), Try(Try(Str, [Null]), [Missing]) -> Bool
 optional_nullable_str_eq = |left, right|
 	match left {
 		Ok(left_value) =>
 			match right {
-				Ok(right_value) => Str.is_eq(left_value, right_value)
+				Ok(right_value) => nullable_str_eq(left_value, right_value)
 				Err(Missing) => False
-				Err(Null) => False
 			}
 		Err(Missing) =>
 			match right {
 				Ok(_) => False
 				Err(Missing) => True
-				Err(Null) => False
 			}
-		Err(Null) =>
-			match right {
-				Ok(_) => False
-				Err(Missing) => False
-				Err(Null) => True
-			}
-		}
+	}
 
 expect nullable_round_trips(nullable_source)
 

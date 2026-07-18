@@ -6938,7 +6938,7 @@ const BodyContext = struct {
                 if (self.tryJsonInfo(shape_ty)) |info| {
                     return try self.collectSerializationPlanInputs(kind, info.ok_payload_ty, encoding_ty, plan, inputs);
                 }
-                if (self.optionalParseTryInfo(shape_ty)) |info| {
+                if (self.missingTryInfo(shape_ty)) |info| {
                     return try self.collectSerializationPlanInputs(kind, info.ok_ty, encoding_ty, plan, inputs);
                 }
                 if (try self.customParserLookup(shape_ty) != null or self.jsonParseScalarMethodName(shape_ty) != null) return;
@@ -6983,7 +6983,7 @@ const BodyContext = struct {
                 for (fields) |field| {
                     const child_ty = switch (kind) {
                         .parser => field.ty,
-                        .encoder => self.encodeRecordFieldPayloadType(field.ty, encoding_ty),
+                        .encoder => self.encodeRecordFieldPayloadType(field.ty),
                     };
                     try self.collectSerializationPlanInputs(kind, child_ty, encoding_ty, plan, inputs);
                 }
@@ -12746,7 +12746,7 @@ const BodyContext = struct {
         if (self.tryJsonInfo(shape_ty)) |info| {
             return try self.buildParserConstructionPrecomputedPlan(plan, info.ok_payload_ty, encoding_expr, encoding_ty, str_ty);
         }
-        if (self.optionalParseTryInfo(shape_ty)) |info| {
+        if (self.missingTryInfo(shape_ty)) |info| {
             return try self.buildParserConstructionPrecomputedPlan(plan, info.ok_ty, encoding_expr, encoding_ty, str_ty);
         }
         if (try self.customParserLookup(shape_ty) != null) return;
@@ -12819,7 +12819,7 @@ const BodyContext = struct {
                 const fields = try self.dupeRecordFieldsForShape(shape_ty);
                 defer self.allocator.free(fields);
                 for (fields) |field| {
-                    try self.buildEncodeConstructionPrecomputedPlan(plan, self.encodeRecordFieldPayloadType(field.ty, encoding_ty), encoding_expr, encoding_ty, str_ty);
+                    try self.buildEncodeConstructionPrecomputedPlan(plan, self.encodeRecordFieldPayloadType(field.ty), encoding_expr, encoding_ty, str_ty);
                 }
             },
             .tag_union => |span| {
@@ -12874,7 +12874,7 @@ const BodyContext = struct {
                 const fields = try self.dupeRecordFieldsForShape(shape_ty);
                 defer self.allocator.free(fields);
                 for (fields) |field| {
-                    try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, self.encodeRecordFieldPayloadType(field.ty, encoding_ty), encoding_ty, str_ty);
+                    try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, self.encodeRecordFieldPayloadType(field.ty), encoding_ty, str_ty);
                 }
             },
             .tag_union => |span| {
@@ -13040,6 +13040,9 @@ const BodyContext = struct {
     ) Allocator.Error!void {
         if (self.tryJsonInfo(shape_ty)) |info| {
             return try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, info.ok_payload_ty, str_ty);
+        }
+        if (self.missingTryInfo(shape_ty)) |info| {
+            return try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, info.ok_ty, str_ty);
         }
         if (try self.customParserLookup(shape_ty) != null) return;
         if (self.jsonParseScalarMethodName(shape_ty) != null) return;
@@ -14276,11 +14279,8 @@ const BodyContext = struct {
         ret_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
         const ret_info = self.tryInfo(ret_ty);
-        const maybe_json_try = self.tryJsonInfo(field.ty);
-        const maybe_optional_try = self.optionalParseTryInfo(field.ty);
-        const field_parse_ty = if (maybe_json_try) |info|
-            if (info.has_null) field.ty else info.ok_payload_ty
-        else if (maybe_optional_try) |info|
+        const maybe_missing_try = self.missingTryInfo(field.ty);
+        const field_parse_ty = if (maybe_missing_try) |info|
             info.ok_ty
         else
             field.ty;
@@ -14298,12 +14298,7 @@ const BodyContext = struct {
         const value_name = try self.builder.program.names.internRecordFieldLabel("value");
         const rest_name = try self.builder.program.names.internRecordFieldLabel("rest");
         const parsed_value_local = try self.addLocal(self.builder.symbols.fresh(), field_parse_ty);
-        const field_value = if (maybe_json_try) |info|
-            if (info.has_null)
-                try self.localExpr(parsed_value_local, field_parse_ty)
-            else
-                try self.tryOk(field.ty, try self.localExpr(parsed_value_local, field_parse_ty))
-        else if (maybe_optional_try != null)
+        const field_value = if (maybe_missing_try != null)
             try self.tryOk(field.ty, try self.localExpr(parsed_value_local, field_parse_ty))
         else
             try self.localExpr(parsed_value_local, field_parse_ty);
@@ -14431,7 +14426,6 @@ const BodyContext = struct {
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         if (self.tryJsonInfo(shape_ty)) |info| {
-            if (!info.has_null) Common.invariant("non-null JSON Try shape reached parse lowering");
             return try self.lowerParseJsonTryFromState(info, shape_ty, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan);
         }
         if (self.dictEntryShape(shape_ty)) |dict| {
@@ -15712,7 +15706,7 @@ const BodyContext = struct {
         defer self.allocator.free(field_locals);
         for (record_fields, 0..) |field, index| {
             field_locals[index] = try self.addLocal(self.builder.symbols.fresh(), field.ty);
-            const field_can_be_missing = self.optionalParseTryInfo(field.ty) != null;
+            const field_can_be_missing = self.missingTryInfo(field.ty) != null;
             if (!field_can_be_missing) {
                 const field_try_ty = try self.tryTypeLike(ret_ty, field.ty, ret_info.err_ty);
                 field_try_tys[index] = field_try_ty;
@@ -15746,7 +15740,7 @@ const BodyContext = struct {
         var field_index = record_fields.len;
         while (field_index > 0) {
             field_index -= 1;
-            const field_can_be_missing = self.optionalParseTryInfo(record_fields[field_index].ty) != null;
+            const field_can_be_missing = self.missingTryInfo(record_fields[field_index].ty) != null;
             body = if (field_can_be_missing)
                 try self.finishOptionalRecordFieldFromPresencePayload(
                     body,
@@ -15755,11 +15749,6 @@ const BodyContext = struct {
                     record_fields[field_index],
                     field_index,
                     field_locals[field_index],
-                    rest_local,
-                    encoding_expr,
-                    encoding_ty,
-                    state_ty,
-                    renamed_field_locals[field_index],
                 )
             else
                 try self.sequenceTry(
@@ -20740,7 +20729,7 @@ const BodyContext = struct {
 
         const shape_ty = try self.sealCheckedType(plan.dispatcher_ty);
         const top_level_json_try = self.tryJsonInfo(shape_ty);
-        if (self.jsonParseScalarMethodName(shape_ty) == null and !(top_level_json_try != null and top_level_json_try.?.has_null and !top_level_json_try.?.has_missing)) {
+        if (self.jsonParseScalarMethodName(shape_ty) == null and top_level_json_try == null) {
             if (self.setPayloadType(shape_ty)) |elem_ty| {
                 if (!self.parseFieldTypeIsSupported(elem_ty, false)) Common.invariant("structural parser set element type was not supported");
             } else if (self.dictEntryShape(shape_ty)) |dict| {
@@ -20952,7 +20941,6 @@ const BodyContext = struct {
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         if (self.tryJsonInfo(shape_ty)) |info| {
-            if (!info.has_null or info.has_missing) Common.invariant("unsupported JSON Try shape reached encoder_for lowering");
             return try self.lowerEncodeJsonTryToState(info, shape_ty, value_expr, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan);
         }
         if (self.dictEntryShape(shape_ty)) |dict| {
@@ -21851,43 +21839,23 @@ const BodyContext = struct {
             } },
         });
 
-        if (self.builder.typeIsBuiltinJsonEncoding(encoding_ty)) {
-            if (self.tryJsonInfo(field.ty)) |optional_info| {
-                if (!optional_info.has_missing) {
-                    return try self.lowerEncodePresentRecordFieldFrom(
-                        shape_ty,
-                        value_expr,
-                        encoding_expr,
-                        encoding_ty,
-                        state_expr,
-                        state_ty,
-                        ret_ty,
-                        precomputed_plan,
-                        record_fields,
-                        renamed_field_locals,
-                        field_writer_expr,
-                        field_index,
-                        field.ty,
-                        field_value_expr,
-                    );
-                }
-                return try self.lowerEncodeOptionalRecordFieldFrom(
-                    shape_ty,
-                    value_expr,
-                    encoding_expr,
-                    encoding_ty,
-                    state_expr,
-                    state_ty,
-                    ret_ty,
-                    precomputed_plan,
-                    record_fields,
-                    renamed_field_locals,
-                    field_writer_expr,
-                    field_index,
-                    field_value_expr,
-                    optional_info,
-                );
-            }
+        if (self.missingTryInfo(field.ty)) |optional_info| {
+            return try self.lowerEncodeOptionalRecordFieldFrom(
+                shape_ty,
+                value_expr,
+                encoding_expr,
+                encoding_ty,
+                state_expr,
+                state_ty,
+                ret_ty,
+                precomputed_plan,
+                record_fields,
+                renamed_field_locals,
+                field_writer_expr,
+                field_index,
+                field_value_expr,
+                optional_info,
+            );
         }
 
         return try self.lowerEncodePresentRecordFieldFrom(
@@ -21991,35 +21959,6 @@ const BodyContext = struct {
         return value_try;
     }
 
-    fn lowerEncodeNullRecordField(
-        self: *BodyContext,
-        encoding_ty: Type.TypeId,
-        state_expr: DraftExprId,
-        state_ty: Type.TypeId,
-        ret_ty: Type.TypeId,
-        renamed_field_locals: []const DraftLocalId,
-        field_writer_expr: DraftExprId,
-        field_index: usize,
-    ) Allocator.Error!DraftExprId {
-        const str_ty = try self.builder.primitiveType(.str);
-        const renamed_field_expr = try self.localExpr(renamed_field_locals[field_index], str_ty);
-        const null_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const null_body = try self.lowerEncodeFormatMethod("encode_null", &.{try self.localExpr(null_state_local, state_ty)}, &.{state_ty}, encoding_ty, ret_ty);
-        const null_value_writer = try self.lowerGeneratedEncoderCallbackLambda(
-            try self.encodeValueThunkType(state_ty, ret_ty),
-            &.{.{ .local = null_state_local, .ty = state_ty }},
-            null_body,
-        );
-        const null_try = try self.addExpr(.{
-            .ty = ret_ty,
-            .data = .{ .call_value = .{
-                .callee = field_writer_expr,
-                .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, renamed_field_expr, null_value_writer }),
-            } },
-        });
-        return null_try;
-    }
-
     fn lowerEncodeOptionalRecordFieldFrom(
         self: *BodyContext,
         shape_ty: Type.TypeId,
@@ -22035,15 +21974,15 @@ const BodyContext = struct {
         field_writer_expr: DraftExprId,
         field_index: usize,
         field_value_expr: DraftExprId,
-        optional_info: TryJsonInfo,
+        optional_info: TryInfo,
     ) Allocator.Error!DraftExprId {
         const field_ty = record_fields[field_index].ty;
         const try_info = self.tryInfo(field_ty);
-        if (!self.sameType(try_info.ok_ty, optional_info.ok_payload_ty)) Common.invariant("optional encoder_for field Ok payload differed from optional info");
+        if (!self.sameType(try_info.ok_ty, optional_info.ok_ty)) Common.invariant("optional encoder_for field Ok payload differed from optional info");
         if (!self.sameType(try_info.err_ty, optional_info.err_ty)) Common.invariant("optional encoder_for field Err payload differed from optional info");
 
-        const ok_payload_local = try self.addLocal(self.builder.symbols.fresh(), optional_info.ok_payload_ty);
-        const ok_payload_pat = try self.bindPat(ok_payload_local, optional_info.ok_payload_ty);
+        const ok_payload_local = try self.addLocal(self.builder.symbols.fresh(), optional_info.ok_ty);
+        const ok_payload_pat = try self.bindPat(ok_payload_local, optional_info.ok_ty);
         const ok_backing_pat = try self.addPat(.{ .ty = optional_info.backing_ty, .data = .{ .tag = .{
             .name = try_info.ok_tag.name,
             .payloads = try self.addPatSpan(&[_]DraftPatId{ok_payload_pat}),
@@ -22062,12 +22001,12 @@ const BodyContext = struct {
             renamed_field_locals,
             field_writer_expr,
             field_index,
-            optional_info.ok_payload_ty,
-            try self.localExpr(ok_payload_local, optional_info.ok_payload_ty),
+            optional_info.ok_ty,
+            try self.localExpr(ok_payload_local, optional_info.ok_ty),
         );
 
         const missing_tag = self.monoTagByText(optional_info.err_ty, "Missing");
-        if (self.builder.program.types.span(missing_tag.payloads).len != 0) Common.invariant("JSON Missing marker unexpectedly had payloads");
+        if (self.builder.program.types.span(missing_tag.payloads).len != 0) Common.invariant("Missing marker unexpectedly had payloads");
         const missing_payload_pat = try self.addPat(.{ .ty = optional_info.err_ty, .data = .{ .tag = .{
             .name = missing_tag.name,
             .payloads = .empty(),
@@ -22086,33 +22025,6 @@ const BodyContext = struct {
         defer branches.deinit(self.allocator);
         try branches.append(self.allocator, .{ .pat = ok_pat, .body = ok_body });
         try branches.append(self.allocator, .{ .pat = missing_pat, .body = missing_body });
-
-        if (optional_info.has_null) {
-            const null_tag = self.monoTagByText(optional_info.err_ty, "Null");
-            if (self.builder.program.types.span(null_tag.payloads).len != 0) Common.invariant("JSON Null marker unexpectedly had payloads");
-            const null_payload_pat = try self.addPat(.{ .ty = optional_info.err_ty, .data = .{ .tag = .{
-                .name = null_tag.name,
-                .payloads = .empty(),
-            } } });
-            const null_backing_pat = try self.addPat(.{ .ty = optional_info.backing_ty, .data = .{ .tag = .{
-                .name = try_info.err_tag.name,
-                .payloads = try self.addPatSpan(&[_]DraftPatId{null_payload_pat}),
-            } } });
-            const null_pat = try self.addPat(.{
-                .ty = field_ty,
-                .data = .{ .nominal = null_backing_pat },
-            });
-            const null_body = try self.lowerEncodeNullRecordField(
-                encoding_ty,
-                state_expr,
-                state_ty,
-                ret_ty,
-                renamed_field_locals,
-                field_writer_expr,
-                field_index,
-            );
-            try branches.append(self.allocator, .{ .pat = null_pat, .body = null_body });
-        }
 
         const field_try = try self.addExpr(.{ .ty = ret_ty, .data = .{ .match_ = .{
             .scrutinee = field_value_expr,
@@ -22376,17 +22288,15 @@ const BodyContext = struct {
         return try self.sequenceEncodeTry(item_try, ret_ty, item_done_local, rest, ret_ty);
     }
 
-    fn encodeRecordFieldPayloadType(self: *BodyContext, field_ty: Type.TypeId, encoding_ty: Type.TypeId) Type.TypeId {
-        if (self.builder.typeIsBuiltinJsonEncoding(encoding_ty)) {
-            if (self.tryJsonInfo(field_ty)) |optional_info| {
-                if (optional_info.has_missing) return optional_info.ok_payload_ty;
-            }
+    fn encodeRecordFieldPayloadType(self: *BodyContext, field_ty: Type.TypeId) Type.TypeId {
+        if (self.missingTryInfo(field_ty)) |optional_info| {
+            return optional_info.ok_ty;
         }
         return field_ty;
     }
 
     fn encodeRecordFieldTypeIsSupported(self: *BodyContext, field_ty: Type.TypeId, encoding_ty: Type.TypeId) bool {
-        return self.encodeFieldTypeIsSupported(self.encodeRecordFieldPayloadType(field_ty, encoding_ty), encoding_ty);
+        return self.encodeFieldTypeIsSupported(self.encodeRecordFieldPayloadType(field_ty), encoding_ty);
     }
 
     fn encodeTagUnionTypeIsSupported(self: *BodyContext, tags_span: Type.Span, encoding_ty: Type.TypeId) bool {
@@ -22522,13 +22432,6 @@ const BodyContext = struct {
         backing_ty: Type.TypeId,
         ok_payload_ty: Type.TypeId,
         err_ty: Type.TypeId,
-        has_missing: bool,
-        has_null: bool,
-    };
-
-    const JsonTryErrInfo = struct {
-        has_missing: bool,
-        has_null: bool,
     };
 
     const TryInfo = struct {
@@ -22657,13 +22560,10 @@ const BodyContext = struct {
         };
     }
 
-    fn optionalParseTryInfo(self: *BodyContext, try_ty: Type.TypeId) ?TryInfo {
+    fn missingTryInfo(self: *BodyContext, try_ty: Type.TypeId) ?TryInfo {
         if (self.typeHasParserForTarget(try_ty)) return null;
-        if (self.tryJsonInfo(try_ty)) |info| {
-            if (!info.has_missing) return null;
-            return self.tryInfoOptional(try_ty) orelse Common.invariant("JSON Try info was not backed by a Try type");
-        }
-        return self.tryInfoOptional(try_ty);
+        const info = self.tryInfoOptional(try_ty) orelse return null;
+        return if (self.typeIsExactUnitTagUnion(info.err_ty, "Missing")) info else null;
     }
 
     fn tryTypeLike(
@@ -22845,13 +22745,12 @@ const BodyContext = struct {
 
     fn parseFieldTypeIsSupported(self: *BodyContext, ty: Type.TypeId, allow_missing: bool) bool {
         if (self.jsonParseScalarMethodName(ty) != null) return true;
-        if (self.tryJsonInfo(ty)) |info| {
-            if (info.has_missing and !allow_missing) return false;
-            return self.parseFieldTypeIsSupported(info.ok_payload_ty, false);
-        }
-        if (self.optionalParseTryInfo(ty)) |info| {
+        if (self.missingTryInfo(ty)) |info| {
             if (!allow_missing) return false;
             return self.parseFieldTypeIsSupported(info.ok_ty, false);
+        }
+        if (self.tryJsonInfo(ty)) |info| {
+            return self.parseFieldTypeIsSupported(info.ok_payload_ty, false);
         }
         if (self.customParserLookupReadOnly(ty) != null) return true;
         if (self.setPayloadType(ty)) |payload_ty| return self.parseFieldTypeIsSupported(payload_ty, false);
@@ -22896,7 +22795,6 @@ const BodyContext = struct {
     fn encodeFieldTypeIsSupported(self: *BodyContext, ty: Type.TypeId, encoding_ty: Type.TypeId) bool {
         if (self.jsonEncodeScalarMethodName(ty) != null) return true;
         if (self.tryJsonInfo(ty)) |info| {
-            if (info.has_missing) return false;
             return self.encodeFieldTypeIsSupported(info.ok_payload_ty, encoding_ty);
         }
         if (self.customEncoderForLookupReadOnly(ty) != null) return true;
@@ -23023,38 +22921,24 @@ const BodyContext = struct {
         const ok_payloads = self.builder.program.types.span(ok_tag.payloads);
         const err_payloads = self.builder.program.types.span(err_tag.payloads);
         if (ok_payloads.len != 1 or err_payloads.len != 1) return null;
-        const err_info = self.jsonTryErrInfo(GuardedList.at(err_payloads, 0)) orelse return null;
+        const err_ty = GuardedList.at(err_payloads, 0);
+        if (!self.typeIsExactUnitTagUnion(err_ty, "Null")) return null;
         return .{
             .backing_ty = backing_ty,
             .ok_payload_ty = GuardedList.at(ok_payloads, 0),
-            .err_ty = GuardedList.at(err_payloads, 0),
-            .has_missing = err_info.has_missing,
-            .has_null = err_info.has_null,
+            .err_ty = err_ty,
         };
     }
 
-    fn jsonTryErrInfo(self: *BodyContext, err_ty: Type.TypeId) ?JsonTryErrInfo {
-        const tags = switch (self.builder.shapeContent(err_ty)) {
+    fn typeIsExactUnitTagUnion(self: *BodyContext, ty: Type.TypeId, tag_text: []const u8) bool {
+        const tags = switch (self.builder.shapeContent(ty)) {
             .tag_union => |span| self.builder.program.types.tagSpan(span),
-            else => return null,
+            else => return false,
         };
-        if (tags.len == 0) return null;
-
-        var has_missing = false;
-        var has_null = false;
-        for (0..GuardedList.borrowLen(tags)) |index| {
-            const tag = GuardedList.at(tags, index);
-            if (self.builder.program.types.span(tag.payloads).len != 0) return null;
-            const text = self.builder.program.names.tagLabelText(tag.name);
-            if (Ident.textEql(text, "Missing")) {
-                has_missing = true;
-            } else if (Ident.textEql(text, "Null")) {
-                has_null = true;
-            } else {
-                return null;
-            }
-        }
-        return .{ .has_missing = has_missing, .has_null = has_null };
+        if (tags.len != 1) return false;
+        const tag = GuardedList.at(tags, 0);
+        if (self.builder.program.types.span(tag.payloads).len != 0) return false;
+        return Ident.textEql(self.builder.program.names.tagLabelText(tag.name), tag_text);
     }
 
     fn tagUnionValueWithoutPayload(self: *BodyContext, ty: Type.TypeId, tag_text: []const u8) Allocator.Error!DraftExprId {
@@ -23077,14 +22961,9 @@ const BodyContext = struct {
         field: Type.Field,
         field_index: usize,
         field_local: DraftLocalId,
-        rest_local: DraftLocalId,
-        encoding_expr: DraftExprId,
-        encoding_ty: Type.TypeId,
-        state_ty: Type.TypeId,
-        renamed_field_local: DraftLocalId,
     ) Allocator.Error!DraftExprId {
         const field_ty = field.ty;
-        const optional_info = self.optionalParseTryInfo(field_ty) orelse
+        const optional_info = self.missingTryInfo(field_ty) orelse
             Common.invariant("optional record finish requested for a non-optional Try field");
         const payload_local = record_slots.payload_locals[field_index];
         const payload_ty = record_slots.payload_tys[field_index];
@@ -23095,11 +22974,8 @@ const BodyContext = struct {
             Common.invariant("record finish field local type differed from optional field type");
         }
 
-        const renamed_field_ty = try self.localType(renamed_field_local);
-        if (!self.typeHasBuiltinOwner(renamed_field_ty, .str)) Common.invariant("record parser renamed field local was not Str");
-        const renamed_field_expr = try self.localExpr(renamed_field_local, renamed_field_ty);
-        const missing_error = try self.missingOptionalFieldError(encoding_expr, renamed_field_expr, rest_local, encoding_ty, state_ty, optional_info.err_ty);
-        const missing_field = try self.tryErr(field_ty, missing_error);
+        const missing_tag = try self.tagUnionValueWithoutPayload(optional_info.err_ty, "Missing");
+        const missing_field = try self.tryErr(field_ty, missing_tag);
         const present_field = try self.localExpr(payload_local, payload_ty);
         const presence_word = recordPresenceWordIndex(field_index);
         const is_present_expr = try self.localExpr(record_slots.presence_locals[presence_word], record_slots.presence_tys[presence_word]);
@@ -23142,10 +23018,6 @@ const BodyContext = struct {
 
         const absent_body = if (self.typeHasBuiltinOwner(field_ty, .str)) blk: {
             break :blk try self.tryErr(field_try_ty, try self.missingRecordFieldError(encoding_expr, renamed_field_expr, rest_local, encoding_ty, state_ty, field_try_info.err_ty));
-        } else if (self.optionalParseTryInfo(field_ty)) |info| blk: {
-            const missing_error = try self.missingOptionalFieldError(encoding_expr, renamed_field_expr, rest_local, encoding_ty, state_ty, info.err_ty);
-            const missing_field = try self.tryErr(field_ty, missing_error);
-            break :blk try self.tryOk(field_try_ty, missing_field);
         } else try self.tryErr(field_try_ty, try self.missingRecordFieldError(encoding_expr, renamed_field_expr, rest_local, encoding_ty, state_ty, field_try_info.err_ty));
 
         return try self.addExpr(.{ .ty = field_try_ty, .data = .{ .if_initialized_payload = .{
@@ -23231,40 +23103,6 @@ const BodyContext = struct {
                 .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize))),
                 .args = try self.addExprSpan(&[_]DraftExprId{ encoding_expr, state_expr }),
                 .is_cold = true,
-            } },
-        });
-    }
-
-    fn missingOptionalFieldError(
-        self: *BodyContext,
-        encoding_expr: DraftExprId,
-        field_name_expr: DraftExprId,
-        rest_local: DraftLocalId,
-        encoding_ty: Type.TypeId,
-        state_ty: Type.TypeId,
-        err_ty: Type.TypeId,
-    ) Allocator.Error!DraftExprId {
-        const str_ty = try self.builder.primitiveType(.str);
-        const lookup = try self.methodLookupForTypeName(encoding_ty, "missing_optional_field");
-        const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ encoding_ty, str_ty, state_ty }, err_ty);
-        const missing_fn = self.builder.functionShape(callable_mono_ty, "missing_optional_field target method was not a function");
-        const arg_tys = self.builder.program.types.span(missing_fn.args);
-        if (arg_tys.len != 3) Common.invariant("missing_optional_field target method had an unexpected arity");
-        if (!self.sameType(GuardedList.at(arg_tys, 0), encoding_ty)) Common.invariant("missing_optional_field encoding type differed from record encoding type");
-        if (!self.sameType(GuardedList.at(arg_tys, 1), str_ty)) Common.invariant("missing_optional_field name type differed from Str");
-        if (!self.sameType(GuardedList.at(arg_tys, 2), state_ty)) Common.invariant("missing_optional_field state type differed from record rest state type");
-        if (!self.sameType(missing_fn.ret, err_ty)) Common.invariant("missing_optional_field return type differed from optional field error type");
-
-        const args = [_]DraftExprId{
-            encoding_expr,
-            field_name_expr,
-            try self.localExpr(rest_local, state_ty),
-        };
-        return try self.addExpr(.{
-            .ty = err_ty,
-            .data = .{ .call_proc = .{
-                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize))),
-                .args = try self.addExprSpan(&args),
             } },
         });
     }
