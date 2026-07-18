@@ -32,8 +32,8 @@ reach:
    shims — `"roc_shim_get_ops"`, `"roc_entrypoint"`,
    `"roc_entrypoint_from_image"`, `"roc_shim_hosted_fns"`,
    `"roc_shim_hosted_count"` — are raw literals on both sides:
-   emission in `src/backend/llvm/MonoLlvmCodeGen.zig:473-482, 1576,
-   1622, 1627` versus definition in `src/machine_code_shim/main.zig:754-758`,
+   emission in `src/backend/llvm/MonoLlvmCodeGen.zig:469-500, 1594,
+   1640, 1645` versus definition in `src/machine_code_shim/main.zig:750-754`,
    `src/interpreter_shim/main.zig:213-231`, and
    `src/shim_host_abi.zig:19-20`. No shared constants module; a typo is
    a link failure at best.

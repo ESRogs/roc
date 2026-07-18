@@ -9,13 +9,13 @@ interpreter, the dev backend, and the wasm backend — so adding or
 renaming one is a compile error there. The LLVM backend is the
 exception: its `emitLowLevel` dispatch ends in
 `else => try self.emitNumericConversionOrCrash(...)`
-(`src/backend/llvm/MonoLlvmCodeGen.zig:2927`), and that function
+(`src/backend/llvm/MonoLlvmCodeGen.zig:2945`), and that function
 derives semantics by **parsing the enum tag name**
-(`const name = @tagName(op)` at `:3533`, then
-`std.mem.endsWith(u8, name, "_to_dec")` at `:3575`,
-`endsWith(name, "_try")` at `:3579`,
+(`const name = @tagName(op)` at `:3543`, then
+`std.mem.endsWith(u8, name, "_to_dec")` at `:3585`,
+`endsWith(name, "_try")` at `:3589`,
 `std.mem.find(u8, name, "_to_")` / `"_try"` / `"_str"` at
-`:3589-3591`), falling back to emitting a runtime crash with the tag
+`:3599-3601`), falling back to emitting a runtime crash with the tag
 name as the message.
 
 The enum's naming convention is load-bearing codegen logic in exactly
@@ -41,9 +41,9 @@ obvious home beside them.
 
 ## Evidence
 
-- `src/backend/llvm/MonoLlvmCodeGen.zig:2927` — the `else` prong that
+- `src/backend/llvm/MonoLlvmCodeGen.zig:2945` — the `else` prong that
   exempts LLVM from the exhaustiveness guarantee.
-- `:3532-3598` — `emitNumericConversionOrCrash`'s substring
+- `:3542-3608` — `emitNumericConversionOrCrash`'s substring
   heuristics and the `emitCrashBytes(name)` fallback.
 - The three sibling backends' explicit arms (cited above) — proof the
   explicit form is tractable at this op count.
@@ -109,6 +109,6 @@ diffing emitted IR for a conversion-heavy fixture).
 
 ## Related projects
 
-- [../big/single-source-builtin-registration.md](../big/single-source-builtin-registration.md)
-  — the same backend's inline symbol-string literals; same disease,
-  neighboring mechanism.
+- The landed single-source builtin registration
+  (`src/builtins/builtin_registry.zig`) — cured the same backend's
+  symbol-string drift; same disease, neighboring mechanism.

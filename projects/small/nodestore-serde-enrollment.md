@@ -15,10 +15,10 @@ sub-store, not a compile error).
 The enforcement machinery this file needs already exists thirty lines
 of import away and is used by its sibling: `ModuleEnv.Serialized`
 invokes `assertBidirectionalFieldSet`
-(`src/canonicalize/ModuleEnv.zig:3290`, helper in
+(`src/canonicalize/ModuleEnv.zig:3296`, helper in
 `src/collections/serde_validation.zig:40`), making owner/Serialized
 field drift a compile error. `CheckedModuleArtifact` is enrolled too
-(`src/check/checked_artifact.zig:22873`). NodeStore — the largest
+(`src/check/checked_artifact.zig:22908`). NodeStore — the largest
 hand-enumerated serialization root in the codebase — is not.
 
 A same-family loose end in the parser: `src/parse/NodeStore.zig:150-158`

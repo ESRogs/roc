@@ -12,17 +12,16 @@ as hand-written magic numbers:
 
 - The dev backend hardcodes RocStr/RocList field offsets as raw integer
   literals — `+ 8` for length, `+ 16` for capacity — at
-  `src/backend/dev/LirCodeGen.zig:1687, 1707, 1818, 1844, 2009`, with
+  `src/backend/dev/LirCodeGen.zig:1379, 1397, 1534, 4889`, with
   comments like "length is at offset 8". It also recomputes
   `roc_str_size = 3 * target_ptr_size` and `small_str_max_len`
-  (`LirCodeGen.zig:745-746`) and open-codes the `| 0x80` small-string
-  length byte (`:16896`).
+  (`LirCodeGen.zig:437-438`).
 - The LLVM backend comptime-asserts the header *word count*
   (`src/backend/llvm/layout_types.zig:158-159` — good), but hardcodes
   the field offsets (`rocListLenOffset`/`rocListCapacityOffset`/
-  `rocStrCapacityOffset`, `MonoLlvmCodeGen.zig:7534-7542`), the slice
-  tag as a literal `1` (`:4248-4250`), and the small-string byte as
-  `3 * word_size - 1` with mask `0x7F` (`:4239-4240`). `layout_types.zig:288-307`
+  `rocStrCapacityOffset`, `MonoLlvmCodeGen.zig:7584-7592`), the slice
+  tag as a literal `1` (`:4320-4321, 7345`), and the small-string bit
+  and `0x7F` mask open-coded (`:4301-4312, 4350`). `layout_types.zig:288-307`
   re-states "Str/List = 3 words, Box = 1 word" as `ptr_size * 3`
   literals instead of importing `word_count`/`SizeAlign`.
 - The wasm backend is fully manual: field offsets 0/4/8 throughout,
@@ -31,7 +30,7 @@ as hand-written magic numbers:
   by the sign bit of the length word (`:2506-2520`), and the refcount
   contract re-implemented inline — data pointer minus 4 to reach the
   refcount word, `i32_eqz` as the "static data, never touch" check
-  (`emitDataPtrIncref` and friends, `:2657-2812`) — with no reference
+  (`emitDataPtrIncref` and friends, `:2658-2812`) — with no reference
   to `builtins.utils.REFCOUNT_STATIC_DATA`. `WasmLayout.wasmRepr`
   hardcodes `.str => 12` (`src/backend/wasm/WasmLayout.zig:45-47`)
   while the same file's header comment declares the layout store "the
@@ -77,9 +76,9 @@ reference those names.
 
 ## Evidence
 
-- `src/backend/dev/LirCodeGen.zig:1687` — "List is a (ptr, len,
+- `src/backend/dev/LirCodeGen.zig:1379` — "List is a (ptr, len,
   capacity) triple - length is at offset 8", with the literal `8`.
-- `src/backend/wasm/WasmCodeGen.zig:2657-2812` — inline refcount
+- `src/backend/wasm/WasmCodeGen.zig:2658-2812` — inline refcount
   arithmetic with `-4` offsets and `i32_eqz` static checks, no
   `REFCOUNT_STATIC_DATA` reference.
 - `src/backend/llvm/layout_types.zig:288-307` — `ptr_size * 3`
@@ -168,10 +167,10 @@ output expected.
 
 ## Related projects
 
-- [Single-Source Builtin
-  Registration](single-source-builtin-registration.md) — the symbol
-  name/ABI half of the same backend-drift disease; this project is the
-  data-layout half.
+- The landed single-source builtin registration
+  (`src/builtins/builtin_registry.zig`) — the symbol name/ABI half of
+  the same backend-drift disease, now consolidated; this project is
+  the data-layout half.
 - [../small/silent-drift-guards.md](../small/silent-drift-guards.md) —
   the pattern language for mirrors that cannot share code (the Python
   debuggers are exactly that case).

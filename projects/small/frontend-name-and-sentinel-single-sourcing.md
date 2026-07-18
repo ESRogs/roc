@@ -12,32 +12,34 @@ small deletion or redirection, and each is the exact
 name-keyed/hand-mirrored pattern that produced previous bug rounds.
 
 1. **A duplicate ident→NumKind map.** `builtinNumKindFromTypeName`
-   (`src/check/Check.zig:4486`) is a hand-written chain re-deriving
+   (`src/check/Check.zig:4521`) is a hand-written chain re-deriving
    what `BuiltinIndices.numKindFromIdent` (`CIR.zig:124`) already
    computes from the spec table. A renamed or added numeric type
    silently stops being recognized by the hand copy.
-2. **Bool's discriminant hardcoded.** `src/postcheck/solved_lir_lower.zig:6070`
-   and `:6075` emit `CFSwitchBranch{ .value = 1, .body = true_body }`
+2. **Bool's discriminant hardcoded.** `src/postcheck/solved_lir_lower.zig:6083`
+   and `:6088` emit `CFSwitchBranch{ .value = 1, .body = true_body }`
    — baking "True == 1", which is true only because tag discriminants
    come from alphabetical sorting and "False" < "True" lexically.
    Nothing links the literal to the sort convention or to `mkBool`'s
    construction order (`src/types/store.zig:582-585`). A collation
    change would silently invert every boolean branch.
 3. **Method-name strings bypass their own registry.**
-   `structural_method_kinds` (`src/check/static_dispatch_registry.zig:794`,
-   doc comment at `:786`: "the one table") is not consulted by
-   postcheck, which re-types `"is_eq"`
-   (`src/postcheck/monotype/lower.zig:8994, 23315, 27167`),
-   `"to_hash"` (`:23416`), `"parser_for"` (`:22966-22996`), and
-   `"encoder_for"` (`:23015-23036`) as raw literals;
+   `structural_method_kinds` (`src/check/static_dispatch_registry.zig:849`,
+   doc comment at `:841-848`: "this single source") is not consulted
+   everywhere: postcheck re-types `"is_eq"`
+   (`src/postcheck/monotype/lower.zig:8990, 23331, 27191, 27211`),
+   `"to_hash"` (`:23432`), `"parser_for"` (`:22967-23006`), and
+   `"encoder_for"` (`:23027-23050`) as raw literals;
    `"from_numeral"`/`"from_quote"` are separately re-interned in
    `src/check/canonical_type_keys.zig:727-728` and
-   `static_dispatch_registry.zig:1256, 1296`.
+   `static_dispatch_registry.zig:1313, 1353`.
 4. **A hand-written bidirectional builtin-name map.**
    `TypeAnnotation.Builtin.toBytes`/`fromBytes`
    (`src/canonicalize/TypeAnnotation.zig:419-455`) spell every builtin
    type name twice more; the qualified-name strings in `CommonIdents`
-   (`src/canonicalize/ModuleEnv.zig:135-181`) spell them again.
+   (`src/canonicalize/ModuleEnv.zig:135-181`) spell them again, as
+   does the deliberately-partial numeric list `flat_types` in
+   `src/postcheck/monotype/lower.zig:10046`.
 5. **Row-sort comparators ×5.** Record-field/tag canonical ordering
    (ascending byte order of names) is implemented independently in
    `src/types/types.zig:672, 721`, inline lambdas in
@@ -48,8 +50,9 @@ name-keyed/hand-mirrored pattern that produced previous bug rounds.
    out in byte comparison; discriminant assignment depends on that
    agreement.
 6. **Default-cased cross-phase lowering switches.** The
-   checked→monotype lowering (`src/postcheck/monotype/lower.zig:9219-9240`
-   and `lowerExprWithType` at `:9394`) uses `else => {}`/partial
+   checked→monotype lowering (`lowerExpr` at
+   `src/postcheck/monotype/lower.zig:9206` and `lowerExprWithType` at
+   `:9378`) uses `else => {}`/partial
    switches where the codebase's own parallel-enum conversions
    (`reconstructCheckedExprData`, `snapshot.zig`'s deep-copies) are
    exhaustive — the one cross-phase seam where a new checked variant
@@ -145,5 +148,6 @@ it is invisible, and take the assertion route if not.
 - [cross-phase-coverage-parity-tests.md](cross-phase-coverage-parity-tests.md)
   — the parity-suite pattern; item 6 here is the structural
   (exhaustiveness) complement to that project's divergence suite.
-- [../big/single-source-builtin-registration.md](../big/single-source-builtin-registration.md)
-  — the same registry-consolidation move for runtime symbols.
+- The landed single-source builtin registration
+  (`src/builtins/builtin_registry.zig`) — the same
+  registry-consolidation move, already made for runtime symbols.
