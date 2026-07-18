@@ -58,6 +58,7 @@ test "postcheck declarations are referenced" {
     std.testing.refAllDecls(@import("lambda_mono/type.zig"));
     std.testing.refAllDecls(@import("lambda_mono/lower.zig"));
     std.testing.refAllDecls(@import("lambda_mono/specialize.zig"));
+    std.testing.refAllDecls(@import("lambda_mono/eval.zig"));
     std.testing.refAllDecls(@import("match_tree.zig"));
     std.testing.refAllDecls(@import("solved_inline.zig"));
     std.testing.refAllDecls(@import("solved_lir_lower.zig"));
