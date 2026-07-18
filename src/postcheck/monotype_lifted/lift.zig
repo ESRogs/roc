@@ -182,11 +182,13 @@ fn movedMonoView(source: *const Mono.Program, moved: *const Ast.Program) Mono.Pr
 }
 
 /// Recompute every lifted function's capture span from the current function
-/// bodies, then rebase every function reference/direct-call capture operand
-/// span to the recomputed capture slot order. Transformations that clone or
-/// rewrite lifted bodies must call this after they finish mutating the program,
-/// because substitutions can change the capture shape of the rewritten
-/// functions.
+/// bodies, then rebase every reachable function reference/direct-call capture
+/// operand span to the recomputed capture slot order. Transformations that
+/// clone or rewrite lifted bodies must call this after they finish mutating the
+/// program, because substitutions can change the capture shape of the rewritten
+/// functions. Replaced bodies remain in the append-only expression store but
+/// are not part of the executable program and therefore need no capture
+/// operands.
 pub fn recomputeCaptures(allocator: Allocator, program: *Ast.Program) Allocator.Error!void {
     var graph = try CaptureDependencyGraph.init(allocator, program, null);
     defer graph.deinit();
@@ -199,15 +201,28 @@ pub fn recomputeCaptures(allocator: Allocator, program: *Ast.Program) Allocator.
         program.setFnCaptures(fn_id, try program.addTypedLocalSpan(graph.states[index].captures.items));
     }
 
-    verifyCaptureInvariants(program);
+    verifyActiveCaptureInvariants(program, &graph);
 }
 
-/// Debug-only structural check that a Lifted program's capture representation is
-/// internally consistent. It is run after every Lifted-IR mutation (the initial
-/// lift and `recomputeCaptures`, which follows spec_constr / any body rewrite),
-/// so a pass that forgets to maintain captures fails deterministically at its
-/// own boundary instead of surfacing as a confusing crash five stages later.
-/// Compiled out entirely in release builds — release cost is zero.
+/// Verify the capture representation that is reachable from current function
+/// bodies. Post-lift transforms use append-only stores, so expressions from
+/// replaced bodies can retain capture operands for the old function shapes;
+/// they are deliberately absent from the active capture graph and cannot reach
+/// downstream compilation.
+fn verifyActiveCaptureInvariants(program: *const Ast.Program, graph: *const CaptureDependencyGraph) void {
+    if (@import("builtin").mode != .Debug) return;
+    const violation = checkActiveCaptureInvariants(program, graph) catch |err| switch (err) {
+        error.OutOfMemory => Common.invariant("verifyActiveCaptureInvariants: out of memory during structural check"),
+    };
+    if (violation) |message| std.debug.panic("postcheck invariant violated: {s}", .{message});
+}
+
+/// Debug-only structural check that a freshly lifted program's entire capture
+/// backing store is internally consistent. Post-lift transforms use append-only
+/// stores and can leave replaced expressions behind; `recomputeCaptures` checks
+/// the active capture graph instead. Both checks fail at the mutation boundary
+/// instead of surfacing as a confusing crash five stages later. Compiled out
+/// entirely in release builds — release cost is zero.
 ///
 /// It checks, per function and per `fn_ref`/`call_proc` site:
 ///   - every capture slot's local carries a CaptureId, and the slot's type
@@ -241,6 +256,40 @@ pub fn checkCaptureInvariants(program: *const Ast.Program) Allocator.Error!?[]co
                 .func => {},
             },
             else => {},
+        }
+    }
+    return null;
+}
+
+fn checkActiveCaptureInvariants(program: *const Ast.Program, graph: *const CaptureDependencyGraph) Allocator.Error!?[]const u8 {
+    for (program.fnsView()) |fn_| {
+        if (checkCaptureSlotSpan(program, program.typedLocalSpan(fn_.captures))) |message| return message;
+    }
+
+    for (graph.edges.items) |edge| {
+        if (!edge.active) continue;
+        switch (edge.site) {
+            .pre_lift => return "post-lift capture graph contained an active pre-lift edge",
+            .fn_ref => |expr_id| {
+                const fn_ref = switch (program.getExpr(expr_id).data) {
+                    .fn_ref => |fn_ref| fn_ref,
+                    else => return "active capture graph function-reference site changed expression kind",
+                };
+                if (fn_ref.fn_id != edge.target) return "active capture graph function-reference target changed";
+                if (try checkOperandSpan(program, edge.target, fn_ref.captures)) |message| return message;
+            },
+            .call_proc => |expr_id| {
+                const call = switch (program.getExpr(expr_id).data) {
+                    .call_proc => |call| call,
+                    else => return "active capture graph direct-call site changed expression kind",
+                };
+                const target = switch (call.callee) {
+                    .lifted => |fn_id| fn_id,
+                    .func => return "active capture graph direct-call target changed kind",
+                };
+                if (target != edge.target) return "active capture graph direct-call target changed";
+                if (try checkOperandSpan(program, edge.target, call.captures)) |message| return message;
+            },
         }
     }
     return null;
@@ -2538,6 +2587,48 @@ test "capture graph does not activate an operand for a removed target slot" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(@as(usize, 0), program.captureOperandSpan(finalized.captures).len);
+}
+
+test "capture recomputation excludes replaced bodies from the active invariant" {
+    const allocator = std.testing.allocator;
+    var program = initCaptureTestProgram(allocator);
+    defer program.deinit();
+
+    const ty = try program.types.add(.zst);
+    const binder: checked.PatternBinderId = @enumFromInt(1);
+    const stale_capture = try program.addLocalWithBinder(@enumFromInt(1), ty, binder);
+    const stale_slots = try program.addTypedLocalSpan(&.{.{ .local = stale_capture, .ty = ty }});
+    const callee_body = try program.addExpr(.{ .ty = ty, .data = .unit });
+    const callee = try program.addFn(.{
+        .symbol = @enumFromInt(1),
+        .args = .empty(),
+        .captures = stale_slots,
+        .body = .{ .roc = callee_body },
+        .ret = ty,
+    });
+
+    const supplied_value = try program.addExpr(.{ .ty = ty, .data = .{ .local = stale_capture } });
+    const supplied_span = try program.addCaptureOperandSpan(&.{.{
+        .id = checked.CaptureId.fromBinder(binder),
+        .value = supplied_value,
+    }});
+    const replaced_reference = try program.addExpr(.{ .ty = ty, .data = .{ .fn_ref = .{
+        .fn_id = callee,
+        .captures = supplied_span,
+    } } });
+
+    try recomputeCaptures(allocator, &program);
+
+    try std.testing.expectEqual(@as(usize, 0), program.typedLocalSpan(program.getFn(callee).captures).len);
+    const stale_reference = switch (program.getExpr(replaced_reference).data) {
+        .fn_ref => |fn_ref| fn_ref,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), program.captureOperandSpan(stale_reference.captures).len);
+    try std.testing.expectEqualStrings(
+        "operand count differed from target capture slot count",
+        (try checkCaptureInvariants(&program)).?,
+    );
 }
 
 test "capture graph propagates recursive captures with a worklist" {
