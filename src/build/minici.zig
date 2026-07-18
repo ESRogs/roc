@@ -71,6 +71,7 @@ const jobs = [_]Job{
     .{ .name = "run-test-zig-module-bundle" },
     .{ .name = "run-test-zig-module-unbundle" },
     .{ .name = "run-test-zig-module-base58" },
+    .{ .name = "run-test-zig-module-lsp" },
     .{ .name = "run-test-zig-module-lsp_unit" },
     .{ .name = "run-test-zig-module-lsp_integration", .kind = .harness },
     .{ .name = "run-test-zig-module-backend" },

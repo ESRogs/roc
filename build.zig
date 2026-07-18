@@ -2805,6 +2805,15 @@ pub fn build(b: *std.Build) void {
     run_test_wiring.step.dependOn(&install_test_wiring.step);
     run_check_test_wiring_step.dependOn(&run_test_wiring.step);
 
+    // The wiring check's semantic phase runs every Zig test binary with
+    // --listen=- to enumerate the tests each one actually contains (metadata
+    // only; no tests execute), then requires every named test decl in src/ to
+    // appear in some binary. The binary paths are appended as args at each
+    // b.addTest site below. They are only passed when the host can execute
+    // the configured target and no --test-filter trimmed the test set;
+    // otherwise the checker falls back to its import-level check alone.
+    const enumerate_tests_for_wiring_check = target_is_native and test_filters.len == 0;
+
     const run_minici = b.addRunArtifact(minici_exe);
     run_minici.addArg(b.graph.zig_exe);
     for (b.search_prefixes.items) |search_prefix| {
@@ -2922,7 +2931,7 @@ pub fn build(b: *std.Build) void {
     llvm_codegen_module.addImport("roc_target", roc_modules.roc_target);
     llvm_codegen_module.addImport("vendor_llvm_ir", roc_modules.vendor_llvm_ir);
 
-    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true, valgrind_support) orelse return;
+    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true, if (enumerate_tests_for_wiring_check) run_test_wiring else null, valgrind_support) orelse return;
     roc_modules.addAll(roc_exe);
     _ = install_and_run(b, no_bin, roc_exe, build_roc_step, run_roc_step, run_args);
 
@@ -2962,6 +2971,7 @@ pub fn build(b: *std.Build) void {
             llvm_codegen_module,
             null, // No tracy
             false,
+            null, // No machine-code shim test, so nothing to enumerate
             valgrind_support,
         );
         if (release_exe) |exe| {
@@ -4397,7 +4407,7 @@ pub fn build(b: *std.Build) void {
 
     for (module_tests_result.tests) |module_test| {
         // Add compiled builtins to tests that canonicalize ordinary modules.
-        if (std.mem.eql(u8, module_test.test_step.name, "can") or std.mem.eql(u8, module_test.test_step.name, "check") or std.mem.eql(u8, module_test.test_step.name, "eval") or std.mem.eql(u8, module_test.test_step.name, "compile") or std.mem.eql(u8, module_test.test_step.name, "lsp_unit") or std.mem.eql(u8, module_test.test_step.name, "lsp_integration")) {
+        if (std.mem.eql(u8, module_test.test_step.name, "can") or std.mem.eql(u8, module_test.test_step.name, "check") or std.mem.eql(u8, module_test.test_step.name, "eval") or std.mem.eql(u8, module_test.test_step.name, "compile") or std.mem.eql(u8, module_test.test_step.name, "lsp") or std.mem.eql(u8, module_test.test_step.name, "lsp_unit") or std.mem.eql(u8, module_test.test_step.name, "lsp_integration")) {
             module_test.test_step.root_module.addImport("compiled_builtins", compiled_builtins_module);
             module_test.test_step.step.dependOn(&write_compiled_builtins.step);
         }
@@ -4496,6 +4506,7 @@ pub fn build(b: *std.Build) void {
 
         b.default_step.dependOn(&module_test.test_step.step);
         build_test_zig_step.dependOn(&module_test.test_step.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(module_test.test_step);
         tests_summary.addRun(&module_test.run_step.step);
     }
 
@@ -4554,6 +4565,7 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     build_test_zig_step.dependOn(&build_helpers_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(build_helpers_test);
     const run_build_helpers_test = b.addRunArtifact(build_helpers_test);
     if (run_args.len != 0) {
         run_build_helpers_test.addArgs(run_args);
@@ -4585,6 +4597,7 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     build_test_zig_step.dependOn(&cli_runner_unit_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_runner_unit_test);
     const run_cli_runner_unit_test = b.addRunArtifact(cli_runner_unit_test);
     if (run_args.len != 0) {
         run_cli_runner_unit_test.addArgs(run_args);
@@ -4635,6 +4648,7 @@ pub fn build(b: *std.Build) void {
         backend_llvm_test.root_module.link_libcpp = true;
     }
     build_test_zig_step.dependOn(&backend_llvm_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(backend_llvm_test);
     const run_backend_llvm_test = b.addRunArtifact(backend_llvm_test);
     if (run_args.len != 0) {
         run_backend_llvm_test.addArgs(run_args);
@@ -4681,6 +4695,7 @@ pub fn build(b: *std.Build) void {
 
         add_tracy(b, roc_modules.build_options, snapshot_test, target, true, flag_enable_tracy);
         build_test_zig_step.dependOn(&snapshot_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(snapshot_test);
 
         const run_snapshot_test = b.addRunArtifact(snapshot_test);
         if (snapshot_exe_install) |install| {
@@ -4735,6 +4750,7 @@ pub fn build(b: *std.Build) void {
         }
         add_tracy(b, roc_modules.build_options, builtin_doc_test, target, true, flag_enable_tracy);
         build_test_zig_step.dependOn(&builtin_doc_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(builtin_doc_test);
 
         const run_builtin_doc_test = b.addRunArtifact(builtin_doc_test);
         if (run_args.len != 0) {
@@ -4781,6 +4797,7 @@ pub fn build(b: *std.Build) void {
     }
     add_tracy(b, roc_modules.build_options, lir_inline_test, target, true, flag_enable_tracy);
     build_test_zig_step.dependOn(&lir_inline_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(lir_inline_test);
 
     const run_lir_inline_test = b.addRunArtifact(lir_inline_test);
     if (run_args.len != 0) {
@@ -4826,6 +4843,7 @@ pub fn build(b: *std.Build) void {
     }
     add_tracy(b, roc_modules.build_options, trmc_lir_test, target, true, flag_enable_tracy);
     build_test_zig_step.dependOn(&trmc_lir_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(trmc_lir_test);
 
     const run_trmc_lir_test = b.addRunArtifact(trmc_lir_test);
     if (run_args.len != 0) {
@@ -4876,6 +4894,7 @@ pub fn build(b: *std.Build) void {
         cli_test.root_module.addImport("compiled_builtins", compiled_builtins_module);
         cli_test.step.dependOn(&write_compiled_builtins.step);
         build_test_zig_step.dependOn(&cli_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_test);
 
         const run_cli_test = b.addRunArtifact(cli_test);
         if (run_args.len != 0) {
@@ -4910,6 +4929,7 @@ pub fn build(b: *std.Build) void {
         linkWatchPlatformLibs(watch_test, target);
 
         build_test_zig_step.dependOn(&watch_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(watch_test);
 
         const run_watch_test = b.addRunArtifact(watch_test);
         if (run_args.len != 0) {
@@ -4937,6 +4957,7 @@ pub fn build(b: *std.Build) void {
             .filters = test_filters,
         });
         build_test_zig_step.dependOn(&minici_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(minici_test);
 
         const run_minici_test = b.addRunArtifact(minici_test);
         if (run_args.len != 0) {
@@ -5336,6 +5357,7 @@ pub fn build(b: *std.Build) void {
             run_fx_platform_test.addArgs(run_args);
         }
         build_test_zig_step.dependOn(&fx_platform_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(fx_platform_test);
         // Ensure host library is copied AND fixed before running the test
         run_fx_platform_test.step.dependOn(final_fx_host_step);
         run_fx_platform_test.step.dependOn(final_static_data_platform_step);
@@ -5432,6 +5454,7 @@ pub fn build(b: *std.Build) void {
                 run_http_header_decoder_platform_test.addArgs(run_args);
             }
             build_test_zig_step.dependOn(&http_header_decoder_platform_test.step);
+            if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(http_header_decoder_platform_test);
             run_http_header_decoder_platform_test.step.dependOn(final_http_host_step);
             run_http_header_decoder_platform_test.step.dependOn(&install_http_app.step);
             run_http_header_decoder_platform_test.step.dependOn(build_roc_step);
@@ -5551,6 +5574,7 @@ pub fn build(b: *std.Build) void {
                 run_json_decoder_platform_test.addArgs(run_args);
             }
             build_test_zig_step.dependOn(&json_decoder_platform_test.step);
+            if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(json_decoder_platform_test);
             run_json_decoder_platform_test.step.dependOn(final_json_host_step);
             run_json_decoder_platform_test.step.dependOn(&install_json_app.step);
             run_json_decoder_platform_test.step.dependOn(&install_json_camel_app.step);
@@ -5827,6 +5851,9 @@ fn addMainExe(
     llvm_codegen_module: *std.Build.Module,
     flag_enable_tracy: ?[]const u8,
     add_machine_code_shim_test: bool,
+    /// When set, the machine-code shim test binary is registered with the
+    /// test-wiring checker's semantic enumeration.
+    test_wiring_run: ?*Step.Run,
     valgrind_support: ?bool,
 ) ?*Step.Compile {
     const exe = b.addExecutable(.{
@@ -6066,6 +6093,7 @@ fn addMainExe(
         machine_code_shim_test.root_module.addObject(machine_code_shim_test_host);
         machine_code_shim_test.bundle_compiler_rt = true;
         add_tracy(b, roc_modules.build_options, machine_code_shim_test, b.graph.host, false, flag_enable_tracy);
+        if (test_wiring_run) |wiring_run| wiring_run.addArtifactArg(machine_code_shim_test);
 
         const run_machine_code_shim_test = b.addRunArtifact(machine_code_shim_test);
         const run_machine_code_shim_test_step = b.step(

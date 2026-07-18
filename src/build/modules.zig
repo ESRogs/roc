@@ -455,7 +455,7 @@ pub const RocModules = struct {
             .unbundle = b.addModule("unbundle", .{ .root_source_file = b.path("src/unbundle/mod.zig") }),
             .base58 = b.addModule("base58", .{ .root_source_file = b.path("src/base58/mod.zig") }),
             .lsp = b.addModule("lsp", .{ .root_source_file = b.path("src/lsp/mod.zig") }),
-            .lsp_unit = b.addModule("lsp_unit", .{ .root_source_file = b.path("src/lsp/unit_tests.zig") }),
+            .lsp_unit = b.addModule("lsp_unit", .{ .root_source_file = b.path("src/lsp/test/unit.zig") }),
             .lsp_integration = b.addModule("lsp_integration", .{ .root_source_file = b.path("src/lsp/test/integration.zig") }),
             .backend = b.addModule("backend", .{ .root_source_file = b.path("src/backend/mod.zig") }),
             .lir_core = b.addModule("lir_core", .{ .root_source_file = b.path("src/lir/core.zig") }),
@@ -716,6 +716,7 @@ pub const RocModules = struct {
             .bundle,
             .unbundle,
             .base58,
+            .lsp,
             .lsp_unit,
             .backend,
             .lir_core,
@@ -757,6 +758,12 @@ pub const RocModules = struct {
                 }),
                 .filters = filter_injection.filters,
             });
+
+            // The eval module's host-call trampoline is implemented in assembly;
+            // the test compile has its own root module, so it needs the file too.
+            if (module_type == .eval) {
+                test_step.root_module.addAssemblyFile(b.path("src/eval/host_trampoline.S"));
+            }
 
             // Watch module needs Core Foundation and FSEvents on macOS (only when not cross-compiling)
             // These frameworks provide the FSEvents API for proper event-driven file system monitoring on macOS.
