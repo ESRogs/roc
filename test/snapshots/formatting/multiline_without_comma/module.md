@@ -5,11 +5,13 @@ type=snippet
 ~~~
 # SOURCE
 ~~~roc
+module [
 	a,
 	b
 ]
 
 a = 'a'
+
 b = 'a'
 ~~~
 # EXPECTED

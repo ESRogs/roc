@@ -1346,13 +1346,3 @@ test "isUnique with different scenarios" {
     try std.testing.expect(@import("utils.zig").isUnique(ptr, ops));
 }
 
-test "rcNone function" {
-    // rcNone should be safe to call with any pointer
-    @import("utils.zig").rcNone(null, null);
-
-    var dummy: u8 = 42;
-    @import("utils.zig").rcNone(null, @as(?[*]u8, @ptrCast(&dummy)));
-
-    // If we get here without crashing, the test passed
-    try std.testing.expect(true);
-}

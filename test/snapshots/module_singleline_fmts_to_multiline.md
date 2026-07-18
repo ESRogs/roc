@@ -5,7 +5,7 @@ type=snippet
 ~~~
 # SOURCE
 ~~~roc
-
+module [something, SomeType,]
 ~~~
 # EXPECTED
 NIL

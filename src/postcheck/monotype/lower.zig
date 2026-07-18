@@ -28380,6 +28380,11 @@ test "body draft store appends draft-local ids spans and type cells" {
 
     const sealed_local: Ast.LocalId = @enumFromInt(@intFromEnum(local));
     const sealed_pat: Ast.PatId = @enumFromInt(@intFromEnum(pat));
+    const sealed_record_pat: Ast.PatId = @enumFromInt(@intFromEnum(record_pat));
+    const sealed_str_pat: Ast.PatId = @enumFromInt(@intFromEnum(str_pat));
+    const sealed_record_expr: Ast.ExprId = @enumFromInt(@intFromEnum(record_expr));
+    const sealed_match_expr: Ast.ExprId = @enumFromInt(@intFromEnum(match_expr));
+    const sealed_if_expr: Ast.ExprId = @enumFromInt(@intFromEnum(if_expr));
     const sealed_expr: Ast.ExprId = @enumFromInt(@intFromEnum(expr));
     const sealed_literal: Ast.StringLiteralId = @enumFromInt(@intFromEnum(literal));
     const sealed_site: Ast.ComptimeSiteId = @enumFromInt(@intFromEnum(site));
@@ -28414,14 +28419,14 @@ test "body draft store appends draft-local ids spans and type cells" {
         .bind => |bind_local| try std.testing.expectEqual(sealed_local, bind_local),
         else => return error.TestExpectedEqual,
     }
-    switch (program.getPat(record_pat).data) {
+    switch (program.getPat(sealed_record_pat).data) {
         .record => |span| {
             try std.testing.expectEqual(@as(u32, 0), span.start);
             try std.testing.expectEqual(@as(u32, 1), span.len);
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.getPat(str_pat).data) {
+    switch (program.getPat(sealed_str_pat).data) {
         .str_pattern => |pattern| {
             try std.testing.expectEqual(sealed_literal, pattern.prefix);
             try std.testing.expectEqual(@as(u32, 0), pattern.steps.start);
@@ -28434,14 +28439,14 @@ test "body draft store appends draft-local ids spans and type cells" {
         .local => |expr_local| try std.testing.expectEqual(sealed_local, expr_local),
         else => return error.TestExpectedEqual,
     }
-    switch (program.getExpr(record_expr).data) {
+    switch (program.getExpr(sealed_record_expr).data) {
         .record => |span| {
             try std.testing.expectEqual(@as(u32, 0), span.start);
             try std.testing.expectEqual(@as(u32, 1), span.len);
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.getExpr(match_expr).data) {
+    switch (program.getExpr(sealed_match_expr).data) {
         .match_ => |match_| {
             try std.testing.expectEqual(sealed_expr, match_.scrutinee);
             try std.testing.expectEqual(@as(u32, 0), match_.branches.start);
@@ -28450,7 +28455,7 @@ test "body draft store appends draft-local ids spans and type cells" {
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.getExpr(if_expr).data) {
+    switch (program.getExpr(sealed_if_expr).data) {
         .if_ => |if_| {
             try std.testing.expectEqual(@as(u32, 0), if_.branches.start);
             try std.testing.expectEqual(@as(u32, 1), if_.branches.len);
