@@ -258,6 +258,8 @@ const WrapperAnalyzer = struct {
             .loop_,
             .break_,
             .continue_,
+            .join_point,
+            .jump,
             .crash,
             .comptime_exhaustiveness_failed,
             => false,
@@ -360,6 +362,11 @@ const WrapperAnalyzer = struct {
                 try self.visitBodyCallees(h.hasher);
             },
             .block => |block| try self.visitBodyCallees(block.final_expr),
+            .join_point => |join_point| {
+                try self.visitBodyCallees(join_point.body);
+                try self.visitBodyCallees(join_point.remainder);
+            },
+            .jump => |jump| try self.visitSpanCallees(jump.args),
             .lambda,
             .fn_def,
             .let_,
