@@ -57,10 +57,18 @@ negate_if_odd = |num| if num.is_odd() {
 }
 ````
 
-TODO: explain code blocks in here.
-TODO: explain [autolink] syntax inside doc comments.
+TODO
+
+<!-- notes:
+explain code blocks in here.
+explain [autolink] syntax inside doc comments.
+-->
 
 ## Generating Docs with `roc docs`
 
-TODO: explain `roc docs`
-TODO: explain `roc docs --serve`
+TODO
+
+<!-- notes:
+explain `roc docs`
+explain `roc docs --serve`
+-->
