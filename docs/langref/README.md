@@ -94,6 +94,8 @@ If you're looking for a beginner tutorial, check out [roc-lang.org/tutorial](htt
     - [Or](operators#or)
     - [Arithmetic Operators](operators#arithmetic-operators)
     - [Comparison Operators](operators#comparison-operators)
+    - [Range Operators](operators#range-operators)
+    - [`??` (default value on `Err`)](operators#-default-value-on-err)
   - [Unary Prefix Operators](operators#unary-prefix-operators)
     - [`-` (`.negate()`)](operators#--negate)
     - [`!` (`.not()`)](operators#-not)
