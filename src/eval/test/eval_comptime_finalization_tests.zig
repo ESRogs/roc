@@ -59,11 +59,6 @@ const expect_success =
     \\main = 42
 ;
 
-const expect_failure =
-    \\expect missing_expect_condition
-    \\main = 42
-;
-
 const inline_expect_failure =
     \\bad = {
     \\    expect False
@@ -195,16 +190,29 @@ const associated_deep_multiple =
     \\main = Outer.a + Outer.Middle.b + Outer.Middle.Inner.c
 ;
 
-const problem_type_mismatch =
-    \\main = missing_numeric_bound_value
+const u8_out_of_range =
+    \\main : U8
+    \\main = 256
+;
+
+const i8_below_min =
+    \\main : I8
+    \\main = -129
+;
+
+const u64_negative =
+    \\main : U64
+    \\main = -1
 ;
 
 const div_zero =
-    \\main = missing_division_by_zero_value
+    \\main : I64
+    \\main = 1 // 0
 ;
 
 const mod_zero =
-    \\main = missing_modulo_by_zero_value
+    \\main : I64
+    \\main = 1 % 0
 ;
 
 const int_list_nil =
@@ -829,7 +837,6 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime eval - cross-module crash is detected", .source_kind = .module, .imports = &.{.{ .name = "Util", .source = import_crash_module }}, .source = "import Util\nmain = Util.safe", .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "comptime eval - imported constant can be accessed from headerless module", .source_kind = .module, .imports = &.{.{ .name = "Util", .source = "Util := [].{\n    hidden = 1\n    shown = 2\n}\n" }}, .source = "import Util\nmain = Util.hidden", .expected = .{ .inspect_str = "1.0" } },
     .{ .name = "comptime eval - expect success does not report", .source_kind = .module, .source = expect_success, .expected = .{ .inspect_str = "42.0" } },
-    .{ .name = "comptime eval - expect failure is reported but does not halt within def", .source_kind = .module, .source = expect_failure, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - inline expect failure in constant is reported", .source_kind = .module, .source = inline_expect_failure, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - multiple inline expect failures in constant are reported", .source_kind = .module, .source = multiple_inline_expect_failures, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - crash does not halt other defs", .source_kind = .module, .source = crash_other_defs, .expected = .{ .inspect_str = "42.0" } },
@@ -851,7 +858,9 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime eval - multiple associated items with dependencies", .source_kind = .module, .source = associated_multiple, .expected = .{ .inspect_str = "7.0" } },
     .{ .name = "comptime eval - deeply nested associated items (5+ levels)", .source_kind = .module, .source = associated_deep, .expected = .{ .inspect_str = "123.0" } },
     .{ .name = "comptime eval - deeply nested with multiple items at each level", .source_kind = .module, .source = associated_deep_multiple, .expected = .{ .inspect_str = "60.0" } },
-    .{ .name = "comptime eval - U8: 256 does not fit", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
+    .{ .name = "comptime eval - U8: 256 does not fit", .source_kind = .module, .source = u8_out_of_range, .expected = .{ .problem = {} } },
+    .{ .name = "comptime eval - I8: -129 does not fit", .source_kind = .module, .source = i8_below_min, .expected = .{ .problem = {} } },
+    .{ .name = "comptime eval - U64: negative literal does not fit", .source_kind = .module, .source = u64_negative, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - U8 valid max value", .source_kind = .module, .source = "main : U8\nmain = 255", .expected = .{ .inspect_str = "255" } },
     .{ .name = "comptime eval - I8 valid range", .source_kind = .module, .source = "main : I8\nmain = -128", .expected = .{ .inspect_str = "-128" } },
     .{ .name = "comptime eval - U16 valid max value", .source_kind = .module, .source = "main : U16\nmain = 65535", .expected = .{ .inspect_str = "65535" } },

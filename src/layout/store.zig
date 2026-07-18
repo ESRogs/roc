@@ -2708,9 +2708,9 @@ test "commitGraph resolves recursive Box back-edges to the union layout itself (
     // RichDoc := [PlainText(Str), Wrapped(Box(RichDoc))]. The recursive
     // reference reaches RichDoc through a Box, and the same shape is committed
     // twice through independently built graphs (as happens when the nominal is
-    // reached through different type vars). Issue #8816 was a segfault caused
-    // by the second computation leaving the recursive reference as an
-    // unresolved opaque_ptr placeholder instead of a Box of the union layout.
+    // reached through different type vars). Every commit must resolve the
+    // recursive reference to a Box of the union layout itself, never to an
+    // unresolved opaque_ptr placeholder (issue #8816).
     var graph_a = LayoutGraph{};
     defer graph_a.deinit(testing.allocator);
     const union_a = try graph_a.reserveNode(testing.allocator);
@@ -2754,11 +2754,11 @@ test "recursive nominal through Box keeps a single box indirection (issue #8916)
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
 
-    // Nat := [Zero, Suc(Box(Nat))]. Issue #8916 was a null-pointer crash when
-    // pattern matching such a value: the recursive occurrence inside an
-    // explicit Box container got boxed a second time, so unboxing followed a
-    // pointer that was never there. The Suc payload must be exactly one Box
-    // whose element is the union layout itself.
+    // Nat := [Zero, Suc(Box(Nat))]. The Suc payload must be exactly one Box
+    // whose element is the union layout itself: pattern matching unboxes
+    // exactly one level of indirection, so a second Box wrapped around the
+    // recursive occurrence would send it through a pointer that is never
+    // there (issue #8916).
     var graph = LayoutGraph{};
     defer graph.deinit(testing.allocator);
     const union_node = try graph.reserveNode(testing.allocator);
@@ -2801,10 +2801,9 @@ test "layoutSizeAlign computes finite sizes for a recursive union whose record p
     //     ForLoop({ identifiers: List(Str), block: List(Statement) }),
     //     IfStatement({ condition: U64, block: List(Statement) }),
     // ]
-    // Issue #8923 was a segfault from unbounded recursion while computing the
-    // size of a recursive type whose recursion runs through record fields
-    // holding List(Statement); size computation must terminate at the list
-    // indirection and keep the recursive element as the union layout itself.
+    // The recursion runs through record fields holding List(Statement); size
+    // computation must terminate at the list indirection and keep the
+    // recursive element as the union layout itself (issue #8923).
     var graph = LayoutGraph{};
     defer graph.deinit(testing.allocator);
 
