@@ -51,12 +51,8 @@ termination hazard, and one verification coverage gap):
 - [small/lift-capture-single-sourcing.md](small/lift-capture-single-sourcing.md)
   — one capture-fixpoint driver, the `if_initialized_payload` binder
   question, and the capture-id override path.
-- [big/solved-lir-body-verification.md](big/solved-lir-body-verification.md)
-  — a body-level oracle for the fused solved-to-LIR path (decision
-  verification exists; statement bodies are unverified).
 
-Within this batch: land `lambda-mono-oracle-fidelity` before
-`solved-lir-body-verification`; the rest are independent.
+Within this batch the projects are independent.
 `spec-constr-specialization-limits` pairs naturally with
 `spec-constr-static-match-soundness`.
 
