@@ -7,7 +7,7 @@ can't be wrapped in parentheses without causing an error. Some examples:
 
 - `x` is a valid expression. It evaluates to a value. `(x)` is valid.
 - `foo(1)` is a valid expression. It evaluates to a value. `(foo(1))` is valid.
-- `1` is a valid expression. It's already a value `(1)` is valid.
+- `1` is a valid expression. It's already a value. `(1)` is valid.
 - `import Foo` is a [statement](statements.md) not an expression. `(import Foo)` is invalid.
 - `# Something` is a [comment](comments.md), not an expression. `(# Something)` is invalid.
 - `package […]` is a [module header](modules.md#module-headers), not an expression. `(package […])` is invalid.
@@ -15,7 +15,7 @@ can't be wrapped in parentheses without causing an error. Some examples:
 Another way to think of an expression is that you can always assign it to a name—so, you
 can always put it after an `=` sign.
 
-## [Types of Expressions](#literal-expression) {#literal-expression}
+## [Types of Expressions](#types-of-expressions) {#types-of-expressions}
 
 Here are all the different types of expressions in Roc:
 
@@ -55,7 +55,7 @@ This implies that Roc has no concept of [value identity](https://en.wikipedia.or
 
 Heap-allocated Roc values are automatically [reference-counted](https://en.wikipedia.org/wiki/Reference_counting) ([atomically](https://en.wikipedia.org/wiki/Linearizability#Primitive_atomic_instructions), for thread-safety).
 
-Heap-allocated values include as strings, lists, boxes, and recursive tag unions. Numbers,
+Heap-allocated values include strings, lists, boxes, and recursive tag unions. Numbers,
 records, tuples, and non-recursive tag unions are stack-allocated, and so are not reference counted.
 
 ### [Reference Cycles](#reference-cycles) {#reference-cycles}
@@ -74,8 +74,8 @@ For example, when [`List.set`](../List#set) is passed a unique list (reference c
 ## [Block Expressions](#block-expressions) {#block-expressions}
 
 A _block expression_ is an expression with some optional [statements](statements.md)
-before the expression. It has its own scope, so anything assigned in it can't be.md accessed
-outsdie the block. The entire block evaluates to the expression at its end.
+before the expression. It has its own scope, so anything assigned in it can't be accessed
+outside the block. The entire block evaluates to the expression at its end.
 
 The statements are optional, so `{ x }` is a valid block expression. This is useful
 stylistically in situations like conditional branches:
@@ -84,7 +84,7 @@ stylistically in situations like conditional branches:
 x = if foo {
     …
 } else {
-    x
+    fallback
 }
 ```
 
@@ -116,11 +116,11 @@ like a [step debugger](https://en.wikipedia.org/wiki/Debugger), not part of a pr
 and so the side effect is allowed outside effectful functions (just like step debugging works on
 any expression, not just calling effectful functions).
 
-The only other exception to the rule is [`expect` statements](statements.md#expect),
+The only other exception to the rule is [`expect` statements](statements.md#expect), which similarly perform the side effect of reporting failed expectations. Like `dbg`, this output is intended for the programmer only, and is not part of a program's semantics.
 
 > Note that platform authors are in charge of what happens when memory gets allocated and
 > deallocated, and can therefore decide to perform side effects during memory allocation
-> and deallocation. This can easily cause surprising behavior for Roc applicationa authors,
+> and deallocation. This can easily cause surprising behavior for Roc application authors,
 > and should not be relied upon because Roc's optimizer assumes memory allocation and deallocation
 > has no observable effect on the program (unless allocation fails), which means these side
 > effects may be optimized away differently between patch releases of the compiler.

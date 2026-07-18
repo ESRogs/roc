@@ -7,21 +7,21 @@ They do not [evaluate](expressions.md#evaluation) to a [value](expressions.md#va
 
 An _assignment statement_ gives a name to a [value](expressions.md#values) inside the current scope.
 
-### [Pattern matching in assignments](#import-exposing) {#import-exposing}
+### [Pattern matching in assignments](#assignment-patterns) {#assignment-patterns}
 
-You can use [pattern matching](pattern-matching) in assignments to do things like destructuring:
+You can use [pattern matching](pattern-matching.md) in assignments to do things like destructuring:
 
 ```roc
 (x, y) = (1.1, 2.2)
 ```
 
-The pattern you use here must be [exhaustive](pattern-matching#exhaustiveness). For example, the following would give an exhaustiveness error because it doesn't specify what to do if `list.first()` returned an `Err` instead of `Ok`:
+The pattern you use here must be [exhaustive](pattern-matching.md#exhaustiveness). For example, the following would give an exhaustiveness error because it doesn't specify what to do if `list.first()` returned an `Err` instead of `Ok`:
 
 ```roc
 Ok(item) = list.first()
 ```
 
-If you can't write an exhaustive pattern-match, you can use [`match`](pattern-matching#match) instead of an assignment.
+If you can't write an exhaustive pattern-match, you can use [`match`](pattern-matching.md#match) instead of an assignment.
 
 ### [Assignment Order](#assignment-order) {#assignment-order}
 
@@ -67,14 +67,14 @@ y = |arg| if arg <= 9 { x(arg + 1) } else { 0 }
 ### [Reassignment](#reassignment) {#reassignment}
 
 Reassigning to an existing name is only allowed when the name was declared with
-[`var`](naming#var-keyword). This is allowed:
+[`var`](naming.md#var-keyword). This is allowed:
 
 ```roc
 var $foo = 0
 $foo = 1
 ```
 
-However, this gives a [shadowing](naming.md#shadowing) error:
+However, this gives a [shadowing](naming.md#shadowing) warning:
 
 ```roc
 foo = 0
@@ -123,7 +123,7 @@ my_func = |arg| {
 
 ## [`break`](#break) {#break}
 
-(This has not been implemented yet. It will exit a `for` or `while` loop.)
+The `break` statement immediately exits the innermost `for` or `while` loop. See [loops](loops.md#break-statement) for details.
 
 ## [`continue`](#continue) {#continue}
 
@@ -148,7 +148,7 @@ and have some way of continuing the process, but others may terminate the proces
 ## [Block Statements](#block-statements) {#block-statements}
 
 A _block statement_ is a group of statements which has its own scope, so
-anything [assigned](#assignment) in it can't be accessed outsdie the block.
+anything [assigned](#assignment) in it can't be accessed outside the block.
 
 It's different from a [block expression](expressions.md#block-expressions) in that
 a block statement does not have an expression at the end. A common block
@@ -164,7 +164,7 @@ if foo {
 }
 ```
 
-Having a single statement in a block expression is allowed:
+Having a single statement in a block statement is allowed:
 
 ```roc
 if foo {

@@ -83,7 +83,7 @@ Each platform consists of two parts:
 
 This design means application authors do not necessarily need to know (or care) about the non-Roc language being used to implement the platform's host. That can be a behind-the-scenes implementation detail that only the platform's authors are concerned with. Application authors interact only with the public-facing Roc API.
 
-The platform module's [`provides`](modules.md#provides) section is what maps Roc function identifiers to the symbol names Roc links against in the host.
+The platform module's [`provides`](modules.md#provides) section is what maps the symbol names Roc links against in the host to the Roc functions exposed under those symbols.
 
 ### Memory management
 

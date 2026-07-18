@@ -54,7 +54,7 @@ numbers from `start` up to `end` — excluding `end` with `..<`, including it
 with `..=`. They dispatch to methods on the bound type: `..<` calls
 `range_exclusive` and `..=` calls `range_inclusive`. Both operands must have
 the same type, and the result is an `Iter` of that type. See
-[Ranges](numbers#ranges) in the numbers page.
+[Ranges](numbers.md#ranges) in the numbers page.
 
 Range operators bind more loosely than the other binary operators, so
 `1..<n + 1` parses as `1..<(n + 1)`. They cannot be chained: `1..<5..<10` is
@@ -72,8 +72,8 @@ This desugars to:
 
 ```roc
 value = match fallible_expr {
-    Ok(val) -> val
-    Err(_) -> default_value
+    Ok(val) => val
+    Err(_) => default_value
 }
 ```
 

@@ -9,7 +9,7 @@ Roc uses Hindley–Milner type inference with a few deliberate restrictions:
 
 - **Rank-1.** Quantification happens once per definition, at the outermost
   level. A definition can be polymorphic (`identity : a -> a`), but a function
-  argument is used at a single type. I.E. you can't take an `(a -> a)` argument
+  argument is used at a single type—i.e. you can't take an `(a -> a)` argument
   and apply it at several element types within one call (that needs rank-2).
 - **No higher-kinded polymorphism.** Type variables range over types
   (`Str`, `List(U64)`), never over type constructors — you can't abstract over
@@ -166,7 +166,7 @@ nominal.
 
 ### Destructuring Nominal Types
 
-Pattern can be destructured to access inner values.
+Nominal types can be destructured with patterns to access their inner values.
 
 ```roc
 Color := [Red, Green, Blue].{
@@ -175,8 +175,8 @@ Color := [Red, Green, Blue].{
     
     is_red : Color -> Bool
     is_red = |color| match color {
-        Red -> True
-        _ -> False
+        Red => True
+        _ => False
     }
 }
 

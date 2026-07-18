@@ -70,6 +70,9 @@ specifically a URL parsing error, which is more informative than a generic name 
 
 Alias modules are more useful when exporting [mutually recursive types](#importing-mutually-recursive-types).
 
+(Note: alias modules have not been implemented yet. Currently, the compiler requires a type
+module's type to be nominal, and reports an error if it's a type alias.)
+
 ### "Void" modules
 
 Although it is most common to organize modules around a single type, sometimes you just
@@ -125,7 +128,7 @@ Mutually recursive types (discussed [below](#importing-mutually-recursive-types)
 they work in Roc; you'd define `FooBar.elm` which exposes the mutually recursive types `Foo` and `Bar`,
 and then import them using something like `import FooBar exposing (Foo, Bar)`.
 
-Comparing Roc and Elm, the `Util` case is nicer in Elm (you don't the void `Util` type),
+Comparing Roc and Elm, the `Util` case is nicer in Elm (you don't need the void `Util` type),
 and it's more obvious how to organize mutually recursive types (in Elm, you're already doing
 `import ____ exposing ____` as a matter of course).
 
@@ -196,7 +199,7 @@ Rust allows cyclic module imports because it caches at the package ("crate" in R
 level rather than the module level. (As a similar consequence, Rust disallows packages from
 cyclically depending on one another, as do Elm and Roc.) Cyclic module imports can be
 convenient in Rust, but Rust's lack of module-level caching is a significant contributing
-factor to Elm and Roc being generally being known for much faster build times than Rust.
+factor to Elm and Roc generally being known for much faster build times than Rust.
 
 ## `import` Statements
 
@@ -297,6 +300,9 @@ module for purposes of referencing each other. This technique can be especially 
 [package modules](#package-modules), which can choose to expose `Foo` and `Bar` but not
 `FooBar`, such that end users don't even see the `FooBar` wrapper type.
 
+(Note: as mentioned in the [alias modules](#alias-modules) section, alias modules have not
+been implemented yet, so this technique doesn't work yet either.)
+
 ### Design Notes on Imports
 
 Obviously, mutually recursive types take more effort to work with than other types.
@@ -321,7 +327,7 @@ fast when a code base is small.
 Roc intentionally disallows import cycles in order to prevent this from happening. If you
 want to have modules reference each other, you have to put them in the same `.roc` file. This
 adds friction (imports get more verbose, and the antidote for that is to create alias modules,
-which is also extra effort), and that friction is the language naturally pushes back on a code
+which is also extra effort), and that friction is how the language naturally pushes back on a code
 organization strategy which unavoidably harms build times.
 
 Having a large module cycle is easy to do by accident when cyclic imports are allowed,
@@ -347,22 +353,6 @@ Exactly what information goes in which headers will be discussed below.
 
 Packages are collections of types that can depend on other packages.
 
-They have their own (lowercase) namespaces, so for example:
-
-```roc
-package [] {
-
-} depends [
-# TODO what's the new syntax for this? introduce package shorthands here, since app modules are down below
-]
-```
-
-### Package Shorthands
-
-TODO
-
-## Package Modules
-
 A _package module_ provides types to be shared with packages, applications and platforms. The module header specifies which types are exposed, and also includes package aliases for importing other packages:
 
 ```roc
@@ -373,6 +363,10 @@ package [
 ] { json: "..." }
 ```
 
+### Package Shorthands
+
+TODO
+
 ## Platform Modules
 
 A _platform module_ defines the interface between a Roc application and the host program.
@@ -382,8 +376,8 @@ platform "my-platform"
     requires { main : Str -> Str }
     exposes [Http, File]
     packages { json: "../json/main.roc" }
-    provides { entrypoint: "roc__entrypoint" }
-    targets { ... }
+    provides { "roc__entrypoint": main }
+    targets : { ... }
 ```
 
 ### requires
@@ -426,10 +420,10 @@ packages { json: "../json/main.roc" }
 
 ### provides
 
-The `provides` section maps function identifiers to the symbols names Roc will link with the platform host:
+The `provides` section maps each symbol name Roc will link with the platform host to the function that will be exposed under that symbol:
 
 ```roc
-provides { entrypoint: "roc__entrypoint" }
+provides { "roc__entrypoint": main }
 ```
 
 ### targets
@@ -445,7 +439,7 @@ targets : {
 }
 ```
 
-- `inputs`: The directory containing target-specific files within a package `.tar.zst` bundle.
+- `inputs_dir`: The directory containing target-specific files within a package `.tar.zst` bundle.
 - Each target entry lists its link `inputs` and an optional `output` kind.
 
 The `output` field declares the artifact kind the target produces:
@@ -524,7 +518,7 @@ a UI for displaying printed output) in WebAssembly. This `echo!` function is aut
 imported unqualified into the application's scope, so that a complete Hello World in Roc can be:
 
 ```roc
-main! = |_args| echo! "Hello, World!"
+main! = |_args| echo!("Hello, World!")
 ```
 
 The `main!` function the Echo Platform receives will get command-line arguments, if applicable,
