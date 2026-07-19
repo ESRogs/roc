@@ -140,19 +140,16 @@ pub fn Callbacks(comptime Env: type) type {
             return realloc(host.rocAllocator(), ptr, new_length, alignment) orelse allocFailed();
         }
 
-        pub fn rocDbgFn(ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
-            _ = ops;
+        pub fn rocDbgFn(_: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
             std.debug.print("ROC DBG: {s}\n", .{bytes[0..len]});
         }
 
-        pub fn rocExpectFailedFn(ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
-            _ = ops;
+        pub fn rocExpectFailedFn(_: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
             const trimmed = std.mem.trim(u8, bytes[0..len], " \t\n\r");
             std.debug.print("Expect failed: {s}\n", .{trimmed});
         }
 
-        pub fn rocCrashedFn(ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
-            _ = ops;
+        pub fn rocCrashedFn(_: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
             std.debug.print("\n\x1b[31mRoc crashed:\x1b[0m {s}\n", .{bytes[0..len]});
             std.process.exit(1);
         }
