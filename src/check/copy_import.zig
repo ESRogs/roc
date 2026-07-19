@@ -23,6 +23,7 @@ const Var = types_mod.Var;
 const Flex = types_mod.Flex;
 const Rigid = types_mod.Rigid;
 const StaticDispatchConstraint = types_mod.StaticDispatchConstraint;
+const InterpolationPartMetadata = types_mod.InterpolationPartMetadata;
 const Content = types_mod.Content;
 const FlatType = types_mod.FlatType;
 const Alias = types_mod.Alias;
@@ -465,6 +466,7 @@ fn copyStaticDispatchConstraints(
         var dest_constraint = source_constraint;
         dest_constraint.fn_name = translated_fn_name;
         dest_constraint.fn_var = try copyVarCtx(ctx, source_constraint.fn_var);
+        dest_constraint.interpolation = try copyInterpolationMetadata(ctx, source_constraint.interpolation);
         if (source_constraint.derived_map_plan) |plan| {
             dest_constraint.derived_map_plan = .{
                 .tag_name = try ctx.copyIdent(plan.tag_name),
@@ -482,4 +484,28 @@ fn copyStaticDispatchConstraints(
     }
 
     return try ctx.dest_store.appendStaticDispatchConstraints(dest_constraints.items);
+}
+
+fn copyInterpolationMetadata(
+    ctx: *const CopyContext,
+    source_metadata: StaticDispatchConstraint.InterpolationMetadata,
+) std.mem.Allocator.Error!StaticDispatchConstraint.InterpolationMetadata {
+    if (!source_metadata.isPresent()) return source_metadata;
+
+    const source_parts = ctx.source_store.sliceInterpolationParts(source_metadata.interpolated_parts);
+    var dest_parts = try std.ArrayList(InterpolationPartMetadata).initCapacity(ctx.dest_store.gpa, source_parts.len);
+    defer dest_parts.deinit(ctx.dest_store.gpa);
+
+    for (source_parts) |source_part| {
+        dest_parts.appendAssumeCapacity(.{
+            .var_ = try copyVarCtx(ctx, source_part.var_),
+            .region = source_part.region,
+        });
+    }
+
+    return .{
+        .expr_region = source_metadata.expr_region,
+        .item_var = try copyVarCtx(ctx, source_metadata.item_var),
+        .interpolated_parts = try ctx.dest_store.appendInterpolationParts(dest_parts.items),
+    };
 }
