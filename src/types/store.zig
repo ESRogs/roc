@@ -49,6 +49,7 @@ const FlatType = types.FlatType;
 const NominalType = types.NominalType;
 const NominalDecl = types.NominalDecl;
 const StaticDispatchConstraint = types.StaticDispatchConstraint;
+const InterpolationPartMetadata = types.InterpolationPartMetadata;
 const SourceDecl = types.SourceDecl;
 
 /// A variable & its descriptor info
@@ -128,6 +129,7 @@ pub const Store = struct {
     vars: VarSafeList,
     record_fields: RecordFieldSafeMultiList,
     tags: TagSafeMultiList,
+    interpolation_parts: InterpolationPartMetadata.SafeList,
     static_dispatch_constraints: StaticDispatchConstraint.SafeList,
 
     /// The nominal declaration table: one entry per nominal declaration whose
@@ -185,6 +187,7 @@ pub const Store = struct {
             .vars = try VarSafeList.initCapacity(gpa, child_capacity),
             .record_fields = try RecordFieldSafeMultiList.initCapacity(gpa, child_capacity),
             .tags = try TagSafeMultiList.initCapacity(gpa, child_capacity),
+            .interpolation_parts = try InterpolationPartMetadata.SafeList.initCapacity(gpa, child_capacity),
             .static_dispatch_constraints = try StaticDispatchConstraint.SafeList.initCapacity(gpa, child_capacity),
 
             // nominal declaration table (modules typically declare few types)
@@ -217,6 +220,7 @@ pub const Store = struct {
         self.vars.deinit(self.gpa);
         self.record_fields.deinit(self.gpa);
         self.tags.deinit(self.gpa);
+        self.interpolation_parts.deinit(self.gpa);
         self.static_dispatch_constraints.deinit(self.gpa);
 
         // nominal declaration table
@@ -237,6 +241,7 @@ pub const Store = struct {
             .vars = try self.vars.clone(gpa),
             .record_fields = try self.record_fields.clone(gpa),
             .tags = try self.tags.clone(gpa),
+            .interpolation_parts = try self.interpolation_parts.clone(gpa),
             .static_dispatch_constraints = try self.static_dispatch_constraints.clone(gpa),
             .nominal_decls = try self.nominal_decls.clone(gpa),
             .nominal_decl_index = try self.nominal_decl_index.clone(gpa),
@@ -283,6 +288,7 @@ pub const Store = struct {
         vars_len: usize,
         record_fields_len: usize,
         tags_len: usize,
+        interpolation_parts_len: usize,
         static_dispatch_constraints_len: usize,
         verify_clone: SavepointVerifyClone = savepoint_verify_clone_init,
     };
@@ -336,6 +342,7 @@ pub const Store = struct {
             .vars_len = self.vars.items.items.len,
             .record_fields_len = self.record_fields.items.len,
             .tags_len = self.tags.items.len,
+            .interpolation_parts_len = self.interpolation_parts.items.items.len,
             .static_dispatch_constraints_len = self.static_dispatch_constraints.items.items.len,
             .verify_clone = verify_clone,
         };
@@ -397,6 +404,7 @@ pub const Store = struct {
         self.vars.items.shrinkRetainingCapacity(savepoint.vars_len);
         self.record_fields.items.shrinkRetainingCapacity(savepoint.record_fields_len);
         self.tags.items.shrinkRetainingCapacity(savepoint.tags_len);
+        self.interpolation_parts.items.shrinkRetainingCapacity(savepoint.interpolation_parts_len);
         self.static_dispatch_constraints.items.shrinkRetainingCapacity(savepoint.static_dispatch_constraints_len);
 
         // Back to not speculating; savepoint_baseline_* are dead until the next create.
@@ -808,6 +816,11 @@ pub const Store = struct {
         return try self.tags.appendSlice(self.gpa, slice);
     }
 
+    /// Append interpolation part metadata to the backing list, returning the range
+    pub fn appendInterpolationParts(self: *Self, slice: []const InterpolationPartMetadata) std.mem.Allocator.Error!InterpolationPartMetadata.SafeList.Range {
+        return try self.interpolation_parts.appendSlice(self.gpa, slice);
+    }
+
     /// Append static dispatch constraints to the backing list, returning the range
     pub fn appendStaticDispatchConstraints(self: *Self, s: []const StaticDispatchConstraint) std.mem.Allocator.Error!StaticDispatchConstraint.SafeList.Range {
         return try self.static_dispatch_constraints.appendSlice(self.gpa, s);
@@ -843,6 +856,19 @@ pub const Store = struct {
     /// Given a range, get a slice of tags from the backing array
     pub fn getTagsSlice(self: *const Self, range: TagSafeMultiList.Range) TagSafeMultiList.Slice {
         return self.tags.sliceRange(range);
+    }
+
+    /// Given a range, get a slice of interpolation part metadata from the backing array
+    pub fn sliceInterpolationParts(self: *const Self, range: InterpolationPartMetadata.SafeList.Range) []InterpolationPartMetadata {
+        return self.interpolation_parts.sliceRange(range);
+    }
+
+    /// Get an interpolation part at a specific offset within a range.
+    /// Use this for index-based iteration when checking can trigger reallocations.
+    pub fn getInterpolationPartAt(self: *const Self, range: InterpolationPartMetadata.SafeList.Range, offset: u32) InterpolationPartMetadata {
+        std.debug.assert(offset < range.count);
+        const idx: InterpolationPartMetadata.SafeList.Idx = @enumFromInt(@intFromEnum(range.start) + offset);
+        return self.interpolation_parts.get(idx).*;
     }
 
     /// Given a range, get a slice of vars from the backing array
@@ -1213,6 +1239,7 @@ pub const Store = struct {
         vars: VarSafeList.Serialized,
         record_fields: RecordFieldSafeMultiList.Serialized,
         tags: TagSafeMultiList.Serialized,
+        interpolation_parts: InterpolationPartMetadata.SafeList.Serialized,
         static_dispatch_constraints: StaticDispatchConstraint.SafeList.Serialized,
         nominal_decls: NominalDecl.SafeList.Serialized,
         nominal_decl_index: NominalDeclIndexEntry.SafeList.Serialized,
@@ -1230,6 +1257,7 @@ pub const Store = struct {
             try self.vars.serialize(&store.vars, allocator, writer);
             try self.record_fields.serialize(&store.record_fields, allocator, writer);
             try self.tags.serialize(&store.tags, allocator, writer);
+            try self.interpolation_parts.serialize(&store.interpolation_parts, allocator, writer);
             try self.static_dispatch_constraints.serialize(&store.static_dispatch_constraints, allocator, writer);
             try self.nominal_decls.serialize(&store.nominal_decls, allocator, writer);
             try self.nominal_decl_index.serialize(&store.nominal_decl_index, allocator, writer);
@@ -1251,6 +1279,7 @@ pub const Store = struct {
                 .vars = self.vars.deserializeInto(base_addr),
                 .record_fields = self.record_fields.deserializeInto(base_addr),
                 .tags = self.tags.deserializeInto(base_addr),
+                .interpolation_parts = self.interpolation_parts.deserializeInto(base_addr),
                 .static_dispatch_constraints = self.static_dispatch_constraints.deserializeInto(base_addr),
                 .nominal_decls = self.nominal_decls.deserializeInto(base_addr),
                 .nominal_decl_index = self.nominal_decl_index.deserializeInto(base_addr),
@@ -1267,6 +1296,7 @@ pub const Store = struct {
                 .vars = try self.vars.deserializeWithCopy(base_addr, gpa),
                 .record_fields = try self.record_fields.deserializeWithCopy(base_addr, gpa),
                 .tags = try self.tags.deserializeWithCopy(base_addr, gpa),
+                .interpolation_parts = try self.interpolation_parts.deserializeWithCopy(base_addr, gpa),
                 .static_dispatch_constraints = try self.static_dispatch_constraints.deserializeWithCopy(base_addr, gpa),
                 .nominal_decls = try self.nominal_decls.deserializeWithCopy(base_addr, gpa),
                 .nominal_decl_index = try self.nominal_decl_index.deserializeWithCopy(base_addr, gpa),
@@ -1291,6 +1321,7 @@ pub const Store = struct {
             .vars = (try self.vars.serialize(allocator, writer)).*,
             .record_fields = (try self.record_fields.serialize(allocator, writer)).*,
             .tags = (try self.tags.serialize(allocator, writer)).*,
+            .interpolation_parts = (try self.interpolation_parts.serialize(allocator, writer)).*,
             .static_dispatch_constraints = (try self.static_dispatch_constraints.serialize(allocator, writer)).*,
             .nominal_decls = (try self.nominal_decls.serialize(allocator, writer)).*,
             .nominal_decl_index = (try self.nominal_decl_index.serialize(allocator, writer)).*,
@@ -1306,6 +1337,7 @@ pub const Store = struct {
         self.vars.relocate(offset);
         self.record_fields.relocate(offset);
         self.tags.relocate(offset);
+        self.interpolation_parts.relocate(offset);
         self.static_dispatch_constraints.relocate(offset);
         self.nominal_decls.relocate(offset);
         self.nominal_decl_index.relocate(offset);

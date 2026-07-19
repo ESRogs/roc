@@ -13,6 +13,7 @@ const TypesStore = types_store.Store;
 const Var = types_mod.Var;
 const Flex = types_mod.Flex;
 const StaticDispatchConstraint = types_mod.StaticDispatchConstraint;
+const InterpolationPartMetadata = types_mod.InterpolationPartMetadata;
 const Rigid = types_mod.Rigid;
 const Content = types_mod.Content;
 const FlatType = types_mod.FlatType;
@@ -112,7 +113,6 @@ pub const Instantiator = struct {
     store: *TypesStore,
     idents: *const base.Ident.Store,
     var_map: *std.AutoHashMap(Var, Var),
-    constraint_fn_var_map: ?*std.AutoHashMap(Var, Var) = null,
 
     current_rank: Rank,
     rigid_behavior: RigidBehavior,
@@ -610,9 +610,34 @@ pub const Instantiator = struct {
     fn instantiateStaticDispatchConstraint(self: *Self, constraint: StaticDispatchConstraint) std.mem.Allocator.Error!StaticDispatchConstraint {
         var result = constraint;
         result.fn_var = try self.instantiateVar(constraint.fn_var);
-        if (self.constraint_fn_var_map) |map| {
-            try map.put(constraint.fn_var, result.fn_var);
-        }
+        result.interpolation = try self.instantiateInterpolationMetadata(constraint.interpolation);
         return result;
+    }
+
+    fn instantiateInterpolationMetadata(
+        self: *Self,
+        metadata: StaticDispatchConstraint.InterpolationMetadata,
+    ) std.mem.Allocator.Error!StaticDispatchConstraint.InterpolationMetadata {
+        if (!metadata.isPresent()) return metadata;
+
+        const parts_len = metadata.interpolated_parts.len();
+        var fresh_parts_sfa = std.heap.stackFallback(8 * @sizeOf(InterpolationPartMetadata), self.store.gpa);
+        const fresh_parts_alloc = fresh_parts_sfa.get();
+        var fresh_parts = try std.ArrayList(InterpolationPartMetadata).initCapacity(fresh_parts_alloc, parts_len);
+        defer fresh_parts.deinit(fresh_parts_alloc);
+
+        for (0..parts_len) |i| {
+            const part = self.store.getInterpolationPartAt(metadata.interpolated_parts, @intCast(i));
+            fresh_parts.appendAssumeCapacity(.{
+                .var_ = try self.instantiateVar(part.var_),
+                .region = part.region,
+            });
+        }
+
+        return .{
+            .expr_region = metadata.expr_region,
+            .item_var = try self.instantiateVar(metadata.item_var),
+            .interpolated_parts = try self.store.appendInterpolationParts(fresh_parts.items),
+        };
     }
 };

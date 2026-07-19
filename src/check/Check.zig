@@ -34,6 +34,7 @@ const Ident = base.Ident;
 const Region = base.Region;
 const DeferredConstraintCheck = unifier.DeferredConstraintCheck;
 const StaticDispatchConstraint = types_mod.StaticDispatchConstraint;
+const InterpolationPartMetadata = types_mod.InterpolationPartMetadata;
 const Func = types_mod.Func;
 const Var = types_mod.Var;
 const Flex = types_mod.Flex;
@@ -76,26 +77,6 @@ const FunctionEffectResolution = enum {
             .unresolved => .unresolved,
         };
     }
-};
-
-const InterpolationConstraintId = enum(u32) { _ };
-
-const InterpolationPartMetadata = struct {
-    var_: Var,
-    /// The interpolation use site's region. This remains stable when `var_` is
-    /// remapped to a fresh variable during instantiation.
-    region: Region,
-};
-
-const InterpolationConstraintMetadata = struct {
-    expr_idx: CIR.Expr.Idx,
-    item_var: Var,
-    /// The interpolated expressions (the even-indexed entries of the
-    /// `e_interpolation` `parts`). Their vars are remapped through the
-    /// instantiation var-map in `copyConstraintMetadata`; their source regions
-    /// remain the original interpolation use sites. Owned; freed in `deinit`.
-    interpolated_parts: []InterpolationPartMetadata,
-    checked_parts: bool = false,
 };
 
 /// Transient checker input carrying the platform root's requirement surface:
@@ -165,8 +146,6 @@ return_constraints: std.ArrayListUnmanaged(ReturnConstraint),
 return_constraint_frames: std.ArrayListUnmanaged(ReturnConstraintFrame),
 /// A map from one var to another. Used in instantiation and var copying
 var_map: std.AutoHashMap(Var, Var),
-/// Static-dispatch constraint function vars copied during instantiation.
-constraint_fn_var_map: std.AutoHashMap(Var, Var),
 /// A map from one var to another. Used in instantiation and var copying
 var_set: std.AutoHashMap(Var, void),
 /// A map from one var to another. Used to apply type arguments in instantiation
@@ -205,11 +184,8 @@ ident_to_var_map: std.AutoHashMap(Ident.Idx, Var),
 /// method call resolves to a record field function, the checker rewrites the
 /// method call to an ordinary call using this field access as the callee.
 method_field_access_exprs: std.AutoHashMapUnmanaged(CIR.Expr.Idx, CIR.Expr.Idx),
-/// Interpolation metadata records keyed by their static dispatch constraint function.
-interpolation_constraint_ids_by_fn_var: std.AutoHashMap(Var, InterpolationConstraintId),
-/// Metadata produced when checking interpolation expressions and consumed when
-/// finalizing custom `from_interpolation` dispatch.
-interpolation_constraint_metadata: std.ArrayListUnmanaged(InterpolationConstraintMetadata),
+/// Interpolation constraint function vars whose custom part checks have already run.
+checked_interpolation_part_constraints: std.AutoHashMap(Var, void),
 /// Dispatcher/method pairs already reported by `reportConstraintError`, so a
 /// constraint failing in multiple passes (or reachable through several aliased
 /// type variables) is reported once.
@@ -1463,7 +1439,6 @@ fn initAssumePrepared(
         .env_pool = try EnvPool.init(gpa),
         .generalizer = try Generalizer.init(gpa, types),
         .var_map = std.AutoHashMap(Var, Var).init(gpa),
-        .constraint_fn_var_map = std.AutoHashMap(Var, Var).init(gpa),
         .constraints = try Constraint.SafeList.initCapacity(gpa, 32),
         .return_constraints = .empty,
         .return_constraint_frames = .empty,
@@ -1483,8 +1458,7 @@ fn initAssumePrepared(
         .builtin_types_copied = false,
         .ident_to_var_map = std.AutoHashMap(Ident.Idx, Var).init(gpa),
         .method_field_access_exprs = .{},
-        .interpolation_constraint_ids_by_fn_var = std.AutoHashMap(Var, InterpolationConstraintId).init(gpa),
-        .interpolation_constraint_metadata = .empty,
+        .checked_interpolation_part_constraints = std.AutoHashMap(Var, void).init(gpa),
         .reported_constraint_errors = std.AutoHashMap(ReportedConstraintError, void).init(gpa),
         .reported_effectful_expect = std.AutoHashMap(Var, void).init(gpa),
         .current_expect_region = null,
@@ -1608,7 +1582,6 @@ pub fn deinit(self: *Self) void {
     self.env_pool.deinit();
     self.generalizer.deinit(self.gpa);
     self.var_map.deinit();
-    self.constraint_fn_var_map.deinit();
     self.constraints.deinit(self.gpa);
     self.return_constraints.deinit(self.gpa);
     self.return_constraint_frames.deinit(self.gpa);
@@ -1624,11 +1597,7 @@ pub fn deinit(self: *Self) void {
     self.import_cache.deinit(self.gpa);
     self.ident_to_var_map.deinit();
     self.method_field_access_exprs.deinit(self.gpa);
-    self.interpolation_constraint_ids_by_fn_var.deinit();
-    for (self.interpolation_constraint_metadata.items) |meta| {
-        self.gpa.free(meta.interpolated_parts);
-    }
-    self.interpolation_constraint_metadata.deinit(self.gpa);
+    self.checked_interpolation_part_constraints.deinit();
     self.reported_constraint_errors.deinit();
     self.reported_effectful_expect.deinit();
     self.top_level_ptrns.deinit(self.gpa);
@@ -3740,7 +3709,6 @@ fn tryResolveStructuralRecordFieldDispatch(
     const call_func_var = try self.freshFromContent(call_func_content, env, expr_region);
     const result = try self.unify(callable_field_var, call_func_var, env);
     if (!result.isProblem()) {
-        try self.linkConstraintMetadata(callable_field_var, call_func_var);
         try self.reportEffectfulDispatchInExpect(constraint);
     }
 
@@ -3890,21 +3858,9 @@ fn instantiateVarHelp(
 
     // First, reset state
     instantiator.var_map.clearRetainingCapacity();
-    self.constraint_fn_var_map.clearRetainingCapacity();
-
-    const copy_constraint_metadata = self.hasConstraintMetadata();
-    instantiator.constraint_fn_var_map = if (copy_constraint_metadata) &self.constraint_fn_var_map else null;
 
     // Then, instantiate the variable with the provided context
     const instantiated_var = try instantiator.instantiateVar(var_to_instantiate);
-    instantiator.constraint_fn_var_map = null;
-
-    if (copy_constraint_metadata and self.constraint_fn_var_map.count() > 0) {
-        var constraint_iterator = self.constraint_fn_var_map.iterator();
-        while (constraint_iterator.next()) |x| {
-            try self.copyConstraintMetadata(x.key_ptr.*, x.value_ptr.*);
-        }
-    }
 
     if (instantiator.recursion_overflow) {
         // Non-terminating instantiation — e.g. a self-referential static-dispatch
@@ -7125,130 +7081,6 @@ fn judgeResidualAmbiguityCandidates(self: *Self) Allocator.Error!void {
         };
         if (constraints_range.len() == 0) continue;
         try self.judgeAmbiguityCandidate(candidate.*, resolved.var_, resolved.desc.rank, constraints_range);
-    }
-}
-
-fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationConstraintId {
-    if (self.interpolation_constraint_ids_by_fn_var.count() == 0) return null;
-
-    if (self.interpolation_constraint_ids_by_fn_var.get(fn_var)) |id| return id;
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        if (self.interpolation_constraint_ids_by_fn_var.get(resolved)) |id| return id;
-    }
-
-    return null;
-}
-
-fn recordInterpolationConstraintIdForFnVar(
-    self: *Self,
-    fn_var: Var,
-    id: InterpolationConstraintId,
-) std.mem.Allocator.Error!void {
-    try self.interpolation_constraint_ids_by_fn_var.put(fn_var, id);
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        try self.interpolation_constraint_ids_by_fn_var.put(resolved, id);
-    }
-}
-
-fn recordInterpolationConstraintMetadata(
-    self: *Self,
-    fn_var: Var,
-    expr_idx: CIR.Expr.Idx,
-    item_var: Var,
-) std.mem.Allocator.Error!void {
-    // Capture each part's type var and interpolation use-site region now. Re-checking remaps
-    // the vars per instantiation while keeping the source regions stable (see
-    // `copyConstraintMetadata`).
-    const interpolation = self.cir.store.getExpr(expr_idx).e_interpolation;
-    const parts = self.cir.store.sliceExpr(interpolation.parts);
-    std.debug.assert(parts.len % 2 == 0);
-    const interpolated_parts = try self.gpa.alloc(InterpolationPartMetadata, parts.len / 2);
-    errdefer self.gpa.free(interpolated_parts);
-    var part_i: usize = 0;
-    while (part_i < parts.len) : (part_i += 2) {
-        const part_expr_idx = parts[part_i];
-        interpolated_parts[part_i / 2] = .{
-            .var_ = ModuleEnv.varFrom(part_expr_idx),
-            .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(part_expr_idx)),
-        };
-    }
-
-    const id: InterpolationConstraintId = @enumFromInt(self.interpolation_constraint_metadata.items.len);
-    try self.recordInterpolationConstraintIdForFnVar(fn_var, id);
-    try self.interpolation_constraint_metadata.append(self.gpa, .{
-        .expr_idx = expr_idx,
-        .item_var = item_var,
-        .interpolated_parts = interpolated_parts,
-    });
-}
-
-fn linkConstraintMetadata(
-    self: *Self,
-    left: Var,
-    right: Var,
-) std.mem.Allocator.Error!void {
-    if (self.interpolationConstraintIdForFnVar(left) orelse self.interpolationConstraintIdForFnVar(right)) |id| {
-        try self.recordInterpolationConstraintIdForFnVar(left, id);
-        try self.recordInterpolationConstraintIdForFnVar(right, id);
-    }
-}
-
-fn hasConstraintMetadata(self: *Self) bool {
-    return self.interpolation_constraint_ids_by_fn_var.count() > 0;
-}
-
-fn instantiatedMetadataVar(self: *Self, var_: Var) Var {
-    const resolved = self.types.resolveVar(var_).var_;
-    return self.var_map.get(resolved) orelse resolved;
-}
-
-fn copyConstraintMetadata(
-    self: *Self,
-    old_var: Var,
-    fresh_var: Var,
-) std.mem.Allocator.Error!void {
-    std.debug.assert(self.hasConstraintMetadata());
-
-    var maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(old_var);
-
-    if (maybe_interpolation_id == null) {
-        const resolved_old = self.types.resolveVar(old_var).var_;
-        if (resolved_old != old_var) {
-            maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(resolved_old);
-        }
-    }
-
-    if (maybe_interpolation_id == null) return;
-
-    const resolved_fresh = self.types.resolveVar(fresh_var).var_;
-    if (maybe_interpolation_id) |old_id| {
-        const old_metadata = self.interpolation_constraint_metadata.items[@intFromEnum(old_id)];
-        // Remap each interpolated-part var through the instantiation var-map, exactly as
-        // `item_var` is remapped, so the re-check unifies instantiated item type against
-        // instantiated part vars (the original CIR part vars belong to the generalized copy).
-        const new_interpolated_parts = try self.gpa.alloc(InterpolationPartMetadata, old_metadata.interpolated_parts.len);
-        errdefer self.gpa.free(new_interpolated_parts);
-        for (old_metadata.interpolated_parts, 0..) |old_part, i| {
-            new_interpolated_parts[i] = .{
-                .var_ = self.instantiatedMetadataVar(old_part.var_),
-                .region = old_part.region,
-            };
-        }
-        const new_item_var = self.instantiatedMetadataVar(old_metadata.item_var);
-        const new_id: InterpolationConstraintId = @enumFromInt(self.interpolation_constraint_metadata.items.len);
-        try self.recordInterpolationConstraintIdForFnVar(fresh_var, new_id);
-        if (resolved_fresh != fresh_var) {
-            try self.recordInterpolationConstraintIdForFnVar(resolved_fresh, new_id);
-        }
-        try self.interpolation_constraint_metadata.append(self.gpa, .{
-            .expr_idx = old_metadata.expr_idx,
-            .item_var = new_item_var,
-            .interpolated_parts = new_interpolated_parts,
-        });
     }
 }
 
@@ -16699,6 +16531,39 @@ fn mkTypeMethodCallConstraint(
     return constraint_fn_var;
 }
 
+fn mkInterpolationMetadata(
+    self: *Self,
+    expr_idx: CIR.Expr.Idx,
+    item_var: Var,
+) Allocator.Error!StaticDispatchConstraint.InterpolationMetadata {
+    const interpolation = self.cir.store.getExpr(expr_idx).e_interpolation;
+    const parts = self.cir.store.sliceExpr(interpolation.parts);
+    std.debug.assert(parts.len % 2 == 0);
+
+    const interpolated_len = parts.len / 2;
+    var interpolated_parts_sfa = std.heap.stackFallback(8 * @sizeOf(InterpolationPartMetadata), self.gpa);
+    const interpolated_parts_alloc = interpolated_parts_sfa.get();
+    var interpolated_parts = try std.ArrayList(InterpolationPartMetadata).initCapacity(interpolated_parts_alloc, interpolated_len);
+    defer interpolated_parts.deinit(interpolated_parts_alloc);
+
+    var part_i: usize = 0;
+    while (part_i < parts.len) : (part_i += 2) {
+        const part_expr_idx = parts[part_i];
+        interpolated_parts.appendAssumeCapacity(.{
+            .var_ = ModuleEnv.varFrom(part_expr_idx),
+            .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(part_expr_idx)),
+        });
+    }
+
+    return .{
+        .expr_region = StaticDispatchConstraint.Provenance.OptRegion.some(
+            self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(expr_idx)),
+        ),
+        .item_var = item_var,
+        .interpolated_parts = try self.types.appendInterpolationParts(interpolated_parts.items),
+    };
+}
+
 fn mkInterpolationConstraint(
     self: *Self,
     dispatcher_var: Var,
@@ -16721,9 +16586,9 @@ fn mkInterpolationConstraint(
         .fn_var = constraint_fn_var,
         .origin = .{ .from_literal = .interpolation },
         .provenance = self.methodDispatchProvenance(expr_idx),
+        .interpolation = try self.mkInterpolationMetadata(expr_idx, item_var),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    try self.recordInterpolationConstraintMetadata(constraint_fn_var, expr_idx, item_var);
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -19011,7 +18876,6 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             try self.unifyWith(deferred_constraint.var_, .err, env);
                             try self.unifyWith(resolved_func.ret, .err, env);
                         } else {
-                            try self.linkConstraintMetadata(rigid_var, constraint.fn_var);
                             try self.reportEffectfulDispatchInExpect(constraint);
 
                             // The body provably forces this where-clause method: a
@@ -19975,18 +19839,18 @@ fn satisfyBuiltinStrInterpolation(
     constraint: StaticDispatchConstraint,
     env: *Env,
 ) Allocator.Error!bool {
-    const metadata_id = self.interpolationConstraintIdForFnVar(constraint.fn_var) orelse {
+    const metadata = constraint.interpolation;
+    const expr_region = metadata.expr_region.get() orelse {
         if (builtin.mode == .Debug) {
             std.debug.panic("type checker invariant violated: builtin Str interpolation constraint had no metadata", .{});
         }
         unreachable;
     };
-    const metadata = self.interpolation_constraint_metadata.items[@intFromEnum(metadata_id)];
-    const expr_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(metadata.expr_idx));
     const expected_str_var = try self.freshStr(env, expr_region);
 
     var did_err = false;
-    for (metadata.interpolated_parts) |part| {
+    for (0..metadata.interpolated_parts.len()) |part_i| {
+        const part = self.types.getInterpolationPartAt(metadata.interpolated_parts, @intCast(part_i));
         did_err = (try self.constrainInterpolationPartToStr(part, expected_str_var, env)) or did_err;
     }
 
@@ -20002,24 +19866,26 @@ fn ensureCustomInterpolationPartsChecked(
     constraint: StaticDispatchConstraint,
     env: *Env,
 ) Allocator.Error!void {
-    const metadata_id = self.interpolationConstraintIdForFnVar(constraint.fn_var) orelse {
+    const metadata = constraint.interpolation;
+    if (!metadata.isPresent()) {
         if (builtin.mode == .Debug) {
             std.debug.panic("type checker invariant violated: checked interpolation constraint had no generated item type", .{});
         }
         unreachable;
-    };
-    const metadata_index = @intFromEnum(metadata_id);
-    if (self.interpolation_constraint_metadata.items[metadata_index].checked_parts) return;
-    self.interpolation_constraint_metadata.items[metadata_index].checked_parts = true;
+    }
 
-    const item_var = self.interpolation_constraint_metadata.items[metadata_index].item_var;
+    const checked_key = self.types.resolveVar(constraint.fn_var).var_;
+    if ((try self.checked_interpolation_part_constraints.getOrPut(checked_key)).found_existing) return;
+
+    const item_var = metadata.item_var;
     // Use the captured part metadata, not the original CIR `parts`, so an instantiated call
     // site unifies the item type against its instantiated arguments and reports at the
     // interpolation use site.
-    const interpolated_parts = self.interpolation_constraint_metadata.items[metadata_index].interpolated_parts;
+    const interpolated_parts = metadata.interpolated_parts;
 
     var did_err = false;
-    for (interpolated_parts) |part| {
+    for (0..interpolated_parts.len()) |part_i| {
+        const part = self.types.getInterpolationPartAt(interpolated_parts, @intCast(part_i));
         const result = try self.unifyInContext(item_var, part.var_, env, .{ .interpolation_part = part.region });
         did_err = did_err or result.isProblem() or self.types.resolveVar(part.var_).desc.content == .err;
     }
