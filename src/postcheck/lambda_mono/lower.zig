@@ -673,6 +673,16 @@ const Lowerer = struct {
             } },
             .break_ => |maybe| .{ .break_ = if (maybe) |value| try self.lowerExpr(value) else null },
             .continue_ => |continue_| .{ .continue_ = .{ .values = try self.lowerExprSpan(continue_.values) } },
+            .join_point => |join_point| .{ .join_point = .{
+                .id = join_point.id,
+                .params = try self.lowerTypedLocalSpan(join_point.params),
+                .body = try self.lowerExpr(join_point.body),
+                .remainder = try self.lowerExpr(join_point.remainder),
+            } },
+            .jump => |jump| .{ .jump = .{
+                .target = jump.target,
+                .args = try self.lowerExprSpan(jump.args),
+            } },
             .return_ => |ret| .{ .return_ = try self.lowerExpr(ret.value) },
             .crash => |msg| .{ .crash = msg },
             .comptime_branch_taken => |taken| .{ .comptime_branch_taken = .{

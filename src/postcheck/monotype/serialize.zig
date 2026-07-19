@@ -28,7 +28,8 @@ pub const MAGIC: [8]u8 = .{ 'R', 'O', 'C', 'S', 'P', 'E', 'C', 0 };
 /// Version 5: Monotype programs carry restored static-data candidate records.
 /// Version 6: specialization identities include the checked method lookup
 /// scope whose generated dispatch targets are embedded in the body.
-pub const FORMAT_VERSION: u32 = 6;
+/// Version 7: expression tags include post-lift join-point control forms.
+pub const FORMAT_VERSION: u32 = 7;
 
 const SECTION_COUNT = 40;
 /// Required byte alignment for every section payload. This covers all typed
@@ -570,6 +571,11 @@ pub const MappedProgramView = struct {
                 self.exprRefInBounds(loop.body),
             .break_ => |maybe_expr| if (maybe_expr) |expr| self.exprRefInBounds(expr) else true,
             .continue_ => |continue_| self.exprIdSpanInBounds(continue_.values),
+            // These shared-union variants are post-lift-only and are never
+            // valid in a serialized Monotype specialization.
+            .join_point,
+            .jump,
+            => false,
             .dbg,
             .expect,
             => |expr| self.exprRefInBounds(expr),

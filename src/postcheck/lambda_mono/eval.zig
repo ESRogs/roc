@@ -60,7 +60,7 @@ pub const Error = error{ OutOfMemory, Unsupported };
 
 /// Internal control-flow and error set. `Aborted` carries a stored `Abort`;
 /// `Returned`/`Broke`/`Continued` carry values stashed on the evaluator.
-const EvalError = error{ OutOfMemory, Unsupported, Aborted, Returned, Broke, Continued };
+const EvalError = error{ OutOfMemory, Unsupported, Aborted, Returned, Broke, Continued, Jumped };
 
 /// A generated-callable value: a runtime variant selector plus optional payload.
 pub const CallableValue = struct { variant: Type.FnVariantId, payload: ?*const Value };
@@ -151,6 +151,9 @@ pub const Evaluator = struct {
     break_value: Value,
     /// Values carried by `error.Continued`.
     continue_values: []const Value,
+    /// Join-point transfer carried by `error.Jumped`.
+    jump_target: Ast.JoinPointId,
+    jump_values: []const Value,
     /// Live call depth, capped by `recursion_depth_cap`.
     depth: usize,
 
@@ -172,6 +175,8 @@ pub const Evaluator = struct {
             .return_value = .unit,
             .break_value = .unit,
             .continue_values = &.{},
+            .jump_target = @enumFromInt(0),
+            .jump_values = &.{},
             .depth = 0,
             .roc_ops = null,
             .ops_alloc_sizes = std.AutoHashMap(usize, usize).init(gpa),
@@ -215,6 +220,7 @@ pub const Evaluator = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.Unsupported => return error.Unsupported,
             error.Broke, error.Continued => return self.unsup("break or continue escaped a loop"),
+            error.Jumped => return self.unsup("jump escaped its join point"),
         };
         return RunOutcome{ .value = value };
     }
@@ -378,6 +384,12 @@ pub const Evaluator = struct {
             .continue_ => |cont| {
                 self.continue_values = try self.evalExprSpan(frame, cont.values);
                 return error.Continued;
+            },
+            .join_point => |join_point| return try self.evalJoinPoint(frame, join_point),
+            .jump => |jump| {
+                self.jump_target = jump.target;
+                self.jump_values = try self.evalExprSpan(frame, jump.args);
+                return error.Jumped;
             },
             .return_ => |value_expr| {
                 self.return_value = try self.evalExpr(frame, value_expr);
@@ -694,6 +706,26 @@ pub const Evaluator = struct {
                     for (0..param_slice.len) |i| {
                         frame.put(GuardedList.at(param_slice, i).local, next[i]) catch return error.OutOfMemory;
                     }
+                    continue;
+                },
+                else => return err,
+            };
+            return result;
+        }
+    }
+
+    fn evalJoinPoint(self: *Evaluator, frame: *Frame, join_point: Ast.JoinPointExpr) EvalError!Value {
+        const params = self.program.typedLocalSpan(join_point.params);
+        var next_expr = join_point.remainder;
+        while (true) {
+            const result = self.evalExpr(frame, next_expr) catch |err| switch (err) {
+                error.Jumped => {
+                    if (self.jump_target != join_point.id) return error.Jumped;
+                    if (self.jump_values.len != params.len) return self.unsupported_("join-point argument arity mismatch");
+                    for (0..params.len) |index| {
+                        frame.put(GuardedList.at(params, index).local, self.jump_values[index]) catch return error.OutOfMemory;
+                    }
+                    next_expr = join_point.body;
                     continue;
                 },
                 else => return err,
@@ -1417,23 +1449,47 @@ pub const Evaluator = struct {
             .negate => return .{ .dec = -%a },
             .abs => return .{ .dec = if (a < 0) -%a else a },
             .abs_diff => return .{ .dec = if (a > b) a -% b else b -% a },
-            // The interpreter runs these through a crash boundary that yields 0
-            // on any divide-by-zero or overflow, so the observable result is 0
-            // in every failing case; this mirrors that outcome without a crash.
-            .div => return .{ .dec = decDivRaw(a, b) },
-            .div_trunc => return .{ .dec = decTrunc(decDivRaw(a, b)) },
+            .div => return .{ .dec = try self.decDiv(a, b) },
+            .div_trunc => return .{ .dec = decTrunc(try self.decDiv(a, b)) },
             .rem => {
-                if (b == 0) return .{ .dec = 0 };
+                if (b == 0) return self.crashAbort("Decimal remainder by 0!");
                 return .{ .dec = @rem(a, b) };
             },
             .mod => {
-                if (b == 0) return .{ .dec = 0 };
+                if (b == 0) return self.crashAbort("Decimal modulo by 0!");
                 const remainder = @rem(a, b);
                 if (remainder == 0) return .{ .dec = 0 };
                 if ((remainder > 0) != (b > 0)) return .{ .dec = remainder +% b };
                 return .{ .dec = remainder };
             },
         }
+    }
+
+    fn decDiv(self: *Evaluator, a: i128, b: i128) EvalError!i128 {
+        if (b == 0) return self.crashAbort("Decimal division by 0!");
+        if (a == 0) return 0;
+
+        const one = RocDec.one_point_zero_i128;
+        const max_i128: u128 = @intCast(std.math.maxInt(i128));
+        const is_negative = (a < 0) != (b < 0);
+        const numerator = absU128(a);
+        if (numerator > max_i128) {
+            if (b == one) return a;
+            return self.crashAbort("Decimal division overflow in numerator!");
+        }
+
+        const denominator = absU128(b);
+        if (denominator > max_i128) {
+            if (a == one) return b;
+            return self.crashAbort("Decimal division overflow in denominator!");
+        }
+
+        const scaled: u256 = @as(u256, numerator) * @as(u256, @intCast(one));
+        const quotient: u256 = scaled / @as(u256, denominator);
+        if (quotient > @as(u256, max_i128)) return self.crashAbort("Decimal division overflow!");
+
+        const magnitude: i128 = @intCast(quotient);
+        return if (is_negative) -magnitude else magnitude;
     }
 
     // transcendental / rounding
@@ -2305,25 +2361,6 @@ fn intType(comptime prim: Primitive) type {
 
 fn absU128(x: i128) u128 {
     return if (x < 0) @bitCast(-%x) else @intCast(x);
-}
-
-/// Divide two Dec fixed-point values, mirroring `RocDec.div`. The production
-/// path catches every divide-by-zero and overflow crash and yields 0, so this
-/// returns 0 in exactly those cases and the scaled quotient otherwise.
-fn decDivRaw(a: i128, b: i128) i128 {
-    if (b == 0 or a == 0) return 0;
-    const one = RocDec.one_point_zero_i128;
-    const max_i128: u128 = @intCast(std.math.maxInt(i128));
-    const neg = (a < 0) != (b < 0);
-    const num_u = absU128(a);
-    if (num_u > max_i128) return if (b == one) a else 0;
-    const den_u = absU128(b);
-    if (den_u > max_i128) return if (a == one) b else 0;
-    const scaled: u256 = @as(u256, num_u) * @as(u256, @intCast(one));
-    const quotient: u256 = scaled / @as(u256, den_u);
-    if (quotient > @as(u256, max_i128)) return 0;
-    const magnitude: i128 = @intCast(quotient);
-    return if (neg) -magnitude else magnitude;
 }
 
 /// Truncate a Dec fixed-point value toward zero, mirroring `RocDec.trunc`.
