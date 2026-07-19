@@ -92,7 +92,7 @@ resolve_tag_union_type_c = |type_table, duplicate_record_names, duplicate_tag_na
 			} else {
 				"void*"
 			}
-		}
+	}
 
 c_record_field_decl : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, AbiFieldLayout, AbiWidth -> Str
 c_record_field_decl = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field, width| {
@@ -236,19 +236,23 @@ type_name_roots_c = |hosted_functions, provides_list, type_table| {
 		var $arg_idx = 0
 		for arg_type_id in func.arg_type_ids {
 			arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
-			$roots = $roots.append({
-				alias_base: type_name_root_alias_base_c(type_table, arg_fallback, arg_type_id),
-				module_base,
-				type_id: arg_type_id,
-			})
+			$roots = $roots.append(
+				{
+					alias_base: type_name_root_alias_base_c(type_table, arg_fallback, arg_type_id),
+					module_base,
+					type_id: arg_type_id,
+				},
+			)
 			$arg_idx = $arg_idx + 1
 		}
 
-		$roots = $roots.append({
-			alias_base: base,
-			module_base,
-			type_id: func.ret_type_id,
-		})
+		$roots = $roots.append(
+			{
+				alias_base: base,
+				module_base,
+				type_id: func.ret_type_id,
+			},
+		)
 	}
 
 	for entry in provides_list {
@@ -260,26 +264,32 @@ type_name_roots_c = |hosted_functions, provides_list, type_table| {
 				var $arg_idx = 0
 				for arg_type_id in func.args {
 					arg_fallback = "${base}Arg${U64.to_str($arg_idx)}"
-					$roots = $roots.append({
-						alias_base: type_name_root_alias_base_c(type_table, arg_fallback, arg_type_id),
-						module_base,
-						type_id: arg_type_id,
-					})
+					$roots = $roots.append(
+						{
+							alias_base: type_name_root_alias_base_c(type_table, arg_fallback, arg_type_id),
+							module_base,
+							type_id: arg_type_id,
+						},
+					)
 					$arg_idx = $arg_idx + 1
 				}
 
-				$roots = $roots.append({
-					alias_base: base,
-					module_base,
-					type_id: func.ret,
-				})
+				$roots = $roots.append(
+					{
+						alias_base: base,
+						module_base,
+						type_id: func.ret,
+					},
+				)
 			}
 			_ => {
-				$roots = $roots.append({
-					alias_base: type_name_root_alias_base_c(type_table, base, entry.type_id),
-					module_base,
-					type_id: entry.type_id,
-				})
+				$roots = $roots.append(
+					{
+						alias_base: type_name_root_alias_base_c(type_table, base, entry.type_id),
+						module_base,
+						type_id: entry.type_id,
+					},
+				)
 			}
 		}
 	}
@@ -392,10 +402,8 @@ name_to_struct_name = |name| RocName.from_str(name).to_pascal_clean()
 
 ## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("Stdout.line!") == "StdoutLine"
-
 ## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("Foo.bar.baz!") == "FooBarBaz"
-
 ## Checks `name_to_struct_name` for this representative case.
 expect name_to_struct_name("__AnonStruct10") == "AnonStruct10"
 
@@ -404,7 +412,6 @@ name_to_upper_ident = |name| RocName.from_str(name).to_screaming_snake_identifie
 
 ## Checks `name_to_upper_ident` for this representative case.
 expect name_to_upper_ident("Stdout.line!") == "STDOUT_LINE"
-
 ## Checks `name_to_upper_ident` for this representative case.
 expect name_to_upper_ident("Foo.barBaz!") == "FOO_BAR_BAZ"
 
@@ -413,13 +420,12 @@ name_to_c_func_name = |name| RocName.from_str(name).to_lower_snake_identifier()
 
 ## Checks `name_to_c_func_name` for this representative case.
 expect name_to_c_func_name("Stdout.line!") == "stdout_line"
-
 ## Checks `name_to_c_func_name` for this representative case.
 expect name_to_c_func_name("Foo.barBaz!") == "foo_bar_baz"
 
 name_to_c_field_ident : Str -> Str
 name_to_c_field_ident = |name| {
-	sanitized = 
+	sanitized =
 		RocName.from_str(name).to_bang_snake_identifier()
 
 	match sanitized {
@@ -465,10 +471,8 @@ name_to_c_field_ident = |name| {
 
 ## Checks `name_to_c_field_ident` for this representative case.
 expect name_to_c_field_ident("init!") == "init_bang"
-
 ## Checks `name_to_c_field_ident` for this representative case.
 expect name_to_c_field_ident("type") == "type"
-
 ## Checks `name_to_c_field_ident` for this representative case.
 expect name_to_c_field_ident("struct") == "struct_field"
 
@@ -596,7 +600,7 @@ generate_opaque_type_decl = |type_name, size64, alignment64, size32, alignment32
 		alignment32
 	}
 
-	decl = 
+	decl =
 		\\#if UINTPTR_MAX == UINT64_MAX
 		\\typedef struct {
 		\\    ROC_ALIGNAS(${U64.to_str(type_alignment64)}) uint8_t bytes[${U64.to_str(byte_count64)}];
@@ -666,16 +670,18 @@ generate_args_struct = |func, type_table, duplicate_records, duplicate_tags, pre
 			fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer64)
 			fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer32)
 
-			doc = doc_comment([
-				"Arguments for ${func.name}",
-				"Roc signature: ${func.type_str}",
-				"Refcounted fields are owned by the hosted function.",
-			])
+			doc = doc_comment(
+				[
+					"Arguments for ${func.name}",
+					"Roc signature: ${func.type_str}",
+					"Refcounted fields are owned by the hosted function.",
+				],
+			)
 
 			args_name = "${struct_name}Args"
 			assertions64 = static_asserts(args_name, record.layout.size64, record.layout.alignment64)
 			assertions32 = static_asserts(args_name, record.layout.size32, record.layout.alignment32)
-			decl = 
+			decl =
 				\\${doc}#if UINTPTR_MAX == UINT64_MAX
 				\\typedef struct {
 				\\${fields64}} ${args_name};
@@ -694,11 +700,13 @@ generate_args_struct = |func, type_table, duplicate_records, duplicate_tags, pre
 				$idx = $idx + 1
 			}
 
-			doc = doc_comment([
-				"Arguments for ${func.name}",
-				"Roc signature: ${func.type_str}",
-				"Refcounted fields are owned by the hosted function.",
-			])
+			doc = doc_comment(
+				[
+					"Arguments for ${func.name}",
+					"Roc signature: ${func.type_str}",
+					"Refcounted fields are owned by the hosted function.",
+				],
+			)
 
 			"${doc}typedef struct {\n${$positional_fields}} ${struct_name}Args;\n\n"
 		}
@@ -842,35 +850,37 @@ doc_comment = |lines| {
 
 header_guard_top : Str
 header_guard_top = {
-	header_doc = doc_comment([
-		"Roc Platform ABI Header",
-		"",
-		"This file defines C declarations for a Roc platform's direct symbol ABI.",
-		"It is automatically generated by the Roc glue generator.",
-		"",
-		"Hosted argument ownership:",
-		"Roc transfers ownership of refcounted arguments to the hosted function.",
-		"The hosted function must decref owned refcounted arguments when done,",
-		"or retain/transfer ownership explicitly when storing or returning them.",
-	])
+	header_doc = doc_comment(
+		[
+			"Roc Platform ABI Header",
+			"",
+			"This file defines C declarations for a Roc platform's direct symbol ABI.",
+			"It is automatically generated by the Roc glue generator.",
+			"",
+			"Hosted argument ownership:",
+			"Roc transfers ownership of refcounted arguments to the hosted function.",
+			"The hosted function must decref owned refcounted arguments when done,",
+			"or retain/transfer ownership explicitly when storing or returning them.",
+		],
+	)
 
 	"${header_doc}\n#ifndef ROC_PLATFORM_ABI_H\n#define ROC_PLATFORM_ABI_H\n\n"
 }
 
 includes_section : Str
-includes_section = 
+includes_section =
 	"#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n#if defined(__cplusplus)\n#define ROC_ALIGNAS(n) alignas(n)\n#define ROC_ALIGNOF(T) alignof(T)\n#define ROC_STATIC_ASSERT(cond, message) static_assert(cond, message)\n#else\n#define ROC_ALIGNAS(n) _Alignas(n)\n#define ROC_ALIGNOF(T) _Alignof(T)\n#define ROC_STATIC_ASSERT(cond, message) _Static_assert(cond, message)\n#endif\n\n"
 
 extern_c_start : Str
-extern_c_start = 
+extern_c_start =
 	"#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
 
 extern_c_end : Str
-extern_c_end = 
+extern_c_end =
 	"\n#ifdef __cplusplus\n}\n#endif\n\n"
 
 header_guard_bottom : Str
-header_guard_bottom = 
+header_guard_bottom =
 	"#endif /* ROC_PLATFORM_ABI_H */\n"
 
 core_types_section : Str
@@ -883,7 +893,7 @@ core_types_section = {
 
 	roc_box_def = "typedef void* RocBox;\n\n"
 
-	erased_callable_def = 
+	erased_callable_def =
 		"struct RocOps;\n\n"
 			.concat("typedef void (*RocErasedCallableFn)(struct RocOps* ops, uint8_t* ret, const uint8_t* args, uint8_t* capture);\n")
 			.concat("typedef void (*RocErasedCallableOnDrop)(uint8_t* capture, struct RocOps* ops);\n")
@@ -916,15 +926,17 @@ function_count_section = |count| {
 }
 
 args_structs_header : Str
-args_structs_header = 
+args_structs_header =
 	section("Argument Structures", "")
 
 hosted_functions_registry : Str -> Str
 hosted_functions_registry = |fields| {
-	registry_doc = doc_comment([
-		"Registry of all hosted function implementations.",
-		"Store each implementation cast to HostedFn.",
-	])
+	registry_doc = doc_comment(
+		[
+			"Registry of all hosted function implementations.",
+			"Store each implementation cast to HostedFn.",
+		],
+	)
 	registry_typedef = "typedef struct {\n${fields}\n} HostedFunctions;\n"
 
 	section("HostedFunctions Registry", "${registry_doc}${registry_typedef}")
