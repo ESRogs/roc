@@ -1994,6 +1994,14 @@ allocation-free. Per-chain minting removes the recursive layout edge in every
 mode. SpecConstr improves optimized loop and call shape so later lowering and
 LLVM see scalar state and direct operations.
 
+SpecConstr preserves shared control explicitly. When a rewrite would move one
+continuation under multiple `match` or `if` arms, it introduces one typed lifted
+join point and replaces each arm result with a jump that supplies the result as
+an argument. It must never copy the continuation into the arms. This makes the
+amount of stored continuation code independent of branch count and nesting;
+later specialization may inspect the jump arguments without destroying that
+sharing.
+
 #### Constant Storage
 
 Compile-time finalization is separate from iterator representation and
@@ -3062,6 +3070,20 @@ The lifted stage output adds only the data that lifting owns:
 - capture spans appended by lifting are stored in the shared typed-local side
   array
 
+Optional lifted optimization may append typed `join_point` and `jump`
+expressions to that shared storage. A join point has an id, typed parameters, a
+body that consumes those parameters, and a remainder that enters the shared
+control region. The id is in scope in both body and remainder; the parameters
+are in scope only in the body. A jump names an in-scope id and supplies exactly
+one argument of the declared type for every parameter. The join body and
+remainder both produce the enclosing expression's result type. These forms
+express shared control only; they do not choose layouts or ownership.
+
+Case-of-case and let-of-case rewrites use these forms to thread branch results
+to one continuation. They never clone that continuation into each branch. Join
+ids are fresh within the lifted program, and cloning a region freshens both the
+id and its parameter locals while preserving lexical scope.
+
 ```zig
 const LiftedDef = struct {
     symbol: Symbol,
@@ -3182,6 +3204,8 @@ The solver:
 - propagates erased callable requirements through the same type graph
 - generalizes and instantiates polymorphic definitions
 - solves recursive groups as groups, not by accidental declaration order
+- verifies each lifted jump is lexically scoped and unifies its arguments with
+  the corresponding join-point parameter types
 
 The solved type graph is the callable representation source of truth. There is
 no descriptor replacement, no callable repointing, no post-demand payload
@@ -3331,6 +3355,8 @@ const ExprData = union(enum) {
     loop_: LoopExpr,
     break_: ?ExprId,
     continue_: ContinueExpr,
+    join_point: JoinPointExpr,
+    jump: JumpExpr,
     return_: ExprId,
     crash: StringLiteralId,
     dbg: ExprId,
@@ -3348,8 +3374,10 @@ compiler stages.
 
 Lambda Mono uses the same loop-carried `LoopExpr` and `ContinueExpr` shape as
 Monotype. A pass that preserves loops must preserve explicit parameters,
-initial values, and continue values. LIR lowering is the first stage allowed to
-turn that state into concrete jumps, blocks, or backend-friendly loop control.
+initial values, and continue values. LIR lowering turns loop state into LIR
+joins and jumps. Lifted join points are already explicit control edges, so LIR
+lowering maps them directly to LIR `join`/`jump` with the same parameter order
+and types rather than rebuilding or copying their continuation.
 
 Logical Lambda Mono has no `call_value` node. A call through a finite lambda set is
 lowered to a match over the generated callable tag union; each branch makes a
@@ -3608,10 +3636,12 @@ all); open matches keep the `comptime_exhaustiveness_failed` / `runtime_error`
 terminal.
 
 **The sharing invariant.** Monotype is a DAG: an expression id referenced from
-multiple positions is re-lowered at each reference, so downstream sharing must
-go through LIR join points (`join`/`jump`), never through re-lowering a
-Monotype id twice. PR 9707 removed the one known violator (the list-pattern
-desugarer) after measuring ~(elements+1)^branches statement blowup. The match
+multiple positions is re-lowered at each reference, so downstream control
+sharing must go through typed lifted join points or LIR join points, never
+through re-lowering a Monotype id twice. Direct lowering preserves lifted
+`join_point`/`jump` as LIR `join`/`jump`. PR 9707 removed the one known violator,
+the list-pattern desugarer, after measuring ~(elements+1)^branches statement
+blowup. The match
 compiler holds the invariant by construction: rows (branches) are never
 duplicated during specialization — a row that does not test the selected
 occurrence ends the test group instead of being copied into every arm, and the

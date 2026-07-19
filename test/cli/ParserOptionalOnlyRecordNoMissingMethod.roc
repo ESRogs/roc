@@ -21,9 +21,6 @@ Format := [Default].{
 
 	skip_record_field : Format, State -> Try(State, [MissingRequired])
 	skip_record_field = |_, state| Ok(state)
-
-	missing_optional_field : Format, Str, State -> [Missing]
-	missing_optional_field = |_, _, _| Missing
 }
 
 State := [Present(Str)]

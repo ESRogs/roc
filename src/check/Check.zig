@@ -5408,6 +5408,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     try self.reportPolymorphicExecutableRootResults();
 
     try self.reportNonExhaustiveLambdaParams(&env);
+    try self.reportNonExhaustiveForPatterns(&env);
 
     try self.pruneSelectedHoistedRootsAfterSolving();
 
@@ -14414,6 +14415,31 @@ fn checkDestructureExhaustiveness(
     self.known_empty_payload_vars_destructure.clearRetainingCapacity();
     const value_constructors_known = try self.collectKnownEmptyPayloadVarsForExpr(value_expr_idx, value_var, &self.known_empty_payload_vars_destructure);
 
+    try self.checkPatternExhaustiveness(
+        pattern_idx,
+        value_var,
+        self.known_empty_payload_vars_destructure.items,
+        value_constructors_known,
+        env,
+        region,
+    );
+}
+
+/// Check one pattern in an irrefutable binding position against its settled
+/// scrutinee type. Callers supply constructor facts only when a concrete value
+/// expression proves them; function parameters and iterator items have no such
+/// expression and must conservatively cover every inhabitant of their type.
+fn checkPatternExhaustiveness(
+    self: *Self,
+    pattern_idx: CIR.Pattern.Idx,
+    value_var: Var,
+    known_empty_payload_vars: []const Var,
+    value_constructors_known: bool,
+    env: *Env,
+    region: Region,
+) std.mem.Allocator.Error!void {
+    if (!self.patternNeedsExhaustiveness(pattern_idx)) return;
+
     var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
     defer open_cache.deinit();
     const result_or_err = exhaustive.checkDestructure(
@@ -14424,7 +14450,7 @@ fn checkDestructureExhaustiveness(
         self.exhaustiveBuiltinIdents(&open_cache),
         pattern_idx,
         value_var,
-        self.known_empty_payload_vars_destructure.items,
+        known_empty_payload_vars,
         value_constructors_known,
     );
     try self.backfillRegionsForAnalysisVars();
@@ -14474,16 +14500,25 @@ fn checkDestructureExhaustiveness(
 fn reportNonExhaustiveLambdaParams(self: *Self, env: *Env) std.mem.Allocator.Error!void {
     for (self.checked_lambda_params.items) |arg_span| {
         for (self.cir.store.slicePatterns(arg_span)) |pattern_idx| {
-            try self.checkParamPatternExhaustiveness(pattern_idx, env);
+            try self.checkPatternExhaustivenessWithoutValue(pattern_idx, env);
         }
     }
 }
 
-/// Exhaustiveness check for a single function/lambda parameter pattern. Unlike
-/// `checkDestructureExhaustiveness`, a parameter has no value expression, so the
-/// pattern's own type var is the scrutinee and there is no known-empty-payload
-/// information to collect (passed conservatively as empty / not-known).
-fn checkParamPatternExhaustiveness(
+/// Run exhaustiveness analysis on every source `for` pattern after iterator
+/// dispatch has settled the item type. Iterator items are dynamic values, so
+/// the iterable expression cannot supply constructor facts about them.
+fn reportNonExhaustiveForPatterns(self: *Self, env: *Env) std.mem.Allocator.Error!void {
+    for (self.cir.for_loop_dispatch_plans.items.items) |plan| {
+        const pattern_idx: CIR.Pattern.Idx = @enumFromInt(plan.pattern_idx);
+        try self.checkPatternExhaustivenessWithoutValue(pattern_idx, env);
+    }
+}
+
+/// Exhaustiveness check for a pattern without a concrete value expression.
+/// The pattern's own type var is the scrutinee and there is no constructor
+/// information to narrow the set of values it must cover.
+fn checkPatternExhaustivenessWithoutValue(
     self: *Self,
     pattern_idx: CIR.Pattern.Idx,
     env: *Env,
@@ -14491,51 +14526,8 @@ fn checkParamPatternExhaustiveness(
     if (!self.patternNeedsExhaustiveness(pattern_idx)) return;
 
     const value_var = ModuleEnv.varFrom(pattern_idx);
-    var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
-    defer open_cache.deinit();
-    const result_or_err = exhaustive.checkDestructure(
-        self.cir.gpa,
-        self.types,
-        self.cir,
-        &self.cir.store,
-        self.exhaustiveBuiltinIdents(&open_cache),
-        pattern_idx,
-        value_var,
-        &.{},
-        false,
-    );
-    try self.backfillRegionsForAnalysisVars();
-    const result = result_or_err catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.TypeError => return,
-    };
-    defer result.deinit(self.cir.gpa);
-
     const region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(pattern_idx));
-    try self.closeExhaustiveVars(result, env, region);
-
-    if (result.is_exhaustive) return;
-
-    const value_snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, value_var);
-    const missing_patterns_start = self.problems.missing_patterns_backing.items.len;
-    for (result.missing_patterns) |pattern| {
-        const idx = try exhaustive.formatPattern(
-            &self.problems.extra_strings_backing,
-            &self.cir.common.idents,
-            &self.cir.common.strings,
-            pattern,
-        );
-        try self.problems.missing_patterns_backing.append(idx);
-    }
-    const missing_patterns_range = problem.MissingPatternsRange{
-        .start = missing_patterns_start,
-        .count = self.problems.missing_patterns_backing.items.len - missing_patterns_start,
-    };
-    try self.problems.appendPendingStaticExhaustiveness(self.gpa, .destructure, self.pendingExhaustivenessMode(), .{ .destructure_pattern = pattern_idx }, region, .{ .non_exhaustive_destructure = .{
-        .pattern = pattern_idx,
-        .value_snapshot = value_snapshot,
-        .missing_patterns = missing_patterns_range,
-    } });
+    try self.checkPatternExhaustiveness(pattern_idx, value_var, &.{}, false, env, region);
 }
 
 // stmts //
@@ -16382,7 +16374,8 @@ fn checkIteratorForLoop(
     var does_fx = false;
     const child_expected = expected.forStatement();
 
-    try self.checkPattern(pattern, .for_, env);
+    const pattern_ctx: PatternCtx = if (self.patternNeedsExhaustiveness(pattern)) .match_branch else .for_;
+    try self.checkPattern(pattern, pattern_ctx, env);
     const item_var: Var = ModuleEnv.varFrom(pattern);
 
     does_fx = try self.checkExpr(iterable, env, child_expected) or does_fx;
@@ -18133,7 +18126,7 @@ fn recordHasPendingOpenLiteralForDerivedEncode(
 ) Allocator.Error!bool {
     const fields = self.types.getRecordFieldsSlice(fields_range);
     for (fields.items(.var_)) |field_var| {
-        const child_var = (try self.optionalEncodePayloadVar(field_var)) orelse field_var;
+        const child_var = if (try self.missingTryInfoForVar(field_var)) |info| info.ok_var else field_var;
         if (try self.varHasPendingOpenLiteralForDerivedEncode(child_var, env, visited)) return true;
     }
     return false;
@@ -18191,6 +18184,9 @@ fn nominalHasPendingOpenLiteralForDerivedEncode(
     }
     if (self.nominalIsBuiltinTryType(nominal)) {
         if (try self.jsonTryInfoFromNominal(nominal)) |info| {
+            return try self.varHasPendingOpenLiteralForDerivedEncode(info.ok_var, env, visited);
+        }
+        if (try self.missingTryInfoFromNominal(nominal)) |info| {
             return try self.varHasPendingOpenLiteralForDerivedEncode(info.ok_var, env, visited);
         }
     }
@@ -20591,8 +20587,7 @@ fn nominalSupportsDerivedParseShape(
             try self.varSupportsDerivedParseShape(args.value, env, region);
     }
     if (self.nominalIsBuiltinTryType(nominal)) {
-        const info = try self.jsonTryInfoFromNominal(nominal) orelse return false;
-        return info.has_null and !info.has_missing;
+        return (try self.jsonTryInfoFromNominal(nominal)) != null;
     }
     if (nominal.originIsBuiltin()) return false;
     return true;
@@ -20622,11 +20617,17 @@ fn nominalSupportsDerivedParseField(
             try self.varSupportsJsonObjectKey(args.key) and
             try self.varSupportsDerivedParseShape(args.value, env, region);
     }
-    if (!self.nominalIsBuiltinTryType(nominal)) {
-        return !nominal.originIsBuiltin();
+    if (self.nominalIsBuiltinTryType(nominal)) {
+        if (try self.missingTryInfoFromNominal(nominal)) |info| {
+            return try self.varSupportsDerivedParseShape(info.ok_var, env, region);
+        }
+        if (try self.jsonTryInfoFromNominal(nominal)) |info| {
+            return try self.varSupportsDerivedParseShape(info.ok_var, env, region);
+        }
+        return false;
     }
 
-    return (try self.builtinTryInfoFromNominal(nominal)) != null;
+    return !nominal.originIsBuiltin();
 }
 
 const DerivedSupport = enum {
@@ -20706,10 +20707,8 @@ fn varSupportsDerivedEncodeRecordField(
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedSupport {
-    if (try self.varIsBuiltinJsonEncoding(encoding_var)) {
-        if (try self.optionalEncodePayloadVar(var_)) |payload_var| {
-            return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
-        }
+    if (try self.missingTryInfoForVar(var_)) |info| {
+        return try self.varSupportsDerivedEncodeShape(info.ok_var, encoding_var, env, region);
     }
     return try self.varSupportsDerivedEncodeShape(var_, encoding_var, env, region);
 }
@@ -20785,19 +20784,25 @@ fn nominalSupportsDerivedEncodeShape(
         );
     }
     if (self.nominalIsBuiltinTryType(nominal)) {
-        const info = try self.jsonTryInfoFromNominal(nominal) orelse return .unsupported;
-        return derivedSupportFromBool(!info.has_missing);
+        return if ((try self.jsonTryInfoFromNominal(nominal)) != null) .supported else .unsupported;
     }
     if (nominal.originIsBuiltin()) return .unsupported;
     return .supported;
 }
 
-fn optionalEncodePayloadVar(
+fn missingTryInfoForVar(
     self: *Self,
     var_: Var,
-) Allocator.Error!?Var {
-    const info = (try self.jsonTryInfoForVar(var_)) orelse return null;
-    return if (info.has_missing) info.ok_var else null;
+) Allocator.Error!?MissingTryInfo {
+    return switch (self.types.resolveVar(var_).desc.content) {
+        .structure => |structure| switch (structure) {
+            .nominal_type => |nominal| try self.missingTryInfoFromNominal(nominal),
+            else => null,
+        },
+        .alias => |alias| try self.missingTryInfoForVar(self.types.getAliasBackingVar(alias)),
+        .err => null,
+        .flex, .rigid => null,
+    };
 }
 
 fn builtinTryInfoFromNominal(
@@ -20813,97 +20818,64 @@ fn builtinTryInfoFromNominal(
     };
 }
 
-fn jsonTryInfoForVar(
-    self: *Self,
-    var_: Var,
-) Allocator.Error!?JsonTryInfo {
-    return switch (self.types.resolveVar(var_).desc.content) {
-        .structure => |structure| switch (structure) {
-            .nominal_type => |nominal| try self.jsonTryInfoFromNominal(nominal),
-            else => null,
-        },
-        .alias => |alias| try self.jsonTryInfoForVar(self.types.getAliasBackingVar(alias)),
-        .err => null,
-        .flex, .rigid => null,
-    };
-}
-
 fn jsonTryInfoFromNominal(
     self: *Self,
     nominal: types_mod.NominalType,
 ) Allocator.Error!?JsonTryInfo {
     const try_info = (try self.builtinTryInfoFromNominal(nominal)) orelse return null;
-    const err_info = (try self.jsonTryErrInfo(try_info.err_var)) orelse return null;
+    if (!try self.varIsExactUnitTagUnion(try_info.err_var, "Null")) return null;
     return .{
         .ok_var = try_info.ok_var,
         .err_var = try_info.err_var,
-        .has_missing = err_info.has_missing,
-        .has_null = err_info.has_null,
     };
 }
 
-fn varIsBuiltinJsonEncoding(self: *Self, var_: Var) Allocator.Error!bool {
+fn missingTryInfoFromNominal(
+    self: *Self,
+    nominal: types_mod.NominalType,
+) Allocator.Error!?MissingTryInfo {
+    const try_info = (try self.builtinTryInfoFromNominal(nominal)) orelse return null;
+    if (!try self.varIsExactMissingTagUnion(try_info.err_var)) return null;
+    return .{
+        .ok_var = try_info.ok_var,
+        .err_var = try_info.err_var,
+    };
+}
+
+fn varIsExactMissingTagUnion(self: *Self, var_: Var) Allocator.Error!bool {
+    return try self.varIsExactUnitTagUnion(var_, "Missing");
+}
+
+fn varIsExactUnitTagUnion(
+    self: *Self,
+    var_: Var,
+    tag_text: []const u8,
+) Allocator.Error!bool {
     return switch (self.types.resolveVar(var_).desc.content) {
+        .alias => |alias| try self.varIsExactUnitTagUnion(self.types.getAliasBackingVar(alias), tag_text),
         .structure => |structure| switch (structure) {
-            .nominal_type => |nominal| self.nominalIsBuiltinJsonEncodingType(nominal),
+            .tag_union => |tag_union| blk: {
+                const tags = self.types.getTagsSlice(tag_union.tags);
+                const tag_names = tags.items(.name);
+                const tag_args = tags.items(.args);
+                if (tag_names.len != 1) break :blk false;
+                if (!try self.tagExtIsClosedEmpty(tag_union.ext)) break :blk false;
+                if (self.types.sliceVars(tag_args[0]).len != 0) break :blk false;
+                const text = self.cir.getIdentStoreConst().getText(tag_names[0]);
+                break :blk Ident.textEql(text, tag_text);
+            },
             else => false,
         },
-        .alias => |alias| try self.varIsBuiltinJsonEncoding(self.types.getAliasBackingVar(alias)),
-        .err => true,
-        .flex, .rigid => false,
+        .err, .flex, .rigid => false,
     };
 }
 
-fn nominalIsBuiltinJsonEncodingType(self: *const Self, nominal_type: types_mod.NominalType) bool {
-    if (!nominal_type.originIsBuiltin()) return false;
-    if (nominal_type.sourceDeclOptional()) |source_decl| {
-        if (self.builtin_ctx.builtin_indices) |indices| {
-            if (source_decl == @intFromEnum(indices.json_encoding_type)) return true;
-        }
-    }
-
-    const ident_text = self.cir.getIdentStoreConst().getText(nominal_type.ident.ident_idx);
-    return Ident.textEql(ident_text, "JsonEncoding") or Ident.textEql(ident_text, "Builtin.Encoding.JsonEncoding");
-}
-
-fn jsonTryErrInfo(
-    self: *Self,
-    err_var: Var,
-) Allocator.Error!?JsonTryErrInfo {
-    var current = err_var;
-    var has_missing = false;
-    var has_null = false;
-    var guard = types_mod.debug.IterationGuard.init("jsonTryErrInfo");
-
-    while (true) {
-        guard.tick();
-        switch (self.types.resolveVar(current).desc.content) {
-            .alias => |alias| current = self.types.getAliasBackingVar(alias),
-            .structure => |structure| switch (structure) {
-                .empty_tag_union => {
-                    if (!has_missing and !has_null) return null;
-                    return .{ .has_missing = has_missing, .has_null = has_null };
-                },
-                .tag_union => |tag_union| {
-                    const tags = self.types.getTagsSlice(tag_union.tags);
-                    for (tags.items(.name), tags.items(.args)) |name, args_range| {
-                        if (self.types.sliceVars(args_range).len != 0) return null;
-                        const text = self.cir.getIdentStoreConst().getText(name);
-                        if (Ident.textEql(text, "Missing")) {
-                            has_missing = true;
-                        } else if (Ident.textEql(text, "Null")) {
-                            has_null = true;
-                        } else {
-                            return null;
-                        }
-                    }
-                    current = tag_union.ext;
-                },
-                else => return null,
-            },
-            .err, .flex, .rigid => return null,
-        }
-    }
+fn tagExtIsClosedEmpty(self: *Self, var_: Var) Allocator.Error!bool {
+    return switch (self.types.resolveVar(var_).desc.content) {
+        .alias => |alias| try self.tagExtIsClosedEmpty(self.types.getAliasBackingVar(alias)),
+        .structure => |structure| structure == .empty_tag_union,
+        .err, .flex, .rigid => false,
+    };
 }
 
 fn varIsBuiltinStr(self: *Self, var_: Var) std.mem.Allocator.Error!bool {
@@ -21923,19 +21895,17 @@ const DerivedParseValidation = enum {
     reported_error,
 };
 
-const JsonTryErrInfo = struct {
-    has_missing: bool,
-    has_null: bool,
-};
-
 const JsonTryInfo = struct {
     ok_var: Var,
     err_var: Var,
-    has_missing: bool,
-    has_null: bool,
 };
 
 const BuiltinTryInfo = struct {
+    ok_var: Var,
+    err_var: Var,
+};
+
+const MissingTryInfo = struct {
     ok_var: Var,
     err_var: Var,
 };
@@ -22016,10 +21986,6 @@ fn parseSpecDeclForNumKind(num_kind: CIR.NumKind) BuiltinParseSpecDecl {
 
 fn missingRecordFieldMethodName(self: *Self) Allocator.Error!Ident.Idx {
     return try @constCast(self.cir).insertIdent(base.Ident.for_text("missing_record_field"));
-}
-
-fn missingOptionalFieldMethodName(self: *Self) Allocator.Error!Ident.Idx {
-    return try @constCast(self.cir).insertIdent(base.Ident.for_text("missing_optional_field"));
 }
 
 fn invalidValueMethodName(self: *Self) Allocator.Error!Ident.Idx {
@@ -22437,31 +22403,6 @@ fn validateMissingRecordFieldMethod(
     return if (result.isOk()) .ok else .reported_error;
 }
 
-fn validateMissingOptionalFieldMethod(
-    self: *Self,
-    encoding_var: Var,
-    state_var: Var,
-    optional_err_var: Var,
-    constraint: StaticDispatchConstraint,
-    env: *Env,
-    region: Region,
-) Allocator.Error!DerivedParseValidation {
-    const method_name = try self.missingOptionalFieldMethodName();
-    const method = try self.parseFormatMethodVarForEncoding(encoding_var, method_name, env, region) orelse {
-        return try self.reportDerivedParseMissingMethod(encoding_var, method_name, constraint, env);
-    };
-    const str_var = try self.freshStr(env, region);
-    const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ encoding_var, str_var, state_var }, optional_err_var), env, region);
-    const result = try self.unifyInContext(method.var_, expected_fn, env, .{
-        .method_type = .{
-            .constraint_var = encoding_var,
-            .dispatcher_name = method.dispatcher_name,
-            .method_name = method_name,
-        },
-    });
-    return if (result.isOk()) .ok else .reported_error;
-}
-
 fn validateInvalidValueMethod(
     self: *Self,
     encoding_var: Var,
@@ -22699,11 +22640,7 @@ fn nominalIsOptionalParseField(
     self: *Self,
     nominal: types_mod.NominalType,
 ) Allocator.Error!bool {
-    if ((try self.builtinTryInfoFromNominal(nominal)) == null) return false;
-    if (try self.jsonTryInfoFromNominal(nominal)) |info| {
-        return info.has_missing;
-    }
-    return true;
+    return (try self.missingTryInfoFromNominal(nominal)) != null;
 }
 
 fn validateDerivedParseTagUnion(
@@ -22816,29 +22753,16 @@ fn validateDerivedParseNominal(
         return try self.validateDerivedParseVar(args.value, encoding_var, state_var, err_var, constraint, env, region, visited, .shape);
     }
     if (self.nominalIsBuiltinTryType(nominal)) {
-        const try_info = try self.builtinTryInfoFromNominal(nominal) orelse return .unsupported;
-        if (try self.jsonTryInfoFromNominal(nominal)) |info| {
-            if (context != .record_field and info.has_missing) return .unsupported;
-            if (info.has_missing) {
-                switch (try self.validateMissingOptionalFieldMethod(encoding_var, state_var, info.err_var, constraint, env, region)) {
-                    .ok => {},
-                    .unsupported, .reported_error => |result| return result,
-                }
-            }
-            if (info.has_null) {
-                switch (try self.validateParseFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
-                    .ok => {},
-                    .unsupported, .reported_error => |result| return result,
-                }
-            }
+        if (try self.missingTryInfoFromNominal(nominal)) |info| {
+            if (context != .record_field) return .unsupported;
             return try self.validateDerivedParseVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited, .shape);
         }
-        if (context != .record_field) return .unsupported;
-        switch (try self.validateMissingOptionalFieldMethod(encoding_var, state_var, try_info.err_var, constraint, env, region)) {
+        const info = try self.jsonTryInfoFromNominal(nominal) orelse return .unsupported;
+        switch (try self.validateParseFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
-        return try self.validateDerivedParseVar(try_info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited, .shape);
+        return try self.validateDerivedParseVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited, .shape);
     }
 
     const original_env, _ = self.ownerEnvForOriginModule(
@@ -22946,22 +22870,13 @@ fn validateDerivedEncodeRecord(
     const field_vars = try self.gpa.dupe(Var, fields.items(.var_));
     defer self.gpa.free(field_vars);
 
-    const json_object_optional_fields = try self.varIsBuiltinJsonEncoding(encoding_var);
     for (field_vars) |field_var| {
-        if (json_object_optional_fields) {
-            if (try self.jsonTryInfoForVar(field_var)) |info| {
-                if (info.has_null) {
-                    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
-                        .ok => {},
-                        .unsupported, .reported_error => |result| return result,
-                    }
-                }
-                switch (try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
-                    .ok => {},
-                    .unsupported, .reported_error => |result| return result,
-                }
-                continue;
+        if (try self.missingTryInfoForVar(field_var)) |info| {
+            switch (try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
+                .ok => {},
+                .unsupported, .reported_error => |result| return result,
             }
+            continue;
         }
 
         switch (try self.validateDerivedEncodeVar(field_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
@@ -23223,12 +23138,9 @@ fn validateDerivedEncodeNominal(
     }
     if (self.nominalIsBuiltinTryType(nominal)) {
         const info = try self.jsonTryInfoFromNominal(nominal) orelse return .unsupported;
-        if (info.has_missing) return .unsupported;
-        if (info.has_null) {
-            switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
-                .ok => {},
-                .unsupported, .reported_error => |result| return result,
-            }
+        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
+            .ok => {},
+            .unsupported, .reported_error => |result| return result,
         }
         return try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited);
     }
