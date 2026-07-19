@@ -20,7 +20,7 @@ NAME NOT IN SCOPE - simple_mod_no_blanks.md:2:10:2:22
  │                                                                            │
  │  hello! = Stdout.line!("Hello")                                            │
  │           ‾‾‾‾‾‾‾‾‾‾‾‾                                                     │
- └────────────────────────────────────────────── simple_mod_no_blanks.md:2:10 ┘
+ └─────────────────────────────────────────── simple_mod_no_blanks.md:2:10 ┘
 
     Is it misspelled, or is there an import missing?
 

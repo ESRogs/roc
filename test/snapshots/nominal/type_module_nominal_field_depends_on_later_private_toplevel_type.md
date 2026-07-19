@@ -22,7 +22,7 @@ PRIVATE TYPE IN EXPOSED FIELD - type_mod_nominal_field_depends_on_later_private_
  │                                                                            │
  │  field : InternalType,                                                     │
  │          ‾‾‾‾‾‾‾‾‾‾‾‾                                                      │
- └───── type_mod_nominal_field_depends_on_later_private_toplevel_type.md:2:13 ┘
+ └── type_mod_nominal_field_depends_on_later_private_toplevel_type.md:2:13 ┘
 
     Other mods can see this field because ModType is exposed and not opaque,
     but they cannot name this private type.

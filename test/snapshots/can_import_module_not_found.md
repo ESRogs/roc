@@ -19,7 +19,7 @@ NAME NOT IN SCOPE - can_import_mod_not_found.md:3:8:3:21
  │                                                                            │
  │  main = Mod.something                                                      │
  │         ‾‾‾‾‾‾‾‾‾‾‾‾‾                                                      │
- └─────────────────────────────────────────── can_import_mod_not_found.md:3:8 ┘
+ └──────────────────────────────────────── can_import_mod_not_found.md:3:8 ┘
 
     Is it misspelled, or is there an import missing?
 

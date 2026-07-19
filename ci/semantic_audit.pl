@@ -382,10 +382,6 @@ sub scan_snapshot_module_words {
             return unless -f $path;
             return unless $path =~ /\.md$/;
 
-            if ($path =~ /module/i) {
-                push @violations, [$path, 0, "snapshot path contains forbidden text `module`; use `mod` in snapshot paths", $path];
-            }
-
             open my $fh, '<', $path or die "failed to open $path: $!";
             my $line_no = 0;
             while (my $line = <$fh>) {

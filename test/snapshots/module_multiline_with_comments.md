@@ -24,7 +24,7 @@ UNEXPECTED STATEMENT - mod_multiline_with_comments.md:4:2:4:3
  │                                                                            │
  │  [ # Comment After exposes open                                            │
  │  ‾                                                                         │
- └──────────────────────────────────────── mod_multiline_with_comments.md:1:2 ┘
+ └───────────────────────────────────── mod_multiline_with_comments.md:1:2 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.
@@ -41,7 +41,7 @@ UNEXPECTED STATEMENT - mod_multiline_with_comments.md:4:2:4:3
  │                                                                            │
  │  something, # Comment after exposed item                                   │
  │  ‾‾‾‾‾‾‾‾‾                                                                 │
- └──────────────────────────────────────── mod_multiline_with_comments.md:2:3 ┘
+ └───────────────────────────────────── mod_multiline_with_comments.md:2:3 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.
@@ -60,7 +60,7 @@ UNEXPECTED STATEMENT - mod_multiline_with_comments.md:4:2:4:3
  │                                                                            │
  │  something, # Comment after exposed item                                   │
  │           ‾                                                                │
- └─────────────────────────────────────── mod_multiline_with_comments.md:2:12 ┘
+ └──────────────────────────────────── mod_multiline_with_comments.md:2:12 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.
@@ -79,7 +79,7 @@ UNEXPECTED STATEMENT - mod_multiline_with_comments.md:4:2:4:3
  │                                                                            │
  │  SomeType, # Comment after final exposed item                              │
  │          ‾                                                                 │
- └─────────────────────────────────────── mod_multiline_with_comments.md:3:11 ┘
+ └──────────────────────────────────── mod_multiline_with_comments.md:3:11 ┘
 
     Roc type applications use parentheses around their arguments. Write
     `List(U8)`, not `List U8`.
@@ -97,7 +97,7 @@ UNEXPECTED STATEMENT - mod_multiline_with_comments.md:4:2:4:3
  │                                                                            │
  │  ]                                                                         │
  │  ‾                                                                         │
- └──────────────────────────────────────── mod_multiline_with_comments.md:4:2 ┘
+ └───────────────────────────────────── mod_multiline_with_comments.md:4:2 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.
