@@ -50,7 +50,14 @@ jobs:
           # present across runs: it is read every run, so it stays warm and is
           # not evicted by the setup action's churnier per-run cache. A cold runner then no
           # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          # while the setup action's own cache still handles build artifacts for speed.
+          #
+          # Note this step is currently the ONLY working cache. The setup
+          # action also caches build artifacts, but `.zig-cache` exceeds its
+          # 2048 MiB cache-size-limit on every platform, so the action clears
+          # the directory in its post step and saves nothing -- every run then
+          # starts from a cold build cache. See the "Report .zig-cache
+          # composition" step in ci_manager.yml; sizing the limit is a
+          # follow-up.
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
           key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
@@ -217,7 +224,14 @@ jobs:
           # present across runs: it is read every run, so it stays warm and is
           # not evicted by the setup action's churnier per-run cache. A cold runner then no
           # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          # while the setup action's own cache still handles build artifacts for speed.
+          #
+          # Note this step is currently the ONLY working cache. The setup
+          # action also caches build artifacts, but `.zig-cache` exceeds its
+          # 2048 MiB cache-size-limit on every platform, so the action clears
+          # the directory in its post step and saves nothing -- every run then
+          # starts from a cold build cache. See the "Report .zig-cache
+          # composition" step in ci_manager.yml; sizing the limit is a
+          # follow-up.
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
           key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
@@ -327,7 +341,14 @@ jobs:
           # present across runs: it is read every run, so it stays warm and is
           # not evicted by the setup action's churnier per-run cache. A cold runner then no
           # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          # while the setup action's own cache still handles build artifacts for speed.
+          #
+          # Note this step is currently the ONLY working cache. The setup
+          # action also caches build artifacts, but `.zig-cache` exceeds its
+          # 2048 MiB cache-size-limit on every platform, so the action clears
+          # the directory in its post step and saves nothing -- every run then
+          # starts from a cold build cache. See the "Report .zig-cache
+          # composition" step in ci_manager.yml; sizing the limit is a
+          # follow-up.
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
           key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
@@ -476,7 +497,14 @@ jobs:
           # present across runs: it is read every run, so it stays warm and is
           # not evicted by the setup action's churnier per-run cache. A cold runner then no
           # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          # while the setup action's own cache still handles build artifacts for speed.
+          #
+          # Note this step is currently the ONLY working cache. The setup
+          # action also caches build artifacts, but `.zig-cache` exceeds its
+          # 2048 MiB cache-size-limit on every platform, so the action clears
+          # the directory in its post step and saves nothing -- every run then
+          # starts from a cold build cache. See the "Report .zig-cache
+          # composition" step in ci_manager.yml; sizing the limit is a
+          # follow-up.
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
           key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
@@ -543,7 +571,14 @@ jobs:
           # present across runs: it is read every run, so it stays warm and is
           # not evicted by the setup action's churnier per-run cache. A cold runner then no
           # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          # while the setup action's own cache still handles build artifacts for speed.
+          #
+          # Note this step is currently the ONLY working cache. The setup
+          # action also caches build artifacts, but `.zig-cache` exceeds its
+          # 2048 MiB cache-size-limit on every platform, so the action clears
+          # the directory in its post step and saves nothing -- every run then
+          # starts from a cold build cache. See the "Report .zig-cache
+          # composition" step in ci_manager.yml; sizing the limit is a
+          # follow-up.
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
           key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
