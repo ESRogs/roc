@@ -38,18 +38,18 @@ expect {
 }
 
 expect {
-	missing_result : Try({ field : Try(Str, [Missing, Null]) }, Json.ParseErr)
+	missing_result : Try({ field : Try(Try(Str, [Null]), [Missing]) }, Json.ParseErr)
 	missing_result = Json.parse("{}")
 
-	null_result : Try({ field : Try(Str, [Missing, Null]) }, Json.ParseErr)
+	null_result : Try({ field : Try(Try(Str, [Null]), [Missing]) }, Json.ParseErr)
 	null_result = Json.parse("{\"field\":null}")
 
-	value_result : Try({ field : Try(Str, [Missing, Null]) }, Json.ParseErr)
+	value_result : Try({ field : Try(Try(Str, [Null]), [Missing]) }, Json.ParseErr)
 	value_result = Json.parse("{\"field\":\"value\"}")
 
 	missing_result == Ok({ field: Err(Missing) })
-		and null_result == Ok({ field: Err(Null) })
-			and value_result == Ok({ field: Ok("value") })
+		and null_result == Ok({ field: Ok(Err(Null)) })
+			and value_result == Ok({ field: Ok(Ok("value")) })
 }
 
 expect {

@@ -5,7 +5,7 @@ Format := [Default].{
 	rename_field = |_, name| name
 
 	parse_str : Format, State -> Try({ value : Str, rest : State }, [MissingRequired])
-	parse_str = |_| Err(MissingRequired)
+	parse_str = |_, _| Err(MissingRequired)
 
 	parse_record_field : Format, Encoding.FieldName.FieldNames(_shape), State -> Try(
 		[
@@ -21,6 +21,9 @@ Format := [Default].{
 
 	skip_record_field : Format, State -> Try(State, [MissingRequired])
 	skip_record_field = |_, state| Ok(state)
+
+	missing_record_field : Format, Str, State -> [MissingRequired]
+	missing_record_field = |_, _, _| MissingRequired
 }
 
 State := [Done]
