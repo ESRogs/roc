@@ -6,8 +6,6 @@ const builtins = @import("builtins");
 const build_options = @import("build_options");
 const host_alloc = @import("host_alloc");
 
-const trace_refcount = build_options.trace_refcount;
-
 pub const std_options_elf_debug_info_search_paths = shim_io.elfDebugInfoSearchPaths;
 pub const std_options_debug_io = shim_io.io();
 pub const std_options_debug_threaded_io = null;
