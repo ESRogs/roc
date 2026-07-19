@@ -5550,6 +5550,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     try self.reportPolymorphicExecutableRootResults();
 
     try self.reportNonExhaustiveLambdaParams(&env);
+    try self.reportNonExhaustiveForPatterns(&env);
 
     try self.pruneSelectedHoistedRootsAfterSolving();
 
@@ -14560,6 +14561,31 @@ fn checkDestructureExhaustiveness(
     self.known_empty_payload_vars_destructure.clearRetainingCapacity();
     const value_constructors_known = try self.collectKnownEmptyPayloadVarsForExpr(value_expr_idx, value_var, &self.known_empty_payload_vars_destructure);
 
+    try self.checkPatternExhaustiveness(
+        pattern_idx,
+        value_var,
+        self.known_empty_payload_vars_destructure.items,
+        value_constructors_known,
+        env,
+        region,
+    );
+}
+
+/// Check one pattern in an irrefutable binding position against its settled
+/// scrutinee type. Callers supply constructor facts only when a concrete value
+/// expression proves them; function parameters and iterator items have no such
+/// expression and must conservatively cover every inhabitant of their type.
+fn checkPatternExhaustiveness(
+    self: *Self,
+    pattern_idx: CIR.Pattern.Idx,
+    value_var: Var,
+    known_empty_payload_vars: []const Var,
+    value_constructors_known: bool,
+    env: *Env,
+    region: Region,
+) std.mem.Allocator.Error!void {
+    if (!self.patternNeedsExhaustiveness(pattern_idx)) return;
+
     var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
     defer open_cache.deinit();
     const result_or_err = exhaustive.checkDestructure(
@@ -14570,7 +14596,7 @@ fn checkDestructureExhaustiveness(
         self.exhaustiveBuiltinIdents(&open_cache),
         pattern_idx,
         value_var,
-        self.known_empty_payload_vars_destructure.items,
+        known_empty_payload_vars,
         value_constructors_known,
     );
     try self.backfillRegionsForAnalysisVars();
@@ -14620,16 +14646,25 @@ fn checkDestructureExhaustiveness(
 fn reportNonExhaustiveLambdaParams(self: *Self, env: *Env) std.mem.Allocator.Error!void {
     for (self.checked_lambda_params.items) |arg_span| {
         for (self.cir.store.slicePatterns(arg_span)) |pattern_idx| {
-            try self.checkParamPatternExhaustiveness(pattern_idx, env);
+            try self.checkPatternExhaustivenessWithoutValue(pattern_idx, env);
         }
     }
 }
 
-/// Exhaustiveness check for a single function/lambda parameter pattern. Unlike
-/// `checkDestructureExhaustiveness`, a parameter has no value expression, so the
-/// pattern's own type var is the scrutinee and there is no known-empty-payload
-/// information to collect (passed conservatively as empty / not-known).
-fn checkParamPatternExhaustiveness(
+/// Run exhaustiveness analysis on every source `for` pattern after iterator
+/// dispatch has settled the item type. Iterator items are dynamic values, so
+/// the iterable expression cannot supply constructor facts about them.
+fn reportNonExhaustiveForPatterns(self: *Self, env: *Env) std.mem.Allocator.Error!void {
+    for (self.cir.for_loop_dispatch_plans.items.items) |plan| {
+        const pattern_idx: CIR.Pattern.Idx = @enumFromInt(plan.pattern_idx);
+        try self.checkPatternExhaustivenessWithoutValue(pattern_idx, env);
+    }
+}
+
+/// Exhaustiveness check for a pattern without a concrete value expression.
+/// The pattern's own type var is the scrutinee and there is no constructor
+/// information to narrow the set of values it must cover.
+fn checkPatternExhaustivenessWithoutValue(
     self: *Self,
     pattern_idx: CIR.Pattern.Idx,
     env: *Env,
@@ -14637,51 +14672,8 @@ fn checkParamPatternExhaustiveness(
     if (!self.patternNeedsExhaustiveness(pattern_idx)) return;
 
     const value_var = ModuleEnv.varFrom(pattern_idx);
-    var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
-    defer open_cache.deinit();
-    const result_or_err = exhaustive.checkDestructure(
-        self.cir.gpa,
-        self.types,
-        self.cir,
-        &self.cir.store,
-        self.exhaustiveBuiltinIdents(&open_cache),
-        pattern_idx,
-        value_var,
-        &.{},
-        false,
-    );
-    try self.backfillRegionsForAnalysisVars();
-    const result = result_or_err catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.TypeError => return,
-    };
-    defer result.deinit(self.cir.gpa);
-
     const region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(pattern_idx));
-    try self.closeExhaustiveVars(result, env, region);
-
-    if (result.is_exhaustive) return;
-
-    const value_snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, value_var);
-    const missing_patterns_start = self.problems.missing_patterns_backing.items.len;
-    for (result.missing_patterns) |pattern| {
-        const idx = try exhaustive.formatPattern(
-            &self.problems.extra_strings_backing,
-            &self.cir.common.idents,
-            &self.cir.common.strings,
-            pattern,
-        );
-        try self.problems.missing_patterns_backing.append(idx);
-    }
-    const missing_patterns_range = problem.MissingPatternsRange{
-        .start = missing_patterns_start,
-        .count = self.problems.missing_patterns_backing.items.len - missing_patterns_start,
-    };
-    try self.problems.appendPendingStaticExhaustiveness(self.gpa, .destructure, self.pendingExhaustivenessMode(), .{ .destructure_pattern = pattern_idx }, region, .{ .non_exhaustive_destructure = .{
-        .pattern = pattern_idx,
-        .value_snapshot = value_snapshot,
-        .missing_patterns = missing_patterns_range,
-    } });
+    try self.checkPatternExhaustiveness(pattern_idx, value_var, &.{}, false, env, region);
 }
 
 // stmts //
@@ -16528,7 +16520,8 @@ fn checkIteratorForLoop(
     var does_fx = false;
     const child_expected = expected.forStatement();
 
-    try self.checkPattern(pattern, .for_, env);
+    const pattern_ctx: PatternCtx = if (self.patternNeedsExhaustiveness(pattern)) .match_branch else .for_;
+    try self.checkPattern(pattern, pattern_ctx, env);
     const item_var: Var = ModuleEnv.varFrom(pattern);
 
     does_fx = try self.checkExpr(iterable, env, child_expected) or does_fx;
