@@ -181,7 +181,6 @@ const TestsSummaryStep = struct {
     has_filters: bool,
     test_filters: []const []const u8,
     forced_passes: u64,
-    run_prerequisite: ?*Step,
     serialize_runs: bool,
     last_run: ?*Step,
     run_steps: std.ArrayList(*Step),
@@ -202,7 +201,6 @@ const TestsSummaryStep = struct {
             .has_filters = test_filters.len > 0,
             .test_filters = test_filters,
             .forced_passes = @intCast(forced_passes),
-            .run_prerequisite = null,
             .serialize_runs = false,
             .last_run = null,
             .run_steps = .empty,
@@ -214,11 +212,13 @@ const TestsSummaryStep = struct {
         self.serialize_runs = true;
     }
 
+    /// Registers `run_step` with the summary. On Windows the registered runs
+    /// are chained so that test binaries start one at a time; that chain is
+    /// private to the summary and must never be reachable from a public
+    /// `run-test-zig-*` step. Prefer `TestSuiteRegistry.register`, which
+    /// guarantees that by construction.
     fn addRun(self: *TestsSummaryStep, run_step: *Step) void {
         self.run_steps.append(self.step.owner.allocator, run_step) catch @panic("OOM");
-        if (self.run_prerequisite) |prerequisite| {
-            run_step.dependOn(prerequisite);
-        }
         if (self.serialize_runs) {
             if (self.last_run) |last_run| {
                 run_step.dependOn(last_run);
@@ -310,17 +310,91 @@ const TestsSummaryStep = struct {
     }
 };
 
-fn addTestRunArtifact(
+/// One environment variable, applied identically to both runs of a test suite.
+const TestSuiteEnv = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Everything that differs between the Zig test suites registered with
+/// `TestsSummaryStep`. Anything not expressible here is applied uniformly by
+/// `TestSuiteRegistry.register`. If a suite ever needs a knob that is missing
+/// (a working directory, `has_side_effects`, ...), add a field here rather than
+/// hand-wiring that one suite at its call site -- see the note on `register`.
+const TestSuiteSpec = struct {
+    /// Suffix appended to `run-test-zig-`. This is also the MiniCI job name in
+    /// `src/build/minici.zig`, so it must stay stable.
+    step_suffix: []const u8,
+    /// Description for the public `run-test-zig-<step_suffix>` step.
+    description: []const u8,
+    /// The test binary. Both runs execute this one `Step.Compile`, so it is
+    /// compiled once no matter which step was asked for.
+    compile: *Step.Compile,
+    /// Extra edges both runs need: copied host libraries, installed prebuilt
+    /// apps, the `roc` CLI, and so on.
+    deps: []const *Step = &.{},
+    /// Environment variables both runs need.
+    env: []const TestSuiteEnv = &.{},
+    /// Whether a bare `zig build` should also build this test binary.
+    default_step: bool = false,
+};
+
+/// Owns every cross-cutting edge a Zig test suite needs, so that a suite is
+/// wired up in exactly one call.
+///
+/// The failure this type exists to prevent: on Windows `TestsSummaryStep`
+/// chains its registered runs (see `setRunSerialization`) so that test binaries
+/// start one at a time. If a granular `run-test-zig-<suite>` step is pointed at
+/// the *same* `Step.Run` that the chain owns, it inherits the entire prefix of
+/// that chain. `run-test-zig-minici` is a std-only suite of ~11 string-parsing
+/// tests; wired that way it re-ran 41 unrelated test binaries and took 441s
+/// instead of ~2s. MiniCI runs each granular step as its own `zig build`
+/// process, so it replayed that prefix once per affected job -- which is what
+/// pushed the Windows CI job past its two-hour limit.
+///
+/// `register` builds *both* runs from one spec, so the summary's run and the
+/// public step's run can neither be the same object nor drift apart in their
+/// configuration. `assertGranularTestStepsAreIsolated` re-checks the finished
+/// graph, in case a suite is ever wired by hand anyway.
+const TestSuiteRegistry = struct {
     b: *std.Build,
-    artifact: *Step.Compile,
+    summary: *TestsSummaryStep,
+    build_test_zig_step: *Step,
+    /// Non-null only while the test-wiring check is enumerating test binaries.
+    wiring_run: ?*Step.Run,
+    /// Args forwarded from `zig build -- <args>`, e.g. `--test-filter`.
     run_args: []const []const u8,
-) *std.Build.Step.Run {
-    const run = b.addRunArtifact(artifact);
-    if (run_args.len != 0) {
-        run.addArgs(run_args);
+
+    fn register(self: TestSuiteRegistry, spec: TestSuiteSpec) void {
+        const b = self.b;
+
+        // Build-side wiring, uniform for every suite.
+        self.build_test_zig_step.dependOn(&spec.compile.step);
+        if (spec.default_step) b.default_step.dependOn(&spec.compile.step);
+        if (self.wiring_run) |wiring| wiring.addArtifactArg(spec.compile);
+
+        // Two runs over one compile. Only the summary's run joins the Windows
+        // serialization chain; the public step gets a run with no chain edges,
+        // which is what every non-Windows platform already does implicitly.
+        self.summary.addRun(&self.configuredRun(spec).step);
+
+        const public_step = b.step(
+            b.fmt("run-test-zig-{s}", .{spec.step_suffix}),
+            spec.description,
+        );
+        public_step.dependOn(&self.configuredRun(spec).step);
     }
-    return run;
-}
+
+    /// Both runs are produced by this one function from one spec, so there is
+    /// never a second copy of the configuration to fall out of sync.
+    fn configuredRun(self: TestSuiteRegistry, spec: TestSuiteSpec) *Step.Run {
+        const run = self.b.addRunArtifact(spec.compile);
+        if (self.run_args.len != 0) run.addArgs(self.run_args);
+        for (spec.env) |entry| run.setEnvironmentVariable(entry.key, entry.value);
+        for (spec.deps) |dep| run.step.dependOn(dep);
+        return run;
+    }
+};
 
 /// Build step that checks for forbidden patterns in the type checker code.
 ///
@@ -4474,6 +4548,10 @@ pub fn build(b: *std.Build) void {
         // Zig 0.16's Windows test runner IPC can time out while many Roc test
         // binaries are starting at once. Keep the same tests, but start them
         // in a deterministic order.
+        //
+        // Only the summary's own runs are chained. The public run-test-zig-*
+        // steps get separate, unchained runs via `TestSuiteRegistry`, so asking
+        // for one suite never drags in the whole chain -- see the note there.
         tests_summary.setRunSerialization();
     }
 
