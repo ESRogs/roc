@@ -1,10 +1,14 @@
 # Naming
 
-## Identifiers
+## Rules
 
-The name an [assignment](statements#assignment) gives must be a valid Roc _identifier_, which means:
+Valid names in Roc have different rules depending on what they are used for.
 
-- It's a combination of ASCII letters, numbers, and underscores.
+### Lowercase Names
+
+Lowercase names, used by [patterns](pattern-matching) (which includes [assignments](statements#assignment)), [type variables](types#type-variables), [record fields](records#fields), and [package shorthands](packages#shorthands), must follow these rules:
+
+- The name is a combination of ASCII letters, numbers, and underscores.
     - Consecutive underscores are allowed, but discouraged stylistically.
 - It must begin with either `_`, `$`, or a lowercase ASCII letter.
   - The `$` prefix is only for [reassignment with `var`](statements#reassignment), and must be followed by an ASCII lowercase letter
@@ -12,6 +16,19 @@ The name an [assignment](statements#assignment) gives must be a valid Roc _ident
     - The compiler will give a warning if an identifier begins with `_` and is referenced again in the same scope.
     - Note that [the `_` pattern](pattern-matching#underscore) is not an identifier and doesn't actually name anything.
 - It can optionally end with `!` if it's naming an [effectful function](functions#effectful-functions).
+
+[Type variables](types#type-variables), [record fields](records#fields), and [package shorthands](packages#shorthands), not only follow these rules, they have the additional restriction that they may not include `$` or `!` anywhere. (All of them may still begin with an underscore to indicate that they are unused.)
+
+### Uppercase Names
+
+Uppercase names, used by [type](types) names and [tag](tag-unions) names, have the same rules as [lowercase identifiers](#lowercase-identifiers) except:
+- They must begin with an ASCII uppercase letter (which implies they may not begin with an underscore)
+- They may not include `$` or `!`
+- Stylistically, they should not include any underscores
+
+## Unused Names
+
+TODO
 
 ## Shadowing
 
