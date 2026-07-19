@@ -14,5 +14,5 @@ emit! = |s| {
 main! : List(Str) => Try({}, _)
 main! = |_args| {
     rec = { shout!: |s| emit!("<<${s}>>") }
-    rec.shout!("boom")
+    (rec.shout!)("boom")
 }
