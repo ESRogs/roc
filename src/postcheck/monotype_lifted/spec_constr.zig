@@ -433,6 +433,11 @@ const InlineFrame = struct {
     known_size: usize,
 };
 
+const ActiveJoinClone = struct {
+    source: Ast.JoinPointId,
+    target: Ast.JoinPointId,
+};
+
 const Pass = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -471,6 +476,7 @@ const Pass = struct {
     /// This keeps later materialization rooted at the source instead of cloning
     /// an already-rewritten worker.
     callable_sources: std.AutoHashMap(Ast.FnId, Ast.FnId),
+    next_join_point: u32,
     fn init(allocator: Allocator, program: *Ast.Program) Allocator.Error!Pass {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -568,7 +574,14 @@ const Pass = struct {
             .self_recursive_fns = self_recursive_fns,
             .callable_workers = std.AutoHashMap(Ast.FnId, Ast.FnId).init(allocator),
             .callable_sources = std.AutoHashMap(Ast.FnId, Ast.FnId).init(allocator),
+            .next_join_point = 0,
         };
+    }
+
+    fn freshJoinPoint(self: *Pass) Ast.JoinPointId {
+        const id: Ast.JoinPointId = @enumFromInt(self.next_join_point);
+        self.next_join_point += 1;
+        return id;
     }
 
     fn deinit(self: *Pass) void {
@@ -859,6 +872,14 @@ const Pass = struct {
                 const values = self.program.exprSpan(continue_.values);
                 for (0..values.len) |index| try self.markArgUsesInExpr(fn_id, GuardedList.at(values, index), changed);
             },
+            .join_point => |join_point| {
+                try self.markArgUsesInExpr(fn_id, join_point.body, changed);
+                try self.markArgUsesInExpr(fn_id, join_point.remainder, changed);
+            },
+            .jump => |jump| {
+                const args = self.program.exprSpan(jump.args);
+                for (0..args.len) |index| try self.markArgUsesInExpr(fn_id, GuardedList.at(args, index), changed);
+            },
             .if_initialized_payload => |payload_switch| {
                 try self.markArgUsesInExpr(fn_id, payload_switch.cond, changed);
                 try self.markArgUsesInExpr(fn_id, payload_switch.initialized, changed);
@@ -1000,6 +1021,11 @@ const Pass = struct {
             },
             .break_ => |maybe| if (maybe) |value| try self.collectCallPatternsInExpr(owner, value),
             .continue_ => |continue_| try self.collectCallPatternsInExprSpan(owner, continue_.values),
+            .join_point => |join_point| {
+                try self.collectCallPatternsInExpr(owner, join_point.body);
+                try self.collectCallPatternsInExpr(owner, join_point.remainder);
+            },
+            .jump => |jump| try self.collectCallPatternsInExprSpan(owner, jump.args),
             .if_initialized_payload => |payload_switch| {
                 try self.collectCallPatternsInExpr(owner, payload_switch.cond);
                 try self.collectCallPatternsInExpr(owner, payload_switch.initialized);
@@ -2694,6 +2720,14 @@ const Pass = struct {
             .static_data_candidate => |candidate| try self.collectKnownLoops(candidate.runtime_expr, out),
             .return_ => |ret| try self.collectKnownLoops(ret.value, out),
             .comptime_branch_taken => |taken| try self.collectKnownLoops(taken.body, out),
+            .join_point => |join_point| {
+                try self.collectKnownLoops(join_point.body, out);
+                try self.collectKnownLoops(join_point.remainder, out);
+            },
+            .jump => |jump| {
+                const args = self.program.exprSpan(jump.args);
+                for (0..args.len) |index| try self.collectKnownLoops(GuardedList.at(args, index), out);
+            },
             else => {},
         }
     }
@@ -2810,6 +2844,11 @@ const Pass = struct {
             },
             .break_ => |maybe| if (maybe) |value| try self.rewriteCallsInExpr(value, done),
             .continue_ => |continue_| try self.rewriteCallsInExprSpan(continue_.values, done),
+            .join_point => |join_point| {
+                try self.rewriteCallsInExpr(join_point.body, done);
+                try self.rewriteCallsInExpr(join_point.remainder, done);
+            },
+            .jump => |jump| try self.rewriteCallsInExprSpan(jump.args, done),
             .if_initialized_payload => |payload_switch| {
                 try self.rewriteCallsInExpr(payload_switch.cond, done);
                 try self.rewriteCallsInExpr(payload_switch.initialized, done);
@@ -3174,6 +3213,7 @@ const Cloner = struct {
     changes: std.ArrayList(BindingChange),
     inline_stack: std.ArrayList(InlineFrame),
     loop_stack: std.ArrayList(LoopPattern),
+    join_stack: std.ArrayList(ActiveJoinClone),
     /// Bindings created while producing a structured value, not yet emitted.
     /// Each holds a fresh local the value's leaves reference. They are
     /// emitted — oldest outermost, preserving evaluation order — at the
@@ -3232,6 +3272,7 @@ const Cloner = struct {
             .changes = .empty,
             .inline_stack = .empty,
             .loop_stack = .empty,
+            .join_stack = .empty,
             .pending = .empty,
             .effect_marks = 0,
             .region_entry_marks = 0,
@@ -3259,6 +3300,7 @@ const Cloner = struct {
             .changes = .empty,
             .inline_stack = .empty,
             .loop_stack = .empty,
+            .join_stack = .empty,
             .pending = .empty,
             .effect_marks = 0,
             .region_entry_marks = 0,
@@ -3280,6 +3322,7 @@ const Cloner = struct {
         self.pending.deinit(self.pass.allocator);
         self.inline_stack.deinit(self.pass.allocator);
         self.loop_stack.deinit(self.pass.allocator);
+        self.join_stack.deinit(self.pass.allocator);
         self.changes.deinit(self.pass.allocator);
         self.binder_subst.deinit();
         self.subst.deinit();
@@ -3386,6 +3429,15 @@ const Cloner = struct {
             },
             .break_ => |maybe| if (maybe) |value| try self.collectCallPatternsInExpr(owner, value),
             .continue_ => |continue_| try self.collectCallPatternsInExprSpan(owner, continue_.values),
+            .join_point => |join_point| {
+                const change_start = self.changes.items.len;
+                const params = self.pass.program.typedLocalSpan(join_point.params);
+                for (0..params.len) |index| try self.shadowLocal(GuardedList.at(params, index).local);
+                try self.collectCallPatternsInExpr(owner, join_point.body);
+                self.restore(change_start);
+                try self.collectCallPatternsInExpr(owner, join_point.remainder);
+            },
+            .jump => |jump| try self.collectCallPatternsInExprSpan(owner, jump.args),
             .if_initialized_payload => |payload_switch| {
                 try self.collectCallPatternsInExpr(owner, payload_switch.cond);
                 try self.collectCallPatternsInExpr(owner, payload_switch.initialized);
@@ -3634,6 +3686,15 @@ const Cloner = struct {
             },
             .break_ => |maybe| if (maybe) |value| try self.rewriteCallsWithValuesInExpr(value),
             .continue_ => |continue_| try self.rewriteCallsWithValuesInExprSpan(continue_.values),
+            .join_point => |join_point| {
+                const change_start = self.changes.items.len;
+                const params = self.pass.program.typedLocalSpan(join_point.params);
+                for (0..params.len) |index| try self.shadowLocal(GuardedList.at(params, index).local);
+                try self.rewriteCallsWithValuesInExpr(join_point.body);
+                self.restore(change_start);
+                try self.rewriteCallsWithValuesInExpr(join_point.remainder);
+            },
+            .jump => |jump| try self.rewriteCallsWithValuesInExprSpan(jump.args),
             .if_initialized_payload => |payload_switch| {
                 try self.rewriteCallsWithValuesInExpr(payload_switch.cond);
                 try self.rewriteCallsWithValuesInExpr(payload_switch.initialized);
@@ -4325,6 +4386,11 @@ const Cloner = struct {
             .loop_ => |loop| return try self.materialize(try self.cloneLoopValue(expr.ty, loop)),
             .break_ => |maybe| .{ .break_ = if (maybe) |value| try self.cloneExpr(value) else null },
             .continue_ => |continue_| try self.cloneContinue(continue_),
+            .join_point => |join_point| return try self.cloneJoinPoint(expr.ty, join_point),
+            .jump => |jump| .{ .jump = .{
+                .target = self.clonedJoinTarget(jump.target),
+                .args = try self.cloneExprSpan(jump.args),
+            } },
             .if_initialized_payload => |payload_switch| .{ .if_initialized_payload = .{
                 .cond = try self.cloneExpr(payload_switch.cond),
                 .cond_mask = payload_switch.cond_mask,
@@ -4384,6 +4450,47 @@ const Cloner = struct {
         return try self.addExpr(.{ .ty = expr.ty, .data = data });
     }
 
+    fn cloneJoinPoint(self: *Cloner, ty: Type.TypeId, join_point: Ast.JoinPointExpr) Common.LowerError!Ast.ExprId {
+        const source_params = try GuardedList.dupe(self.pass.allocator, Ast.TypedLocal, self.pass.program.typedLocalSpan(join_point.params));
+        defer self.pass.allocator.free(source_params);
+        const params = try self.pass.allocator.alloc(Ast.TypedLocal, source_params.len);
+        defer self.pass.allocator.free(params);
+        for (source_params, 0..) |source_param, index| {
+            const local = try self.pass.program.addLocal(self.pass.symbols.fresh(), source_param.ty);
+            params[index] = .{ .local = local, .ty = source_param.ty };
+        }
+
+        const target = self.pass.freshJoinPoint();
+        try self.join_stack.append(self.pass.allocator, .{ .source = join_point.id, .target = target });
+        defer _ = self.join_stack.pop();
+
+        const change_start = self.changes.items.len;
+        for (source_params, params) |source_param, param| {
+            const local_expr = try self.addExpr(.{ .ty = param.ty, .data = .{ .local = param.local } });
+            try self.putSubst(source_param.local, .{ .expr = local_expr });
+        }
+        const body = try self.cloneExpr(join_point.body);
+        self.restore(change_start);
+        const remainder = try self.cloneExpr(join_point.remainder);
+
+        return try self.addExpr(.{ .ty = ty, .data = .{ .join_point = .{
+            .id = target,
+            .params = try self.pass.program.addTypedLocalSpan(params),
+            .body = body,
+            .remainder = remainder,
+        } } });
+    }
+
+    fn clonedJoinTarget(self: *Cloner, source: Ast.JoinPointId) Ast.JoinPointId {
+        var index = self.join_stack.items.len;
+        while (index > 0) {
+            index -= 1;
+            const join_point = self.join_stack.items[index];
+            if (join_point.source == source) return join_point.target;
+        }
+        Common.invariant("SpecConstr jump referenced a join point outside its lexical scope");
+    }
+
     fn cloneLetValue(self: *Cloner, let_: anytype) Common.LowerError!Value {
         const value = try self.cloneExprValue(let_.value);
         const value_expr = try self.materialize(value);
@@ -4411,9 +4518,8 @@ const Cloner = struct {
             self.restore(change_start);
             return rest;
         }
-        // A branch-built value cannot bind as one value; the binding and the
-        // let's continuation sink into the branches instead, where each
-        // branch's constructor is known.
+        // A branch-built value that cannot bind as one value transfers each
+        // branch result to one shared continuation.
         if (self.caseExprFromValue(value)) |case_expr| {
             if (try self.cloneLetOfCase(let_, case_expr)) |data| {
                 const rest_ty = self.pass.program.getExpr(let_.rest).ty;
@@ -4556,187 +4662,86 @@ const Cloner = struct {
     fn cloneLetOfCase(self: *Cloner, let_: anytype, value_expr: Ast.ExprId) Common.LowerError!?Ast.ExprData {
         const value_data = self.pass.program.getExpr(value_expr).data;
         switch (value_data) {
-            .match_ => |match| {
+            .match_, .if_ => {},
+            else => return null,
+        }
+
+        const value_ty = self.pass.program.getExpr(value_expr).ty;
+        const rest_ty = self.pass.program.getExpr(let_.rest).ty;
+        const join_param = try self.pass.program.addLocal(self.pass.symbols.fresh(), value_ty);
+        const params = [_]Ast.TypedLocal{.{ .local = join_param, .ty = value_ty }};
+        const param_expr = try self.addExpr(.{ .ty = value_ty, .data = .{ .local = join_param } });
+
+        const change_start = self.changes.items.len;
+        const pending_start = self.pending.items.len;
+        try self.shadowPatLocals(let_.bind);
+        const rest = try self.flushPendingSince(pending_start, try self.cloneExpr(let_.rest));
+        self.restore(change_start);
+        const continuation = try self.addExpr(.{ .ty = rest_ty, .data = .{ .let_ = .{
+            .bind = try self.clonePat(let_.bind),
+            .value = param_expr,
+            .rest = rest,
+            .comptime_site = let_.comptime_site,
+        } } });
+
+        const join_id = self.pass.freshJoinPoint();
+        const remainder = switch (value_data) {
+            .match_ => |match| blk: {
                 const branches = try GuardedList.dupe(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(match.branches));
                 defer self.pass.allocator.free(branches);
-
-                var rewritten = try self.pass.allocator.alloc(Ast.Branch, branches.len);
+                const rewritten = try self.pass.allocator.alloc(Ast.Branch, branches.len);
                 defer self.pass.allocator.free(rewritten);
-
                 for (branches, 0..) |branch, index| {
-                    const change_start = self.changes.items.len;
-                    try self.shadowPatLocals(branch.pat);
-                    const body = (try self.cloneLetCaseBranchBody(let_, branch.body)) orelse {
-                        self.restore(change_start);
-                        return null;
-                    };
-                    self.restore(change_start);
+                    const args = [_]Ast.ExprId{branch.body};
                     rewritten[index] = .{
                         .pat = branch.pat,
                         .guard = branch.guard,
-                        .body = body,
+                        .body = try self.addExpr(.{ .ty = rest_ty, .data = .{ .jump = .{
+                            .target = join_id,
+                            .args = try self.pass.program.addExprSpan(&args),
+                        } } }),
                     };
                 }
-
-                return .{ .match_ = .{
+                break :blk try self.addExpr(.{ .ty = rest_ty, .data = .{ .match_ = .{
                     .scrutinee = match.scrutinee,
                     .branches = try self.pass.program.addBranchSpan(rewritten),
                     .comptime_site = match.comptime_site,
-                } };
-            },
-            .if_ => |if_| {
-                const branches = try GuardedList.dupe(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(if_.branches));
-                defer self.pass.allocator.free(branches);
-
-                var rewritten = try self.pass.allocator.alloc(Ast.IfBranch, branches.len);
-                defer self.pass.allocator.free(rewritten);
-
-                for (branches, 0..) |branch, index| {
-                    const body = (try self.cloneLetCaseBranchBody(let_, branch.body)) orelse return null;
-                    rewritten[index] = .{
-                        .cond = branch.cond,
-                        .body = body,
-                    };
-                }
-                const final_else = (try self.cloneLetCaseBranchBody(let_, if_.final_else)) orelse return null;
-
-                return .{ .if_ = .{
-                    .branches = try self.pass.program.addIfBranchSpan(rewritten),
-                    .final_else = final_else,
-                } };
-            },
-            else => return null,
-        }
-    }
-
-    fn cloneLetCaseBranchBody(self: *Cloner, let_: anytype, branch_body: Ast.ExprId) Common.LowerError!?Ast.ExprId {
-        // The rewritten branch flushes every pending binding it creates, so
-        // it is its own region.
-        const saved_entry_marks = self.region_entry_marks;
-        self.region_entry_marks = self.effect_marks;
-        defer self.region_entry_marks = saved_entry_marks;
-
-        const branch_expr = self.pass.program.getExpr(branch_body);
-        switch (branch_expr.data) {
-            .block => |block| {
-                const change_start = self.changes.items.len;
-                const pending_entry = self.pending.items.len;
-
-                const source = try GuardedList.dupe(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(block.statements));
-                defer self.pass.allocator.free(source);
-
-                var statements = std.ArrayList(Ast.StmtId).empty;
-                defer statements.deinit(self.pass.allocator);
-                for (source) |stmt| {
-                    const pending_start = self.pending.items.len;
-                    const cloned = try self.cloneStmt(stmt);
-                    try self.appendPendingStmtsSince(pending_start, &statements);
-                    if (cloned) |cloned_stmt| try statements.append(self.pass.allocator, cloned_stmt);
-                }
-
-                const pending_final = self.pending.items.len;
-                const final_value = try self.cloneExprValue(block.final_expr);
-                const rest_ty = self.pass.program.getExpr(let_.rest).ty;
-                if (!try self.bindPatToBranchValue(let_.bind, block.final_expr, let_.rest, final_value)) {
-                    if (try self.cloneDivergentAtType(block.final_expr, rest_ty)) |divergent| {
-                        self.restore(change_start);
-                        try self.appendPendingStmtsSince(pending_final, &statements);
-                        return try self.addExpr(.{ .ty = rest_ty, .data = .{ .block = .{
-                            .statements = try self.pass.program.addStmtSpan(statements.items),
-                            .final_expr = divergent,
-                        } } });
-                    }
-                    self.restore(change_start);
-                    self.pending.shrinkRetainingCapacity(pending_entry);
-                    return null;
-                }
-
-                try self.appendPendingStmtsSince(pending_final, &statements);
-                const rest = try self.cloneExpr(let_.rest);
-                self.restore(change_start);
-
-                return try self.addExpr(.{ .ty = rest_ty, .data = .{ .block = .{
-                    .statements = try self.pass.program.addStmtSpan(statements.items),
-                    .final_expr = rest,
                 } } });
             },
-            else => {
-                const pending_entry = self.pending.items.len;
-                const branch_value = try self.cloneExprValue(branch_body);
-                const change_start = self.changes.items.len;
-                if (!try self.bindPatToBranchValue(let_.bind, branch_body, let_.rest, branch_value)) {
-                    self.restore(change_start);
-                    self.pending.shrinkRetainingCapacity(pending_entry);
-                    return null;
+            .if_ => |if_| blk: {
+                const branches = try GuardedList.dupe(self.pass.allocator, Ast.IfBranch, self.pass.program.ifBranchSpan(if_.branches));
+                defer self.pass.allocator.free(branches);
+                const rewritten = try self.pass.allocator.alloc(Ast.IfBranch, branches.len);
+                defer self.pass.allocator.free(rewritten);
+                for (branches, 0..) |branch, index| {
+                    const args = [_]Ast.ExprId{branch.body};
+                    rewritten[index] = .{
+                        .cond = branch.cond,
+                        .body = try self.addExpr(.{ .ty = rest_ty, .data = .{ .jump = .{
+                            .target = join_id,
+                            .args = try self.pass.program.addExprSpan(&args),
+                        } } }),
+                    };
                 }
-                const rest = try self.flushPendingSince(pending_entry, try self.cloneExpr(let_.rest));
-                self.restore(change_start);
-                return rest;
+                const else_args = [_]Ast.ExprId{if_.final_else};
+                const final_else = try self.addExpr(.{ .ty = rest_ty, .data = .{ .jump = .{
+                    .target = join_id,
+                    .args = try self.pass.program.addExprSpan(&else_args),
+                } } });
+                break :blk try self.addExpr(.{ .ty = rest_ty, .data = .{ .if_ = .{
+                    .branches = try self.pass.program.addIfBranchSpan(rewritten),
+                    .final_else = final_else,
+                } } });
             },
-        }
-    }
-
-    /// Bind a sunk let's pattern to one branch's result value: directly when
-    /// the value substitutes wholesale, otherwise by naming its opaque leaves
-    /// as pending bindings the caller pins at the branch's position — the
-    /// same computations in the same order. Sinking a continuation into the
-    /// branches pays for itself only when a branch yields a constructor the
-    /// binding consumes structurally; an opaque branch value gains nothing
-    /// and would only duplicate the continuation, so it declines.
-    fn bindPatToBranchValue(
-        self: *Cloner,
-        pat_id: Ast.PatId,
-        source_value: Ast.ExprId,
-        rest: Ast.ExprId,
-        value: Value,
-    ) Common.LowerError!bool {
-        switch (value) {
-            .expr => return false,
-            else => {},
-        }
-        if (try self.bindPatToReusableValue(pat_id, value) == .match) return true;
-        const change_before = self.changes.items.len;
-        const pending_before = self.pending.items.len;
-        if (self.pass.program.getPat(pat_id).data == .bind) {
-            const local = self.pass.program.getPat(pat_id).data.bind;
-            const unsafe_count = self.unsafeLeafCount(value);
-            const prepared = try self.valueForMatchLocal(local, value, rest, unsafe_count);
-            if (prepared != .expr) {
-                try self.putSubst(local, prepared);
-                return true;
-            }
-            self.restore(change_before);
-            self.pending.shrinkRetainingCapacity(pending_before);
-        }
-        const pat = self.pass.program.getPat(pat_id);
-        const self_referential = switch (pat.data) {
-            .bind => |local| localUseCountInExpr(self.pass.program, local, source_value) != 0,
-            else => false,
+            else => unreachable,
         };
-        if (self_referential) return false;
-        const reusable = try self.makeReusableForMatch(value);
-        if (reusable == .expr) {
-            self.restore(change_before);
-            self.pending.shrinkRetainingCapacity(pending_before);
-            return false;
-        }
-        if (try self.bindPatToFlowValue(pat_id, reusable)) return true;
-        self.restore(change_before);
-        self.pending.shrinkRetainingCapacity(pending_before);
-        return false;
-    }
 
-    fn cloneDivergentAtType(self: *Cloner, expr_id: Ast.ExprId, ty: Type.TypeId) Common.LowerError!?Ast.ExprId {
-        const expr = self.pass.program.getExpr(expr_id);
-        return switch (expr.data) {
-            .crash => |msg| try self.addExpr(.{ .ty = ty, .data = .{ .crash = msg } }),
-            .comptime_exhaustiveness_failed => |site| try self.addExpr(.{ .ty = ty, .data = .{ .comptime_exhaustiveness_failed = site } }),
-            .return_ => |ret| try self.addExpr(.{ .ty = ty, .data = .{ .return_ = .{
-                .value = try self.cloneExpr(ret.value),
-                .target = ret.target,
-            } } }),
-            else => null,
-        };
+        return .{ .join_point = .{
+            .id = join_id,
+            .params = try self.pass.program.addTypedLocalSpan(&params),
+            .body = continuation,
+            .remainder = remainder,
+        } };
     }
 
     fn cloneLoopValue(self: *Cloner, ty: Type.TypeId, loop: anytype) Common.LowerError!Value {
@@ -7235,6 +7240,8 @@ fn exprCallsFn(program: *const Ast.Program, expr_id: Ast.ExprId, fn_id: Ast.FnId
         .loop_ => |loop| exprSpanCallsFn(program, loop.initial_values, fn_id) or exprCallsFn(program, loop.body, fn_id),
         .break_ => |maybe| if (maybe) |value| exprCallsFn(program, value, fn_id) else false,
         .continue_ => |continue_| exprSpanCallsFn(program, continue_.values, fn_id),
+        .join_point => |join_point| exprCallsFn(program, join_point.body, fn_id) or exprCallsFn(program, join_point.remainder, fn_id),
+        .jump => |jump| exprSpanCallsFn(program, jump.args, fn_id),
         .if_initialized_payload => |payload_switch| exprCallsFn(program, payload_switch.cond, fn_id) or
             exprCallsFn(program, payload_switch.initialized, fn_id) or
             exprCallsFn(program, payload_switch.uninitialized, fn_id),
@@ -7357,6 +7364,9 @@ fn exprMayCrash(program: *const Ast.Program, fn_may_crash: []const bool, expr_id
             exprMayCrash(program, fn_may_crash, loop.body),
         .break_ => |maybe| if (maybe) |value| exprMayCrash(program, fn_may_crash, value) else false,
         .continue_ => |continue_| exprSpanMayCrash(program, fn_may_crash, continue_.values),
+        .join_point => |join_point| exprMayCrash(program, fn_may_crash, join_point.body) or
+            exprMayCrash(program, fn_may_crash, join_point.remainder),
+        .jump => |jump| exprSpanMayCrash(program, fn_may_crash, jump.args),
         .if_initialized_payload => |payload_switch| exprMayCrash(program, fn_may_crash, payload_switch.cond) or
             exprMayCrash(program, fn_may_crash, payload_switch.initialized) or
             exprMayCrash(program, fn_may_crash, payload_switch.uninitialized),
@@ -7475,6 +7485,8 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
         .loop_ => |loop| exprSpanContainsReturn(program, loop.initial_values) or exprContainsReturn(program, loop.body),
         .break_ => |maybe| if (maybe) |value| exprContainsReturn(program, value) else false,
         .continue_ => |continue_| exprSpanContainsReturn(program, continue_.values),
+        .join_point => |join_point| exprContainsReturn(program, join_point.body) or exprContainsReturn(program, join_point.remainder),
+        .jump => |jump| exprSpanContainsReturn(program, jump.args),
         .if_initialized_payload => |payload_switch| exprContainsReturn(program, payload_switch.cond) or
             exprContainsReturn(program, payload_switch.initialized) or
             exprContainsReturn(program, payload_switch.uninitialized),
@@ -7598,6 +7610,18 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
         .loop_ => |loop| localUseCountInExprSpan(program, local, loop.initial_values) + localUseCountInExpr(program, local, loop.body),
         .break_ => |maybe| if (maybe) |value| localUseCountInExpr(program, local, value) else 0,
         .continue_ => |continue_| localUseCountInExprSpan(program, local, continue_.values),
+        .join_point => |join_point| blk: {
+            var body_count = localUseCountInExpr(program, local, join_point.body);
+            const params = program.typedLocalSpan(join_point.params);
+            for (0..params.len) |index| {
+                if (GuardedList.at(params, index).local == local) {
+                    body_count = 0;
+                    break;
+                }
+            }
+            break :blk body_count + localUseCountInExpr(program, local, join_point.remainder);
+        },
+        .jump => |jump| localUseCountInExprSpan(program, local, jump.args),
         .if_initialized_payload => |payload_switch| localUseCountInExpr(program, local, payload_switch.cond) +
             (if (payload_switch.payload == local) @as(usize, 1) else 0) +
             localUseCountInExpr(program, local, payload_switch.initialized) +
@@ -7753,6 +7777,9 @@ fn exprHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []cons
         .break_ => |maybe| allow_control and
             (if (maybe) |value| exprHasNoObservableEffect(program, fn_effect_free, value, allow_control) else true),
         .continue_ => |continue_| allow_control and exprSpanHasNoObservableEffect(program, fn_effect_free, continue_.values, allow_control),
+        .join_point => |join_point| exprHasNoObservableEffect(program, fn_effect_free, join_point.body, allow_control) and
+            exprHasNoObservableEffect(program, fn_effect_free, join_point.remainder, allow_control),
+        .jump => |jump| exprSpanHasNoObservableEffect(program, fn_effect_free, jump.args, allow_control),
         .if_initialized_payload => |payload_switch| exprHasNoObservableEffect(program, fn_effect_free, payload_switch.cond, allow_control) and
             exprHasNoObservableEffect(program, fn_effect_free, payload_switch.initialized, allow_control) and
             exprHasNoObservableEffect(program, fn_effect_free, payload_switch.uninitialized, allow_control),
@@ -7925,6 +7952,19 @@ fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: 
         },
         .continue_ => |continue_| {
             scanLocalUseInExprSpan(program, local, continue_.values, scan);
+            scan.seen_effect = true;
+        },
+        .join_point => |join_point| {
+            var body_scan = scan.*;
+            scanLocalUseInExpr(program, local, join_point.body, &body_scan);
+            var remainder_scan = scan.*;
+            scanLocalUseInExpr(program, local, join_point.remainder, &remainder_scan);
+            scan.found_before_effect = scan.found_before_effect or body_scan.found_before_effect or remainder_scan.found_before_effect;
+            scan.found_after_effect = scan.found_after_effect or body_scan.found_after_effect or remainder_scan.found_after_effect;
+            scan.seen_effect = scan.seen_effect or body_scan.seen_effect or remainder_scan.seen_effect;
+        },
+        .jump => |jump| {
+            scanLocalUseInExprSpan(program, local, jump.args, scan);
             scan.seen_effect = true;
         },
         .if_initialized_payload => |payload_switch| {
@@ -8287,32 +8327,32 @@ fn emptyLiftedProgramForTest(allocator: Allocator) Ast.Program {
         allocator,
         names.NameStore.init(allocator),
         Type.Store.init(allocator),
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
+        .empty, // imported_fns
+        .empty, // exprs
+        .empty, // pats
+        .empty, // stmts
+        .empty, // locals
+        .empty, // expr_ids
+        .empty, // pat_ids
+        .empty, // typed_locals
+        .empty, // stmt_ids
+        .empty, // field_exprs
+        .empty, // fn_def_captures
+        .empty, // record_destructs
+        .empty, // str_pattern_steps
+        .empty, // branches
+        .empty, // if_branches
+        .empty, // string_literals
         Mono.ProcDebugNameMap.init(allocator),
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        0,
+        .empty, // source_files
+        .empty, // expr_locs
+        .empty, // expr_regions
+        .empty, // stmt_locs
+        .empty, // stmt_regions
+        .empty, // local_names
+        .empty, // static_data_values
+        .empty, // comptime_sites
+        0, // next_symbol
     );
 }
 
@@ -8560,17 +8600,23 @@ test "known match fold aborts on undecidable branches and trips the invariant wh
     const excluded_branches = try program.addBranchSpan(&.{
         .{ .pat = bar_pat, .body = body },
     });
-    const pid = try std.posix.fork();
+    const pid = std.c.fork();
+    try std.testing.expect(pid >= 0);
     if (pid == 0) {
-        const devnull = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(2);
-        std.posix.dup2(devnull, std.posix.STDERR_FILENO) catch std.posix.exit(2);
-        _ = cloner.simplifyKnownMatchValue(foo_value, excluded_branches) catch std.posix.exit(2);
+        const dev_null = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+        if (dev_null >= 0) {
+            _ = std.c.dup2(dev_null, 2);
+            _ = std.c.close(dev_null);
+        }
+        _ = cloner.simplifyKnownMatchValue(foo_value, excluded_branches) catch std.c._exit(2);
         // Reaching this line means the invariant did not fire.
-        std.posix.exit(0);
+        std.c._exit(0);
     }
-    const result = std.posix.waitpid(pid, 0);
-    const failed = std.posix.W.IFSIGNALED(result.status) or
-        (std.posix.W.IFEXITED(result.status) and std.posix.W.EXITSTATUS(result.status) != 0);
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    const raw_status: u32 = @bitCast(status);
+    const failed = std.posix.W.IFSIGNALED(raw_status) or
+        (std.posix.W.IFEXITED(raw_status) and std.posix.W.EXITSTATUS(raw_status) != 0);
     try std.testing.expect(failed);
 }
 

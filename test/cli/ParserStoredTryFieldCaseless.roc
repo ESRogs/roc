@@ -52,9 +52,6 @@ Format := [Default].{
 
 	missing_record_field : Format, Str, State -> [MissingRequired]
 	missing_record_field = |_, _, _| MissingRequired
-
-	missing_optional_field : Format, Str, State -> [Missing]
-	missing_optional_field = |_, _, _| Missing
 }
 
 State := [

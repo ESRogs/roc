@@ -38,6 +38,8 @@ pub const FnId = Mono.LiftedFnId;
 pub const Span = Mono.Span;
 /// Local binding id shared with Monotype IR.
 pub const LocalId = Mono.LocalId;
+/// Lexically scoped lifted join-point identity.
+pub const JoinPointId = Mono.JoinPointId;
 /// Local binding shared with Monotype IR.
 pub const Local = Mono.Local;
 /// Local id paired with a monomorphic type.
@@ -64,6 +66,10 @@ pub const InitializedPayloadSwitch = Mono.InitializedPayloadSwitch;
 pub const ListPattern = Mono.ListPattern;
 /// `..`/`.. as name` portion of a list pattern.
 pub const ListRestPattern = Mono.ListRestPattern;
+/// Typed shared continuation introduced by lifted optimization.
+pub const JoinPointExpr = Mono.JoinPointExpr;
+/// Transfer to a lexically enclosing lifted join point.
+pub const JumpExpr = Mono.JumpExpr;
 
 /// Typed Monotype Lifted expression.
 pub const Expr = Mono.Expr;
@@ -770,6 +776,18 @@ pub const Program = struct {
 
     pub fn getStringLiteral(self: *const Program, id: StringLiteralId) Mono.StringLiteral {
         return self.string_literals.unsafeRawItemsForView()[@intFromEnum(id)];
+    }
+
+    pub fn addStringLiteral(self: *Program, text: []const u8) std.mem.Allocator.Error!StringLiteralId {
+        const id: StringLiteralId = @enumFromInt(@as(u32, @intCast(self.string_literals.len())));
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        try self.string_literals.append(self.allocator, .{
+            .backing = owned,
+            .offset = 0,
+            .len = @intCast(text.len),
+        });
+        return id;
     }
 
     pub fn importedFnCount(self: *const Program) usize {

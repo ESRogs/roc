@@ -56,6 +56,7 @@ const Solver = struct {
     generated_backing_pats: []bool,
     loop_results: std.ArrayList(Type.TypeVarId),
     loop_params: std.ArrayList(Type.Span),
+    join_points: std.ArrayList(ActiveJoinPoint),
     return_contexts: std.ArrayList(ReturnContext),
     active_unifications: std.AutoHashMap(UnifyPair, void),
 
@@ -68,6 +69,11 @@ const Solver = struct {
     const ReturnContext = struct {
         mono_ret: MonoType.TypeId,
         solved_ret: Type.TypeVarId,
+    };
+
+    const ActiveJoinPoint = struct {
+        id: Lifted.JoinPointId,
+        params: Type.Span,
     };
 
     fn init(allocator: Allocator, program: *Ast.Program) Allocator.Error!Solver {
@@ -104,6 +110,7 @@ const Solver = struct {
             .generated_backing_pats = generated_backing_pats,
             .loop_results = .empty,
             .loop_params = .empty,
+            .join_points = .empty,
             .return_contexts = .empty,
             .active_unifications = std.AutoHashMap(UnifyPair, void).init(allocator),
         };
@@ -112,6 +119,7 @@ const Solver = struct {
     fn deinit(self: *Solver) void {
         self.active_unifications.deinit();
         self.return_contexts.deinit(self.allocator);
+        self.join_points.deinit(self.allocator);
         self.loop_params.deinit(self.allocator);
         self.loop_results.deinit(self.allocator);
         self.allocator.free(self.generated_backing_pats);
@@ -634,6 +642,29 @@ const Solver = struct {
                     _ = try self.expectExpr(value, param_ty);
                 }
             },
+            .join_point => |join_point| {
+                const params = self.lifted.typedLocalSpan(join_point.params);
+                const param_tys = try self.allocator.alloc(Type.TypeVarId, params.len);
+                defer self.allocator.free(param_tys);
+                for (params, 0..) |param, param_index| {
+                    param_tys[param_index] = self.localTy(param.local);
+                }
+                try self.join_points.append(self.allocator, .{
+                    .id = join_point.id,
+                    .params = try self.program.types.addSpan(param_tys),
+                });
+                defer _ = self.join_points.pop();
+                _ = try self.expectExpr(join_point.body, expected);
+                _ = try self.expectExpr(join_point.remainder, expected);
+            },
+            .jump => |jump| {
+                const params = self.activeJoinPoint(jump.target).params;
+                const args = self.lifted.exprSpan(jump.args);
+                if (params.count() != args.len) Common.invariant("jump argument count differs from join-point parameter count");
+                for (args, 0..) |arg, arg_index| {
+                    _ = try self.expectExpr(arg, self.program.types.spanItem(params, arg_index));
+                }
+            },
             .return_ => |ret| _ = try self.expectExpr(ret.value, try self.returnTargetTy(ret.target)),
             .dbg,
             .expect,
@@ -1030,6 +1061,16 @@ const Solver = struct {
     fn currentLoopParams(self: *Solver) Type.Span {
         if (self.loop_params.items.len == 0) Common.invariant("continue expression reached Lambda Solved outside a loop");
         return self.loop_params.items[self.loop_params.items.len - 1];
+    }
+
+    fn activeJoinPoint(self: *Solver, id: Lifted.JoinPointId) ActiveJoinPoint {
+        var index = self.join_points.items.len;
+        while (index > 0) {
+            index -= 1;
+            const join_point = self.join_points.items[index];
+            if (join_point.id == id) return join_point;
+        }
+        Common.invariant("jump expression referenced a join point outside its lexical scope");
     }
 
     fn markErasedCallablesReachedByType(self: *Solver, ty: Type.TypeVarId) Allocator.Error!void {
