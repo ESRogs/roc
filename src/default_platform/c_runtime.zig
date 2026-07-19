@@ -46,9 +46,28 @@ comptime {
     @export(&rocDealloc, .{ .name = shim_symbols.roc_dealloc });
 }
 
+/// Set when an inline `expect` fails. A failed inline expect reports and lets
+/// the program continue; the process exit turns an otherwise-successful status
+/// into 1, matching the interpreter's default-app behavior.
+var inline_expect_failed: bool = false;
+
+/// The Roc entrypoint the synthetic default platform exports.
+const roc_default_start_main: *const fn () callconv(.c) i32 =
+    @extern(*const fn () callconv(.c) i32, .{ .name = shim_symbols.roc_default_start_main });
+
+/// The C runtime owns the process entrypoint: it initializes the Roc runtime,
+/// runs the Roc entrypoint, and folds failed inline expects into the status.
+export fn main() callconv(.c) c_int {
+    runtimeInit();
+    const status = roc_default_start_main();
+    if (status == 0 and inline_expect_failed) return 1;
+    return status;
+}
+
 fn runtimeInit() callconv(.c) void {}
 
 fn defaultExit(code: u8) callconv(.c) noreturn {
+    if (code == 0 and inline_expect_failed) c.exit(1);
     c.exit(code);
 }
 
@@ -60,15 +79,16 @@ fn defaultEchoLine(str: RocStr) callconv(.c) void {
 }
 
 fn rocDbg(bytes: [*]const u8, len: usize) callconv(.c) void {
+    writeAll(2, "[dbg] ");
     writeAll(2, bytes[0..len]);
     writeAll(2, "\n");
 }
 
-fn rocExpectFailed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
-    writeAll(2, "Roc expect failed: ");
+fn rocExpectFailed(bytes: [*]const u8, len: usize) callconv(.c) void {
+    inline_expect_failed = true;
+    writeAll(2, "Expect failed: ");
     writeAll(2, bytes[0..len]);
     writeAll(2, "\n");
-    c.exit(1);
 }
 
 fn rocCrashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {

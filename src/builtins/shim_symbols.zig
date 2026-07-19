@@ -28,6 +28,8 @@ pub const roc_shim_hosted_fns_table = "roc_shim_hosted_fns_table";
 pub const roc_shim_default_main = "roc_shim_default_main";
 /// The default platform's pre-main runtime initialization hook.
 pub const roc_default_runtime_init = "roc_default_runtime_init";
+/// The synthetic default platform's exported Roc entrypoint.
+pub const roc_default_start_main = "roc_default_start_main";
 /// The default platform's process-exit hosted function.
 pub const roc_default_exit = "roc_default_exit";
 /// The default platform's line-echo hosted function.
