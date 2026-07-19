@@ -462,7 +462,7 @@ pub fn relocate(store: *NodeStore, offset: isize) void {
 /// Count of the diagnostic nodes in the ModuleEnv
 pub const MODULEENV_DIAGNOSTIC_NODE_COUNT = 85;
 /// Count of the expression nodes in the ModuleEnv
-pub const MODULEENV_EXPR_NODE_COUNT = 55;
+pub const MODULEENV_EXPR_NODE_COUNT = 56;
 /// Count of the statement nodes in the ModuleEnv
 pub const MODULEENV_STATEMENT_NODE_COUNT = 20;
 /// Count of the type annotation nodes in the ModuleEnv
@@ -1346,6 +1346,13 @@ pub fn getExpr(store: *const NodeStore, expr: CIR.Expr.Idx) CIR.Expr {
             const p = payload.expr_anno_only;
             return CIR.Expr{ .e_anno_only = .{
                 .ident = @bitCast(p.ident),
+            } };
+        },
+        .expr_derived_method => {
+            const p = payload.expr_derived_method;
+            return CIR.Expr{ .e_derived_method = .{
+                .ident = @bitCast(p.ident),
+                .kind = @enumFromInt(p.kind),
             } };
         },
         .expr_return => {
@@ -2848,6 +2855,13 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
             node.tag = .expr_anno_only;
             node.setPayload(.{ .expr_anno_only = .{
                 .ident = @bitCast(anno.ident),
+            } });
+        },
+        .e_derived_method => |derived| {
+            node.tag = .expr_derived_method;
+            node.setPayload(.{ .expr_derived_method = .{
+                .ident = @bitCast(derived.ident),
+                .kind = @intFromEnum(derived.kind),
             } });
         },
         .e_return => |ret| {
