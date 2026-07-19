@@ -130,7 +130,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Adv")
@@ -406,7 +406,7 @@ main = {
 								(e-literal (string "hello")))))))
 			(s-let
 				(p-assign (ident "next_val"))
-				(e-dispatch-call (method "update_str") (constraint-fn-var 468)
+				(e-dispatch-call (method "update_str") (constraint-fn-var 461)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "val"))))
@@ -422,7 +422,7 @@ main = {
 		(e-block
 			(s-let
 				(p-assign (ident "next_val"))
-				(e-dispatch-call (method "update") (constraint-fn-var 547)
+				(e-dispatch-call (method "update") (constraint-fn-var 540)
 					(receiver
 						(e-string
 							(e-literal (string "Hello"))))
@@ -442,9 +442,9 @@ main = {
 								(e-literal (string "hello")))))))
 			(s-let
 				(p-assign (ident "next_val"))
-				(e-dispatch-call (method "update_u64") (constraint-fn-var 634)
+				(e-dispatch-call (method "update_u64") (constraint-fn-var 627)
 					(receiver
-						(e-dispatch-call (method "update_str") (constraint-fn-var 613)
+						(e-dispatch-call (method "update_str") (constraint-fn-var 606)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "val"))))
@@ -455,12 +455,12 @@ main = {
 						(e-num (value "20")))))
 			(e-tuple
 				(elems
-					(e-dispatch-call (method "to_str") (constraint-fn-var 657)
+					(e-dispatch-call (method "to_str") (constraint-fn-var 647)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "next_val"))))
 						(args))
-					(e-dispatch-call (method "to_u64") (constraint-fn-var 659)
+					(e-dispatch-call (method "to_u64") (constraint-fn-var 649)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "next_val"))))
