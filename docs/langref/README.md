@@ -49,6 +49,7 @@ If you're looking for a beginner tutorial, check out [roc-lang.org/tutorial](htt
     - [Tail Call Optimization](functions#tail-call-optimization)
       - [Modulo Cons](functions#modulo-cons)
 - [Naming](naming)
+  - [Identifiers](naming#identifiers)
   - [Shadowing](naming#shadowing)
   - [Constants](naming#constants)
   - [Variables (with `var`)](naming#variables-with-var)
