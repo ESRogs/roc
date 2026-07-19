@@ -171,8 +171,12 @@ test "annotation regions preserve nested content on every render target" {
         defer gpa.free(stripped);
         try testing.expectEqualStrings(plain, stripped);
 
-        // HTML nests one tag per region, all of them balanced.
-        try testing.expectEqual(@as(usize, 1), countOccurrences(outputs.html, plain));
+        // HTML interleaves region tags with the text, so the plain string is
+        // split across them; each segment must still appear exactly once, with
+        // one balanced tag pair per region.
+        try testing.expectEqual(@as(usize, 1), countOccurrences(outputs.html, "outer one "));
+        try testing.expectEqual(@as(usize, 1), countOccurrences(outputs.html, "inner"));
+        try testing.expectEqual(@as(usize, 1), countOccurrences(outputs.html, " outer two"));
         try testing.expectEqual(@as(usize, 2), countOccurrences(outputs.html, "</"));
     }
 }
