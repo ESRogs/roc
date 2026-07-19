@@ -6658,38 +6658,8 @@ pub const Interpreter = struct {
 
     fn floatToInt(self: *LirInterpreter, comptime Src: type, comptime Dst: type, arg: Value, ret_layout: layout_mod.Idx) Error!Value {
         const val = try self.alloc(ret_layout);
-        const sv = arg.read(Src);
-        if (std.math.isNan(sv) or std.math.isInf(sv)) {
-            val.write(Dst, 0);
-        } else {
-            val.write(Dst, floatToIntWrap(Src, Dst, sv));
-        }
+        val.write(Dst, builtins.numeric_conversions.floatToIntWrap(Src, Dst, arg.read(Src)));
         return val;
-    }
-
-    fn floatToIntWrap(comptime Src: type, comptime Dst: type, sv: Src) Dst {
-        const truncated = @trunc(sv);
-        const int_info = @typeInfo(Dst).int;
-
-        if (int_info.bits <= 64) {
-            const U = std.meta.Int(.unsigned, int_info.bits);
-            const modulus: Src = @floatFromInt(@as(u128, 1) << int_info.bits);
-            var remainder = @mod(truncated, modulus);
-            if (remainder < 0) remainder += modulus;
-            if (remainder >= modulus) remainder = 0;
-            const unsigned: U = @intFromFloat(remainder);
-            return @bitCast(unsigned);
-        }
-
-        const min_val: Src = if (int_info.signedness == .signed)
-            @floatFromInt(std.math.minInt(Dst))
-        else
-            0;
-        const max_val: Src = @floatFromInt(std.math.maxInt(Dst));
-        if (truncated >= min_val and truncated <= max_val) {
-            return @intFromFloat(truncated);
-        }
-        return 0;
     }
 
     fn floatToIntTry(self: *LirInterpreter, comptime Src: type, comptime Dst: type, arg: Value, ret_layout: layout_mod.Idx) Error!Value {
@@ -7134,6 +7104,14 @@ pub const Interpreter = struct {
         };
     }
 
+    fn callDecBinaryBuiltin(self: *LirInterpreter, comptime func: anytype, av: i128, bv: i128) Error!i128 {
+        var crash_boundary = self.enterCrashBoundary();
+        defer crash_boundary.deinit();
+        const sj = crash_boundary.set();
+        if (sj != 0) return error.Crash;
+        return func(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
+    }
+
     /// Dec (fixed-point i128 with 10^18 scale) binary operation.
     fn decBinOp(self: *LirInterpreter, av: i128, bv: i128, op: NumOp) Error!i128 {
         return switch (op) {
@@ -7147,28 +7125,10 @@ pub const Interpreter = struct {
                 if (result.has_overflowed) return self.triggerCrash("Decimal multiplication overflowed!");
                 break :blk result.value.num;
             },
-            .div => blk: {
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.divC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
-            .div_trunc => blk: {
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
-            .rem => blk: {
-                if (bv == 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.remC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
-            .mod => blk: {
-                if (bv == 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.modC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
+            .div => self.callDecBinaryBuiltin(builtins.dec.divC, av, bv),
+            .div_trunc => self.callDecBinaryBuiltin(builtins.dec.divTruncC, av, bv),
+            .rem => self.callDecBinaryBuiltin(builtins.dec.remC, av, bv),
+            .mod => self.callDecBinaryBuiltin(builtins.dec.modC, av, bv),
         };
     }
 

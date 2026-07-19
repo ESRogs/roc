@@ -40,4 +40,5 @@ pub const formatUtf8Bounded = @import("config.zig").formatUtf8Bounded;
 test {
     const std = @import("std");
     std.testing.refAllDecls(@import("test.zig"));
+    std.testing.refAllDecls(@import("common_misspellings.zig"));
 }

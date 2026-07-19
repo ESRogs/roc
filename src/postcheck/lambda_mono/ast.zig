@@ -40,6 +40,8 @@ pub const StmtId = enum(u32) { _ };
 pub const FnId = Type.FnId;
 /// Identifier for a local binding in Lambda Mono IR.
 pub const LocalId = enum(u32) { _ };
+/// Lifted join-point identity retained by the debug materialized tree.
+pub const JoinPointId = Lifted.JoinPointId;
 /// Owned string literal id shared with the lifted stage.
 pub const StringLiteralId = Lifted.StringLiteralId;
 /// Identifier for a compile-time-observed control-flow site.
@@ -69,6 +71,20 @@ pub const Local = struct {
 pub const TypedLocal = struct {
     local: LocalId,
     ty: Type.TypeId,
+};
+
+/// A typed shared continuation retained by debug Lambda Mono materialization.
+pub const JoinPointExpr = struct {
+    id: JoinPointId,
+    params: Span(TypedLocal),
+    body: ExprId,
+    remainder: ExprId,
+};
+
+/// Transfer to a lexically enclosing join point.
+pub const JumpExpr = struct {
+    target: JoinPointId,
+    args: Span(ExprId),
 };
 
 /// Record field expression entry.
@@ -288,6 +304,8 @@ pub const ExprData = union(enum) {
     continue_: struct {
         values: Span(ExprId),
     },
+    join_point: JoinPointExpr,
+    jump: JumpExpr,
     return_: ExprId,
     crash: StringLiteralId,
     comptime_branch_taken: ComptimeBranchTaken,

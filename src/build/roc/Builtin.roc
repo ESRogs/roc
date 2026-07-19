@@ -1536,9 +1536,6 @@ Builtin :: [].{
 			missing_record_field : JsonEncoding, Str, JsonState -> Json.ParseErr
 			missing_record_field = |_, field, _| MissingRequiredField(field)
 
-			missing_optional_field : JsonEncoding, Str, JsonState -> [Missing, ..]
-			missing_optional_field = |_, _, _| Missing
-
 			invalid_value : JsonEncoding, JsonState -> Json.ParseErr
 			invalid_value = |_, _| Json.invalid_json
 
@@ -1850,9 +1847,6 @@ Builtin :: [].{
 
 			missing_record_field : HttpHeaderEncoding, Str, HttpHeaderState -> HttpHeader
 			missing_record_field = |_, _, _| HttpHeader.MissingRequired
-
-			missing_optional_field : HttpHeaderEncoding, Str, HttpHeaderState -> [Missing]
-			missing_optional_field = |_, _, _| Missing
 		}
 
 		HttpHeader := [MissingRequired, BadHeader].{

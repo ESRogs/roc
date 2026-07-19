@@ -32,9 +32,6 @@ Format := [Default].{
 
 	missing_record_field : Format, Str, State -> [MissingRequired]
 	missing_record_field = |_, _, _| MissingRequired
-
-	missing_optional_field : Format, Str, State -> [Absent]
-	missing_optional_field = |_, _, _| Absent
 }
 
 State := [Present(Str), Done]
@@ -51,8 +48,8 @@ parse = |input| {
 }
 
 expect {
-	result : Try({ foo : Try(Str, [Absent]) }, [MissingRequired])
+	result : Try({ foo : Try(Str, [Missing]) }, [MissingRequired])
 	result = parse(State.Done)
 
-	result == Ok({ foo: Err(Absent) })
+	result == Ok({ foo: Err(Missing) })
 }
