@@ -1372,6 +1372,16 @@ solution row is the record of an app-side check failure and is consumed only by
 flows that permit user errors, which output the platform root without a
 relation.
 
+A platform requirement's for-clause alias is a binder over an app-supplied
+type: the requirement's `Model` IS the app's `Model` by the for-clause's own
+definition, so identity provenance follows meaning provenance. After the
+requirement surface is checked, copied occurrences of a platform-root-owned
+for-clause alias resolve to the app's own type declaration (the checker
+redirects those solved vars, cited as
+`RedirectRule.for_clause_alias_identity`). Nothing in the app's checked
+output needs the platform root's checked module as a type owner, which is
+what lets an app build's platform root defer its checked-module output.
+
 The platform root's checked module is output exactly once per build:
 relation-bearing at finalization when an app root is paired (keyed by the
 platform/app relation identity), or relation-less at check completion when the
@@ -2043,6 +2053,129 @@ The following properties require focused tests:
 Backends receive only ordinary LIR and explicit ARC statements. They must not
 know whether a value originated as a public iterator, a minted iterator,
 forced-dynamic callable state, or a scalarized loop.
+
+## Solver-Mutating Rewrites
+
+Pure unification is the authority on what typechecks. Any code that mutates
+the solved type graph or restamps stamped dispatch-plan metadata outside ordinary
+unification is one of two things, and must say which:
+
+- Mechanism: the rewrite cannot change which programs typecheck or which
+  plans are output for error-free programs. Examples: diagnostic recovery
+  on an already-reported error, a descriptor fast path that writes exactly
+  what a unify would have produced, recycling of orphaned vars.
+- Policy: the rewrite makes a program typecheck that pure unification would
+  reject, or changes checked-module output for error-free programs. Every policy
+  rewrite implements a rule declared in this document, is named for that
+  rule, and has tests pinning both its accepted and its rejected side.
+
+The distinction exists because a probe-then-mutate rewrite is
+indistinguishable at review time from a change to the language's typing
+rules: it passes its own repro, and nothing in the type system flags that
+subsumption or dispatch policy changed. The solved-graph mutation primitive,
+`Store.dangerousSetVarRedirect` (src/types/store.zig), therefore requires a
+`RedirectRule` enum member naming the declared rule each call site operates
+under — an unreasoned redirect does not compile, and adding a caller means
+adding or citing a member, which is greppable and reviewable. A new
+probe-then-mutate rewrite requires a declared rule in this document first;
+"it makes a test pass" is not a rule.
+
+### Hosted Try Question Widening
+
+`?` unwraps a `Try` condition and re-raises its error row into the enclosing
+function's return row. When the callee's error row is closed and the
+enclosing annotated return's row is open (a rigid extension), ordinary
+unification rejects the pair, and that mismatch is a type error by design: a
+closed error row is not widened into an open annotated row at use sites
+(issue #9798's program is rejected).
+
+The one declared exception is a direct call of a hosted function. A hosted
+function's boundary type is an ABI contract keyed by its declared closed row
+(see Host Symbol ABI), so the hosted callee cannot adopt the caller's wider
+row, and requiring callers to re-tag hosted errors by hand would make hosted
+functions unusable with `?`. When the `?` condition is a direct call of a
+hosted function — the call's function expression resolves statically to an
+`e_hosted_lambda` def; dispatch calls and value-carried functions never
+qualify — and every visible error in the callee's row is included in the
+expected row (same tag names, mutually usable payloads), the checker widens
+the condition at the use site: the condition's root is redirected to a fresh
+`Try` at the expected row (`widenTryConditionForExpectedReturn`, cited as
+`RedirectRule.hosted_try_question_widening`), leaving the hosted callee's own
+declared type untouched. Monotype lowering gives a widened hosted
+specialization request a generated Roc adapter at the requested type that
+calls the declared-type boundary and re-tags the error into the wider row,
+so the extern boundary itself is always emitted at the declared row.
+
+Both sides are pinned by tests: accepted —
+test/fx-open/issue_9963_hosted_try_question_mark.roc (a direct hosted `?`
+inside an open-row platform function builds and the host's Ok is observed as
+Ok); rejected — test/fx-open/hosted_try_question_not_included.roc (a direct
+hosted `?` whose enclosing annotation omits the hosted error is a type
+error), and the issue #9798 regression test in
+src/check/test/type_checking_integration.zig (a non-hosted `?` into an open
+annotated row is a type error even when the visible errors are included).
+
+### Rewrite Inventory
+
+Every solver-mutating rewrite in checking, classified. A change that adds a
+site to any family below must classify it here.
+
+`dangerousSetVarRedirect` call sites (all in src/check/Check.zig; the
+`RedirectRule` member at each site is the citation):
+
+- `widenTryConditionForExpectedReturn` — policy: Hosted Try Question
+  Widening (above).
+- `resolveForClauseAliasOccurrences` — policy: for-clause alias identity
+  (see Platform/App Relation): copied occurrences of a platform
+  requirement's for-clause alias resolve to the app's own type declaration,
+  because the alias is a binder over the app-supplied type.
+- `markErroneousBranchWithExpected` — mechanism: diagnostic recovery. The
+  expression already has a reported error; its var is redirected to a fresh
+  var unified with the expected return so checking can continue past it.
+
+Other solved-graph mutations:
+
+- `unifyWithFresh` (`dangerousSetVarDesc`) — mechanism: fast path writing
+  exactly the descriptor that unifying a root flex placeholder with fresh
+  content would produce.
+- `resetAnnotationNodes` (`resetVarToUnbound`) — mechanism: recycles
+  annotation node vars after the scheme was copied off as a disjoint orphan.
+- Occurs-check and invalid-nominal-declaration poisoning
+  (`setVarContent(.err)`) — mechanism: diagnostic recovery after a reported
+  problem.
+- `finalizeFunctionEffectsAtBoundary` — policy: directed-effect
+  materialization at generalization boundaries, the rule declared in
+  Checking Effects And Const Roots.
+- `closeAbsentConstructedPayloadVars` / `closePayloadVarToEmpty` — policy:
+  absent-constructor payload closing. A constructed value's unconstrained,
+  ignorable payload vars for tags the expression provably never constructs
+  close to the empty tag union, so matches on constructed values are
+  exhaustive without wildcard arms.
+- Literal defaulting (`commitLiteralDefault`, `commitLiteralGroupDefault`)
+  — policy: literal defaulting as declared in Static Dispatch At The
+  Checked Boundary (the `LITERAL DEFAULTED` warning) and the numeric
+  default candidate order (`Dec` first); mutation happens only through
+  committed probes of ordinary unification.
+- `instantiate.zig` / `copy_import.zig` `dangerousSetVarDesc` — mechanism:
+  instantiation and import copying build fresh disjoint graphs.
+
+Stamped-plan restamps on CIR nodes (discharge time): the restamp rule —
+only the node's own constraint may restamp a node that already carries a
+stamped plan — is documented and enforced at the restamp sites
+(`rewriteEqBinopAsMethodEq`, `rewriteDerivedIsEqMethodCallAsStructuralEq`,
+`rewriteDerivedMethodCallAsStructuralHash`). Plan stamping at creation
+(`replaceExprWithDispatchCall` and friends at plan-creation sites) is the
+plan's first stamp, not a restamp; `replaceExprWithRuntimeError` is diagnostic
+recovery.
+
+Read-only acceptance probes (no mutation; their rules live in doc comments
+at their definitions): `staticDispatchConstraintAcceptsCandidate` states the
+method-acceptance rule of static dispatch, with accepted/missing-method/
+signature-mismatch branches each pinned by tests;
+`numeralCandidateStructurallyRefuted` implements no rule of its own and is
+witness-asserted against the probe it pre-filters in safety builds;
+`probeCanUseAs`/`tryErrorRowNeedsUseSiteWidening` are the gating probes for
+Hosted Try Question Widening.
 
 ## Shared Post-Check Model
 
