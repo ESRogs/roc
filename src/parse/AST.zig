@@ -2776,7 +2776,11 @@ pub const Expr = union(enum) {
         token: Token.Idx,
         region: TokenizedRegion,
     },
+    /// Record field access, written `receiver.field` with no argument list.
+    /// Calling a function stored in the field is a separate ordinary apply,
+    /// written `(receiver.field)(args)`.
     field_access: BinOp,
+    /// Attached method call, written `receiver.method(args)`.
     method_call: struct {
         receiver: Expr.Idx,
         method_token: Token.Idx,
