@@ -10,7 +10,7 @@ A _tag_ is a name for one of the alternatives in a tag union. Tags can optionall
 - In `y = Foo(4)`, `Foo` is a tag with a payload of `4`.
 - In `y = Foo(4, 2)`, `Foo` is a tag with payloads of `4` and `2`.
 
-> **Note:** At runtime, Payloads optimize to the same thing as tuples. After optimizations, `Foo(4, 2)` and `Foo((4, 2))` compile to exactly the same thing.
+> **Note:** At runtime, payloads optimize to the same thing as tuples. After optimizations, `Foo(4, 2)` and `Foo((4, 2))` compile to exactly the same thing.
 
 Tag unions can't have multiple tags with the same name but different payload types. So for example,
 `Foo("a string")` and `Foo(1, 2)` couldn't go in the same tag union, because their tags have
@@ -21,7 +21,7 @@ the same name but their payloads are incompatible.
 _Structural_ tag unions are both structural and extensible.
 
 - **Structural** means that you don't have to choose a name for the type (or declare it in any way), and that two types are considered equivalent if they have the same structure.
-- **Extensible** means that the type can accumulate new tags based on how it's used, and also that you can use type variables to .
+- **Extensible** means that the type can accumulate new tags based on how it's used, and also that you can use type variables to represent additional tags the union might contain.
 
 In contrast, [_nominal_ tag unions](#nominal-tag-unions) are neither structural nor extensible.
 
@@ -90,7 +90,7 @@ This is equivalent to writing `.._` but is more concise.
 
 ### Closed Tag Unions
 
-It's very rare, but occasionally useful to restrict a tag union's ability to be extended:
+It's very rare, but occasionally useful to restrict a tag union's ability to be extended. (Note: the `..[]` syntax shown here has not been implemented yet.)
 
 ```roc
 to_color : Str -> [Red, Green, Blue, Other, ..[]]
@@ -115,7 +115,7 @@ extended_color = if some_condition {
 
 This is rarely useful to application authors, but it is useful to platform authors.
 Platform authors can't send extensible types across the host boundary (as otherwise
-the host couldn't reliably know which tags map to which integer descriminants), 
+the host couldn't reliably know which tags map to which integer discriminants), 
 so this is a way to (for example) make a structural tag union for errors, and then 
 mark it as closed so that it can be sent across the host boundary.
 

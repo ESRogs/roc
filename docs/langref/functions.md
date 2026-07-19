@@ -60,7 +60,7 @@ pure_fn : Str, Str -> Str
 run_fx! : Str, Str => Str
 ```
 
-Each function takes two `Str` values as arguments, and returns as `Str`. `run_fx!` may
+Each function takes two `Str` values as arguments, and returns a `Str`. Unlike `pure_fn`, `run_fx!` may perform side effects when called.
 
 ### `->` and `=>` in function type annotations
 
@@ -77,9 +77,9 @@ By convention, all effectful functions—and _only_ effectful functions—have n
 in  `!`. This design has two purposes:
 
 * It makes it easy to see at a glance exactly which parts of your code are potentially performing effects.
-* It makes it easy to distinguish between higher-order functions like `List.keep_if` and `List.keep_if!` which differ only in the effectfulness of the functions they accept.
+* It makes it easy to distinguish between higher-order functions like `Try.map_ok` and `Try.map_ok!` which differ only in the effectfulness of the functions they accept.
 
-Roc's compiler reports a warning if this naming convention is not followed.
+Roc's compiler reports a warning if an effectful function's name does not end in `!`.
 
 ## Purity inference
 
@@ -93,6 +93,8 @@ that's been incorrectly annotated as a pure function, but you could still run th
 This is a useful feature, as it means you can do things like take a function that has been
 historically pure and add some debugging that involves doing I/O in the middle of the function.
 You'll get a warning (and potentially miss out on some optimizations) but you won't have to do the chore of going around changing a bunch of annotations just to be able to run the program.
+
+(Note: this is not fully implemented yet. Currently, the compiler reports an incorrect purity annotation as a type mismatch error rather than a warning.)
 
 Note that this still doesn't make it possible to call effectful functions at compile time.
 The rule still applies that effectful functions can only be called from within other
@@ -115,19 +117,19 @@ Functions can be recursive, meaning they call themselves.
 
 _Self-recursive_ functions are functions that call themselves directly.
 
-Here's an implementation of `List.contains` that calls itself directly:
+Here's a `contains` function for lists of strings that calls itself directly:
 
-```
-contains : List(item), item -> Bool
-contains = |list, item| match list.split_first() {
-    Ok((first, rest)) => {
+```roc
+contains : List(Str), Str -> Bool
+contains = |list, item| match list {
+    [] => False
+    [first, .. as rest] => {
         if first == item {
             True
         } else {
-            find(rest, query) # recursion
+            contains(rest, item) # recursion
         }
     }
-    Err(WasEmpty) => False
 }
 ```
 
@@ -141,7 +143,7 @@ mean a function that recurses forever will loop forever instead of overflowing t
 A _tail call_ is a function call followed immediately by returning from the current function,
 without doing any other work in between.
 
-In the previous example, `find(rest, query)` is a tail call. It's calling a function and then
+In the previous example, `contains(rest, item)` is a tail call. It's calling a function and then
 immediately returning without doing any other work. In this case, it's calling itself (making
 this a _self-tail-call,_ which is also known as _self-tail-recursion),_ although tail calls
 can be to other functions too.
