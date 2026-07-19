@@ -346,6 +346,7 @@ const Lowerer = struct {
     comptime_site_map: []?LIR.ComptimeSiteId,
     next_join_point: u32 = 0,
     loop_stack: std.ArrayList(LoopContext),
+    join_stack: std.ArrayList(JoinContext),
     current_ret_ty: ?Type.TypeId = null,
     current_proc_locals: ?*ProcLocalSet = null,
     current_fn: ?Type.FnId = null,
@@ -361,6 +362,13 @@ const Lowerer = struct {
         param_tys: []const Type.TypeId,
         result_target: LIR.LocalId,
         after_loop: LIR.CFStmtId,
+    };
+
+    const JoinContext = struct {
+        source_id: Lifted.JoinPointId,
+        join_id: LIR.JoinPointId,
+        params: LIR.LocalSpan,
+        param_tys: []const Type.TypeId,
     };
 
     fn init(
@@ -421,11 +429,13 @@ const Lowerer = struct {
             .local_types = std.AutoHashMap(LIR.LocalId, Type.TypeId).init(allocator),
             .comptime_site_map = comptime_site_map,
             .loop_stack = .empty,
+            .join_stack = .empty,
         };
     }
 
     fn deinit(self: *Lowerer) void {
         self.folded_map_matches.deinit(self.allocator);
+        self.join_stack.deinit(self.allocator);
         self.loop_stack.deinit(self.allocator);
         self.allocator.free(self.comptime_site_map);
         self.typed_local_map.deinit();
@@ -461,6 +471,7 @@ const Lowerer = struct {
             .runtime_schemas = self.runtime_schemas,
         };
         self.folded_map_matches.deinit(self.allocator);
+        self.join_stack.deinit(self.allocator);
         self.loop_stack.deinit(self.allocator);
         self.allocator.free(self.comptime_site_map);
         self.typed_local_map.deinit();
@@ -494,6 +505,7 @@ const Lowerer = struct {
         self.static_data_map = &.{};
         self.comptime_site_map = &.{};
         self.loop_stack = .empty;
+        self.join_stack = .empty;
         self.folded_map_matches = .empty;
         return output;
     }
@@ -2149,6 +2161,8 @@ const Lowerer = struct {
             .loop_ => |loop| try self.lowerLoopInto(target, loop, next),
             .break_ => |value| try self.lowerBreak(value),
             .continue_ => |continue_| try self.lowerContinue(continue_.values),
+            .join_point => |join_point| try self.lowerJoinPointInto(target, join_point, next),
+            .jump => |jump| try self.lowerJump(jump),
             .return_ => |ret| try self.lowerReturn(ret),
             .crash => |msg| try self.result.store.addCFStmt(.{ .crash = .{
                 .msg = try self.result.store.insertString(self.stringLiteralText(msg)),
@@ -4276,6 +4290,58 @@ const Lowerer = struct {
         jump = try self.prependJoinParamInitializers(loop.params, locals.ids, jump);
         jump = try self.prependJoinExprsAtTypes(locals, loop.param_tys, jump);
         return jump;
+    }
+
+    fn lowerJoinPointInto(
+        self: *Lowerer,
+        target: LIR.LocalId,
+        join_point: Lifted.JoinPointExpr,
+        next: LIR.CFStmtId,
+    ) Common.LowerError!LIR.CFStmtId {
+        const params = self.solved.lifted.typedLocalSpan(join_point.params);
+        const param_locals = try self.allocator.alloc(LIR.LocalId, params.len);
+        defer self.allocator.free(param_locals);
+        const param_tys = try self.allocator.alloc(Type.TypeId, params.len);
+        defer self.allocator.free(param_tys);
+        for (0..params.len) |index| {
+            const param = GuardedList.at(params, index);
+            param_tys[index] = try self.lowerLocalTy(param.local);
+            param_locals[index] = try self.bindLocalForTyped(param.local, param_tys[index]);
+        }
+
+        const param_span = try self.result.store.addLocalSpan(param_locals);
+        const lir_join_id = self.freshJoinPointId();
+        try self.join_stack.append(self.allocator, .{
+            .source_id = join_point.id,
+            .join_id = lir_join_id,
+            .params = param_span,
+            .param_tys = param_tys,
+        });
+        defer _ = self.join_stack.pop();
+
+        const body = try self.lowerExprInto(target, join_point.body, next);
+        const remainder = try self.lowerExprInto(target, join_point.remainder, next);
+        return try self.result.store.addCFStmt(.{ .join = .{
+            .id = lir_join_id,
+            .params = param_span,
+            .body = body,
+            .remainder = remainder,
+        } });
+    }
+
+    fn lowerJump(self: *Lowerer, jump: Lifted.JumpExpr) Common.LowerError!LIR.CFStmtId {
+        const join_point = self.activeJoinPoint(jump.target);
+        const args = self.solved.lifted.exprSpan(jump.args);
+        if (self.result.store.getLocalSpan(join_point.params).len != args.len) {
+            Common.invariant("jump argument count differed from join-point parameter count during direct LIR lowering");
+        }
+
+        const locals = try self.lowerExprsToJoinTempsAtTypes(join_point.params, join_point.param_tys, args);
+        defer locals.deinit(self.allocator);
+        var lir_jump = try self.result.store.addCFStmt(.{ .jump = .{ .target = join_point.join_id } });
+        lir_jump = try self.prependJoinParamInitializers(join_point.params, locals.ids, lir_jump);
+        lir_jump = try self.prependJoinExprsAtTypes(locals, join_point.param_tys, lir_jump);
+        return lir_jump;
     }
 
     fn lowerReturn(self: *Lowerer, ret: Mono.Return) Common.LowerError!LIR.CFStmtId {
@@ -7770,6 +7836,16 @@ const Lowerer = struct {
     fn currentLoop(self: *Lowerer) LoopContext {
         if (self.loop_stack.items.len == 0) Common.invariant("loop control expression reached LIR outside a loop");
         return self.loop_stack.items[self.loop_stack.items.len - 1];
+    }
+
+    fn activeJoinPoint(self: *Lowerer, id: Lifted.JoinPointId) JoinContext {
+        var index = self.join_stack.items.len;
+        while (index > 0) {
+            index -= 1;
+            const join_point = self.join_stack.items[index];
+            if (join_point.source_id == id) return join_point;
+        }
+        Common.invariant("jump expression reached LIR lowering outside its join-point scope");
     }
 
     fn freshJoinPointId(self: *Lowerer) LIR.JoinPointId {

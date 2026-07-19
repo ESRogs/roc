@@ -52,6 +52,12 @@ pub const ShardId = enum(u32) { local = 0, _ };
 pub const ImportedFnId = enum(u32) { _ };
 /// Identifier for a local binding in Monotype IR.
 pub const LocalId = enum(u32) { _ };
+/// Identifier for a lexically scoped Monotype Lifted join point.
+///
+/// Monotype itself never produces join points. The shared expression storage
+/// carries this id so lifting and later lifted optimizations can represent
+/// shared continuations without copying their expression bodies.
+pub const JoinPointId = enum(u32) { _ };
 /// Identifier assigned by Monotype lifting when this storage is consumed.
 pub const LiftedFnId = enum(u32) { _ };
 /// Identifier for an owned string literal.
@@ -492,6 +498,24 @@ pub const ContinueExpr = struct {
     values: Span(ExprId),
 };
 
+/// A typed shared continuation introduced after Monotype lifting.
+///
+/// `body` is evaluated when a matching `jump` supplies `params`; `remainder`
+/// is the expression that may transfer control to the join point. Both have
+/// the enclosing expression's result type.
+pub const JoinPointExpr = struct {
+    id: JoinPointId,
+    params: Span(TypedLocal),
+    body: ExprId,
+    remainder: ExprId,
+};
+
+/// Transfer control to a lexically enclosing join point.
+pub const JumpExpr = struct {
+    target: JoinPointId,
+    args: Span(ExprId),
+};
+
 /// Source control-flow construct observed during compile-time finalization.
 pub const ComptimeSiteKind = enum(u8) {
     match,
@@ -600,6 +624,8 @@ pub const ExprData = union(enum(u8)) {
     loop_: LoopExpr,
     break_: ?ExprId,
     continue_: ContinueExpr,
+    join_point: JoinPointExpr,
+    jump: JumpExpr,
     return_: Return,
     crash: StringLiteralId,
     comptime_branch_taken: ComptimeBranchTaken,

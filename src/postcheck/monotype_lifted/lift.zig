@@ -723,6 +723,9 @@ const Lifter = struct {
             },
             .break_ => |maybe| if (maybe) |value| try self.rewriteExpr(value),
             .continue_ => |continue_| try self.rewriteExprSpan(continue_.values),
+            .join_point,
+            .jump,
+            => Common.invariant("lifted join-point control reached Monotype lifting"),
         }
     }
 
@@ -1431,6 +1434,18 @@ const CaptureSet = struct {
             .continue_ => |continue_| {
                 const values = input.exprSpan(continue_.values);
                 for (0..values.len) |value_index| try self.collectExpr(GuardedList.at(values, value_index), bound);
+            },
+            .join_point => |join_point| {
+                var added = std.ArrayList(Mono.LocalId).empty;
+                defer added.deinit(self.allocator);
+                try bindTypedLocalsTracked(self.allocator, input, bound, input.typedLocalSpan(join_point.params), &added);
+                try self.collectExpr(join_point.body, bound);
+                removeBound(input, bound, added.items);
+                try self.collectExpr(join_point.remainder, bound);
+            },
+            .jump => |jump| {
+                const args = input.exprSpan(jump.args);
+                for (0..args.len) |arg_index| try self.collectExpr(GuardedList.at(args, arg_index), bound);
             },
         }
     }
@@ -2297,6 +2312,15 @@ const CaptureGraphBuilder = struct {
             },
             .break_ => |maybe| if (maybe) |value| try self.collectExpr(value, node),
             .continue_ => |continue_| try self.collectExprSpan(continue_.values, node),
+            .join_point => |join_point| {
+                var added: std.ArrayList(Ast.LocalId) = .empty;
+                defer added.deinit(self.graph.allocator);
+                try self.bindTypedLocals(input.typedLocalSpan(join_point.params), &added);
+                try self.collectExpr(join_point.body, node);
+                self.removeLocals(added.items);
+                try self.collectExpr(join_point.remainder, node);
+            },
+            .jump => |jump| try self.collectExprSpan(jump.args, node),
         }
     }
 };

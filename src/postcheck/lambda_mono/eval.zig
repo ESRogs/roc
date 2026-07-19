@@ -60,7 +60,7 @@ pub const Error = error{ OutOfMemory, Unsupported };
 
 /// Internal control-flow and error set. `Aborted` carries a stored `Abort`;
 /// `Returned`/`Broke`/`Continued` carry values stashed on the evaluator.
-const EvalError = error{ OutOfMemory, Unsupported, Aborted, Returned, Broke, Continued };
+const EvalError = error{ OutOfMemory, Unsupported, Aborted, Returned, Broke, Continued, Jumped };
 
 /// A generated-callable value: a runtime variant selector plus optional payload.
 pub const CallableValue = struct { variant: Type.FnVariantId, payload: ?*const Value };
@@ -151,6 +151,9 @@ pub const Evaluator = struct {
     break_value: Value,
     /// Values carried by `error.Continued`.
     continue_values: []const Value,
+    /// Join-point transfer carried by `error.Jumped`.
+    jump_target: Ast.JoinPointId,
+    jump_values: []const Value,
     /// Live call depth, capped by `recursion_depth_cap`.
     depth: usize,
 
@@ -172,6 +175,8 @@ pub const Evaluator = struct {
             .return_value = .unit,
             .break_value = .unit,
             .continue_values = &.{},
+            .jump_target = @enumFromInt(0),
+            .jump_values = &.{},
             .depth = 0,
             .roc_ops = null,
             .ops_alloc_sizes = std.AutoHashMap(usize, usize).init(gpa),
@@ -215,6 +220,7 @@ pub const Evaluator = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.Unsupported => return error.Unsupported,
             error.Broke, error.Continued => return self.unsup("break or continue escaped a loop"),
+            error.Jumped => return self.unsup("jump escaped its join point"),
         };
         return RunOutcome{ .value = value };
     }
@@ -378,6 +384,12 @@ pub const Evaluator = struct {
             .continue_ => |cont| {
                 self.continue_values = try self.evalExprSpan(frame, cont.values);
                 return error.Continued;
+            },
+            .join_point => |join_point| return try self.evalJoinPoint(frame, join_point),
+            .jump => |jump| {
+                self.jump_target = jump.target;
+                self.jump_values = try self.evalExprSpan(frame, jump.args);
+                return error.Jumped;
             },
             .return_ => |value_expr| {
                 self.return_value = try self.evalExpr(frame, value_expr);
@@ -694,6 +706,26 @@ pub const Evaluator = struct {
                     for (0..param_slice.len) |i| {
                         frame.put(GuardedList.at(param_slice, i).local, next[i]) catch return error.OutOfMemory;
                     }
+                    continue;
+                },
+                else => return err,
+            };
+            return result;
+        }
+    }
+
+    fn evalJoinPoint(self: *Evaluator, frame: *Frame, join_point: Ast.JoinPointExpr) EvalError!Value {
+        const params = self.program.typedLocalSpan(join_point.params);
+        var next_expr = join_point.remainder;
+        while (true) {
+            const result = self.evalExpr(frame, next_expr) catch |err| switch (err) {
+                error.Jumped => {
+                    if (self.jump_target != join_point.id) return error.Jumped;
+                    if (self.jump_values.len != params.len) return self.unsupported_("join-point argument arity mismatch");
+                    for (0..params.len) |index| {
+                        frame.put(GuardedList.at(params, index).local, self.jump_values[index]) catch return error.OutOfMemory;
+                    }
+                    next_expr = join_point.body;
                     continue;
                 },
                 else => return err,
