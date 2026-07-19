@@ -4389,8 +4389,12 @@ test "check type - try operator on method call should apply to whole expression 
     try checkTypesModule(source, .{ .pass = .last_def }, "List(Str) -> Try(Str, [ListWasEmpty, ..])");
 }
 
-test "check type - try closed error row satisfies open return error row" {
-    // Regression test for https://github.com/roc-lang/roc/issues/9798
+test "check type - try does not widen closed error row into open return error row" {
+    // Verifies intended behavior for https://github.com/roc-lang/roc/issues/9798:
+    // `?` does not widen a callee's closed error tag union into the enclosing
+    // annotation's open error row, so this program is a type error. The sole
+    // exception is a direct call of a hosted function (design.md "Hosted Try
+    // Question Widening"); `inner` is not hosted, so no widening applies.
     const source =
         \\inner : {} -> Try({}, [InnerErr])
         \\inner = |{}| Err(InnerErr)
@@ -4401,7 +4405,7 @@ test "check type - try closed error row satisfies open return error row" {
         \\    Ok({})
         \\}
     ;
-    try checkTypesModule(source, .{ .pass = .last_def }, "{} -> Try({}, [InnerErr, ..])");
+    try checkTypesModule(source, .fail, "Type Mismatch");
 }
 
 // record extension in type annotations //

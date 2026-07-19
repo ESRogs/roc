@@ -548,18 +548,57 @@ pub const Store = struct {
         try self.setDesc(resolved.desc_idx, desc);
     }
 
+    /// The declared rule a `dangerousSetVarRedirect` call site bends the solved
+    /// graph under. A redirect outside ordinary unification is indistinguishable
+    /// at review time from a change to the language's typing rules, so every call
+    /// site must name the rule it operates under, and every member here must be
+    /// one of:
+    ///
+    ///   (i)  diagnostic recovery on an already-reported error — the redirect
+    ///        cannot change which programs typecheck or which plans are output
+    ///        for error-free programs; or
+    ///   (ii) a language/pipeline rule declared in design.md — the member's doc
+    ///        comment names the design.md section that declares it, and the rule
+    ///        has tests pinning both its accepted and its rejected side.
+    ///
+    /// A new call site must either cite an existing member whose rule covers it
+    /// or add a member (and the design.md declaration it cites) in the same
+    /// change. "It makes a test pass" is not a rule.
+    pub const RedirectRule = enum {
+        /// (i) Diagnostic recovery: the target var belongs to an expression
+        /// whose error has already been reported, and the redirect only lets
+        /// checking continue past it.
+        diagnostic_recovery_reported_error,
+        /// (ii) design.md "Platform/App Relation" (for-clause alias identity):
+        /// a platform requirement's for-clause alias is a binder over an
+        /// app-supplied type, so copied occurrences of the alias resolve to the
+        /// app's own type declaration.
+        for_clause_alias_identity,
+        /// (ii) design.md "Hosted Try Question Widening": `?` on a direct call
+        /// of a hosted function widens the condition's closed error row to the
+        /// enclosing annotated return's error row when every visible error is
+        /// included, keeping the hosted callee's declared closed row intact.
+        hosted_try_question_widening,
+    };
+
     /// Set a type variable to redirect to the provided variables.
     /// During type-checking, you probably don't want to use this function.
+    ///
+    /// This is the primitive that mutates the solved graph outside ordinary
+    /// unification. `rule` names the declared rule (see `RedirectRule`) the call
+    /// site operates under; a call without one does not compile.
     ///
     /// IMPORTANT: When using this function during type checking, it's possible
     /// to loose `rank` information! You should prefer to use regular `unify`
     /// over this function, which correctly propagates rank, unless you already
     /// know the two vars are of the same rank.
-    pub fn dangerousSetVarRedirect(self: *Self, target_var: Var, redirect_to: Var) Allocator.Error!void {
+    pub fn dangerousSetVarRedirect(self: *Self, comptime rule: RedirectRule, target_var: Var, redirect_to: Var) Allocator.Error!void {
         std.debug.assert(@intFromEnum(target_var) < self.len());
         std.debug.assert(@intFromEnum(redirect_to) < self.len());
         // Self-redirects cause infinite loops in resolveVar
-        std.debug.assert(target_var != redirect_to);
+        if (std.debug.runtime_safety and target_var == redirect_to) {
+            std.debug.panic("self-redirect of var {d} under rule {s}", .{ @intFromEnum(target_var), @tagName(rule) });
+        }
         if (std.debug.runtime_safety) {
             // Redirecting a root var into a transparent alias whose backing resolves
             // back to that same root creates a self-referential (infinite) alias.
@@ -1545,6 +1584,18 @@ test "resolveVarAndCompressPath - flattens redirect chain to flex" {
     try std.testing.expectEqual(c, result.var_);
     try std.testing.expectEqual(Slot{ .redirect = c }, store.getSlot(a));
     try std.testing.expectEqual(Slot{ .redirect = c }, store.getSlot(b));
+}
+
+test "dangerousSetVarRedirect requires a declared rule by signature" {
+    // Zig has no negative-compile test harness, so the "an unreasoned call
+    // does not build" guarantee is pinned by reflection: the signature must
+    // take a `RedirectRule` before the two vars, and the enum must stay
+    // exhaustive so only declared members can be passed. Removing the rule
+    // parameter fails this test.
+    const fn_info = @typeInfo(@TypeOf(Store.dangerousSetVarRedirect)).@"fn";
+    try std.testing.expectEqual(4, fn_info.params.len);
+    try std.testing.expectEqual(Store.RedirectRule, fn_info.params[1].type.?);
+    comptime std.debug.assert(@typeInfo(Store.RedirectRule).@"enum".is_exhaustive);
 }
 
 test "savepoint clone cross-check is compiled in for test builds" {

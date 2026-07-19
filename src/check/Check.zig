@@ -8740,7 +8740,7 @@ fn resolveForClauseAliasOccurrences(
         for (bindings) |binding| {
             if (source_decl == @intFromEnum(binding.platform_alias_stmt_idx)) {
                 if (binding.app_type_var) |app_type_var| {
-                    try self.types.dangerousSetVarRedirect(resolved.var_, app_type_var);
+                    try self.types.dangerousSetVarRedirect(.for_clause_alias_identity, resolved.var_, app_type_var);
                 }
                 break;
             }
@@ -15215,6 +15215,31 @@ fn tryArgsFromVar(self: *Self, try_var: Var) ?TryArgs {
     }
 }
 
+/// Whether a `?` condition is a direct call of a hosted function — the only
+/// shape the hosted-try-question-widening rule (design.md "Hosted Try Question
+/// Widening") applies to. The callee is statically resolved from the call's
+/// function expression (the local or external lookup canonicalization
+/// produced); dispatch calls and value-carried functions are never direct
+/// hosted calls, so `?` on them gets no widening.
+fn tryConditionIsDirectHostedCall(self: *Self, cond_idx: CIR.Expr.Idx) bool {
+    const call = switch (self.cir.store.getExpr(cond_idx)) {
+        .e_call => |call| call,
+        else => return false,
+    };
+    const callable_def = self.hoistedCallableDefForExpr(self.cir, call.func) orelse return false;
+    const def = callable_def.module.store.getDef(callable_def.def);
+    return callable_def.module.store.getExpr(def.expr) == .e_hosted_lambda;
+}
+
+/// The hosted-try-question-widening rule (design.md "Hosted Try Question
+/// Widening"): `?` on a direct call of a hosted function widens the condition
+/// to a fresh `Try` at the enclosing annotated return's error row when every
+/// visible error in the callee's row is included in it. The redirect targets
+/// the fresh `Try`, so the hosted callee's declared closed row — the host
+/// ABI's shape — is what checking outputs for the callee itself. For every
+/// other callee, a closed error row meeting an open annotated row stays a
+/// type error (issue #9798's program is rejected by design); the caller gates
+/// on `tryConditionIsDirectHostedCall`.
 fn widenTryConditionForExpectedReturn(
     self: *Self,
     cond_var: Var,
@@ -15229,9 +15254,9 @@ fn widenTryConditionForExpectedReturn(
         return;
     }
 
-    // `?` injects the callee's error row into the enclosing return row. Ordinary
-    // tag-union unification still rejects closed-vs-open rigid rows; this use-site
-    // rewrite runs only after proving the callee's visible errors are included.
+    // Ordinary tag-union unification rejects closed-vs-open rigid rows; this
+    // use-site rewrite runs only after proving the callee's visible errors are
+    // included in the expected row.
     const widened_try_var = try self.freshFromContent(
         try self.mkTryContent(actual_try.ok, expected_try.err),
         env,
@@ -15239,7 +15264,7 @@ fn widenTryConditionForExpectedReturn(
     );
     const cond_root = self.types.resolveVar(cond_var).var_;
     if (cond_root != widened_try_var) {
-        try self.types.dangerousSetVarRedirect(cond_root, widened_try_var);
+        try self.types.dangerousSetVarRedirect(.hosted_try_question_widening, cond_root, widened_try_var);
     }
 }
 
@@ -15578,7 +15603,9 @@ fn checkMatchExpr(
         if (!try_result.isOk()) {
             has_invalid_try = true;
         } else if (expected.returnResult()) |expected_return| {
-            try self.widenTryConditionForExpectedReturn(cond_var, expected_return, env, expr_region);
+            if (self.tryConditionIsDirectHostedCall(match.cond)) {
+                try self.widenTryConditionForExpectedReturn(cond_var, expected_return, env, expr_region);
+            }
         }
     }
     if (!match.is_try_suffix and !match.skip_exhaustiveness) {
@@ -16738,6 +16765,15 @@ fn mkInterpolationConstraint(
     return constraint_fn_var;
 }
 
+/// Rewrite a derived `is_eq` method call into an explicit structural-eq node.
+///
+/// RESTAMP RULE (all discharge-time plan rewrites): only the node's own
+/// constraint may restamp a node that already carries a stamped plan
+/// (`constraint_fn_var`). A discharge of an instantiated copy carries the
+/// copy's fn var, so the guarded arms below return early on a mismatch,
+/// keeping the scheme-pristine fn var stamped at plan creation. Restamping
+/// from a foreign constraint would pin the stamped plan to one
+/// instantiation's concrete types (the issue #9971 failure).
 fn rewriteDerivedIsEqMethodCallAsStructuralEq(
     self: *Self,
     constraint: StaticDispatchConstraint,
@@ -16791,6 +16827,10 @@ fn rewriteDerivedIsEqMethodCallAsStructuralEq(
 /// Rewrite a derived `to_hash` method call into an explicit structural-hash node.
 /// The call is `value.to_hash(hasher)`, so the receiver is the value being hashed
 /// and the single argument is the Hasher being threaded through.
+///
+/// Subject to the RESTAMP RULE documented on
+/// `rewriteDerivedIsEqMethodCallAsStructuralEq`: the dispatch-call arms only
+/// rewrite when the node's own constraint is discharging.
 fn rewriteDerivedMethodCallAsStructuralHash(
     self: *Self,
     constraint: StaticDispatchConstraint,
@@ -16833,6 +16873,12 @@ fn rewriteDerivedMethodCallAsStructuralHash(
     return true;
 }
 
+/// Rewrite a desugared `==`/`!=` binop into an explicit method-eq node.
+///
+/// Subject to the RESTAMP RULE documented on
+/// `rewriteDerivedIsEqMethodCallAsStructuralEq`: the `e_method_eq` arm only
+/// restamps when the node's own constraint is discharging, enforced by its
+/// guard at the restamp site (not only by checked-module output checks).
 fn rewriteEqBinopAsMethodEq(self: *Self, constraint: StaticDispatchConstraint) void {
     if (constraint.origin != .desugared_binop) return;
     const expr_idx = constraintIntroExpr(constraint) orelse return;
@@ -18497,6 +18543,14 @@ fn rangeHasNonLiteralConstraint(self: *Self, range: StaticDispatchConstraint.Saf
 /// NEVER mutates them. Anything uncertain returns false (fall through to the
 /// probe) — refutation is exact logic, probing is the default.
 ///
+/// This filter implements no language rule of its own: the acceptance rule is
+/// `staticDispatchConstraintAcceptsCandidate`'s (see its doc comment), and this
+/// function must refute exactly when that probe would fail. Safety-checked
+/// builds prove every refutation by running the skipped probe and asserting it
+/// fails (the witness in `commitLiteralDefault`), so a drift between this
+/// logic and the unifier's semantics crashes rather than changing which
+/// default a literal picks.
+///
 /// Two refutation facts, per non-literal constraint (the literal-conversion
 /// ones are pre-filtered by digit-fit inside `tryCommitNumeralCandidate` via
 /// `literalInfoAcceptsBuiltinNumKind`):
@@ -18658,6 +18712,15 @@ fn literalInfoAcceptsBuiltinNumKind(lit: StaticDispatchConstraint.LiteralInfo, n
     };
 }
 
+/// The method-acceptance rule of static dispatch — the intended language rule,
+/// not an implementation convenience: a candidate nominal type satisfies a
+/// dispatch constraint `fn_name : F` iff the type's declaring module provides
+/// a method binding named `fn_name` whose declared type, instantiated fresh,
+/// unifies with `F`. The two rejected sides are a missing binding and a
+/// signature mismatch; nothing structural is consulted here (structural
+/// eq/hash derivation is decided by the constraint's own origin/allowance,
+/// upstream of this check).
+///
 /// Speculatively mutates the real stores (copyVar/instantiateVar, real
 /// unification) and does NOT roll them back itself — the caller's commit-probe
 /// rollback does (or its commit keeps them). The `*CommitProbe` parameter is a
@@ -23549,7 +23612,7 @@ fn markErroneousBranchWithExpected(self: *Self, expr_idx: CIR.Expr.Idx, expected
     const redirected_ret = try self.fresh(env, region);
     _ = try self.unifyInContext(redirected_ret, expected_ret, env, .none);
 
-    try self.types.dangerousSetVarRedirect(expr_var, redirected_ret);
+    try self.types.dangerousSetVarRedirect(.diagnostic_recovery_reported_error, expr_var, redirected_ret);
 }
 
 /// Check if a type variable contains any error types anywhere in its structure.
