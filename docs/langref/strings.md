@@ -82,7 +82,7 @@ Try putting `'👩'` into `roc repl`. You should see this:
 ```
 » '👩'
 
-128105 : Int *
+128105
 ```
 
 The single-quote `'` syntax lets you put a grapheme directly into your source code (so you can see what it looks like) as long as that grapheme contains only one code point, like 👩 does (namely, the code point 128105). At runtime, the single-quoted value will be treated the same as an ordinary number literal—in other words, `'👩'` is syntax sugar for writing `128105`.
@@ -92,7 +92,7 @@ You can verify this in `roc repl`:
 ```
 » '👩' == 128105
 
-Bool.true : Bool
+True
 ```
 
 Double quotes (`"`), on the other hand, are not type-compatible with integers—not only because strings can be empty (`""` is valid, but `''` is not) but also because there may be more than one code point involved in any given string!
@@ -124,7 +124,7 @@ We can verify this by putting the following into `roc repl`:
 ```
 » "caf\u(e9)" == "café"
 
-Bool.true : Bool
+True
 ```
 
 As it turns out, `"cafe\u(301)"` is another way to represent the same word. The Unicode code point 0x301 represents a ["combining acute accent"](https://unicodeplus.com/U+0301)—which essentially means that it will add an accent mark to whatever came before it. In this case, since `"cafe\u(301)"` has an `e` before the `"\u(301)"`, that `e` ends up with an accent mark on it and becomes `é`.
@@ -134,7 +134,7 @@ Although these two strings get rendered identically to one another, they are dif
 ```
 » "caf\u(e9)" == "cafe\u(301)"
 
-Bool.false : Bool
+False
 ```
 
 This can be a source of bugs! One way to prevent this problem is to perform string normalization.

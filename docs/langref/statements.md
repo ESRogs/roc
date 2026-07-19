@@ -7,6 +7,23 @@ They do not [evaluate](expressions.md#evaluation) to a [value](expressions.md#va
 
 An _assignment statement_ gives a name to a [value](expressions.md#values) inside the current scope.
 
+```roc
+answer = 42
+```
+
+### [Identifiers](#identifiers) {#identifiers}
+
+The name an assignment gives must be a valid Roc _identifier_, which means:
+
+- It's a combination of ASCII letters, numbers, and underscores.
+    - Consecutive underscores are allowed, but discouraged stylistically.
+- It must begin with either `_`, `$`, or a lowercase ASCII letter.
+  - The `$` prefix is only for [reassignment with `var`](#reassignment), and must be followed by an ASCII lowercase letter
+  - The `_` prefix is only for naming things that don't actually get used, and must be followed by an ASCII lowercase letter.
+    - The compiler will give a warning if an identifier begins with `_` and is referenced again in the same scope.
+    - Note that [the `_` pattern](pattern-matching#underscore) is not an identifier and doesn't actually name anything.
+- It can optionally end with `!` if it's naming an [effectful function](functions#effectful).
+
 ### [Pattern matching in assignments](#import-exposing) {#import-exposing}
 
 You can use [pattern matching](pattern-matching) in assignments to do things like destructuring:
@@ -64,7 +81,7 @@ x = |arg| if arg >= 1 { y(arg + 1) } else { 0 }
 y = |arg| if arg <= 9 { x(arg + 1) } else { 0 }
 ```
 
-### [Reassignment](#reassignment) {#reassignment}
+### [Reassignment with `var`](#reassignment) {#reassignment}
 
 Reassigning to an existing name is only allowed when the name was declared with
 [`var`](naming#var-keyword). This is allowed:
