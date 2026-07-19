@@ -5836,6 +5836,74 @@ pub fn build(b: *std.Build) void {
             name,
         );
     }
+
+    // Last, so that every top-level step exists -- including the ones created
+    // inside addMainExe.
+    assertGranularTestStepsAreIsolated(b);
+}
+
+/// Configure-time guard: a public `run-test-zig-*` step must never pull more
+/// than one test binary into its graph.
+///
+/// On Windows `TestsSummaryStep` chains its registered runs so that test
+/// binaries start one at a time. Pointing a granular step at the *same*
+/// `Step.Run` that the chain owns makes that step inherit the whole chain
+/// prefix: `run-test-zig-minici` (~11 std-only string-parsing tests, ~2s) once
+/// re-ran 41 unrelated binaries and took 441s, and MiniCI replayed that prefix
+/// once per affected job. `TestSuiteRegistry.register` makes that shape
+/// unrepresentable; this re-checks the finished graph in case a suite is ever
+/// wired up by hand instead.
+///
+/// The aggregate step is named exactly "run-test-zig" (no trailing hyphen), so
+/// the prefix test excludes it without needing an allowlist.
+fn assertGranularTestStepsAreIsolated(b: *std.Build) void {
+    var visited: std.AutoHashMapUnmanaged(*Step, void) = .empty;
+    defer visited.deinit(b.allocator);
+
+    for (b.top_level_steps.keys(), b.top_level_steps.values()) |name, tls| {
+        if (!std.mem.startsWith(u8, name, "run-test-zig-")) continue;
+
+        visited.clearRetainingCapacity();
+        var found: [4][]const u8 = undefined;
+        var found_len: usize = 0;
+        collectTestRuns(b, &tls.step, &visited, &found, &found_len);
+
+        if (found_len > 1) {
+            std.log.warn(
+                "build.zig: step \"{s}\" runs at least {d} test binaries ({s}, {s}, ...). " ++
+                    "A granular run-test-zig-* step must run exactly one; wire the suite " ++
+                    "through TestSuiteRegistry.register rather than handing the summary's " ++
+                    "Step.Run to b.step().",
+                .{ name, found_len, found[0], found[1] },
+            );
+        }
+    }
+}
+
+/// Walks `step`'s transitive dependencies, recording the names of the test
+/// binaries executed along the way. Stops recording at `found.len` names; the
+/// caller only needs to know "more than one" and two names for its message.
+fn collectTestRuns(
+    b: *std.Build,
+    step: *Step,
+    visited: *std.AutoHashMapUnmanaged(*Step, void),
+    found: *[4][]const u8,
+    found_len: *usize,
+) void {
+    const gop = visited.getOrPut(b.allocator, step) catch @panic("OOM");
+    if (gop.found_existing) return;
+
+    if (step.id == .run) {
+        const run: *Step.Run = @fieldParentPtr("step", step);
+        if (run.producer) |producer| {
+            if (producer.kind.isTest() and found_len.* < found.len) {
+                found[found_len.*] = producer.name;
+                found_len.* += 1;
+            }
+        }
+    }
+
+    for (step.dependencies.items) |dep| collectTestRuns(b, dep, visited, found, found_len);
 }
 
 fn discoverBuiltinRocFiles(b: *std.Build) ![]const []const u8 {
