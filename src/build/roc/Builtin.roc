@@ -3728,6 +3728,24 @@ Builtin :: [].{
 					},
 			)
 
+		## Run the given function on each element of a list, and return a list of
+		## the values it wrapped in `Ok`. Elements the function maps to `Err` are
+		## dropped. Use [List.keep_errs] to keep the `Err` values instead.
+		## ```roc
+		## expect [1.I64, 2, 3, 4].keep_oks(|n| if n.is_even() { Ok(n) } else { Err({}) }) == [2, 4]
+		## ```
+		keep_oks : List(before), (before -> Try(after, _err)) -> List(after)
+		keep_oks = |list, transform|
+			List.fold(
+				list,
+				[],
+				|acc, elem|
+					match transform(elem) {
+						Ok(after) => List.concat(acc, [after])
+						Err(_) => acc
+					},
+			)
+
 		## Run the given function on each element of a list, and return the
 		## number of elements for which the function returned `Bool.True`.
 		## ```roc
