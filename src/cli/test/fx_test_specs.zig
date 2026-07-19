@@ -109,8 +109,6 @@ pub const io_spec_tests = [_]TestSpec{
         .roc_file = "test/fx/numeric_fold.roc",
         .io_spec = "1>Sum: 15.0",
         .description = "List.fold with numeric accumulators",
-        // TODO: Dec (i128) parameter passing in for-loop lambdas fails on Windows x86_64 dev backend
-        .skip_on_windows = true,
     },
     .{
         .roc_file = "test/fx/list_for_each.roc",
@@ -535,6 +533,11 @@ pub const io_spec_tests = [_]TestSpec{
         .roc_file = "test/fx/cross_module_recursive_nominal.roc",
         .io_spec = "1>Div (correct)",
         .description = "Cross-module recursive nominal types with pattern matching",
+    },
+    .{
+        .roc_file = "test/fx/issue_10203/main.roc",
+        .io_spec = "1>done",
+        .description = "Regression test: boxed function values in cross-module recursive nominals lower to LIR",
     },
     .{
         .roc_file = "test/fx/transitive_import_nominal_equality/main.roc",

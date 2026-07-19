@@ -106,7 +106,6 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/test_build_env.zig"));
     std.testing.refAllDecls(@import("test/test_package_env.zig"));
     std.testing.refAllDecls(@import("test/module_env_test.zig"));
-    std.testing.refAllDecls(@import("test/type_printing_bug_test.zig"));
     std.testing.refAllDecls(@import("test/embedding_smoke.zig"));
     std.testing.refAllDecls(@import("test/hoisted_constants_test.zig"));
     std.testing.refAllDecls(@import("test/issue_9614_test.zig"));
@@ -119,6 +118,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_10021_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10057_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10132_test.zig"));
+    std.testing.refAllDecls(@import("test/issue_10218_test.zig"));
     std.testing.refAllDecls(@import("test/tce_capture_test.zig"));
     std.testing.refAllDecls(@import("test/list_map_target_independent_lir_test.zig"));
     std.testing.refAllDecls(@import("test/platform_box_update_lir_test.zig"));

@@ -370,13 +370,13 @@ fn lastTitleSegment(title: []const u8) []const u8 {
     return std.mem.trim(u8, title, " \t\r\n");
 }
 
-/// Dupe `s` with ASCII letters uppercased. The EXPECTED section shouts titles
-/// in ALL CAPS, matching the box renderer, even though titles are authored in
-/// title case.
-fn asciiUpperDupe(allocator: std.mem.Allocator, s: []const u8) Allocator.Error![]u8 {
-    const out = try allocator.dupe(u8, s);
-    for (out) |*c| c.* = std.ascii.toUpper(c.*);
-    return out;
+/// Dupe `s` shouted to ALL CAPS via the box renderer's own `writeShouted`, so
+/// the EXPECTED section's titles can never drift from the rendered PROBLEMS.
+fn shoutedDupe(allocator: std.mem.Allocator, s: []const u8) Allocator.Error![]u8 {
+    var shouted = std.Io.Writer.Allocating.init(allocator);
+    errdefer shouted.deinit();
+    reporting.writeShouted(&shouted.writer, s) catch return error.OutOfMemory;
+    return try shouted.toOwnedSlice();
 }
 
 const RegionLoc = struct { file: []const u8, sl: u32, sc: u32, el: u32, ec: u32 };
@@ -428,7 +428,7 @@ fn renderReportsToExpectedContent(allocator: std.mem.Allocator, reports: *const 
     for (reports.items) |*report| {
         const loc = reportRegionLoc(report);
         try entries.append(.{
-            .problem_type = try asciiUpperDupe(allocator, lastTitleSegment(report.title)),
+            .problem_type = try shoutedDupe(allocator, lastTitleSegment(report.title)),
             .file = try allocator.dupe(u8, loc.file),
             .start_line = loc.sl,
             .start_col = loc.sc,
@@ -4221,6 +4221,16 @@ const SnapshotReplSession = struct {
         return false;
     }
 
+    fn removeDefinition(self: *SnapshotReplSession, allocator: Allocator, kind: SnapshotReplDefinitionKind, name: []const u8) void {
+        for (self.definitions.items, 0..) |definition, i| {
+            if (definition.kind == kind and std.mem.eql(u8, definition.name, name)) {
+                var removed = self.definitions.orderedRemove(i);
+                removed.deinit(allocator);
+                return;
+            }
+        }
+    }
+
     fn upsertDefinition(
         self: *SnapshotReplSession,
         allocator: Allocator,
@@ -4626,7 +4636,14 @@ fn snapshotReplDefinitionStep(
     const identity = maybe_identity orelse
         return try allocator.dupe(u8, "Parse error: REPL definitions must bind a top-level identifier");
     if (identity.kind == .type_annotation) {
-        return try allocator.dupe(u8, "Parse error: Type annotations are not supported in the REPL yet");
+        // A standalone annotation is held until the value definition of the same
+        // name arrives, at which point the two are adjacent in the synthetic
+        // module, exactly like an annotation directly above a definition in a
+        // .roc file. It is not validated on its own: an annotation with no value
+        // is not a complete declaration, so compiling it alone would always fail.
+        // The interactive REPL prints nothing for it, so neither does this.
+        try session.upsertDefinition(allocator, identity.kind, identity.name, input);
+        return try allocator.dupe(u8, "");
     }
 
     const defines_main = identity.kind == .value and std.mem.eql(u8, identity.name, "main");
@@ -4655,6 +4672,12 @@ fn snapshotReplDefinitionStep(
     defer if (validation_main_source != null) allocator.free(validation_with_main);
 
     var compiled = compileSnapshotReplInspectedModule(allocator, validation_with_main, config) catch |err| {
+        // Drop any pending annotation for this name. A `y : Str` typed before a
+        // failed `y = 5` would otherwise survive and poison every subsequent
+        // step with "Declaration Has No Value".
+        if (identity.kind == .value and !session.hasDefinition(.value, identity.name)) {
+            session.removeDefinition(allocator, .type_annotation, identity.name);
+        }
         return switch (err) {
             error.TypeCheckError => renderSnapshotReplTypeProblems(allocator, .module, validation_with_main, config),
             else => try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}),
@@ -4879,13 +4902,24 @@ fn generateReplOutputSection(output: *DualOutput, snapshot_path: []const u8, con
                 var expected_outputs = std.array_list.Managed([]const u8).init(output.gpa);
                 defer expected_outputs.deinit();
 
-                var expected_lines = std.mem.splitSequence(u8, expected, "\n---\n");
-                while (expected_lines.next()) |output_str| {
-                    const trimmed = std.mem.trim(u8, output_str, " \t\r\n");
-                    if (trimmed.len > 0) {
-                        try expected_outputs.append(trimmed);
+                // Entries are separated by lines that are exactly `---`, and an
+                // entry may be empty (a step that printed nothing, e.g. a
+                // standalone type annotation), so every entry is kept
+                // positionally rather than dropping blank ones.
+                var entry_begin: usize = 0;
+                var line_offset: usize = 0;
+                var expected_line_it = std.mem.splitScalar(u8, expected, '\n');
+                while (expected_line_it.next()) |line_text| {
+                    const line_start = line_offset;
+                    line_offset += line_text.len + 1;
+                    if (std.mem.eql(u8, line_text, "---")) {
+                        const entry = expected[entry_begin..line_start];
+                        try expected_outputs.append(std.mem.trim(u8, entry, " \t\r\n"));
+                        entry_begin = line_offset;
                     }
                 }
+                const last_entry = if (entry_begin <= expected.len) expected[entry_begin..] else "";
+                try expected_outputs.append(std.mem.trim(u8, last_entry, " \t\r\n"));
 
                 if (actual_outputs.items.len != expected_outputs.items.len) {
                     std.debug.print("REPL output count mismatch: got {} outputs, expected {} in {s}\n", .{
@@ -5052,19 +5086,3 @@ fn searchDirectoryForBuiltin(
         }
     }
 }
-
-test "TODO: cross-module function calls - fibonacci" {}
-
-test "TODO: cross-module function calls - nested_ifs" {}
-
-test "TODO: cross-module function calls - repl_boolean_expressions" {}
-
-test "TODO: cross-module function calls - string_edge_cases" {}
-
-test "TODO: cross-module function calls - string_equality_basic" {}
-
-test "TODO: cross-module function calls - string_interpolation_comparison" {}
-
-test "TODO: cross-module function calls - string_multiline_comparison" {}
-
-test "TODO: cross-module function calls - string_ordering_unsupported" {}

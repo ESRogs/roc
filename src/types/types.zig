@@ -45,7 +45,7 @@ test {
     // (4B) plus a where-clause expect region (8B), both `maxInt`-sentinel packed.
     // The optional derived-map payload selection adds its tag, payload index,
     // and optional discriminant without affecting type identity.
-    try std.testing.expectEqual(76, @sizeOf(StaticDispatchConstraint));
+    try std.testing.expectEqual(96, @sizeOf(StaticDispatchConstraint));
     // Directed effect dependencies must survive type generalization,
     // instantiation, and cross-module copying, so they live with the function
     // payload rather than in checker-only side state.
@@ -909,6 +909,16 @@ pub const NumeralInfo = struct {
     }
 };
 
+/// Metadata for one expression embedded in a string interpolation.
+pub const InterpolationPartMetadata = struct {
+    var_: Var,
+    /// The interpolation use site's region. This remains stable when `var_` is
+    /// remapped to a fresh variable during instantiation or cross-module copy.
+    region: base.Region,
+
+    pub const SafeList = MkSafeList(@This());
+};
+
 /// Represents a static dispatch constraints on a variable
 ///
 /// sort  : List(a) -> List(a) where [a.ord : a -> Ord]
@@ -936,6 +946,11 @@ pub const StaticDispatchConstraint = struct {
     /// This is checker-owned derivation metadata and, like `provenance`, does
     /// not participate in type identity or constraint equality.
     derived_map_plan: ?DerivedMapPlan = null,
+    /// Extra checking metadata for `from_interpolation`. This travels with the
+    /// constraint because the checker must re-check interpolated part types
+    /// after instantiation and cross-module copying. It is metadata, not type
+    /// identity: canonical type keys and constraint equivalence do not read it.
+    interpolation: InterpolationMetadata = .none,
 
     /// The introducing site of a static dispatch constraint. `intro_expr` is the
     /// raw `CIR.Expr.Idx` of the expression that created the constraint, stored
@@ -988,6 +1003,20 @@ pub const StaticDispatchConstraint = struct {
                 return if (self.region.start.offset == std.math.maxInt(u32)) null else self.region;
             }
         };
+    };
+
+    pub const InterpolationMetadata = struct {
+        expr_region: Provenance.OptRegion = Provenance.OptRegion.none,
+        item_var: Var = no_var,
+        interpolated_parts: InterpolationPartMetadata.SafeList.Range = .empty(),
+
+        const no_var: Var = @enumFromInt(std.math.maxInt(u32));
+
+        pub const none = InterpolationMetadata{};
+
+        pub fn isPresent(self: InterpolationMetadata) bool {
+            return self.expr_region.get() != null;
+        }
     };
 
     /// The kinds of literal that desugar to open literal-conversion constraints.

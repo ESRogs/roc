@@ -39,6 +39,7 @@ var debug_threaded_io_instance: std.Io.Threaded = .init_single_threaded;
 pub const std_options_debug_threaded_io: *std.Io.Threaded = &debug_threaded_io_instance;
 
 const build_options = @import("build_options");
+const shim_symbols = @import("builtins").shim_symbols;
 const base = @import("base");
 const reporting = @import("reporting");
 const parse = @import("parse");
@@ -114,7 +115,9 @@ comptime {
         std.testing.refAllDecls(platform_validation);
         std.testing.refAllDecls(cli_context);
         std.testing.refAllDecls(cli_problem);
-        std.testing.refAllDecls(@import("embedded_lld").stack_probe);
+        std.testing.refAllDecls(@import("builder.zig"));
+        std.testing.refAllDecls(@import("host_symbols.zig"));
+        std.testing.refAllDecls(@import("test/platform_config.zig"));
         std.testing.refAllDecls(@import("ReplLine.zig"));
         std.testing.refAllDecls(@import("ReplSession.zig"));
     }
@@ -7601,8 +7604,8 @@ fn staticDataLinkRootSymbols(
         try symbols.append(data_export.symbol_name);
     }
     if (root_default_platform_backtrace) {
-        try symbols.append("roc_default_backtrace_table");
-        try symbols.append("roc_default_backtrace_count");
+        try symbols.append(shim_symbols.roc_default_backtrace_table);
+        try symbols.append(shim_symbols.roc_default_backtrace_count);
     }
     return symbols.items;
 }

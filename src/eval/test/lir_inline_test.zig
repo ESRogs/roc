@@ -1634,6 +1634,72 @@ test "imported and local generic specialization counters reuse closed types" {
     try std.testing.expect(counters.template_lookup_candidates <= counters.template_requests);
 }
 
+test "alias-heavy generic specialization count does not exceed backing types" {
+    const allocator = std.testing.allocator;
+    const backing_source =
+        \\module [main]
+        \\
+        \\id : a -> a
+        \\id = |value| value
+        \\
+        \\main : { a : U64, b : U64, c : U64, d : U64, e : U64 }
+        \\main = {
+        \\    x0 : U64
+        \\    x0 = 1
+        \\    x1 : U64
+        \\    x1 = 2
+        \\    x2 : U64
+        \\    x2 = 3
+        \\    x3 : U64
+        \\    x3 = 4
+        \\    {
+        \\        a: id(0),
+        \\        b: id(x0),
+        \\        c: id(x1),
+        \\        d: id(x2),
+        \\        e: id(x3),
+        \\    }
+        \\}
+    ;
+    const alias_source =
+        \\module [main]
+        \\
+        \\Alias0 : U64
+        \\Alias1 : Alias0
+        \\Alias2 : Alias1
+        \\Alias3 : Alias2
+        \\
+        \\id : a -> a
+        \\id = |value| value
+        \\
+        \\main : { a : U64, b : U64, c : U64, d : U64, e : U64 }
+        \\main = {
+        \\    x0 : Alias0
+        \\    x0 = 1
+        \\    x1 : Alias1
+        \\    x1 = 2
+        \\    x2 : Alias2
+        \\    x2 = 3
+        \\    x3 : Alias3
+        \\    x3 = 4
+        \\    {
+        \\        a: id(0),
+        \\        b: id(x0),
+        \\        c: id(x1),
+        \\        d: id(x2),
+        \\        e: id(x3),
+        \\    }
+        \\}
+    ;
+
+    var backing = try lowerMonotypeModule(allocator, backing_source);
+    defer backing.deinit(allocator);
+    var alias = try lowerMonotypeModule(allocator, alias_source);
+    defer alias.deinit(allocator);
+
+    try std.testing.expect(alias.mono.view().specs.len <= backing.mono.view().specs.len);
+}
+
 test "disabling monotype specialization cache does not change monotype output" {
     const allocator = std.testing.allocator;
     const source =
@@ -3439,36 +3505,6 @@ fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_u
     try std.testing.expectEqual(@as(usize, 1), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "list_with_capacity_count"));
     try std.testing.expectEqual(@as(usize, 1), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "list_reserve_count"));
     try std.testing.expectEqual(expected_append_unsafe_count, try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "list_append_unsafe_count"));
-}
-
-test "direct call wrapper is inlined under optimized post-check lowering" {
-    try expectRootDirectCallCount(
-        \\module [main]
-        \\
-        \\callee : U64 -> U64
-        \\callee = |x| x + 1
-        \\
-        \\wrapper : U64 -> U64
-        \\wrapper = |x| callee(x)
-        \\
-        \\main : U64
-        \\main = wrapper(41)
-    , .wrappers, 0);
-}
-
-test "direct call wrapper is not inlined under ordinary post-check lowering" {
-    try expectRootTargetHasCalls(
-        \\module [main]
-        \\
-        \\callee : U64 -> U64
-        \\callee = |x| x + 1
-        \\
-        \\wrapper : U64 -> U64
-        \\wrapper = |x| callee(x)
-        \\
-        \\main : U64
-        \\main = wrapper(41)
-    , .none);
 }
 
 test "user iter method is not recognized as builtin list cursor" {

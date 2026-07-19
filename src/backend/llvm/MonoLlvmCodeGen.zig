@@ -16,6 +16,7 @@ const build_options = @import("build_options");
 const SourceLoc = lir.SourceLoc;
 const LowLevelBuiltins = @import("base").LowLevelBuiltins;
 const builtins = @import("builtins");
+const shim_symbols = builtins.shim_symbols;
 const layout = @import("layout");
 const lir = @import("lir");
 const GuardedList = lir.LirStore.GuardedList;
@@ -488,16 +489,16 @@ pub const MonoLlvmCodeGen = struct {
             try fn_consts.append(self.allocator, builder.nullConst(ptr_ty) catch return error.OutOfMemory);
         }
         const table_ty = builder.arrayType(table_len, ptr_ty) catch return error.OutOfMemory;
-        const table_var = builder.addVariable(builder.strtabString("roc_shim_hosted_fns_table") catch return error.OutOfMemory, table_ty, .default) catch return error.OutOfMemory;
+        const table_var = builder.addVariable(builder.strtabString(shim_symbols.roc_shim_hosted_fns_table) catch return error.OutOfMemory, table_ty, .default) catch return error.OutOfMemory;
         table_var.ptrConst(&builder).global.setLinkage(.internal, &builder);
         table_var.setMutability(.constant, &builder);
         table_var.setInitializer(builder.arrayConst(table_ty, fn_consts.items) catch return error.OutOfMemory, &builder) catch return error.OutOfMemory;
 
-        const table_ptr_var = builder.addVariable(builder.strtabString("roc_shim_hosted_fns") catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
+        const table_ptr_var = builder.addVariable(builder.strtabString(shim_symbols.roc_shim_hosted_fns) catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
         table_ptr_var.setMutability(.constant, &builder);
         table_ptr_var.setInitializer(table_var.toConst(&builder), &builder) catch return error.OutOfMemory;
 
-        const count_var = builder.addVariable(builder.strtabString("roc_shim_hosted_count") catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
+        const count_var = builder.addVariable(builder.strtabString(shim_symbols.roc_shim_hosted_count) catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
         count_var.setMutability(.constant, &builder);
         count_var.setInitializer(builder.intConst(usize_ty, hosted_symbols.len) catch return error.OutOfMemory, &builder) catch return error.OutOfMemory;
 
@@ -535,40 +536,40 @@ pub const MonoLlvmCodeGen = struct {
         const w = &aw.writer;
 
         switch (self.target.cpu.arch) {
-            .x86_64 => w.writeAll(
+            .x86_64 => w.print(
                 \\.text
                 \\.globl _start
                 \\.type _start,@function
                 \\_start:
                 \\    mov %rsp, %rbx
                 \\    and $-16, %rsp
-                \\    call roc_default_runtime_init
+                \\    call {s}
                 \\    mov (%rbx), %rdi
                 \\    lea 8(%rbx), %rsi
-                \\    call roc_shim_default_main
+                \\    call {s}
                 \\    mov %rax, %rdi
                 \\    mov $60, %rax
                 \\    syscall
                 \\    ud2
                 \\.size _start, .-_start
                 \\
-            ) catch return error.OutOfMemory,
-            .aarch64 => w.writeAll(
+            , .{ shim_symbols.roc_default_runtime_init, shim_symbols.roc_shim_default_main }) catch return error.OutOfMemory,
+            .aarch64 => w.print(
                 \\.text
                 \\.globl _start
                 \\.type _start,%function
                 \\_start:
                 \\    mov x19, sp
-                \\    bl roc_default_runtime_init
+                \\    bl {s}
                 \\    ldr x0, [x19]
                 \\    add x1, x19, #8
-                \\    bl roc_shim_default_main
+                \\    bl {s}
                 \\    mov x8, #94
                 \\    svc #0
                 \\    brk #0
                 \\.size _start, .-_start
                 \\
-            ) catch return error.OutOfMemory,
+            , .{ shim_symbols.roc_default_runtime_init, shim_symbols.roc_shim_default_main }) catch return error.OutOfMemory,
             else => return error.CompilationFailed,
         }
 
@@ -812,11 +813,11 @@ pub const MonoLlvmCodeGen = struct {
         table_data.setMutability(.constant, builder);
         table_data.setInitializer(builder.arrayConst(table_ty, entries.items) catch return error.OutOfMemory, builder) catch return error.OutOfMemory;
 
-        const table_var = builder.addVariable(builder.strtabString("roc_default_backtrace_table") catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
+        const table_var = builder.addVariable(builder.strtabString(shim_symbols.roc_default_backtrace_table) catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
         table_var.setMutability(.constant, builder);
         table_var.setInitializer(table_data.toConst(builder), builder) catch return error.OutOfMemory;
 
-        const count_var = builder.addVariable(builder.strtabString("roc_default_backtrace_count") catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
+        const count_var = builder.addVariable(builder.strtabString(shim_symbols.roc_default_backtrace_count) catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
         count_var.setMutability(.constant, builder);
         count_var.setInitializer(builder.intConst(usize_ty, self.proc_registry.count()) catch return error.OutOfMemory, builder) catch return error.OutOfMemory;
     }
@@ -1591,7 +1592,7 @@ pub const MonoLlvmCodeGen = struct {
             // The interpreter needs a real RocOps; the prelinked shim builds
             // one over the host's extern symbols.
             const get_ops_ty = builder.fnType(ptr_ty, &.{}, .normal) catch return error.OutOfMemory;
-            const get_ops = try self.declareExternSymbol("roc_shim_get_ops", get_ops_ty);
+            const get_ops = try self.declareExternSymbol(shim_symbols.roc_shim_get_ops, get_ops_ty);
             break :blk wip.call(.normal, .ccc, .none, get_ops_ty, get_ops.toValue(builder), &.{}, "") catch return error.OutOfMemory;
         } else builder.nullValue(ptr_ty) catch return error.OutOfMemory;
         self.roc_ops_arg = ops_value;
@@ -1637,12 +1638,12 @@ pub const MonoLlvmCodeGen = struct {
             const usize_ty: LlvmBuilder.Type = if (self.targetWordSize() == 8) .i64 else .i32;
             if (sh.image) |img| {
                 const entry_ty = builder.fnType(.void, &.{ .i32, ptr_ty, ptr_ty, ptr_ty, ptr_ty, usize_ty }, .normal) catch return error.OutOfMemory;
-                const entry_fn = try self.declareExternSymbol("roc_entrypoint_from_image", entry_ty);
+                const entry_fn = try self.declareExternSymbol(shim_symbols.roc_entrypoint_from_image, entry_ty);
                 const len_value = builder.intValue(usize_ty, img.len) catch return error.OutOfMemory;
                 _ = wip.call(.normal, .ccc, .none, entry_ty, entry_fn.toValue(builder), &.{ idx_value, ops_value, ret_slot, args_buf, img.value, len_value }, "") catch return error.OutOfMemory;
             } else {
                 const entry_ty = builder.fnType(.void, &.{ .i32, ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
-                const entry_fn = try self.declareExternSymbol("roc_entrypoint", entry_ty);
+                const entry_fn = try self.declareExternSymbol(shim_symbols.roc_entrypoint, entry_ty);
                 _ = wip.call(.normal, .ccc, .none, entry_ty, entry_fn.toValue(builder), &.{ idx_value, ops_value, ret_slot, args_buf }, "") catch return error.OutOfMemory;
             }
         } else {
@@ -1753,7 +1754,7 @@ pub const MonoLlvmCodeGen = struct {
         const builder = self.builder orelse return error.CompilationFailed;
         const proc_fn = self.proc_registry.get(@intFromEnum(entry_proc)) orelse return error.CompilationFailed;
 
-        const main_symbol = "roc_default_start_main";
+        const main_symbol = shim_symbols.roc_default_start_main;
         const wrapper_ty = builder.fnType(self.ptrSizedIntType(), &.{}, .normal) catch return error.OutOfMemory;
         const wrapper_name = builder.strtabString(main_symbol) catch return error.OutOfMemory;
         const wrapper = builder.addFunction(wrapper_ty, wrapper_name, .default) catch return error.OutOfMemory;
@@ -3344,13 +3345,19 @@ pub const MonoLlvmCodeGen = struct {
         const shift_bits = builder.intValue(.i8, self.intBits(target_layout)) catch return error.OutOfMemory;
         const rhs_u8 = try self.coerceScalar(rhs, .i8, false);
         const too_large = wip.icmp(.uge, rhs_u8, shift_bits, "") catch return error.OutOfMemory;
-        const zero_amount = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
         const amount = try self.coerceScalar(rhs_u8, result_ty, false);
+        if (op == .num_shift_right_by and target_layout.isSigned()) {
+            // Arithmetic right shift keeps filling with sign bits, so any
+            // amount >= the bit width behaves like shifting by bits - 1.
+            const max_amount = builder.intValue(result_ty, self.intBits(target_layout) - 1) catch return error.OutOfMemory;
+            const safe_amount = wip.select(.normal, too_large, max_amount, amount, "") catch return error.OutOfMemory;
+            return wip.bin(.ashr, lhs, safe_amount, "") catch return error.OutOfMemory;
+        }
+        const zero_amount = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
         const safe_amount = wip.select(.normal, too_large, zero_amount, amount, "") catch return error.OutOfMemory;
         const tag: LlvmBuilder.Function.Instruction.Tag = switch (op) {
             .num_shift_left_by => .shl,
-            .num_shift_right_by => if (target_layout.isSigned()) .ashr else .lshr,
-            .num_shift_right_zf_by => .lshr,
+            .num_shift_right_by, .num_shift_right_zf_by => .lshr,
             else => unreachable,
         };
         const shifted = wip.bin(tag, lhs, safe_amount, "") catch return error.OutOfMemory;
@@ -3595,6 +3602,10 @@ pub const MonoLlvmCodeGen = struct {
                 try self.emitFloatDecIntTryUnsafeConversion(target, GuardedList.at(args, 0), info);
                 return;
             }
+            if (floatToIntTruncInfo(op)) |info| {
+                try self.emitFloatToIntTruncConversion(target, GuardedList.at(args, 0), info);
+                return;
+            }
         }
         if (std.mem.find(u8, name, "_to_") != null and args.len >= 1 and
             std.mem.find(u8, name, "_try") == null and
@@ -3653,6 +3664,61 @@ pub const MonoLlvmCodeGen = struct {
             .dec_to_u128_try_unsafe => .{ .src_kind = .dec, .target_bits = 128, .target_signed = false },
             else => null,
         };
+    }
+
+    const FloatToIntTruncInfo = struct {
+        src_is_f32: bool,
+        target_bits: u8,
+        target_signed: bool,
+    };
+
+    fn floatToIntTruncInfo(op: lir.LowLevel) ?FloatToIntTruncInfo {
+        return switch (op) {
+            .f32_to_i8_trunc => .{ .src_is_f32 = true, .target_bits = 8, .target_signed = true },
+            .f32_to_i16_trunc => .{ .src_is_f32 = true, .target_bits = 16, .target_signed = true },
+            .f32_to_i32_trunc => .{ .src_is_f32 = true, .target_bits = 32, .target_signed = true },
+            .f32_to_i64_trunc => .{ .src_is_f32 = true, .target_bits = 64, .target_signed = true },
+            .f32_to_i128_trunc => .{ .src_is_f32 = true, .target_bits = 128, .target_signed = true },
+            .f32_to_u8_trunc => .{ .src_is_f32 = true, .target_bits = 8, .target_signed = false },
+            .f32_to_u16_trunc => .{ .src_is_f32 = true, .target_bits = 16, .target_signed = false },
+            .f32_to_u32_trunc => .{ .src_is_f32 = true, .target_bits = 32, .target_signed = false },
+            .f32_to_u64_trunc => .{ .src_is_f32 = true, .target_bits = 64, .target_signed = false },
+            .f32_to_u128_trunc => .{ .src_is_f32 = true, .target_bits = 128, .target_signed = false },
+            .f64_to_i8_trunc => .{ .src_is_f32 = false, .target_bits = 8, .target_signed = true },
+            .f64_to_i16_trunc => .{ .src_is_f32 = false, .target_bits = 16, .target_signed = true },
+            .f64_to_i32_trunc => .{ .src_is_f32 = false, .target_bits = 32, .target_signed = true },
+            .f64_to_i64_trunc => .{ .src_is_f32 = false, .target_bits = 64, .target_signed = true },
+            .f64_to_i128_trunc => .{ .src_is_f32 = false, .target_bits = 128, .target_signed = true },
+            .f64_to_u8_trunc => .{ .src_is_f32 = false, .target_bits = 8, .target_signed = false },
+            .f64_to_u16_trunc => .{ .src_is_f32 = false, .target_bits = 16, .target_signed = false },
+            .f64_to_u32_trunc => .{ .src_is_f32 = false, .target_bits = 32, .target_signed = false },
+            .f64_to_u64_trunc => .{ .src_is_f32 = false, .target_bits = 64, .target_signed = false },
+            .f64_to_u128_trunc => .{ .src_is_f32 = false, .target_bits = 128, .target_signed = false },
+            else => null,
+        };
+    }
+
+    /// Wrapping float→int conversion: the builtin wrapper implements Roc's
+    /// wrap semantics (NaN and the infinities produce 0, widths of at most
+    /// 64 bits wrap modulo 2^bits, and 128-bit targets produce 0 when the
+    /// truncated value is out of range), writing the result bytes directly
+    /// into the target slot.
+    fn emitFloatToIntTruncConversion(self: *MonoLlvmCodeGen, target: LocalId, arg: LocalId, info: FloatToIntTruncInfo) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
+        const name = if (info.src_is_f32) builtinSymbol(.f32_to_int_wrap) else builtinSymbol(.f64_to_int_wrap);
+        const float_ty: LlvmBuilder.Type = if (info.src_is_f32) .float else .double;
+        try self.callBuiltinVoid(
+            name,
+            &.{ try self.ptrType(), float_ty, .i32, .i32, .i32 },
+            &.{
+                self.slot(target).ptr,
+                value,
+                builder.intValue(.i32, info.target_bits) catch return error.OutOfMemory,
+                builder.intValue(.i32, @intFromBool(info.target_signed)) catch return error.OutOfMemory,
+                builder.intValue(.i32, @as(u32, info.target_bits) / 8) catch return error.OutOfMemory,
+            },
+        );
     }
 
     fn tryUnsafeOffsets(self: *MonoLlvmCodeGen, ret_layout: layout.Idx) Error!TryUnsafeOffsets {
@@ -8257,7 +8323,7 @@ pub const MonoLlvmCodeGen = struct {
     ) Error!bool {
         if (!self.enable_default_platform_hosted_calls) return false;
         if (self.host_call_mode != .extern_symbols) return false;
-        if (!std.mem.eql(u8, self.store.getString(hosted.symbol), "roc_default_echo_line")) return false;
+        if (!std.mem.eql(u8, self.store.getString(hosted.symbol), shim_symbols.roc_default_echo_line)) return false;
 
         switch (self.target.os.tag) {
             .linux, .macos, .windows => {},

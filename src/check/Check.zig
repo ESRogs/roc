@@ -34,6 +34,7 @@ const Ident = base.Ident;
 const Region = base.Region;
 const DeferredConstraintCheck = unifier.DeferredConstraintCheck;
 const StaticDispatchConstraint = types_mod.StaticDispatchConstraint;
+const InterpolationPartMetadata = types_mod.InterpolationPartMetadata;
 const Func = types_mod.Func;
 const Var = types_mod.Var;
 const Flex = types_mod.Flex;
@@ -76,26 +77,6 @@ const FunctionEffectResolution = enum {
             .unresolved => .unresolved,
         };
     }
-};
-
-const InterpolationConstraintId = enum(u32) { _ };
-
-const InterpolationPartMetadata = struct {
-    var_: Var,
-    /// The interpolation use site's region. This remains stable when `var_` is
-    /// remapped to a fresh variable during instantiation.
-    region: Region,
-};
-
-const InterpolationConstraintMetadata = struct {
-    expr_idx: CIR.Expr.Idx,
-    item_var: Var,
-    /// The interpolated expressions (the even-indexed entries of the
-    /// `e_interpolation` `parts`). Their vars are remapped through the
-    /// instantiation var-map in `copyConstraintMetadata`; their source regions
-    /// remain the original interpolation use sites. Owned; freed in `deinit`.
-    interpolated_parts: []InterpolationPartMetadata,
-    checked_parts: bool = false,
 };
 
 /// Transient checker input carrying the platform root's requirement surface:
@@ -165,8 +146,6 @@ return_constraints: std.ArrayListUnmanaged(ReturnConstraint),
 return_constraint_frames: std.ArrayListUnmanaged(ReturnConstraintFrame),
 /// A map from one var to another. Used in instantiation and var copying
 var_map: std.AutoHashMap(Var, Var),
-/// Static-dispatch constraint function vars copied during instantiation.
-constraint_fn_var_map: std.AutoHashMap(Var, Var),
 /// A map from one var to another. Used in instantiation and var copying
 var_set: std.AutoHashMap(Var, void),
 /// A map from one var to another. Used to apply type arguments in instantiation
@@ -201,11 +180,8 @@ u64_var: Var,
 builtin_types_copied: bool,
 /// Map representation of Ident -> Var, used in checking static dispatch constraints
 ident_to_var_map: std.AutoHashMap(Ident.Idx, Var),
-/// Interpolation metadata records keyed by their static dispatch constraint function.
-interpolation_constraint_ids_by_fn_var: std.AutoHashMap(Var, InterpolationConstraintId),
-/// Metadata produced when checking interpolation expressions and consumed when
-/// finalizing custom `from_interpolation` dispatch.
-interpolation_constraint_metadata: std.ArrayListUnmanaged(InterpolationConstraintMetadata),
+/// Interpolation constraint function vars whose custom part checks have already run.
+checked_interpolation_part_constraints: std.AutoHashMap(Var, void),
 /// Dispatcher/method pairs already reported by `reportConstraintError`, so a
 /// constraint failing in multiple passes (or reachable through several aliased
 /// type variables) is reported once.
@@ -464,6 +440,11 @@ instantiation_source_expr: ?CIR.Expr.Idx = null,
 /// recorded against that node's `dispatch_target` evidence slot (see
 /// `recordSchemeUse`).
 evidence_target_site: ?EvidenceTargetSite = null,
+/// One-shot attribution for the outer scheme instantiation performed when a
+/// containing value stores a generalized expression-position function. It is
+/// consumed at `instantiateVarHelp` entry so any instantiations triggered
+/// while processing that edge cannot be misattributed to the same site.
+pending_nested_function_use: ?CIR.Expr.Idx = null,
 /// Scratch buffer for the (scheme var → fresh var) pairs of one constrained
 /// scheme instantiation, flushed into `cir.scheme_uses`.
 scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeUsePair) = .empty,
@@ -1459,7 +1440,6 @@ fn initAssumePrepared(
         .env_pool = try EnvPool.init(gpa),
         .generalizer = try Generalizer.init(gpa, types),
         .var_map = std.AutoHashMap(Var, Var).init(gpa),
-        .constraint_fn_var_map = std.AutoHashMap(Var, Var).init(gpa),
         .constraints = try Constraint.SafeList.initCapacity(gpa, 32),
         .return_constraints = .empty,
         .return_constraint_frames = .empty,
@@ -1478,8 +1458,7 @@ fn initAssumePrepared(
         .u64_var = undefined,
         .builtin_types_copied = false,
         .ident_to_var_map = std.AutoHashMap(Ident.Idx, Var).init(gpa),
-        .interpolation_constraint_ids_by_fn_var = std.AutoHashMap(Var, InterpolationConstraintId).init(gpa),
-        .interpolation_constraint_metadata = .empty,
+        .checked_interpolation_part_constraints = std.AutoHashMap(Var, void).init(gpa),
         .reported_constraint_errors = std.AutoHashMap(ReportedConstraintError, void).init(gpa),
         .reported_effectful_expect = std.AutoHashMap(Var, void).init(gpa),
         .current_expect_region = null,
@@ -1603,7 +1582,6 @@ pub fn deinit(self: *Self) void {
     self.env_pool.deinit();
     self.generalizer.deinit(self.gpa);
     self.var_map.deinit();
-    self.constraint_fn_var_map.deinit();
     self.constraints.deinit(self.gpa);
     self.return_constraints.deinit(self.gpa);
     self.return_constraint_frames.deinit(self.gpa);
@@ -1618,11 +1596,7 @@ pub fn deinit(self: *Self) void {
     self.scratch_deferred_static_dispatch_constraints.deinit();
     self.import_cache.deinit(self.gpa);
     self.ident_to_var_map.deinit();
-    self.interpolation_constraint_ids_by_fn_var.deinit();
-    for (self.interpolation_constraint_metadata.items) |meta| {
-        self.gpa.free(meta.interpolated_parts);
-    }
-    self.interpolation_constraint_metadata.deinit(self.gpa);
+    self.checked_interpolation_part_constraints.deinit();
     self.reported_constraint_errors.deinit();
     self.reported_effectful_expect.deinit();
     self.top_level_ptrns.deinit(self.gpa);
@@ -3748,23 +3722,14 @@ fn instantiateVarHelp(
     const trace = tracy.trace(@src());
     defer trace.end();
 
+    const nested_function_use = self.pending_nested_function_use;
+    self.pending_nested_function_use = null;
+
     // First, reset state
     instantiator.var_map.clearRetainingCapacity();
-    self.constraint_fn_var_map.clearRetainingCapacity();
-
-    const copy_constraint_metadata = self.hasConstraintMetadata();
-    instantiator.constraint_fn_var_map = if (copy_constraint_metadata) &self.constraint_fn_var_map else null;
 
     // Then, instantiate the variable with the provided context
     const instantiated_var = try instantiator.instantiateVar(var_to_instantiate);
-    instantiator.constraint_fn_var_map = null;
-
-    if (copy_constraint_metadata and self.constraint_fn_var_map.count() > 0) {
-        var constraint_iterator = self.constraint_fn_var_map.iterator();
-        while (constraint_iterator.next()) |x| {
-            try self.copyConstraintMetadata(x.key_ptr.*, x.value_ptr.*);
-        }
-    }
 
     if (instantiator.recursion_overflow) {
         // Non-terminating instantiation — e.g. a self-referential static-dispatch
@@ -3897,7 +3862,15 @@ fn instantiateVarHelp(
     // evidence: publication resolves the fresh vars once checking settles to
     // decide how each of the scheme's dispatch constraints was satisfied here.
     if (self.scratch_evidence_pairs.items.len > 0) {
-        if (self.evidence_target_site) |target| {
+        if (nested_function_use) |source_expr| {
+            try self.cir.recordSchemeUse(
+                @intFromEnum(source_expr),
+                .nested_function_use,
+                0,
+                var_to_instantiate,
+                self.scratch_evidence_pairs.items,
+            );
+        } else if (self.evidence_target_site) |target| {
             try self.cir.recordSchemeUse(
                 target.node_idx,
                 .dispatch_target,
@@ -3907,9 +3880,10 @@ fn instantiateVarHelp(
             );
         } else if (self.instantiation_source_expr) |source_expr| {
             // Only value uses of definitions instantiate schemes whose
-            // constraints later need per-site evidence; other in-expression
-            // instantiations (nominal constructors, Try copies, iterator
-            // declarations, …) never become specialization edges.
+            // constraints later need per-site evidence here; the explicit
+            // nested-function construction edge is handled above. Other
+            // in-expression instantiations (nominal constructors, Try copies,
+            // iterator declarations, …) never become specialization edges.
             switch (self.cir.store.nodes.get(@enumFromInt(@intFromEnum(source_expr))).tag) {
                 .expr_var,
                 .expr_external_lookup,
@@ -6986,130 +6960,6 @@ fn judgeResidualAmbiguityCandidates(self: *Self) Allocator.Error!void {
     }
 }
 
-fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationConstraintId {
-    if (self.interpolation_constraint_ids_by_fn_var.count() == 0) return null;
-
-    if (self.interpolation_constraint_ids_by_fn_var.get(fn_var)) |id| return id;
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        if (self.interpolation_constraint_ids_by_fn_var.get(resolved)) |id| return id;
-    }
-
-    return null;
-}
-
-fn recordInterpolationConstraintIdForFnVar(
-    self: *Self,
-    fn_var: Var,
-    id: InterpolationConstraintId,
-) std.mem.Allocator.Error!void {
-    try self.interpolation_constraint_ids_by_fn_var.put(fn_var, id);
-
-    const resolved = self.types.resolveVar(fn_var).var_;
-    if (resolved != fn_var) {
-        try self.interpolation_constraint_ids_by_fn_var.put(resolved, id);
-    }
-}
-
-fn recordInterpolationConstraintMetadata(
-    self: *Self,
-    fn_var: Var,
-    expr_idx: CIR.Expr.Idx,
-    item_var: Var,
-) std.mem.Allocator.Error!void {
-    // Capture each part's type var and interpolation use-site region now. Re-checking remaps
-    // the vars per instantiation while keeping the source regions stable (see
-    // `copyConstraintMetadata`).
-    const interpolation = self.cir.store.getExpr(expr_idx).e_interpolation;
-    const parts = self.cir.store.sliceExpr(interpolation.parts);
-    std.debug.assert(parts.len % 2 == 0);
-    const interpolated_parts = try self.gpa.alloc(InterpolationPartMetadata, parts.len / 2);
-    errdefer self.gpa.free(interpolated_parts);
-    var part_i: usize = 0;
-    while (part_i < parts.len) : (part_i += 2) {
-        const part_expr_idx = parts[part_i];
-        interpolated_parts[part_i / 2] = .{
-            .var_ = ModuleEnv.varFrom(part_expr_idx),
-            .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(part_expr_idx)),
-        };
-    }
-
-    const id: InterpolationConstraintId = @enumFromInt(self.interpolation_constraint_metadata.items.len);
-    try self.recordInterpolationConstraintIdForFnVar(fn_var, id);
-    try self.interpolation_constraint_metadata.append(self.gpa, .{
-        .expr_idx = expr_idx,
-        .item_var = item_var,
-        .interpolated_parts = interpolated_parts,
-    });
-}
-
-fn linkConstraintMetadata(
-    self: *Self,
-    left: Var,
-    right: Var,
-) std.mem.Allocator.Error!void {
-    if (self.interpolationConstraintIdForFnVar(left) orelse self.interpolationConstraintIdForFnVar(right)) |id| {
-        try self.recordInterpolationConstraintIdForFnVar(left, id);
-        try self.recordInterpolationConstraintIdForFnVar(right, id);
-    }
-}
-
-fn hasConstraintMetadata(self: *Self) bool {
-    return self.interpolation_constraint_ids_by_fn_var.count() > 0;
-}
-
-fn instantiatedMetadataVar(self: *Self, var_: Var) Var {
-    const resolved = self.types.resolveVar(var_).var_;
-    return self.var_map.get(resolved) orelse resolved;
-}
-
-fn copyConstraintMetadata(
-    self: *Self,
-    old_var: Var,
-    fresh_var: Var,
-) std.mem.Allocator.Error!void {
-    std.debug.assert(self.hasConstraintMetadata());
-
-    var maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(old_var);
-
-    if (maybe_interpolation_id == null) {
-        const resolved_old = self.types.resolveVar(old_var).var_;
-        if (resolved_old != old_var) {
-            maybe_interpolation_id = self.interpolation_constraint_ids_by_fn_var.get(resolved_old);
-        }
-    }
-
-    if (maybe_interpolation_id == null) return;
-
-    const resolved_fresh = self.types.resolveVar(fresh_var).var_;
-    if (maybe_interpolation_id) |old_id| {
-        const old_metadata = self.interpolation_constraint_metadata.items[@intFromEnum(old_id)];
-        // Remap each interpolated-part var through the instantiation var-map, exactly as
-        // `item_var` is remapped, so the re-check unifies instantiated item type against
-        // instantiated part vars (the original CIR part vars belong to the generalized copy).
-        const new_interpolated_parts = try self.gpa.alloc(InterpolationPartMetadata, old_metadata.interpolated_parts.len);
-        errdefer self.gpa.free(new_interpolated_parts);
-        for (old_metadata.interpolated_parts, 0..) |old_part, i| {
-            new_interpolated_parts[i] = .{
-                .var_ = self.instantiatedMetadataVar(old_part.var_),
-                .region = old_part.region,
-            };
-        }
-        const new_item_var = self.instantiatedMetadataVar(old_metadata.item_var);
-        const new_id: InterpolationConstraintId = @enumFromInt(self.interpolation_constraint_metadata.items.len);
-        try self.recordInterpolationConstraintIdForFnVar(fresh_var, new_id);
-        if (resolved_fresh != fresh_var) {
-            try self.recordInterpolationConstraintIdForFnVar(resolved_fresh, new_id);
-        }
-        try self.interpolation_constraint_metadata.append(self.gpa, .{
-            .expr_idx = old_metadata.expr_idx,
-            .item_var = new_item_var,
-            .interpolated_parts = new_interpolated_parts,
-        });
-    }
-}
-
 fn findStaticDispatchUseForConstraint(
     self: *Self,
     constraint: StaticDispatchConstraint,
@@ -8598,7 +8448,7 @@ fn resolveForClauseAliasOccurrences(
         for (bindings) |binding| {
             if (source_decl == @intFromEnum(binding.platform_alias_stmt_idx)) {
                 if (binding.app_type_var) |app_type_var| {
-                    try self.types.dangerousSetVarRedirect(resolved.var_, app_type_var);
+                    try self.types.dangerousSetVarRedirect(.for_clause_alias_identity, resolved.var_, app_type_var);
                 }
                 break;
             }
@@ -11939,6 +11789,41 @@ fn unifyMatchAltPatternBindings(
 
 // expr //
 
+const CheckedStoredValue = struct {
+    does_fx: bool,
+    var_: Var,
+};
+
+/// Check an expression that a containing value stores, instantiating an
+/// expression-position function scheme at this exact construction edge. The
+/// containing value must refer to the fresh instance: embedding the pristine
+/// generalized scheme would let later projections bypass the scheme-use edge
+/// that supplies the nested function's static-dispatch evidence.
+fn checkStoredValueExpr(
+    self: *Self,
+    expr_idx: CIR.Expr.Idx,
+    env: *Env,
+    expected: Expected,
+) std.mem.Allocator.Error!CheckedStoredValue {
+    const does_fx = try self.checkExpr(expr_idx, env, expected);
+    const source_var = ModuleEnv.varFrom(expr_idx);
+    if (self.types.resolveVar(source_var).desc.rank != .generalized) {
+        return .{ .does_fx = does_fx, .var_ = source_var };
+    }
+
+    const previous_source = self.instantiation_source_expr;
+    self.instantiation_source_expr = expr_idx;
+    defer self.instantiation_source_expr = previous_source;
+    std.debug.assert(self.pending_nested_function_use == null);
+    self.pending_nested_function_use = expr_idx;
+    const instance_var = try self.instantiateVar(source_var, env, .use_last_var);
+    std.debug.assert(self.pending_nested_function_use == null);
+    return .{
+        .does_fx = does_fx,
+        .var_ = instance_var,
+    };
+}
+
 fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected) std.mem.Allocator.Error!bool {
     const trace = tracy.trace(@src());
     defer trace.end();
@@ -12209,14 +12094,16 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 // constrain the rest of the list
 
                 // Check the first elem
-                does_fx = try self.checkExpr(elems[0], env, child_expected) or does_fx;
+                const first_elem = try self.checkStoredValueExpr(elems[0], env, child_expected);
+                does_fx = first_elem.does_fx or does_fx;
 
                 // Iterate over the remaining elements
-                const elem_var = ModuleEnv.varFrom(elems[0]);
+                const elem_var = first_elem.var_;
                 var last_elem_expr_idx = elems[0];
                 for (elems[1..], 1..) |elem_expr_idx, i| {
-                    does_fx = try self.checkExpr(elem_expr_idx, env, child_expected) or does_fx;
-                    const cur_elem_var = ModuleEnv.varFrom(elem_expr_idx);
+                    const current_elem = try self.checkStoredValueExpr(elem_expr_idx, env, child_expected);
+                    does_fx = current_elem.does_fx or does_fx;
+                    const cur_elem_var = current_elem.var_;
 
                     // Unify each element's var with the list's elem var
                     const result = try self.unifyInContext(elem_var, cur_elem_var, env, .{ .list_entry = .{
@@ -12229,7 +12116,8 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     // to the elem_var to catch their individual errors
                     if (!result.isOk()) {
                         for (elems[i + 1 ..]) |remaining_elem_expr_idx| {
-                            does_fx = try self.checkExpr(remaining_elem_expr_idx, env, child_expected) or does_fx;
+                            const remaining_elem = try self.checkStoredValueExpr(remaining_elem_expr_idx, env, child_expected);
+                            does_fx = remaining_elem.does_fx or does_fx;
                         }
 
                         // Break to avoid cascading errors
@@ -12248,12 +12136,15 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         .e_tuple => |tuple| {
             // Check tuple elements
             const elems_slice = self.cir.store.exprSlice(tuple.elems);
+            const scratch_vars_top = self.scratch_vars.top();
+            defer self.scratch_vars.clearFrom(scratch_vars_top);
             for (elems_slice) |single_elem_expr_idx| {
-                does_fx = try self.checkExpr(single_elem_expr_idx, env, child_expected) or does_fx;
+                const elem = try self.checkStoredValueExpr(single_elem_expr_idx, env, child_expected);
+                does_fx = elem.does_fx or does_fx;
+                try self.scratch_vars.append(elem.var_);
             }
 
-            // Cast the elems idxs to vars (this works because Anno Idx are 1-1 with type Vars)
-            const elem_vars_slice = try self.types.appendVars(@ptrCast(elems_slice));
+            const elem_vars_slice = try self.types.appendVars(self.scratch_vars.sliceFromStart(scratch_vars_top));
 
             // Set the type in the store
             try self.unifyWith(expr_var, .{ .structure = .{
@@ -12292,13 +12183,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     const field = self.cir.store.getRecordField(field_idx);
 
                     // Check the field value expression
-                    does_fx = try self.checkExpr(field.value, env, child_expected) or does_fx;
+                    const field_value = try self.checkStoredValueExpr(field.value, env, child_expected);
+                    does_fx = field_value.does_fx or does_fx;
 
                     // Create an unbound record with this field
                     const single_field_record = try self.freshFromContent(.{ .structure = .{
                         .record_unbound = try self.types.appendRecordFields(&.{types_mod.RecordField{
                             .name = field.name,
-                            .var_ = ModuleEnv.varFrom(field.value),
+                            .var_ = field_value.var_,
                         }}),
                     } }, env, expr_region);
 
@@ -12323,12 +12215,13 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     const field = self.cir.store.getRecordField(field_idx);
 
                     // Check the field value expression
-                    does_fx = try self.checkExpr(field.value, env, child_expected) or does_fx;
+                    const field_value = try self.checkStoredValueExpr(field.value, env, child_expected);
+                    does_fx = field_value.does_fx or does_fx;
 
                     // Append it to the scratch records array
                     try self.scratch_record_fields.append(types_mod.RecordField{
                         .name = field.name,
-                        .var_ = ModuleEnv.varFrom(field.value),
+                        .var_ = field_value.var_,
                     });
                 }
 
@@ -12367,14 +12260,18 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Process each tag arg
             const arg_expr_idx_slice = self.cir.store.sliceExpr(e.args);
+            const scratch_vars_top = self.scratch_vars.top();
+            defer self.scratch_vars.clearFrom(scratch_vars_top);
             for (arg_expr_idx_slice) |arg_expr_idx| {
-                does_fx = try self.checkExpr(arg_expr_idx, env, child_expected) or does_fx;
+                const arg = try self.checkStoredValueExpr(arg_expr_idx, env, child_expected);
+                does_fx = arg.does_fx or does_fx;
+                try self.scratch_vars.append(arg.var_);
             }
 
             // Create the type
             const ext_var = try self.fresh(env, expr_region);
 
-            const tag = try self.types.mkTag(e.name, @ptrCast(arg_expr_idx_slice));
+            const tag = try self.types.mkTag(e.name, self.scratch_vars.sliceFromStart(scratch_vars_top));
             const tag_union_content = try self.types.mkTagUnion(&[_]types_mod.Tag{tag}, ext_var);
 
             // Update the expr to point to the new type
@@ -12383,8 +12280,9 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         // nominal //
         .e_nominal => |nominal| {
             // Check the backing expression first
-            does_fx = try self.checkExpr(nominal.backing_expr, env, child_expected) or does_fx;
-            const actual_backing_var = ModuleEnv.varFrom(nominal.backing_expr);
+            const backing = try self.checkStoredValueExpr(nominal.backing_expr, env, child_expected);
+            does_fx = backing.does_fx or does_fx;
+            const actual_backing_var = backing.var_;
 
             // Use shared nominal type checking logic
             _ = try self.checkNominalTypeUsage(
@@ -12398,8 +12296,9 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         },
         .e_nominal_external => |nominal| {
             // Check the backing expression first
-            does_fx = try self.checkExpr(nominal.backing_expr, env, child_expected) or does_fx;
-            const actual_backing_var = ModuleEnv.varFrom(nominal.backing_expr);
+            const backing = try self.checkStoredValueExpr(nominal.backing_expr, env, child_expected);
+            does_fx = backing.does_fx or does_fx;
+            const actual_backing_var = backing.var_;
 
             // Resolve the external type declaration
             if (try self.resolveVarFromExternal(nominal.module_idx, nominal.target_node_idx)) |ext_ref| {
@@ -15069,6 +14968,31 @@ fn tryArgsFromVar(self: *Self, try_var: Var) ?TryArgs {
     }
 }
 
+/// Whether a `?` condition is a direct call of a hosted function — the only
+/// shape the hosted-try-question-widening rule (design.md "Hosted Try Question
+/// Widening") applies to. The callee is statically resolved from the call's
+/// function expression (the local or external lookup canonicalization
+/// produced); dispatch calls and value-carried functions are never direct
+/// hosted calls, so `?` on them gets no widening.
+fn tryConditionIsDirectHostedCall(self: *Self, cond_idx: CIR.Expr.Idx) bool {
+    const call = switch (self.cir.store.getExpr(cond_idx)) {
+        .e_call => |call| call,
+        else => return false,
+    };
+    const callable_def = self.hoistedCallableDefForExpr(self.cir, call.func) orelse return false;
+    const def = callable_def.module.store.getDef(callable_def.def);
+    return callable_def.module.store.getExpr(def.expr) == .e_hosted_lambda;
+}
+
+/// The hosted-try-question-widening rule (design.md "Hosted Try Question
+/// Widening"): `?` on a direct call of a hosted function widens the condition
+/// to a fresh `Try` at the enclosing annotated return's error row when every
+/// visible error in the callee's row is included in it. The redirect targets
+/// the fresh `Try`, so the hosted callee's declared closed row — the host
+/// ABI's shape — is what checking outputs for the callee itself. For every
+/// other callee, a closed error row meeting an open annotated row stays a
+/// type error (issue #9798's program is rejected by design); the caller gates
+/// on `tryConditionIsDirectHostedCall`.
 fn widenTryConditionForExpectedReturn(
     self: *Self,
     cond_var: Var,
@@ -15083,9 +15007,9 @@ fn widenTryConditionForExpectedReturn(
         return;
     }
 
-    // `?` injects the callee's error row into the enclosing return row. Ordinary
-    // tag-union unification still rejects closed-vs-open rigid rows; this use-site
-    // rewrite runs only after proving the callee's visible errors are included.
+    // Ordinary tag-union unification rejects closed-vs-open rigid rows; this
+    // use-site rewrite runs only after proving the callee's visible errors are
+    // included in the expected row.
     const widened_try_var = try self.freshFromContent(
         try self.mkTryContent(actual_try.ok, expected_try.err),
         env,
@@ -15093,7 +15017,7 @@ fn widenTryConditionForExpectedReturn(
     );
     const cond_root = self.types.resolveVar(cond_var).var_;
     if (cond_root != widened_try_var) {
-        try self.types.dangerousSetVarRedirect(cond_root, widened_try_var);
+        try self.types.dangerousSetVarRedirect(.hosted_try_question_widening, cond_root, widened_try_var);
     }
 }
 
@@ -15432,7 +15356,9 @@ fn checkMatchExpr(
         if (!try_result.isOk()) {
             has_invalid_try = true;
         } else if (expected.returnResult()) |expected_return| {
-            try self.widenTryConditionForExpectedReturn(cond_var, expected_return, env, expr_region);
+            if (self.tryConditionIsDirectHostedCall(match.cond)) {
+                try self.widenTryConditionForExpectedReturn(cond_var, expected_return, env, expr_region);
+            }
         }
     }
     if (!match.is_try_suffix and !match.skip_exhaustiveness) {
@@ -16553,6 +16479,39 @@ fn mkTypeMethodCallConstraint(
     return constraint_fn_var;
 }
 
+fn mkInterpolationMetadata(
+    self: *Self,
+    expr_idx: CIR.Expr.Idx,
+    item_var: Var,
+) Allocator.Error!StaticDispatchConstraint.InterpolationMetadata {
+    const interpolation = self.cir.store.getExpr(expr_idx).e_interpolation;
+    const parts = self.cir.store.sliceExpr(interpolation.parts);
+    std.debug.assert(parts.len % 2 == 0);
+
+    const interpolated_len = parts.len / 2;
+    var interpolated_parts_sfa = std.heap.stackFallback(8 * @sizeOf(InterpolationPartMetadata), self.gpa);
+    const interpolated_parts_alloc = interpolated_parts_sfa.get();
+    var interpolated_parts = try std.ArrayList(InterpolationPartMetadata).initCapacity(interpolated_parts_alloc, interpolated_len);
+    defer interpolated_parts.deinit(interpolated_parts_alloc);
+
+    var part_i: usize = 0;
+    while (part_i < parts.len) : (part_i += 2) {
+        const part_expr_idx = parts[part_i];
+        interpolated_parts.appendAssumeCapacity(.{
+            .var_ = ModuleEnv.varFrom(part_expr_idx),
+            .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(part_expr_idx)),
+        });
+    }
+
+    return .{
+        .expr_region = StaticDispatchConstraint.Provenance.OptRegion.some(
+            self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(expr_idx)),
+        ),
+        .item_var = item_var,
+        .interpolated_parts = try self.types.appendInterpolationParts(interpolated_parts.items),
+    };
+}
+
 fn mkInterpolationConstraint(
     self: *Self,
     dispatcher_var: Var,
@@ -16575,9 +16534,9 @@ fn mkInterpolationConstraint(
         .fn_var = constraint_fn_var,
         .origin = .{ .from_literal = .interpolation },
         .provenance = self.methodDispatchProvenance(expr_idx),
+        .interpolation = try self.mkInterpolationMetadata(expr_idx, item_var),
     };
     const constraint_range = try self.types.appendStaticDispatchConstraints(&.{constraint});
-    try self.recordInterpolationConstraintMetadata(constraint_fn_var, expr_idx, item_var);
 
     const constrained_var = try self.freshFromContent(
         .{ .flex = Flex{ .name = null, .constraints = constraint_range } },
@@ -16592,6 +16551,15 @@ fn mkInterpolationConstraint(
     return constraint_fn_var;
 }
 
+/// Rewrite a derived `is_eq` method call into an explicit structural-eq node.
+///
+/// RESTAMP RULE (all discharge-time plan rewrites): only the node's own
+/// constraint may restamp a node that already carries a stamped plan
+/// (`constraint_fn_var`). A discharge of an instantiated copy carries the
+/// copy's fn var, so the guarded arms below return early on a mismatch,
+/// keeping the scheme-pristine fn var stamped at plan creation. Restamping
+/// from a foreign constraint would pin the stamped plan to one
+/// instantiation's concrete types (the issue #9971 failure).
 fn rewriteDerivedIsEqMethodCallAsStructuralEq(
     self: *Self,
     constraint: StaticDispatchConstraint,
@@ -16645,6 +16613,10 @@ fn rewriteDerivedIsEqMethodCallAsStructuralEq(
 /// Rewrite a derived `to_hash` method call into an explicit structural-hash node.
 /// The call is `value.to_hash(hasher)`, so the receiver is the value being hashed
 /// and the single argument is the Hasher being threaded through.
+///
+/// Subject to the RESTAMP RULE documented on
+/// `rewriteDerivedIsEqMethodCallAsStructuralEq`: the dispatch-call arms only
+/// rewrite when the node's own constraint is discharging.
 fn rewriteDerivedMethodCallAsStructuralHash(
     self: *Self,
     constraint: StaticDispatchConstraint,
@@ -16687,6 +16659,12 @@ fn rewriteDerivedMethodCallAsStructuralHash(
     return true;
 }
 
+/// Rewrite a desugared `==`/`!=` binop into an explicit method-eq node.
+///
+/// Subject to the RESTAMP RULE documented on
+/// `rewriteDerivedIsEqMethodCallAsStructuralEq`: the `e_method_eq` arm only
+/// restamps when the node's own constraint is discharging, enforced by its
+/// guard at the restamp site (not only by checked-module output checks).
 fn rewriteEqBinopAsMethodEq(self: *Self, constraint: StaticDispatchConstraint) void {
     if (constraint.origin != .desugared_binop) return;
     const expr_idx = constraintIntroExpr(constraint) orelse return;
@@ -18351,6 +18329,14 @@ fn rangeHasNonLiteralConstraint(self: *Self, range: StaticDispatchConstraint.Saf
 /// NEVER mutates them. Anything uncertain returns false (fall through to the
 /// probe) — refutation is exact logic, probing is the default.
 ///
+/// This filter implements no language rule of its own: the acceptance rule is
+/// `staticDispatchConstraintAcceptsCandidate`'s (see its doc comment), and this
+/// function must refute exactly when that probe would fail. Safety-checked
+/// builds prove every refutation by running the skipped probe and asserting it
+/// fails (the witness in `commitLiteralDefault`), so a drift between this
+/// logic and the unifier's semantics crashes rather than changing which
+/// default a literal picks.
+///
 /// Two refutation facts, per non-literal constraint (the literal-conversion
 /// ones are pre-filtered by digit-fit inside `tryCommitNumeralCandidate` via
 /// `literalInfoAcceptsBuiltinNumKind`):
@@ -18512,6 +18498,15 @@ fn literalInfoAcceptsBuiltinNumKind(lit: StaticDispatchConstraint.LiteralInfo, n
     };
 }
 
+/// The method-acceptance rule of static dispatch — the intended language rule,
+/// not an implementation convenience: a candidate nominal type satisfies a
+/// dispatch constraint `fn_name : F` iff the type's declaring module provides
+/// a method binding named `fn_name` whose declared type, instantiated fresh,
+/// unifies with `F`. The two rejected sides are a missing binding and a
+/// signature mismatch; nothing structural is consulted here (structural
+/// eq/hash derivation is decided by the constraint's own origin/allowance,
+/// upstream of this check).
+///
 /// Speculatively mutates the real stores (copyVar/instantiateVar, real
 /// unification) and does NOT roll them back itself — the caller's commit-probe
 /// rollback does (or its commit keeps them). The `*CommitProbe` parameter is a
@@ -18865,7 +18860,6 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             try self.unifyWith(deferred_constraint.var_, .err, env);
                             try self.unifyWith(resolved_func.ret, .err, env);
                         } else {
-                            try self.linkConstraintMetadata(rigid_var, constraint.fn_var);
                             try self.reportEffectfulDispatchInExpect(constraint);
 
                             // The body provably forces this where-clause method: a
@@ -19821,18 +19815,18 @@ fn satisfyBuiltinStrInterpolation(
     constraint: StaticDispatchConstraint,
     env: *Env,
 ) Allocator.Error!bool {
-    const metadata_id = self.interpolationConstraintIdForFnVar(constraint.fn_var) orelse {
+    const metadata = constraint.interpolation;
+    const expr_region = metadata.expr_region.get() orelse {
         if (builtin.mode == .Debug) {
             std.debug.panic("type checker invariant violated: builtin Str interpolation constraint had no metadata", .{});
         }
         unreachable;
     };
-    const metadata = self.interpolation_constraint_metadata.items[@intFromEnum(metadata_id)];
-    const expr_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(metadata.expr_idx));
     const expected_str_var = try self.freshStr(env, expr_region);
 
     var did_err = false;
-    for (metadata.interpolated_parts) |part| {
+    for (0..metadata.interpolated_parts.len()) |part_i| {
+        const part = self.types.getInterpolationPartAt(metadata.interpolated_parts, @intCast(part_i));
         did_err = (try self.constrainInterpolationPartToStr(part, expected_str_var, env)) or did_err;
     }
 
@@ -19848,24 +19842,26 @@ fn ensureCustomInterpolationPartsChecked(
     constraint: StaticDispatchConstraint,
     env: *Env,
 ) Allocator.Error!void {
-    const metadata_id = self.interpolationConstraintIdForFnVar(constraint.fn_var) orelse {
+    const metadata = constraint.interpolation;
+    if (!metadata.isPresent()) {
         if (builtin.mode == .Debug) {
             std.debug.panic("type checker invariant violated: checked interpolation constraint had no generated item type", .{});
         }
         unreachable;
-    };
-    const metadata_index = @intFromEnum(metadata_id);
-    if (self.interpolation_constraint_metadata.items[metadata_index].checked_parts) return;
-    self.interpolation_constraint_metadata.items[metadata_index].checked_parts = true;
+    }
 
-    const item_var = self.interpolation_constraint_metadata.items[metadata_index].item_var;
+    const checked_key = self.types.resolveVar(constraint.fn_var).var_;
+    if ((try self.checked_interpolation_part_constraints.getOrPut(checked_key)).found_existing) return;
+
+    const item_var = metadata.item_var;
     // Use the captured part metadata, not the original CIR `parts`, so an instantiated call
     // site unifies the item type against its instantiated arguments and reports at the
     // interpolation use site.
-    const interpolated_parts = self.interpolation_constraint_metadata.items[metadata_index].interpolated_parts;
+    const interpolated_parts = metadata.interpolated_parts;
 
     var did_err = false;
-    for (interpolated_parts) |part| {
+    for (0..interpolated_parts.len()) |part_i| {
+        const part = self.types.getInterpolationPartAt(interpolated_parts, @intCast(part_i));
         const result = try self.unifyInContext(item_var, part.var_, env, .{ .interpolation_part = part.region });
         did_err = did_err or result.isProblem() or self.types.resolveVar(part.var_).desc.content == .err;
     }
@@ -23395,7 +23391,7 @@ fn markErroneousBranchWithExpected(self: *Self, expr_idx: CIR.Expr.Idx, expected
     const redirected_ret = try self.fresh(env, region);
     _ = try self.unifyInContext(redirected_ret, expected_ret, env, .none);
 
-    try self.types.dangerousSetVarRedirect(expr_var, redirected_ret);
+    try self.types.dangerousSetVarRedirect(.diagnostic_recovery_reported_error, expr_var, redirected_ret);
 }
 
 /// Check if a type variable contains any error types anywhere in its structure.
