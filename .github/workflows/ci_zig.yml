@@ -485,7 +485,16 @@ jobs:
       - name: build roc + repro executables for valgrind
         uses: ./.github/actions/flaky-retry
         with:
-          command: git clean -fdx && zig build -Dvalgrind=true -Dfuzz -Dsystem-afl=false -Doptimize=ReleaseFast -Dcpu=x86_64_v3 -Dtarget=x86_64-linux-musl -Dstrip=false -Dshared-memory-size=268435456
+          # `-e .zig-cache` is load-bearing: `git clean -x` removes ignored
+          # files, so without it this deletes the `p/` package dir that the
+          # cache step above restored one step earlier -- forcing a full
+          # re-download of every dependency and producing exactly the
+          # HttpConnectionClosing flake that this flaky-retry wrapper then
+          # absorbs. Keeping the rest of `.zig-cache` is safe: Zig keys cache
+          # entries on the full build configuration, so the valgrind build
+          # (-Dvalgrind=true, musl target, ReleaseFast) hashes to different
+          # entries than any other job's and cannot pick up stale artifacts.
+          command: git clean -fdx -e .zig-cache && zig build -Dvalgrind=true -Dfuzz -Dsystem-afl=false -Doptimize=ReleaseFast -Dcpu=x86_64_v3 -Dtarget=x86_64-linux-musl -Dstrip=false -Dshared-memory-size=268435456
           retry_count: 3
 
       - name: install valgrind
