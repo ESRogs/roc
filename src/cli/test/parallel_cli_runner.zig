@@ -1611,7 +1611,7 @@ fn runInterpreterTest(
     const opt_arg = std.fmt.allocPrint(allocator, "--opt={s}", .{backend.cliName()}) catch
         return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate opt arg" };
 
-    var argv_buf: [5][]const u8 = undefined;
+    var argv_buf: [7][]const u8 = undefined;
     var argc: usize = 0;
     argv_buf[argc] = roc_binary_path;
     argc += 1;
@@ -1619,17 +1619,22 @@ fn runInterpreterTest(
     argc += 1;
     argv_buf[argc] = opt_arg;
     argc += 1;
+    argv_buf[argc] = roc_file;
+    argc += 1;
     switch (platform.test_kind) {
         .native_run => {},
         .io_spec => |io_spec| {
-            const test_arg = std.fmt.allocPrint(allocator, "--test={s}", .{io_spec}) catch
-                return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate IO spec arg" };
-            argv_buf[argc] = test_arg;
+            // App args go after `--` so the CLI forwards them to the host
+            // instead of parsing them; the host takes `--test <spec>` as two
+            // arguments, matching the built-executable path below.
+            argv_buf[argc] = "--";
+            argc += 1;
+            argv_buf[argc] = "--test";
+            argc += 1;
+            argv_buf[argc] = io_spec;
             argc += 1;
         },
     }
-    argv_buf[argc] = roc_file;
-    argc += 1;
 
     var run_timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .message = "no clock" };
     const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
