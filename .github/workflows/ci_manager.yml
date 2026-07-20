@@ -113,27 +113,31 @@ jobs:
           - os: ubuntu-24.04
             shard: ubuntu-full
             timeout_minutes: 120
-            minici_args: "--minici-from run-check-zig-format --minici-to run-coverage-parser"
+            minici_args: []
+          - os: macos-15
+            shard: macos-core
+            timeout_minutes: 120
+            minici_args: ["--minici-to", &minici_core_boundary run-test-zig-module-roc_target]
           - os: macos-15
             shard: macos-zig
             timeout_minutes: 120
-            minici_args: "--minici-from run-check-zig-format --minici-to run-test-zig-backend-llvm"
+            minici_args: ["--minici-after", *minici_core_boundary, "--minici-before", &minici_harness_boundary run-test-eval]
           - os: macos-15
             shard: macos-harness
             timeout_minutes: 120
-            minici_args: "--minici-from run-test-eval --minici-to run-coverage-parser"
+            minici_args: ["--minici-from", *minici_harness_boundary]
           - os: windows-2025
             shard: windows-core
             timeout_minutes: 120
-            minici_args: "--minici-from run-check-zig-format --minici-to run-test-zig-module-roc_target"
+            minici_args: ["--minici-to", *minici_core_boundary]
           - os: windows-2025
             shard: windows-zig
             timeout_minutes: 120
-            minici_args: "--minici-from run-test-zig-snapshot-tool --minici-to run-test-zig-backend-llvm"
+            minici_args: ["--minici-after", *minici_core_boundary, "--minici-before", *minici_harness_boundary]
           - os: windows-2025
             shard: windows-harness
             timeout_minutes: 120
-            minici_args: "--minici-from run-test-eval --minici-to run-coverage-parser"
+            minici_args: ["--minici-from", *minici_harness_boundary]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
@@ -186,7 +190,7 @@ jobs:
           retry_count: 3
 
       - name: Run MiniCI
-        run: zig build minici -- ${{ matrix.minici_args }}
+        run: zig build minici -- ${{ join(matrix.minici_args, ' ') }}
 
       - name: Upload MiniCI report and logs
         if: failure()
