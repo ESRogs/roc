@@ -112,9 +112,9 @@ jobs:
           - os: ubuntu-24.04
             timeout_minutes: 120
           - os: macos-15
-            timeout_minutes: 120
+            timeout_minutes: 180
           - os: windows-2025
-            timeout_minutes: 120
+            timeout_minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
@@ -122,7 +122,7 @@ jobs:
       - uses: xyzzylabs/setup-zig@09d85d9dbb73308882e7a26e61a8f706eed40df1 # ratchet:xyzzylabs/setup-zig@v1.0.2
         with:
           version: 0.16.0
-          use-cache: true
+          use-cache: false
 
       - name: Install Rust wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -137,9 +137,10 @@ jobs:
           # Zig stores fetched packages in the `p/` subdir of the global cache.
           # Caching just that under a stable build.zig.zon-hash key keeps deps
           # present across runs: it is read every run, so it stays warm and is
-          # not evicted by the setup action's churnier per-run cache. A cold runner then no
-          # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          # while the setup action's own cache still handles build artifacts for speed.
+          # not evicted by build-artifact churn. MiniCI's full Zig cache is too
+          # large to save usefully, and setup-zig's post-job whole-cache cleanup
+          # can race with cancelled child processes, so setup-zig caching is
+          # intentionally disabled above.
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
           key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
