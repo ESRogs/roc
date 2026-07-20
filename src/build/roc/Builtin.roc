@@ -3846,6 +3846,34 @@ Builtin :: [].{
 			Ok($out)
 		}
 
+		## Like [List.fold], but the step function can fail. Threads `state` through
+		## the list, and if a step returns `Err`, stops and returns it.
+		## ```roc
+		## expect [1.I64, 2, 3].fold_try(0, |sum, n| if n < 3 { Ok(sum + n) } else { Err(Stop) }) == Err(Stop)
+		## ```
+		fold_try : List(item), state, (state, item -> Try(state, err)) -> Try(state, err)
+		fold_try = |list, initial, step| {
+			var $state = initial
+			for elem in list {
+				$state = step($state, elem)?
+			}
+			Ok($state)
+		}
+
+		## Like [List.fold_try], but the step function is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## events.fold_try!(State.init, |state, event| Store.apply!(state, event))
+		## ```
+		fold_try! : List(item), state, (state, item => Try(state, err)) => Try(state, err)
+		fold_try! = |list, initial, step!| {
+			var $state = initial
+			for elem in list {
+				$state = step!($state, elem)?
+			}
+			Ok($state)
+		}
+
 		## Build a value using each element in the list.
 		##
 		## Starting with a given `state` value, this folds through each element in the
