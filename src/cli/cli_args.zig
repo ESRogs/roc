@@ -138,6 +138,7 @@ pub const RunArgs = struct {
     allow_errors: bool = false, // allow execution even if there are type errors
     watch: bool = false, // hot reload when source inputs change; implied for dev runs
     explicit_watch: bool = false, // --watch was passed (as opposed to implied by a dev run)
+    explicit_opt: bool = false, // --opt was passed (as opposed to defaulted)
     timings: bool = false, // always show the per-phase timing breakdown
     max_threads: ?usize = null, // max worker threads (null = auto, 1 = single-threaded)
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
@@ -166,6 +167,7 @@ pub const CheckArgs = struct {
     max_threads: ?usize = null, // max worker threads (null = auto, 1 = single-threaded)
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
     root_source_url: ?[]const u8 = null, // internal: bundle URL provenance when the source was a URL or installed shorthand
+    main_source_url: ?[]const u8 = null, // internal: bundle URL provenance when --main was a URL or installed shorthand
 };
 
 /// Arguments for `roc build`
@@ -212,6 +214,7 @@ pub const TestArgs = struct {
     max_threads: ?usize = null, // max worker threads (null = auto, 1 = single-threaded)
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
     root_source_url: ?[]const u8 = null, // internal: bundle URL provenance when the source was a URL or installed shorthand
+    main_source_url: ?[]const u8 = null, // internal: bundle URL provenance when --main was a URL or installed shorthand
 };
 
 /// Arguments for `roc fmt`
@@ -245,6 +248,7 @@ pub const DocsArgs = struct {
     with_lang_ref: bool = false, // include the language reference articles from docs/langref
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
     root_source_url: ?[]const u8 = null, // internal: bundle URL provenance when the source was a URL or installed shorthand
+    main_source_url: ?[]const u8 = null, // internal: bundle URL provenance when --main was a URL or installed shorthand
 };
 
 /// Arguments for `roc bump`
@@ -1263,6 +1267,7 @@ const RunParseMode = enum { default, run_subcommand };
 fn parseRun(alloc: mem.Allocator, args: []const []const u8, mode: RunParseMode) std.mem.Allocator.Error!CliArgs {
     var path: ?[]const u8 = null;
     var opt: OptLevel = default_dev_opt;
+    var explicit_opt = false;
     var target: ?[]const u8 = null;
     var no_cache: bool = false;
     var allow_errors: bool = false;
@@ -1313,6 +1318,7 @@ fn parseRun(alloc: mem.Allocator, args: []const []const u8, mode: RunParseMode) 
             if (getFlagValue(arg)) |value| {
                 if (OptLevel.from_str(value)) |level| {
                     opt = level;
+                    explicit_opt = true;
                 } else {
                     app_args.deinit();
                     return CliArgs{ .problem = ArgProblem{ .invalid_flag_value = .{ .flag = "--opt", .value = value, .valid_options = "dev,interpreter,speed,size" } } };
@@ -1367,7 +1373,7 @@ fn parseRun(alloc: mem.Allocator, args: []const []const u8, mode: RunParseMode) 
         }
     }
 
-    return CliArgs{ .run = RunArgs{ .path = path orelse "main.roc", .opt = opt, .target = target, .app_args = try app_args.toOwnedSlice(), .no_cache = no_cache, .allow_errors = allow_errors, .watch = watch or (opt == .dev), .explicit_watch = watch, .timings = timings, .max_threads = max_threads, .resolve_limits = resolve_limits, .via_run_subcommand = mode == .run_subcommand } };
+    return CliArgs{ .run = RunArgs{ .path = path orelse "main.roc", .opt = opt, .target = target, .app_args = try app_args.toOwnedSlice(), .no_cache = no_cache, .allow_errors = allow_errors, .watch = watch or (opt == .dev), .explicit_watch = watch, .explicit_opt = explicit_opt, .timings = timings, .max_threads = max_threads, .resolve_limits = resolve_limits, .via_run_subcommand = mode == .run_subcommand } };
 }
 
 fn parseInstall(args: []const []const u8) CliArgs {
@@ -2299,6 +2305,12 @@ test "roc run subcommand" {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "run", "tokei", "--watch" });
         defer result.deinit(gpa);
         try testing.expect(result.run.explicit_watch);
+        try testing.expect(!result.run.explicit_opt);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "run", "tokei", "--opt=dev" });
+        defer result.deinit(gpa);
+        try testing.expect(result.run.explicit_opt);
     }
 }
 

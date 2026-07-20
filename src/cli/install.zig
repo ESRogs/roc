@@ -85,8 +85,12 @@ pub const Manifest = struct {
 /// platform-appropriate persistent user data directory (deliberately not a
 /// cache location, so cache cleanup can never touch installed tools).
 pub fn installRootDir(roc_ctx: CoreCtx, allocator: Allocator) (Allocator.Error || error{NoHomeDirectory})![]u8 {
+    // Empty env values are treated as unset (per the XDG spec, and because a
+    // cwd-relative install root would make installs appear and disappear
+    // with the working directory).
     if (roc_ctx.getEnvVar("ROC_INSTALL_DIR", allocator)) |dir| {
-        return dir;
+        if (dir.len != 0) return dir;
+        allocator.free(dir);
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EnvironmentVariableMissing => {},
@@ -95,7 +99,9 @@ pub fn installRootDir(roc_ctx: CoreCtx, allocator: Allocator) (Allocator.Error |
     if (builtin.target.os.tag != .windows) {
         if (roc_ctx.getEnvVar("XDG_DATA_HOME", allocator)) |xdg_data| {
             defer allocator.free(xdg_data);
-            return std.fs.path.join(allocator, &.{ xdg_data, "roc" });
+            if (xdg_data.len != 0) {
+                return std.fs.path.join(allocator, &.{ xdg_data, "roc" });
+            }
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.EnvironmentVariableMissing => {},
@@ -111,6 +117,7 @@ pub fn installRootDir(roc_ctx: CoreCtx, allocator: Allocator) (Allocator.Error |
         error.EnvironmentVariableMissing => return error.NoHomeDirectory,
     };
     defer allocator.free(home_dir);
+    if (home_dir.len == 0) return error.NoHomeDirectory;
 
     return switch (builtin.target.os.tag) {
         .windows => std.fs.path.join(allocator, &.{ home_dir, "Roc" }),

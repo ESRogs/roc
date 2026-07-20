@@ -6320,6 +6320,15 @@ const InstallBundleServer = struct {
     }
 };
 
+/// Unblock an InstallBundleServer thread stuck in accept() when the roc
+/// command under test failed before ever connecting, so a clean assertion
+/// failure is reported instead of a join hang that the harness times out.
+fn pokeInstallBundleServer(io: std.Io, port: u16) void {
+    var address = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
+    const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream }) catch return;
+    stream.close(io);
+}
+
 fn customInstallRunRoundtrip(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
     // Bundle a headerless default app from its own directory so main.roc sits
     // at the bundle root.
@@ -6381,6 +6390,7 @@ fn customInstallRunRoundtrip(io: std.Io, allocator: Allocator, env: *const CaseE
         .args = &.{ "install", "hello_tool", url },
         .contains = &.{.{ .stream = .stdout, .text = "Installed hello_tool" }},
     })) |failure| {
+        pokeInstallBundleServer(io, port);
         server_thread.join();
         return failure;
     }
@@ -6497,6 +6507,7 @@ fn customInstallHashMismatch(io: std.Io, allocator: Allocator, env: *const CaseE
         .exit = .{ .code = 1 },
         .contains = &.{ .{ .stream = .stderr, .text = "Failed to download from" }, .{ .stream = .stderr, .text = "HashMismatch" } },
     })) |failure| {
+        pokeInstallBundleServer(io, port);
         server_thread.join();
         return failure;
     }

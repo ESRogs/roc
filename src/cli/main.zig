@@ -174,6 +174,9 @@ const CliBuildEnvOptions = struct {
     /// The bundle URL a URL/installed root came from; becomes the root's
     /// package identity in place of the extracted path.
     root_source_url: ?[]const u8 = null,
+    /// The bundle URL an explicit `--main` came from; becomes the root
+    /// identity if that main file ends up as the discovery root.
+    main_source_url: ?[]const u8 = null,
 };
 
 const InitCliBuildEnvError = Allocator.Error ||
@@ -216,6 +219,12 @@ fn initCliBuildEnv(ctx: *CliCtx, opts: CliBuildEnvOptions) InitCliBuildEnvError!
         // The URL was validated before any pipeline could receive it, so the
         // only reachable failure here is allocation.
         build_env.setRootUrl(url) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUrl => unreachable,
+        };
+    }
+    if (opts.main_source_url) |url| {
+        build_env.setMainUrl(url) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidUrl => unreachable,
         };
@@ -2294,7 +2303,7 @@ fn rocRunInstalled(ctx: *CliCtx, args: cli_args.RunArgs) CliMainError!void {
         try ctx.io.stderr().print("Error: --watch is not supported for installed shorthands.\n", .{});
         return error.UnsupportedWatchMode;
     }
-    if (args.opt != cli_args.default_dev_opt) {
+    if (args.explicit_opt) {
         try ctx.io.stderr().print(
             "Error: --opt has no effect on `roc run {s}`; installed tools always run the optimized binary that was built at install time.\n",
             .{name},
@@ -6295,15 +6304,72 @@ fn resolveUrlBundle(ctx: *CliCtx, url: []const u8) (CliError || error{OutOfMemor
     // Platforms must have a main.roc entry point
     const platform_source_path = try std.fs.path.join(ctx.arena, &.{ package_dir_path, "main.roc" });
     std.Io.Dir.cwd().access(ctx.io.std_io, platform_source_path, .{}) catch {
+        // The problem is rendered after this frame returns, so the slice of
+        // searched paths must live on the arena, not this stack frame.
+        const searched_paths = try ctx.arena.alloc([]const u8, 1);
+        searched_paths[0] = platform_source_path;
         return ctx.fail(.{ .platform_source_not_found = .{
             .platform_path = package_dir_path,
-            .searched_paths = &.{platform_source_path},
+            .searched_paths = searched_paths,
         } });
     };
 
     return .{
         .source_path = platform_source_path,
     };
+}
+
+/// Default output basename for `roc build <url>`: the last path segment of
+/// the URL's package id (the part before the version and content hash), e.g.
+/// `tokei` for `https://example.com/tokei/1.2.3/<hash>.tar.zst`. Null when
+/// the URL has no usable segment, in which case the module name is used.
+fn urlDefaultOutputBasename(url: []const u8) ?[]const u8 {
+    const parsed = base.url.parseUrlPath(url) catch return null;
+    var it = std.mem.splitBackwardsScalar(u8, parsed.url_id.prefix(url), '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0) continue;
+        // The host segment can carry a port; a colon is not a usable filename
+        // on Windows, so fall back to the module name instead.
+        if (std.mem.findScalar(u8, segment, ':') != null) return null;
+        return segment;
+    }
+    return null;
+}
+
+test "urlDefaultOutputBasename derives the package segment" {
+    try std.testing.expectEqualStrings("tokei", urlDefaultOutputBasename("https://example.com/tokei/1.2.3/AQmoxbAY7eQfXMbi9XUxBvBGZcxZCs1tdNeFriRRkwSc.tar.zst").?);
+    try std.testing.expectEqualStrings("thing", urlDefaultOutputBasename("https://example.com/thing/AQmoxbAY7eQfXMbi9XUxBvBGZcxZCs1tdNeFriRRkwSc.tar.zst").?);
+    // A bare host:port segment is not a usable filename on Windows.
+    try std.testing.expect(urlDefaultOutputBasename("http://127.0.0.1:8642/AQmoxbAY7eQfXMbi9XUxBvBGZcxZCs1tdNeFriRRkwSc.tar.zst") == null);
+    try std.testing.expect(urlDefaultOutputBasename("not a url") == null);
+}
+
+/// A staging directory older than this cannot belong to a live install and
+/// is safe to reclaim.
+const stale_staging_max_age_ns: i128 = std.time.ns_per_day;
+
+/// Reclaim staging directories stranded by interrupted installs. The install
+/// root is deliberately outside every cache cleanup, and each staging name
+/// embeds a random suffix no later install reuses, so nothing else ever
+/// deletes them. Best-effort: any failure just leaves the sweep to a future
+/// install.
+fn sweepStaleStagingDirs(std_io: std.Io, version_dir: []const u8) void {
+    var dir = std.Io.Dir.cwd().openDir(std_io, version_dir, .{ .iterate = true }) catch return;
+    defer dir.close(std_io);
+
+    const now_ns: i128 = std.Io.Timestamp.now(std_io, .real).nanoseconds;
+    var it = dir.iterate();
+    while (true) {
+        const entry = (it.next(std_io) catch break) orelse break;
+        if (entry.kind != .directory) continue;
+        if (!std.mem.startsWith(u8, entry.name, ".staging-")) continue;
+
+        const info = dir.statFile(std_io, entry.name, .{}) catch continue;
+        const mtime_ns: i128 = @intCast(info.mtime.nanoseconds);
+        if (now_ns - mtime_ns <= stale_staging_max_age_ns) continue;
+
+        dir.deleteTree(std_io, entry.name) catch {};
+    }
 }
 
 /// Install a bundle URL under a shorthand: download and verify it into a
@@ -6384,6 +6450,8 @@ fn rocInstall(ctx: *CliCtx, args: cli_args.InstallArgs, arg0: []const u8) CliMai
     std.Io.Dir.cwd().createDirPath(ctx.io.std_io, version_dir) catch |err| {
         return ctx.fail(.{ .directory_create_failed = .{ .path = version_dir, .err = err } });
     };
+
+    sweepStaleStagingDirs(ctx.io.std_io, version_dir);
 
     // The `.` prefix keeps staging directories out of the shorthand namespace.
     var staging_suffix: [8]u8 = undefined;
@@ -7080,8 +7148,12 @@ fn rocBuild(ctx: *CliCtx, args_in: cli_args.BuildArgs, arg0: []const u8) CliMain
     if (args.root_source_url == null) {
         args.root_source_url = resolved_source.url;
     }
-    if (install_store.classifySourceRef(args_in.path) == .shorthand and args.synthetic_output_basename == null) {
-        args.synthetic_output_basename = args_in.path;
+    if (args.synthetic_output_basename == null) {
+        switch (install_store.classifySourceRef(args_in.path)) {
+            .shorthand => args.synthetic_output_basename = args_in.path,
+            .url => args.synthetic_output_basename = urlDefaultOutputBasename(args_in.path),
+            .local_path => {},
+        }
     }
 
     // `roc build --watch` rebuilds on every change. The watch loop reruns this same
@@ -12218,7 +12290,9 @@ fn rocTest(ctx: *CliCtx, args_in: cli_args.TestArgs, arg0: []const u8) RocTestEr
     args.path = resolved_source.path;
     args.root_source_url = resolved_source.url;
     if (args_in.main) |main_path| {
-        args.main = (try resolveSourceArg(ctx, main_path, args_in.watch)).path;
+        const resolved_main = try resolveSourceArg(ctx, main_path, args_in.watch);
+        args.main = resolved_main.path;
+        args.main_source_url = resolved_main.url;
     }
 
     if (args.watch) {
@@ -12240,6 +12314,7 @@ fn rocTest(ctx: *CliCtx, args_in: cli_args.TestArgs, arg0: []const u8) RocTestEr
         .resolution_config = resolutionConfigFromLimits(args.resolve_limits),
         .track_watch_inputs = args.watch_inputs_file != null,
         .root_source_url = args.root_source_url,
+        .main_source_url = args.main_source_url,
     });
     defer build_env.deinit();
 
@@ -13877,6 +13952,7 @@ fn checkFileWithBuildEnvPreserved(
     filepath: []const u8,
     main_filepath: ?[]const u8,
     root_source_url: ?[]const u8,
+    main_source_url: ?[]const u8,
     _: bool,
     cache_config: CacheConfig,
     max_threads: ?usize,
@@ -13900,6 +13976,7 @@ fn checkFileWithBuildEnvPreserved(
         .source_dir_override = source_dir_override,
         .builtin_role_path = filepath,
         .root_source_url = root_source_url,
+        .main_source_url = main_source_url,
     });
 
     buildForCheckWithOptionalMain(&build_env, filepath, main_filepath) catch |err| {
@@ -14039,6 +14116,7 @@ fn checkFileWithBuildEnv(
     filepath: []const u8,
     main_filepath: ?[]const u8,
     root_source_url: ?[]const u8,
+    main_source_url: ?[]const u8,
     _: bool,
     cache_config: CacheConfig,
     max_threads: ?usize,
@@ -14057,6 +14135,7 @@ fn checkFileWithBuildEnv(
         .source_dir_override = source_dir_override,
         .synthetic_default_app = synthetic_default_app,
         .root_source_url = root_source_url,
+        .main_source_url = main_source_url,
         // Checking is not complete until the platform/app relation output
         // completes, so `roc check` finalizes the relation-bearing platform
         // root once (which also resolves the platform target config constants
@@ -14262,6 +14341,7 @@ fn rocCheckDefaultApp(
         files.app_path,
         null,
         null,
+        null,
         args.time,
         cache_config,
         args.max_threads,
@@ -14314,6 +14394,7 @@ fn rocCheckDefaultAppPreserved(
         files.app_path,
         null,
         null,
+        null,
         args.time,
         cache_config,
         args.max_threads,
@@ -14358,7 +14439,9 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
     args.path = resolved_source.path;
     args.root_source_url = resolved_source.url;
     if (args_in.main) |main_path| {
-        args.main = (try resolveSourceArg(ctx, main_path, args_in.watch)).path;
+        const resolved_main = try resolveSourceArg(ctx, main_path, args_in.watch);
+        args.main = resolved_main.path;
+        args.main_source_url = resolved_main.url;
     }
 
     if (args.watch) {
@@ -14418,6 +14501,7 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
             args.path,
             args.main,
             args.root_source_url,
+            args.main_source_url,
             args.time,
             cache_config,
             args.max_threads,
@@ -14455,6 +14539,7 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
             args.path,
             args.main,
             args.root_source_url,
+            args.main_source_url,
             args.time,
             cache_config,
             args.max_threads,
@@ -14842,6 +14927,7 @@ fn bumpCheckSide(
         path,
         null,
         root_source_url,
+        null,
         false,
         cache_config,
         null,
@@ -15068,7 +15154,9 @@ fn rocDocs(ctx: *CliCtx, args_in: cli_args.DocsArgs) CliMainError!void {
     args.path = resolved_source.path;
     args.root_source_url = resolved_source.url;
     if (args_in.main) |main_path| {
-        args.main = (try resolveSourceArg(ctx, main_path, false)).path;
+        const resolved_main = try resolveSourceArg(ctx, main_path, false);
+        args.main = resolved_main.path;
+        args.main_source_url = resolved_main.url;
     }
 
     const stdout = ctx.io.stdout();
@@ -15089,6 +15177,7 @@ fn rocDocs(ctx: *CliCtx, args_in: cli_args.DocsArgs) CliMainError!void {
         args.path,
         args.main,
         args.root_source_url,
+        args.main_source_url,
         args.time,
         cache_config,
         null, // max_threads: use default (single-threaded for now)

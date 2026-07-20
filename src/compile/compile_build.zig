@@ -236,6 +236,12 @@ pub const BuildEnv = struct {
     /// directory cannot change it.
     root_url: ?package_source.UrlSource = null,
 
+    /// The bundle URL an explicitly supplied `--main` came from. Promoted to
+    /// `root_url` if and only if that main file becomes the discovery root
+    /// (see `buildResolvingMain`), since root identity must follow whichever
+    /// file actually roots the build.
+    main_url: ?package_source.UrlSource = null,
+
     /// Size limits applied during package version resolution.
     resolution_config: package_resolution.Config = .{},
 
@@ -351,6 +357,7 @@ pub const BuildEnv = struct {
         if (self.package_cache_dir) |dir| self.gpa.free(@constCast(dir));
 
         if (self.root_url) |*url| url.deinit(self.gpa);
+        if (self.main_url) |*url| url.deinit(self.gpa);
 
         // Deinit and free owned builtin modules. Borrowed builtins outlive this
         // BuildEnv and are released by their owner.
@@ -568,8 +575,24 @@ pub const BuildEnv = struct {
     /// hash, matching what download validation already enforced.
     pub fn setRootUrl(self: *BuildEnv, url: []const u8) error{ OutOfMemory, InvalidUrl }!void {
         const parsed = base.url.parseUrlPath(url) catch return error.InvalidUrl;
-        if (self.root_url) |*existing| existing.deinit(self.gpa);
+        if (self.root_url) |*existing| {
+            existing.deinit(self.gpa);
+            // Cleared before the fallible init so a failure cannot leave a
+            // dangling pointer for deinit to double-free.
+            self.root_url = null;
+        }
         self.root_url = try package_source.UrlSource.init(self.gpa, .{ .url = url, .url_id = parsed.url_id });
+    }
+
+    /// Declare that an explicitly supplied `--main` came from this bundle
+    /// URL; see the `main_url` field.
+    pub fn setMainUrl(self: *BuildEnv, url: []const u8) error{ OutOfMemory, InvalidUrl }!void {
+        const parsed = base.url.parseUrlPath(url) catch return error.InvalidUrl;
+        if (self.main_url) |*existing| {
+            existing.deinit(self.gpa);
+            self.main_url = null;
+        }
+        self.main_url = try package_source.UrlSource.init(self.gpa, .{ .url = url, .url_id = parsed.url_id });
     }
 
     pub fn setWatchInputTracking(self: *BuildEnv, enabled: bool) void {
@@ -673,6 +696,15 @@ pub const BuildEnv = struct {
             if (std.mem.eql(u8, root_abs, main_abs)) {
                 try self.build(root_file);
             } else {
+                // The main file is the discovery root here, so its bundle
+                // provenance — not the checked file's — is the root identity.
+                if (self.main_url) |*main_url| {
+                    if (self.root_url) |*existing| {
+                        existing.deinit(self.gpa);
+                        self.root_url = null;
+                    }
+                    self.root_url = try package_source.UrlSource.init(self.gpa, main_url.view());
+                }
                 try self.buildWithMain(root_file, main_path);
             }
             return;
