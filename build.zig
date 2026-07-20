@@ -212,8 +212,9 @@ const TestsSummaryStep = struct {
         self.serialize_runs = true;
     }
 
-    /// Registers `run_step` with the summary. On Windows the registered runs
-    /// are chained so that test binaries start one at a time; that chain is
+    /// Registers `run_step` with the summary. When run serialization is
+    /// enabled, registered runs are chained so that test binaries start one at
+    /// a time. The build currently enables this on Windows. That chain is
     /// private to the summary and must never be reachable from a public
     /// `run-test-zig-*` step. Prefer `TestSuiteRegistry.register`, which
     /// guarantees that by construction.
@@ -373,9 +374,9 @@ const TestSuiteRegistry = struct {
         if (spec.default_step) b.default_step.dependOn(&spec.compile.step);
         if (self.wiring_run) |wiring| wiring.addArtifactArg(spec.compile);
 
-        // Two runs over one compile. Only the summary's run joins the Windows
-        // serialization chain; the public step gets a run with no chain edges,
-        // which is what every non-Windows platform already does implicitly.
+        // Two runs over one compile. Only the summary's run joins the
+        // serialization chain (currently enabled only on Windows); the public
+        // step gets a run with no chain edges.
         self.summary.addRun(&self.configuredRun(spec).step);
 
         const public_step = b.step(
@@ -5735,8 +5736,9 @@ pub fn build(b: *std.Build) void {
     assertGranularTestStepsAreIsolated(b);
 }
 
-/// Configure-time guard: a public `run-test-zig-*` step must never pull more
-/// than one test binary into its graph.
+/// Configure-time guard: a public `run-test-zig-*` step must pull exactly the
+/// explicitly declared number of Zig test binaries into its graph. That is one
+/// by default; custom executable-backed runners declare zero below.
 ///
 /// On Windows `TestsSummaryStep` chains its registered runs so that test
 /// binaries start one at a time. Pointing a granular step at the *same*
@@ -5761,7 +5763,24 @@ fn assertGranularTestStepsAreIsolated(b: *std.Build) void {
         var found_len: usize = 0;
         collectTestRuns(b, &tls.step, &visited, &found, &found_len);
 
-        if (found_len > 1) {
+        const expected_len = expectedGranularZigTestBinaries(name);
+        if (found_len == expected_len) continue;
+
+        if (found_len == 0) {
+            std.debug.panic(
+                "build.zig: step \"{s}\" runs no Zig test binary; granular test steps " ++
+                    "must run exactly one unless they are an explicitly declared custom " ++
+                    "executable-backed runner.",
+                .{name},
+            );
+        } else if (expected_len == 0) {
+            std.debug.panic(
+                "build.zig: custom executable-backed step \"{s}\" unexpectedly also " ++
+                    "runs {d} Zig test binaries (first: {s}); update its wiring or its " ++
+                    "explicit declaration.",
+                .{ name, found_len, found[0] },
+            );
+        } else {
             std.debug.panic(
                 "build.zig: step \"{s}\" runs at least {d} test binaries ({s}, {s}, ...). " ++
                     "A granular run-test-zig-* step must run exactly one; wire the suite " ++
@@ -5771,6 +5790,17 @@ fn assertGranularTestStepsAreIsolated(b: *std.Build) void {
             );
         }
     }
+}
+
+/// Expected `Step.Compile` test producers beneath a granular test step.
+///
+/// The LSP integration suite is intentionally an ordinary executable: its own
+/// process-pool harness discovers and runs the integration specs. Keeping that
+/// exception explicit means a newly orphaned `run-test-zig-*` step cannot pass
+/// configuration merely because it reaches zero Zig test binaries.
+fn expectedGranularZigTestBinaries(name: []const u8) usize {
+    if (std.mem.eql(u8, name, "run-test-zig-module-lsp_integration")) return 0;
+    return 1;
 }
 
 /// Walks `step`'s transitive dependencies, recording the names of the test
