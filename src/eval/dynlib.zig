@@ -8,7 +8,7 @@ const eval_loader = @import("vendor_eval_loader");
 const Allocator = std.mem.Allocator;
 const native_runtime_libcalls = builtins.native_runtime_libcalls;
 
-pub const Error = Allocator.Error || std.DynLib.Error || error{LlvmBackendUnavailable};
+pub const Error = Allocator.Error || std.DynLib.Error || error{ InvalidUtf8, LlvmBackendUnavailable };
 
 pub const DynLib = switch (builtin.target.os.tag) {
     .windows => struct {

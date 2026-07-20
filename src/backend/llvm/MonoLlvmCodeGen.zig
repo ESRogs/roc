@@ -179,6 +179,7 @@ pub const MonoLlvmCodeGen = struct {
     layout_store: ?*const layout.Store = null,
     /// Optional compiler-plugin stamp bytes exported by generated shared libs.
     plugin_stamp_bytes: ?[]const u8 = null,
+    plugin_stamp_alignment: u32 = 1,
 
     builder: ?*LlvmBuilder = null,
     wip: ?*LlvmBuilder.WipFunction = null,
@@ -1773,6 +1774,8 @@ pub const MonoLlvmCodeGen = struct {
             .default,
         ) catch return error.OutOfMemory;
         stamp_var.ptrConst(builder).global.setLinkage(.internal, builder);
+        stamp_var.setMutability(.constant, builder);
+        stamp_var.setAlignment(LlvmBuilder.Alignment.fromByteUnits(self.plugin_stamp_alignment), builder);
         stamp_var.setInitializer(
             builder.stringConst(builder.string(stamp_bytes) catch return error.OutOfMemory) catch return error.OutOfMemory,
             builder,

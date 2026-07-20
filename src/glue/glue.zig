@@ -465,6 +465,7 @@ fn runGlueSpecInterpreter(
 
 const glue_plugin_stamp_magic = [8]u8{ 'R', 'O', 'C', 'P', 'L', 'G', '1', 0 };
 const glue_plugin_abi_version: u32 = 1;
+var glue_cache_temp_counter = std.atomic.Value(usize).init(0);
 
 const GluePluginKind = enum(u32) {
     glue = 1,
@@ -512,16 +513,27 @@ fn runGlueSpecDylib(
     if (builtin.target.os.tag == .freestanding) return error.GlueDylibUnavailable;
 
     const stamp = gluePluginStamp(root_artifact_key);
-    const dylib = try getOrBuildGlueDylib(gpa, lowered, glue_proc, arg_layouts, root_artifact_key, stamp, args, std_io);
-    defer dylib.deinit(gpa, std_io);
+    var dylib: ?BuiltGlueDylib = try getOrBuildGlueDylib(gpa, lowered, glue_proc, arg_layouts, root_artifact_key, stamp, args, std_io);
+    defer if (dylib) |d| d.deinit(gpa, std_io);
 
-    var lib = eval_mod.DynLib.open(gpa, dylib.path) catch |err| {
-        stderr.print("Error loading compiled glue dylib {s}: {s}\n", .{ dylib.path, @errorName(err) }) catch {};
-        return error.GlueDylibUnavailable;
+    var lib = blk: {
+        const first = dylib.?;
+        break :blk openVerifiedGlueDylib(gpa, stderr, first, &stamp, args.no_cache) catch |err| {
+            switch (err) {
+                error.GlueDylibUnavailable, error.GlueDylibStampMismatch => {},
+                else => return err,
+            }
+            if (args.no_cache or first.delete_after_use) return err;
+
+            deleteGlueDylibCacheEntry(first, std_io);
+            first.deinit(gpa, std_io);
+            dylib = null;
+
+            dylib = try getOrBuildGlueDylib(gpa, lowered, glue_proc, arg_layouts, root_artifact_key, stamp, args, std_io);
+            break :blk try openVerifiedGlueDylib(gpa, stderr, dylib.?, &stamp, true);
+        };
     };
     defer lib.close();
-
-    try verifyGluePluginStamp(&lib, &stamp);
 
     const GlueEntryFn = *const fn (*builtins.host_abi.RocOps, [*]u8, ?*anyopaque) callconv(.c) void;
     const entry = lib.lookup(GlueEntryFn, builtins.shim_symbols.roc_make_glue) orelse return error.GlueDylibUnavailable;
@@ -585,13 +597,33 @@ fn getOrBuildGlueDylib(
         gpa.free(temp_path);
     }
 
+    const cache_temp_path = glueDylibCacheTempPath(gpa, cache_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer {
+        std.Io.Dir.cwd().deleteFile(std_io, std.mem.sliceTo(cache_temp_path, 0)) catch {};
+        gpa.free(cache_temp_path);
+    }
+
     std.Io.Dir.cwd().copyFile(
         std.mem.sliceTo(temp_path, 0),
         std.Io.Dir.cwd(),
-        std.mem.sliceTo(cache_path, 0),
+        std.mem.sliceTo(cache_temp_path, 0),
         std_io,
         .{},
     ) catch return error.CompilationFailed;
+
+    std.Io.Dir.cwd().rename(
+        std.mem.sliceTo(cache_temp_path, 0),
+        std.Io.Dir.cwd(),
+        std.mem.sliceTo(cache_path, 0),
+        std_io,
+    ) catch {
+        if (std.Io.Dir.cwd().access(std_io, std.mem.sliceTo(cache_path, 0), .{})) {
+            return .{ .path = cache_path, .delete_after_use = false };
+        } else |_| {}
+        return error.CompilationFailed;
+    };
 
     return .{ .path = cache_path, .delete_after_use = false };
 }
@@ -608,6 +640,7 @@ fn buildGlueDylib(
     var codegen = llvm_compile.MonoLlvmCodeGen.init(gpa, &lowered.lir_result.store);
     codegen.layout_store = &lowered.lir_result.layouts;
     codegen.plugin_stamp_bytes = std.mem.asBytes(&stamp);
+    codegen.plugin_stamp_alignment = @alignOf(GluePluginStampV1);
     codegen.emit_debug_info = opt == .dev;
     defer codegen.deinit();
 
@@ -629,6 +662,34 @@ fn buildGlueDylib(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.CompilationFailed,
     };
+}
+
+fn openVerifiedGlueDylib(
+    gpa: Allocator,
+    stderr: *std.Io.Writer,
+    dylib: BuiltGlueDylib,
+    expected: *const GluePluginStampV1,
+    report_errors: bool,
+) GlueError!eval_mod.DynLib {
+    var lib = eval_mod.DynLib.open(gpa, dylib.path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (report_errors) {
+                stderr.print("Error loading compiled glue dylib {s}: {s}\n", .{ dylib.path, @errorName(err) }) catch {};
+            }
+            return error.GlueDylibUnavailable;
+        },
+    };
+    errdefer lib.close();
+
+    verifyGluePluginStamp(&lib, expected) catch |err| {
+        if (report_errors) {
+            stderr.print("Error verifying compiled glue dylib stamp {s}: {s}\n", .{ dylib.path, @errorName(err) }) catch {};
+        }
+        return err;
+    };
+
+    return lib;
 }
 
 fn verifyGluePluginStamp(lib: *eval_mod.DynLib, expected: *const GluePluginStampV1) GlueError!void {
@@ -682,6 +743,26 @@ fn glueDylibCachePath(
         @tagName(opt),
         filename,
     });
+}
+
+fn glueDylibCacheTempPath(allocator: Allocator, cache_path: [:0]const u8) Allocator.Error![:0]u8 {
+    const counter = glue_cache_temp_counter.fetchAdd(1, .monotonic);
+    const pid: u64 = if (builtin.os.tag == .windows)
+        std.os.windows.GetCurrentProcessId()
+    else
+        @intCast(std.c.getpid());
+    const path = try std.fmt.allocPrint(allocator, "{s}.{x}.{x}.tmp", .{
+        std.mem.sliceTo(cache_path, 0),
+        pid,
+        counter,
+    });
+    defer allocator.free(path);
+    return try allocator.dupeZ(u8, path);
+}
+
+fn deleteGlueDylibCacheEntry(dylib: BuiltGlueDylib, std_io: std.Io) void {
+    if (dylib.delete_after_use) return;
+    std.Io.Dir.cwd().deleteFile(std_io, std.mem.sliceTo(dylib.path, 0)) catch {};
 }
 
 fn glueDylibOutputHash(root_artifact_key: CheckedArtifact.CheckedModuleArtifactKey, stamp: GluePluginStampV1) [32]u8 {

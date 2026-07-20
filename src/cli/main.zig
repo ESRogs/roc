@@ -2300,12 +2300,8 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
         return ctx.fail(.{ .cache_dir_unavailable = .{ .reason = @errorName(err) } });
     };
 
-    // First, parse the app file to get the platform reference
-    const platform_spec = try extractPlatformSpecFromApp(ctx, args.path);
-
-    // Resolve platform paths from the platform spec (relative to app file directory)
-    const app_dir = std.fs.path.dirname(args.path) orelse ".";
-    const platform_paths = try resolvePlatformSpecToPaths(ctx, platform_spec, app_dir);
+    // Resolve platform paths from the app header before linking the host shim.
+    const platform_paths = try resolvePlatformPaths(ctx, args.path);
 
     // Validate platform header and get link spec
     var link_spec: ?roc_target.TargetLinkSpec = null;
@@ -5801,114 +5797,64 @@ pub const PlatformPaths = struct {
 
 /// Resolve platform specification from a Roc file to find both host library and platform source.
 /// Returns PlatformPaths with arena-allocated paths (no need to free).
-pub fn resolvePlatformPaths(ctx: *CliCtx, roc_file_path: []const u8) CliError!PlatformPaths {
-    // Use the parser to extract the platform spec
-    const platform_spec = extractPlatformSpecFromApp(ctx, roc_file_path) catch {
-        return ctx.fail(.{ .file_not_found = .{
-            .path = roc_file_path,
-            .context = .source_file,
-        } });
-    };
+pub fn resolvePlatformPaths(ctx: *CliCtx, roc_file_path: []const u8) (CliError || Allocator.Error)!PlatformPaths {
+    const header_info = try parseCliAppHeader(ctx, roc_file_path);
     const app_dir = std.fs.path.dirname(roc_file_path) orelse ".";
-    return resolvePlatformSpecToPaths(ctx, platform_spec, app_dir);
+    return resolvePlatformRefToPaths(ctx, header_info.platform_ref, roc_file_path, app_dir);
 }
 
-/// Extract platform specification from app file header by parsing it properly.
-/// Takes a CliCtx which provides allocators and error reporting.
-fn extractPlatformSpecFromApp(ctx: *CliCtx, app_file_path: []const u8) (Allocator.Error || error{CliError})![]const u8 {
-    // Read the app file
-    var source = std.Io.Dir.cwd().readFileAlloc(ctx.io.std_io, app_file_path, ctx.gpa, .unlimited) catch |err| {
-        return ctx.fail(switch (err) {
-            error.FileNotFound => .{ .file_not_found = .{
-                .path = app_file_path,
-                .context = .source_file,
-            } },
-            else => .{ .file_read_failed = .{
-                .path = app_file_path,
-                .err = err,
-            } },
-        });
-    };
-    source = base.source_utils.normalizeLineEndingsRealloc(ctx.gpa, source) catch |err| {
-        ctx.gpa.free(source);
-        return err;
-    };
-    defer ctx.gpa.free(source);
-
-    // Extract module name from file path (strips .roc extension)
-    const module_name = try base.module_path.getModuleNameAlloc(ctx.arena, app_file_path);
-
-    // Create ModuleEnv for parsing
-    var env = ModuleEnv.init(ctx.gpa, source) catch {
-        return ctx.fail(.{ .module_init_failed = .{
+fn parseCliAppHeader(ctx: *CliCtx, app_file_path: []const u8) (Allocator.Error || error{CliError})!compile.app_header.AppHeaderInfo {
+    return compile.app_header.parseAppHeader(ctx.coreCtx(), ctx.gpa, ctx.arena, app_file_path) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NotAnAppHeader => ctx.fail(.{ .expected_app_header = .{
             .path = app_file_path,
-            .err = error.OutOfMemory,
-        } });
-    };
-    defer env.deinit();
-
-    env.common.source = source;
-    env.module_name = module_name;
-    env.common.calcLineStarts(ctx.gpa) catch {
-        return ctx.fail(.{ .module_init_failed = .{
+            .found = "non-app",
+        } }),
+        error.FileNotFound => ctx.fail(.{ .file_not_found = .{
             .path = app_file_path,
-            .err = error.OutOfMemory,
-        } });
-    };
-
-    // Parse the source
-    const ast = parse.file(ctx.gpa, &env.common) catch {
-        return ctx.fail(.{ .module_init_failed = .{
+            .context = .source_file,
+        } }),
+        error.AccessDenied => ctx.fail(.{ .file_read_failed = .{
             .path = app_file_path,
-            .err = error.OutOfMemory,
-        } });
+            .err = error.AccessDenied,
+        } }),
+        error.StreamTooLong => ctx.fail(.{ .file_read_failed = .{
+            .path = app_file_path,
+            .err = error.StreamTooLong,
+        } }),
+        error.IoError => ctx.fail(.{ .file_read_failed = .{
+            .path = app_file_path,
+            .err = error.ReadFailed,
+        } }),
     };
-    defer ast.deinit();
-
-    // Get the file header
-    const file = ast.store.getFile();
-    const header = ast.store.getHeader(file.header);
-
-    // Check if this is an app file
-    switch (header) {
-        .app => |a| {
-            // Get the platform field
-            const pf = ast.store.getRecordField(a.platform_idx);
-            const value_expr = pf.value orelse {
-                return ctx.fail(.{ .expected_platform_string = .{ .path = app_file_path } });
-            };
-
-            // Extract the string value from the expression
-            const platform_spec = stringFromExpr(ast, value_expr) catch {
-                return ctx.fail(.{ .expected_platform_string = .{ .path = app_file_path } });
-            };
-            return try ctx.arena.dupe(u8, platform_spec);
-        },
-        else => {
-            return ctx.fail(.{ .expected_app_header = .{
-                .path = app_file_path,
-                .found = @tagName(header),
-            } });
-        },
-    }
 }
 
-/// Extract a string value from an expression (for platform/package paths).
-fn stringFromExpr(ast: *parse.AST, expr_idx: parse.AST.Expr.Idx) error{ExpectedString}![]const u8 {
-    const e = ast.store.getExpr(expr_idx);
-    return switch (e) {
-        .string => |s| {
-            // For simple strings, iterate through the parts
-            for (ast.store.exprSlice(s.parts)) |part_idx| {
-                const part = ast.store.getExpr(part_idx);
-                if (part == .string_part) {
-                    // Return the first string part (platform specs are simple strings)
-                    return ast.resolve(part.string_part.token);
-                }
-            }
-            return error.ExpectedString;
+fn resolvePlatformRefToPaths(
+    ctx: *CliCtx,
+    platform_ref: compile.app_header.PlatformRef,
+    app_file_path: []const u8,
+    base_dir: []const u8,
+) (CliError || Allocator.Error)!PlatformPaths {
+    return switch (platform_ref) {
+        .none => ctx.fail(.{ .expected_platform_string = .{ .path = app_file_path } }),
+        .path_or_url => |platform_spec| resolvePlatformSpecToPaths(ctx, platform_spec, base_dir),
+        .compiler_owned => |platform| blk: {
+            const materialized = compile.compiler_platforms.materialize(ctx.arena, ctx.coreCtx(), null, platform) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NoHomeDirectory => return ctx.fail(.{ .cache_dir_unavailable = .{
+                    .reason = "Could not determine cache directory",
+                } }),
+                error.AccessDenied => return ctx.fail(.{ .file_write_failed = .{
+                    .path = compile.compiler_platforms.identity(platform),
+                    .err = error.AccessDenied,
+                } }),
+                error.IoError => return ctx.fail(.{ .file_write_failed = .{
+                    .path = compile.compiler_platforms.identity(platform),
+                    .err = error.WriteFailed,
+                } }),
+            };
+            break :blk .{ .platform_source_path = materialized.root_file };
         },
-        else => error.ExpectedString,
     };
 }
 
