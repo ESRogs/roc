@@ -800,16 +800,18 @@ pub const BuildEnv = struct {
                 header_info.provides_entries = .empty; // Prevent double-free in deinit
                 pkg.targets_config = header_info.targets_config;
                 header_info.targets_config = null; // Prevent double-free in deinit
-                if (header_info.kind == .platform) {
-                    self.moveHeaderExposesToPackage(pkg, &header_info);
-                }
+            }
+        }
+        if (header_info.kind == .package or header_info.kind == .platform) {
+            if (self.packages.getPtr(key_pkg)) |pkg| {
+                self.moveHeaderPublicModulesToPackage(pkg, &header_info);
             }
         }
 
         // Resolve the full dependency graph (downloads plus version solving),
         // then materialize the resolved packages and their shorthands.
         if (header_info.kind == .app or header_info.kind == .default_app or header_info.kind == .package or header_info.kind == .platform) {
-            try self.resolveAndMaterialize(key_pkg);
+            try self.resolveAndMaterialize(key_pkg, header_info.resolver_root);
         }
     }
 
@@ -1368,19 +1370,18 @@ pub const BuildEnv = struct {
         root_dir: []u8,
         url: ?package_source.UrlSource = null,
         shorthands: std.StringHashMapUnmanaged(PackageRef) = .{},
-        /// Platform-exposed modules from the platform header. Only populated
-        /// for platform packages.
-        exposes: std.ArrayListUnmanaged([]const u8) = .empty,
+        /// Modules in the public API declared by a package or platform header.
+        public_modules: std.ArrayListUnmanaged([]const u8) = .empty,
         provides_entries: std.ArrayListUnmanaged(ProvidesEntry) = .empty,
         targets_config: ?targets_config_mod.TargetsConfig = null,
 
         fn deinit(self: *Package, gpa: Allocator) void {
             if (self.url) |*url| url.deinit(gpa);
             if (self.targets_config) |tc| tc.deinit(gpa);
-            for (self.exposes.items) |exposed| {
-                freeConstSlice(gpa, exposed);
+            for (self.public_modules.items) |module_name| {
+                freeConstSlice(gpa, module_name);
             }
-            self.exposes.deinit(gpa);
+            self.public_modules.deinit(gpa);
             for (self.provides_entries.items) |entry| {
                 freeConstSlice(gpa, entry.roc_ident);
                 freeConstSlice(gpa, entry.ffi_symbol);
@@ -1402,11 +1403,9 @@ pub const BuildEnv = struct {
     const HeaderInfo = struct {
         kind: PackageKind,
         source_file_state: ?watch_inputs.State,
-        platform_alias: ?[]u8 = null,
-        platform_path: ?[]u8 = null,
-        shorthands: std.StringHashMapUnmanaged([]const u8) = .{},
-        /// Platform-exposed modules (e.g., Stdout, Stderr) that apps can import
-        exposes: std.ArrayListUnmanaged([]const u8) = .empty,
+        /// Modules in the public API declared by a package or platform header.
+        public_modules: std.ArrayListUnmanaged([]const u8) = .empty,
+        resolver_root: package_resolution.FetchedPackage,
         /// Platform provides entries (roc_ident -> ffi_symbol mapping)
         provides_entries: std.ArrayListUnmanaged(ProvidesEntry) = .empty,
         /// Targets configuration extracted from platform header
@@ -1414,18 +1413,11 @@ pub const BuildEnv = struct {
 
         fn deinit(self: *HeaderInfo, gpa: Allocator) void {
             if (self.targets_config) |tc| tc.deinit(gpa);
-            if (self.platform_alias) |a| freeSlice(gpa, a);
-            if (self.platform_path) |p| freeSlice(gpa, p);
-            var it = self.shorthands.iterator();
-            while (it.next()) |e| {
-                freeConstSlice(gpa, e.key_ptr.*);
-                freeConstSlice(gpa, e.value_ptr.*);
+            self.resolver_root.deinit(gpa);
+            for (self.public_modules.items) |module_name| {
+                freeConstSlice(gpa, module_name);
             }
-            self.shorthands.deinit(gpa);
-            for (self.exposes.items) |e| {
-                freeConstSlice(gpa, e);
-            }
-            self.exposes.deinit(gpa);
+            self.public_modules.deinit(gpa);
             for (self.provides_entries.items) |entry| {
                 freeConstSlice(gpa, entry.roc_ident);
                 freeConstSlice(gpa, entry.ffi_symbol);
@@ -1434,39 +1426,38 @@ pub const BuildEnv = struct {
         }
     };
 
-    fn clearPackageExposes(self: *BuildEnv, pkg: *Package) void {
-        for (pkg.exposes.items) |exposed| {
-            freeConstSlice(self.gpa, exposed);
+    fn clearPackagePublicModules(self: *BuildEnv, pkg: *Package) void {
+        for (pkg.public_modules.items) |module_name| {
+            freeConstSlice(self.gpa, module_name);
         }
-        pkg.exposes.deinit(self.gpa);
-        pkg.exposes = .empty;
+        pkg.public_modules.deinit(self.gpa);
+        pkg.public_modules = .empty;
     }
 
-    fn moveHeaderExposesToPackage(self: *BuildEnv, pkg: *Package, header_info: *HeaderInfo) void {
-        self.clearPackageExposes(pkg);
-        pkg.exposes = header_info.exposes;
-        header_info.exposes = .empty;
+    fn moveHeaderPublicModulesToPackage(self: *BuildEnv, pkg: *Package, header_info: *HeaderInfo) void {
+        self.clearPackagePublicModules(pkg);
+        pkg.public_modules = header_info.public_modules;
+        header_info.public_modules = .empty;
     }
 
-    fn putHeaderShorthand(
+    fn appendHeaderPublicModules(
         self: *BuildEnv,
         info: *HeaderInfo,
-        key: []const u8,
-        path: []const u8,
-    ) BuildError!void {
-        var path_transferred = false;
-        errdefer if (!path_transferred) freeConstSlice(self.gpa, path);
-
-        if (info.shorthands.fetchRemove(key)) |entry| {
-            self.gpa.free(entry.key);
-            self.gpa.free(entry.value);
+        ast: *const parse.AST,
+        exposes: parse.AST.Collection.Idx,
+    ) Allocator.Error!void {
+        const collection = ast.store.getCollection(exposes);
+        for (ast.store.exposedItemSlice(.{ .span = collection.span })) |item_idx| {
+            const item = ast.store.getExposedItem(item_idx);
+            const token_idx = switch (item) {
+                .upper_ident => |upper| upper.ident,
+                .upper_ident_star => |upper| upper.ident,
+                .lower_ident, .malformed => continue,
+            };
+            const module_name = try self.gpa.dupe(u8, ast.resolve(token_idx));
+            errdefer self.gpa.free(module_name);
+            try info.public_modules.append(self.gpa, module_name);
         }
-
-        const key_owned = try self.gpa.dupe(u8, key);
-        errdefer self.gpa.free(key_owned);
-
-        try info.shorthands.put(self.gpa, key_owned, path);
-        path_transferred = true;
     }
 
     fn parseHeaderDeps(self: *BuildEnv, file_path: []const u8) BuildError!HeaderInfo {
@@ -1537,148 +1528,28 @@ pub const BuildEnv = struct {
         const file = ast.store.getFile();
         const header = ast.store.getHeader(file.header);
 
-        var info = HeaderInfo{ .kind = .package, .source_file_state = source_read.file_state };
+        const resolver_root = package_resolution.scanParsedHeader(self.gpa, file_abs, src, ast, header) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.HeaderParseFailed => return error.ExpectedString,
+        };
+        var info = HeaderInfo{
+            .kind = .package,
+            .source_file_state = source_read.file_state,
+            .resolver_root = resolver_root,
+        };
         errdefer info.deinit(self.gpa);
 
         switch (header) {
-            .app => |a| {
+            .app => {
                 info.kind = .app;
-
-                // Platform field
-                const pf = ast.store.getRecordField(a.platform_idx);
-                const alias = ast.resolve(pf.name);
-                const value_expr = pf.value orelse return error.ExpectedPlatformString;
-                const plat_rel = try self.stringFromExpr(ast, value_expr);
-                defer self.gpa.free(plat_rel);
-
-                // URL specs are resolved (downloaded and version-solved) by
-                // package resolution; keep them verbatim here.
-                const plat_path = if (base.url.isSafeUrl(plat_rel)) blk: {
-                    break :blk try self.gpa.dupe(u8, plat_rel);
-                } else blk: {
-                    const header_dir = std.fs.path.dirname(file_abs) orelse ".";
-                    const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir, plat_rel);
-                    // Add the platform directory to workspace roots so that
-                    // imports within the platform can be resolved, even when
-                    // it lives outside the app directory (e.g. ../platform).
-                    if (std.fs.path.dirname(abs_path)) |plat_dir| {
-                        try self.addWorkspaceRoot(plat_dir);
-                    }
-                    break :blk abs_path;
-                };
-
-                info.platform_path = @constCast(plat_path);
-                info.platform_alias = try self.gpa.dupe(u8, alias);
-
-                // Packages map
-                const coll = ast.store.getCollection(a.packages);
-                const fields = ast.store.recordFieldSlice(.{ .span = coll.span });
-                for (fields) |idx| {
-                    const rf = ast.store.getRecordField(idx);
-                    const k = ast.resolve(rf.name);
-                    if (rf.value == null) {
-                        // If no value is provided for an app field, skip it
-                        continue;
-                    }
-                    const relp = try self.stringFromExpr(ast, rf.value.?);
-                    defer self.gpa.free(relp);
-
-                    // URL specs are resolved by package resolution; keep them
-                    // verbatim here.
-                    const v = if (base.url.isSafeUrl(relp)) blk: {
-                        break :blk try self.gpa.dupe(u8, relp);
-                    } else blk: {
-                        const header_dir2 = std.fs.path.dirname(file_abs) orelse ".";
-                        const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir2, relp);
-                        errdefer self.gpa.free(abs_path);
-                        if (std.fs.path.dirname(abs_path)) |pkg_dir| {
-                            try self.addWorkspaceRoot(pkg_dir);
-                        }
-                        break :blk abs_path;
-                    };
-
-                    try self.putHeaderShorthand(&info, k, v);
-                }
             },
             .package => |p| {
                 info.kind = .package;
-                const coll = ast.store.getCollection(p.packages);
-                const fields = ast.store.recordFieldSlice(.{ .span = coll.span });
-                for (fields) |idx| {
-                    const rf = ast.store.getRecordField(idx);
-                    const k = ast.resolve(rf.name);
-                    if (rf.value == null) {
-                        // If no value is provided for a package field, skip it
-                        continue;
-                    }
-                    const relp = try self.stringFromExpr(ast, rf.value.?);
-                    defer self.gpa.free(relp);
-
-                    // URL specs are resolved by package resolution; keep them
-                    // verbatim here.
-                    const v = if (base.url.isSafeUrl(relp)) blk: {
-                        break :blk try self.gpa.dupe(u8, relp);
-                    } else blk: {
-                        const header_dir2 = std.fs.path.dirname(file_abs) orelse ".";
-                        const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir2, relp);
-                        // Enforce: package header deps must be within workspace roots
-                        if (!PathUtils.isWithinRoot(abs_path, self.workspace_roots.items)) {
-                            self.gpa.free(abs_path);
-                            return error.PathOutsideWorkspace;
-                        }
-                        break :blk abs_path;
-                    };
-
-                    try self.putHeaderShorthand(&info, k, v);
-                }
+                try self.appendHeaderPublicModules(&info, ast, p.exposes);
             },
             .platform => |p| {
                 info.kind = .platform;
-                const coll = ast.store.getCollection(p.packages);
-                const fields = ast.store.recordFieldSlice(.{ .span = coll.span });
-                for (fields) |idx| {
-                    const rf = ast.store.getRecordField(idx);
-                    const k = ast.resolve(rf.name);
-                    if (rf.value == null) {
-                        // If no value is provided for a platform field, skip it
-                        continue;
-                    }
-                    const relp = try self.stringFromExpr(ast, rf.value.?);
-                    defer self.gpa.free(relp);
-
-                    // URL specs are resolved by package resolution; keep them
-                    // verbatim here.
-                    const v = if (base.url.isSafeUrl(relp)) blk: {
-                        break :blk try self.gpa.dupe(u8, relp);
-                    } else blk: {
-                        const header_dir2 = std.fs.path.dirname(file_abs) orelse ".";
-                        const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir2, relp);
-                        // Enforce: platform header deps must be within workspace roots
-                        if (!PathUtils.isWithinRoot(abs_path, self.workspace_roots.items)) {
-                            self.gpa.free(abs_path);
-                            return error.PathOutsideWorkspace;
-                        }
-                        break :blk abs_path;
-                    };
-
-                    try self.putHeaderShorthand(&info, k, v);
-                }
-
-                // Extract platform-exposed modules (e.g., Stdout, Stderr)
-                // These are modules that apps can import from the platform
-                const exposes_coll = ast.store.getCollection(p.exposes);
-                const exposes_items = ast.store.exposedItemSlice(.{ .span = exposes_coll.span });
-                for (exposes_items) |item_idx| {
-                    const item = ast.store.getExposedItem(item_idx);
-                    const token_idx = switch (item) {
-                        .upper_ident => |ui| ui.ident,
-                        .upper_ident_star => |uis| uis.ident,
-                        .lower_ident => |li| li.ident,
-                        .malformed => continue, // Skip malformed items
-                    };
-                    const item_name = ast.resolve(token_idx);
-                    try info.exposes.append(self.gpa, try self.gpa.dupe(u8, item_name));
-                }
+                try self.appendHeaderPublicModules(&info, ast, p.exposes);
 
                 // Extract provides entries (roc_ident -> linker symbol mapping)
                 for (ast.store.symbolMapEntrySlice(p.provides)) |entry_idx| {
@@ -1715,37 +1586,6 @@ pub const BuildEnv = struct {
         }
 
         return info;
-    }
-
-    fn stringFromExpr(self: *BuildEnv, ast: *parse.AST, expr_idx: parse.AST.Expr.Idx) BuildError![]const u8 {
-        const e = ast.store.getExpr(expr_idx);
-        return switch (e) {
-            .string => |s| blk: {
-                var buf = std.ArrayList(u8).empty;
-                errdefer buf.deinit(self.gpa);
-
-                // Use exprSlice to properly iterate through string parts
-                for (ast.store.exprSlice(s.parts)) |part_idx| {
-                    const part = ast.store.getExpr(part_idx);
-                    if (part == .string_part) {
-                        const tok = part.string_part.token;
-                        const slice = ast.resolve(tok);
-                        try buf.appendSlice(self.gpa, slice);
-                    }
-                }
-
-                const result = try buf.toOwnedSlice(self.gpa);
-
-                // Check for null bytes in the string, which are invalid in file paths
-                if (std.mem.findScalar(u8, result, 0) != null) {
-                    self.gpa.free(result);
-                    return error.InvalidNullByteInPath;
-                }
-
-                break :blk result;
-            },
-            else => error.ExpectedString,
-        };
     }
 
     fn makeAbsolute(self: *BuildEnv, path: []const u8) Allocator.Error![]u8 {
@@ -2025,9 +1865,11 @@ pub const BuildEnv = struct {
     /// package (named by its unique identity - full URL or absolute path),
     /// wire every package's shorthand aliases to the packages its specs
     /// resolved to, and transfer platform metadata.
-    fn resolveAndMaterialize(self: *BuildEnv, root_pkg_name: []const u8) BuildError!void {
-        const root_abs = self.discovered_root_abs orelse return error.Internal;
-
+    fn resolveAndMaterialize(
+        self: *BuildEnv,
+        root_pkg_name: []const u8,
+        scanned_root: package_resolution.FetchedPackage,
+    ) BuildError!void {
         // Without a cache directory, resolution still works for graphs with
         // no URL dependencies; URL specs report a download failure.
         if (self.package_cache_dir == null) {
@@ -2045,7 +1887,7 @@ pub const BuildEnv = struct {
         var resolver = package_resolution.Resolver.init(self.gpa, ctx_fetcher.fetcher(), self.resolution_config);
         defer resolver.deinit();
 
-        var resolved = resolver.resolve(root_abs) catch |err| switch (err) {
+        var resolved = resolver.resolveScannedRoot(scanned_root) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ResolutionFailed => {
                 for (resolver.diagnostics.items) |diagnostic| {
@@ -2138,8 +1980,8 @@ pub const BuildEnv = struct {
             }
 
             if (self.packages.getPtr(package_keys.identity(i))) |plat_pkg| {
-                if (plat_pkg.exposes.items.len == 0) {
-                    self.moveHeaderExposesToPackage(plat_pkg, &child_info);
+                if (plat_pkg.public_modules.items.len == 0) {
+                    self.moveHeaderPublicModulesToPackage(plat_pkg, &child_info);
                 }
             }
         }
@@ -2170,7 +2012,7 @@ pub const BuildEnv = struct {
         platform_dir: []const u8,
         child_info: *const HeaderInfo,
     ) BuildError!void {
-        for (child_info.exposes.items) |module_name| {
+        for (child_info.public_modules.items) |module_name| {
             // Create path to the module file (e.g., Stdout.roc)
             const module_filename = try std.fmt.allocPrint(self.gpa, "{s}.roc", .{module_name});
             defer self.gpa.free(module_filename);
@@ -2999,19 +2841,58 @@ pub const BuildEnv = struct {
         return modules.toOwnedSlice(allocator);
     }
 
-    /// Return the compiled modules that belong in generated documentation.
-    ///
-    /// For platform roots, the documentation surface is the platform header's
-    /// `exposes` list. Implementation-only modules may still be compiled because
-    /// public wrappers import them, but they are not part of the public platform
-    /// API and must not become docs pages.
-    ///
-    /// For non-platform roots, retain the existing CLI surface: all compiled
-    /// documentable modules except package headers and platform root modules.
-    pub fn getDocumentationModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
-        const all_modules = try self.getCompiledModules(allocator);
-        errdefer allocator.free(all_modules);
+    /// Resolve the root package or platform's explicit public module list to
+    /// completed compiler outputs. Dependency modules are deliberately absent.
+    pub fn getPublicRootModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
+        const root_name = self.discovered_pkg_name orelse {
+            std.debug.panic("build env invariant violated: public modules requested before dependency discovery", .{});
+        };
+        const root_pkg = self.packages.getPtr(root_name) orelse {
+            std.debug.panic("build env invariant violated: public-module root package is unavailable", .{});
+        };
+        if (root_pkg.kind != .package and root_pkg.kind != .platform) {
+            std.debug.panic("build env invariant violated: public modules requested for a non-package root", .{});
+        }
+        const root_scheduler = self.schedulers.get(root_name) orelse {
+            std.debug.panic("build env invariant violated: public-module root scheduler is unavailable", .{});
+        };
 
+        var public_modules = std.ArrayList(CompiledModuleInfo).empty;
+        errdefer public_modules.deinit(allocator);
+
+        for (root_pkg.public_modules.items) |module_name| {
+            const module_state = root_scheduler.getModuleState(module_name) orelse {
+                std.debug.panic(
+                    "build env invariant violated: public module '{s}' was not compiled",
+                    .{module_name},
+                );
+            };
+            const module_data = module_state.semanticData() orelse {
+                std.debug.panic(
+                    "build env invariant violated: public module '{s}' has no completed compiler output",
+                    .{module_name},
+                );
+            };
+            try public_modules.append(allocator, .{
+                .name = module_state.name,
+                .path = module_state.path,
+                .semantic = module_data,
+                .source = module_data.env.common.source,
+                .package_name = root_name,
+                .is_platform_main = false,
+                .is_app = false,
+                .is_platform_sibling = root_pkg.kind == .platform,
+                .depth = module_state.depth,
+            });
+        }
+
+        return public_modules.toOwnedSlice(allocator);
+    }
+
+    /// Return the compiled modules that belong in generated documentation.
+    /// Package and platform roots use their explicit public module list.
+    /// Other roots retain the CLI surface of all compiled documentable modules.
+    pub fn getDocumentationModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
         const root_name = self.discovered_pkg_name orelse {
             std.debug.panic("build env invariant violated: documentation requested before dependency discovery", .{});
         };
@@ -3019,44 +2900,26 @@ pub const BuildEnv = struct {
             std.debug.panic("build env invariant violated: documentation root package is unavailable", .{});
         };
 
+        if (root_pkg.kind == .package or root_pkg.kind == .platform) {
+            return self.getPublicRootModules(allocator);
+        }
+
+        const all_modules = try self.getCompiledModules(allocator);
+        errdefer allocator.free(all_modules);
+
         var docs_modules = std.ArrayList(CompiledModuleInfo).empty;
         errdefer docs_modules.deinit(allocator);
 
-        if (root_pkg.kind == .platform) {
-            for (root_pkg.exposes.items) |exposed_name| {
-                const exposed_module = findCompiledModuleInPackage(all_modules, root_name, exposed_name) orelse {
-                    std.debug.panic(
-                        "build env invariant violated: platform exposes module '{s}' but it was not compiled",
-                        .{exposed_name},
-                    );
-                };
-                try docs_modules.append(allocator, exposed_module);
+        for (all_modules) |mod| {
+            switch (mod.semantic.env.module_kind) {
+                .package, .platform => continue,
+                else => {},
             }
-        } else {
-            for (all_modules) |mod| {
-                switch (mod.semantic.env.module_kind) {
-                    .package, .platform => continue,
-                    else => {},
-                }
-                try docs_modules.append(allocator, mod);
-            }
+            try docs_modules.append(allocator, mod);
         }
 
         allocator.free(all_modules);
         return docs_modules.toOwnedSlice(allocator);
-    }
-
-    fn findCompiledModuleInPackage(
-        modules: []const CompiledModuleInfo,
-        package_name: []const u8,
-        module_name: []const u8,
-    ) ?CompiledModuleInfo {
-        for (modules) |mod| {
-            if (std.mem.eql(u8, mod.package_name, package_name) and std.mem.eql(u8, mod.name, module_name)) {
-                return mod;
-            }
-        }
-        return null;
     }
 
     /// Get modules in serialization order: platform siblings → platform main → app siblings → app.
