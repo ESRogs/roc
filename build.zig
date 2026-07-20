@@ -184,6 +184,7 @@ const TestsSummaryStep = struct {
     run_prerequisite: ?*Step,
     serialize_runs: bool,
     last_run: ?*Step,
+    run_steps: std.ArrayList(*Step),
 
     fn create(
         b: *std.Build,
@@ -204,6 +205,7 @@ const TestsSummaryStep = struct {
             .run_prerequisite = null,
             .serialize_runs = false,
             .last_run = null,
+            .run_steps = .empty,
         };
         return self;
     }
@@ -213,6 +215,7 @@ const TestsSummaryStep = struct {
     }
 
     fn addRun(self: *TestsSummaryStep, run_step: *Step) void {
+        self.run_steps.append(self.step.owner.allocator, run_step) catch @panic("OOM");
         if (self.run_prerequisite) |prerequisite| {
             run_step.dependOn(prerequisite);
         }
@@ -252,7 +255,7 @@ const TestsSummaryStep = struct {
 
         var passed: u64 = 0;
 
-        for (step.dependencies.items) |dependency| {
+        for (self.run_steps.items) |dependency| {
             const module_pass_count = dependency.test_results.passCount();
             passed += @intCast(module_pass_count);
         }
@@ -272,7 +275,7 @@ const TestsSummaryStep = struct {
             var prev_module: []const u8 = "";
             var prev_name: []const u8 = "";
 
-            for (step.dependencies.items) |dependency| {
+            for (self.run_steps.items) |dependency| {
                 if (dependency.id != .run) continue;
                 const run: *std.Build.Step.Run = @fieldParentPtr("step", dependency);
                 const tm = run.cached_test_metadata orelse continue;
@@ -306,6 +309,18 @@ const TestsSummaryStep = struct {
         }
     }
 };
+
+fn addTestRunArtifact(
+    b: *std.Build,
+    artifact: *Step.Compile,
+    run_args: []const []const u8,
+) *std.Build.Step.Run {
+    const run = b.addRunArtifact(artifact);
+    if (run_args.len != 0) {
+        run.addArgs(run_args);
+    }
+    return run;
+}
 
 /// Build step that checks for forbidden patterns in the type checker code.
 ///
@@ -2831,6 +2846,9 @@ pub fn build(b: *std.Build) void {
     if (debug_gpa_traces) {
         run_minici.addArg("-Ddebug-gpa-traces");
     }
+    if (run_args.len != 0) {
+        run_minici.addArgs(run_args);
+    }
     run_minici.step.dependOn(&install_minici.step);
     run_minici_step.dependOn(&run_minici.step);
 
@@ -4670,11 +4688,9 @@ pub fn build(b: *std.Build) void {
     });
     build_test_zig_step.dependOn(&build_helpers_test.step);
     if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(build_helpers_test);
-    const run_build_helpers_test = b.addRunArtifact(build_helpers_test);
-    if (run_args.len != 0) {
-        run_build_helpers_test.addArgs(run_args);
-    }
-    tests_summary.addRun(&run_build_helpers_test.step);
+    const run_build_helpers_test_for_summary = addTestRunArtifact(b, build_helpers_test, run_args);
+    tests_summary.addRun(&run_build_helpers_test_for_summary.step);
+    const run_build_helpers_test = addTestRunArtifact(b, build_helpers_test, run_args);
     const run_build_helpers_step = b.step(
         "run-test-zig-build-helpers",
         "Run build-helper Zig unit tests",
@@ -4702,11 +4718,9 @@ pub fn build(b: *std.Build) void {
     });
     build_test_zig_step.dependOn(&cli_runner_unit_test.step);
     if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_runner_unit_test);
-    const run_cli_runner_unit_test = b.addRunArtifact(cli_runner_unit_test);
-    if (run_args.len != 0) {
-        run_cli_runner_unit_test.addArgs(run_args);
-    }
-    tests_summary.addRun(&run_cli_runner_unit_test.step);
+    const run_cli_runner_unit_test_for_summary = addTestRunArtifact(b, cli_runner_unit_test, run_args);
+    tests_summary.addRun(&run_cli_runner_unit_test_for_summary.step);
+    const run_cli_runner_unit_test = addTestRunArtifact(b, cli_runner_unit_test, run_args);
     const run_cli_runner_unit_step = b.step(
         "run-test-zig-cli-runner-unit",
         "Run CLI runner Zig unit tests",
@@ -4753,11 +4767,9 @@ pub fn build(b: *std.Build) void {
     }
     build_test_zig_step.dependOn(&backend_llvm_test.step);
     if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(backend_llvm_test);
-    const run_backend_llvm_test = b.addRunArtifact(backend_llvm_test);
-    if (run_args.len != 0) {
-        run_backend_llvm_test.addArgs(run_args);
-    }
-    tests_summary.addRun(&run_backend_llvm_test.step);
+    const run_backend_llvm_test_for_summary = addTestRunArtifact(b, backend_llvm_test, run_args);
+    tests_summary.addRun(&run_backend_llvm_test_for_summary.step);
+    const run_backend_llvm_test = addTestRunArtifact(b, backend_llvm_test, run_args);
     const run_backend_llvm_step = b.step(
         "run-test-zig-backend-llvm",
         "Run LLVM backend aggregator Zig tests",
@@ -4801,14 +4813,16 @@ pub fn build(b: *std.Build) void {
         build_test_zig_step.dependOn(&snapshot_test.step);
         if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(snapshot_test);
 
-        const run_snapshot_test = b.addRunArtifact(snapshot_test);
+        const run_snapshot_test_for_summary = addTestRunArtifact(b, snapshot_test, run_args);
+        if (snapshot_exe_install) |install| {
+            run_snapshot_test_for_summary.step.dependOn(&install.step);
+        }
+        tests_summary.addRun(&run_snapshot_test_for_summary.step);
+
+        const run_snapshot_test = addTestRunArtifact(b, snapshot_test, run_args);
         if (snapshot_exe_install) |install| {
             run_snapshot_test.step.dependOn(&install.step);
         }
-        if (run_args.len != 0) {
-            run_snapshot_test.addArgs(run_args);
-        }
-        tests_summary.addRun(&run_snapshot_test.step);
 
         const run_snapshot_tool_test_step = b.step(
             "run-test-zig-snapshot-tool",
@@ -4856,12 +4870,10 @@ pub fn build(b: *std.Build) void {
         build_test_zig_step.dependOn(&builtin_doc_test.step);
         if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(builtin_doc_test);
 
-        const run_builtin_doc_test = b.addRunArtifact(builtin_doc_test);
-        if (run_args.len != 0) {
-            run_builtin_doc_test.addArgs(run_args);
-        }
+        const run_builtin_doc_test_for_summary = addTestRunArtifact(b, builtin_doc_test, run_args);
+        tests_summary.addRun(&run_builtin_doc_test_for_summary.step);
 
-        tests_summary.addRun(&run_builtin_doc_test.step);
+        const run_builtin_doc_test = addTestRunArtifact(b, builtin_doc_test, run_args);
 
         const run_builtin_doc_test_step = b.step(
             "run-test-zig-builtin-doc",
@@ -4903,12 +4915,10 @@ pub fn build(b: *std.Build) void {
     build_test_zig_step.dependOn(&lir_inline_test.step);
     if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(lir_inline_test);
 
-    const run_lir_inline_test = b.addRunArtifact(lir_inline_test);
-    if (run_args.len != 0) {
-        run_lir_inline_test.addArgs(run_args);
-    }
+    const run_lir_inline_test_for_summary = addTestRunArtifact(b, lir_inline_test, run_args);
+    tests_summary.addRun(&run_lir_inline_test_for_summary.step);
 
-    tests_summary.addRun(&run_lir_inline_test.step);
+    const run_lir_inline_test = addTestRunArtifact(b, lir_inline_test, run_args);
 
     const run_lir_inline_test_step = b.step(
         "run-test-zig-lir-inline",
@@ -4949,12 +4959,10 @@ pub fn build(b: *std.Build) void {
     build_test_zig_step.dependOn(&trmc_lir_test.step);
     if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(trmc_lir_test);
 
-    const run_trmc_lir_test = b.addRunArtifact(trmc_lir_test);
-    if (run_args.len != 0) {
-        run_trmc_lir_test.addArgs(run_args);
-    }
+    const run_trmc_lir_test_for_summary = addTestRunArtifact(b, trmc_lir_test, run_args);
+    tests_summary.addRun(&run_trmc_lir_test_for_summary.step);
 
-    tests_summary.addRun(&run_trmc_lir_test.step);
+    const run_trmc_lir_test = addTestRunArtifact(b, trmc_lir_test, run_args);
 
     const run_trmc_lir_test_step = b.step(
         "run-test-zig-trmc-lir",
@@ -5000,11 +5008,10 @@ pub fn build(b: *std.Build) void {
         build_test_zig_step.dependOn(&cli_test.step);
         if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_test);
 
-        const run_cli_test = b.addRunArtifact(cli_test);
-        if (run_args.len != 0) {
-            run_cli_test.addArgs(run_args);
-        }
-        tests_summary.addRun(&run_cli_test.step);
+        const run_cli_test_for_summary = addTestRunArtifact(b, cli_test, run_args);
+        tests_summary.addRun(&run_cli_test_for_summary.step);
+
+        const run_cli_test = addTestRunArtifact(b, cli_test, run_args);
 
         const run_cli_main_test_step = b.step(
             "run-test-zig-cli-main",
@@ -5035,11 +5042,10 @@ pub fn build(b: *std.Build) void {
         build_test_zig_step.dependOn(&watch_test.step);
         if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(watch_test);
 
-        const run_watch_test = b.addRunArtifact(watch_test);
-        if (run_args.len != 0) {
-            run_watch_test.addArgs(run_args);
-        }
-        tests_summary.addRun(&run_watch_test.step);
+        const run_watch_test_for_summary = addTestRunArtifact(b, watch_test, run_args);
+        tests_summary.addRun(&run_watch_test_for_summary.step);
+
+        const run_watch_test = addTestRunArtifact(b, watch_test, run_args);
 
         const run_watch_cli_test_step = b.step(
             "run-test-zig-watch-cli",
@@ -5063,11 +5069,10 @@ pub fn build(b: *std.Build) void {
         build_test_zig_step.dependOn(&minici_test.step);
         if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(minici_test);
 
-        const run_minici_test = b.addRunArtifact(minici_test);
-        if (run_args.len != 0) {
-            run_minici_test.addArgs(run_args);
-        }
-        tests_summary.addRun(&run_minici_test.step);
+        const run_minici_test_for_summary = addTestRunArtifact(b, minici_test, run_args);
+        tests_summary.addRun(&run_minici_test_for_summary.step);
+
+        const run_minici_test = addTestRunArtifact(b, minici_test, run_args);
 
         const run_minici_test_step = b.step(
             "run-test-zig-minici",
@@ -5456,18 +5461,21 @@ pub fn build(b: *std.Build) void {
             .filters = test_filters,
         });
 
-        const run_fx_platform_test = b.addRunArtifact(fx_platform_test);
-        if (run_args.len != 0) {
-            run_fx_platform_test.addArgs(run_args);
-        }
         build_test_zig_step.dependOn(&fx_platform_test.step);
         if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(fx_platform_test);
+
+        const run_fx_platform_test_for_summary = addTestRunArtifact(b, fx_platform_test, run_args);
+        run_fx_platform_test_for_summary.step.dependOn(final_fx_host_step);
+        run_fx_platform_test_for_summary.step.dependOn(final_static_data_platform_step);
+        run_fx_platform_test_for_summary.step.dependOn(build_roc_step);
+        tests_summary.addRun(&run_fx_platform_test_for_summary.step);
+
+        const run_fx_platform_test = addTestRunArtifact(b, fx_platform_test, run_args);
         // Ensure host library is copied AND fixed before running the test
         run_fx_platform_test.step.dependOn(final_fx_host_step);
         run_fx_platform_test.step.dependOn(final_static_data_platform_step);
         // Ensure roc binary is built before running the test (tests invoke roc CLI)
         run_fx_platform_test.step.dependOn(build_roc_step);
-        tests_summary.addRun(&run_fx_platform_test.step);
 
         const run_fx_platform_zig_test_step = b.step(
             "run-test-zig-fx-platform",

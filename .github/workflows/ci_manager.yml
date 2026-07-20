@@ -103,6 +103,7 @@ jobs:
   zig-minici:
     needs: check-changes
     if: needs.check-changes.outputs.zig == 'true'
+    name: zig-minici (${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
@@ -110,11 +111,29 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
+            shard: ubuntu-full
             timeout_minutes: 120
+            minici_args: "--minici-from run-check-zig-format --minici-to run-coverage-parser"
           - os: macos-15
+            shard: macos-zig
             timeout_minutes: 120
+            minici_args: "--minici-from run-check-zig-format --minici-to run-test-zig-backend-llvm"
+          - os: macos-15
+            shard: macos-harness
+            timeout_minutes: 120
+            minici_args: "--minici-from run-test-eval --minici-to run-coverage-parser"
           - os: windows-2025
+            shard: windows-core
             timeout_minutes: 120
+            minici_args: "--minici-from run-check-zig-format --minici-to run-test-zig-module-roc_target"
+          - os: windows-2025
+            shard: windows-zig
+            timeout_minutes: 120
+            minici_args: "--minici-from run-test-zig-snapshot-tool --minici-to run-test-zig-backend-llvm"
+          - os: windows-2025
+            shard: windows-harness
+            timeout_minutes: 120
+            minici_args: "--minici-from run-test-eval --minici-to run-coverage-parser"
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
@@ -123,6 +142,7 @@ jobs:
         with:
           version: 0.16.0
           use-cache: true
+          cache-key: ${{ matrix.shard }}
 
       - name: Install Rust wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -166,13 +186,13 @@ jobs:
           retry_count: 3
 
       - name: Run MiniCI
-        run: zig build minici
+        run: zig build minici -- ${{ matrix.minici_args }}
 
       - name: Upload MiniCI report and logs
         if: failure()
         uses: actions/upload-artifact@v7.0.1 # ratchet:actions/upload-artifact@v7.0.1
         with:
-          name: minici-${{ matrix.os }}
+          name: minici-${{ matrix.shard }}
           path: zig-out/minici/
 
   finish:
