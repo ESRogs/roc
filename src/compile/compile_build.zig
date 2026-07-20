@@ -229,6 +229,13 @@ pub const BuildEnv = struct {
     synthetic_root_identity: bool = false,
     synthetic_root_platform_identity: bool = false,
 
+    /// The bundle URL the root itself came from, when the build was launched
+    /// from a URL or installed source. The URL — never the extracted path —
+    /// is then the root's package identity, so direct-URL use and installed
+    /// use of the same URL share one identity, and moving the extracted
+    /// directory cannot change it.
+    root_url: ?package_source.UrlSource = null,
+
     /// Size limits applied during package version resolution.
     resolution_config: package_resolution.Config = .{},
 
@@ -342,6 +349,8 @@ pub const BuildEnv = struct {
         }
 
         if (self.package_cache_dir) |dir| self.gpa.free(@constCast(dir));
+
+        if (self.root_url) |*url| url.deinit(self.gpa);
 
         // Deinit and free owned builtin modules. Borrowed builtins outlive this
         // BuildEnv and are released by their owner.
@@ -552,6 +561,15 @@ pub const BuildEnv = struct {
 
     pub fn setSyntheticRootPlatformPackageIdentity(self: *BuildEnv) void {
         self.synthetic_root_platform_identity = true;
+    }
+
+    /// Declare that the root being compiled came from this bundle URL; see
+    /// the `root_url` field. The URL must carry a valid trailing content
+    /// hash, matching what download validation already enforced.
+    pub fn setRootUrl(self: *BuildEnv, url: []const u8) error{ OutOfMemory, InvalidUrl }!void {
+        const parsed = base.url.parseUrlPath(url) catch return error.InvalidUrl;
+        if (self.root_url) |*existing| existing.deinit(self.gpa);
+        self.root_url = try package_source.UrlSource.init(self.gpa, .{ .url = url, .url_id = parsed.url_id });
     }
 
     pub fn setWatchInputTracking(self: *BuildEnv, enabled: bool) void {
@@ -770,12 +788,19 @@ pub const BuildEnv = struct {
         }
 
         // Create package entry keyed by stable package identity. Real roots use
-        // their canonical path; synthetic default-app roots keep the explicit
-        // synthetic identity because their temporary paths are ephemeral.
+        // their canonical path; URL-launched roots use their bundle URL because
+        // the extracted directory is a storage detail; synthetic default-app
+        // roots keep the explicit synthetic identity because their temporary
+        // paths are ephemeral.
         const root_identity = try package_identity.packageIdentityFor(
             self.gpa,
             self.filesystem,
-            if (self.synthetic_root_identity) .synthetic_app else .{ .local_path = root_abs },
+            if (self.synthetic_root_identity)
+                .synthetic_app
+            else if (self.root_url) |*root_url|
+                .{ .url = root_url.url }
+            else
+                .{ .local_path = root_abs },
         );
         defer self.gpa.free(root_identity);
 
@@ -789,6 +814,7 @@ pub const BuildEnv = struct {
             .root_file = pkg_root_file,
             .root_file_state = header_info.source_file_state,
             .root_dir = pkg_root_dir,
+            .url = if (self.root_url) |*root_url| try package_source.UrlSource.init(self.gpa, root_url.view()) else null,
         });
         self.discovered_pkg_name = key_pkg;
 
@@ -1886,6 +1912,7 @@ pub const BuildEnv = struct {
         };
         var resolver = package_resolution.Resolver.init(self.gpa, ctx_fetcher.fetcher(), self.resolution_config);
         defer resolver.deinit();
+        if (self.root_url) |*root_url| resolver.setRootUrl(root_url.url);
 
         var resolved = resolver.resolveScannedRoot(scanned_root) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
