@@ -1,6 +1,7 @@
 //! Shared readonly data export records for native object emission.
 
 const std = @import("std");
+const layout = @import("layout");
 const lir = @import("lir");
 
 /// Immutable data symbol to emit into the target's readonly data section.
@@ -44,10 +45,47 @@ pub const StaticDataRelocation = struct {
     addend: i64 = 0,
     /// Runtime meaning of the stored pointer.
     kind: Kind = .address,
+    /// Exact generated RC helper required by this function-pointer relocation.
+    ///
+    /// Static erased-callable `on_drop` slots are always atomic: their
+    /// construction site makes no thread-confinement claim. Backends consume
+    /// this key directly to compile and publish that helper; they must not
+    /// recover it from `target_symbol_name` or from a capture layout.
+    rc_helper: ?layout.RcHelperKey = null,
     /// Whether `target_symbol_name` is owned by this relocation and must be freed
     /// with the static data graph.
     owns_target_symbol_name: bool = false,
 };
+
+/// Deterministic cross-object symbol for an atomic generated RC helper.
+///
+/// The helper identity remains the explicit `RcHelperKey`; this name is only
+/// its linker representation at the backend boundary.
+pub fn atomicRcHelperSymbolName(allocator: std.mem.Allocator, helper: layout.RcHelperKey) std.mem.Allocator.Error![]u8 {
+    return try std.fmt.allocPrint(allocator, "roc__rc_helper_{x}", .{helper.encode()});
+}
+
+/// Collect the distinct explicit RC-helper requirements in a static-data graph.
+pub fn collectRequiredRcHelpers(
+    allocator: std.mem.Allocator,
+    exports: []const StaticDataExport,
+) std.mem.Allocator.Error![]layout.RcHelperKey {
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+    var result = std.ArrayList(layout.RcHelperKey).empty;
+    errdefer result.deinit(allocator);
+
+    for (exports) |data_export| {
+        for (data_export.relocations) |relocation| {
+            const helper = relocation.rc_helper orelse continue;
+            const gop = try seen.getOrPut(helper.encode());
+            if (gop.found_existing) continue;
+            try result.append(allocator, helper);
+        }
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
 
 /// Deterministic object-file symbol name for an internal LIR procedure.
 ///

@@ -1028,6 +1028,7 @@ const Builder = struct {
             .checked_type = request.checked_type,
             .ty = ret_ty,
             .def = def,
+            .const_locator = request.const_locator,
         });
         try self.appendRuntimeSchemaRequestsForType(ret_ty);
     }
@@ -5658,6 +5659,7 @@ const DraftLayoutRequest = struct {
     checked_type: checked.CheckedTypeId,
     ty: DraftTypeCell,
     def: ?DraftDefId = null,
+    const_locator: ?checked.ConstLocator = null,
 };
 
 const DraftRuntimeSchemaRequest = struct {
@@ -6259,6 +6261,7 @@ const BodyDraftStore = struct {
                 .checked_type = request.checked_type,
                 .ty = try request.ty.seal(graph, sealer),
                 .def = if (request.def) |def_id| ids.def(def_id) else null,
+                .const_locator = request.const_locator,
             });
         }
 
