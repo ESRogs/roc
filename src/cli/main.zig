@@ -5083,6 +5083,73 @@ const CoordinatorReportCounts = struct {
     warnings: usize,
 };
 
+const SummaryStream = enum {
+    stdout,
+    stderr,
+};
+
+fn summaryUsesColor(ctx: *CliCtx, stream: SummaryStream) Allocator.Error!bool {
+    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.os.tag == .freestanding) return false;
+    if (try envVarNonEmpty(ctx.gpa, "NO_COLOR")) return false;
+    if (try envVarNonEmpty(ctx.gpa, "FORCE_COLOR")) return true;
+    if (try envVarEquals(ctx.gpa, "TERM", "dumb")) return false;
+
+    const file = switch (stream) {
+        .stdout => std.Io.File.stdout(),
+        .stderr => std.Io.File.stderr(),
+    };
+    return file.supportsAnsiEscapeCodes(ctx.io.std_io) catch false;
+}
+
+fn writeDiagnosticCounts(writer: *std.Io.Writer, error_count: anytype, warning_count: anytype, use_color: bool) std.Io.Writer.Error!void {
+    const error_suffix = if (error_count == 1) "" else "s";
+    const warning_suffix = if (warning_count == 1) "" else "s";
+    const red = if (use_color) ansi_term.red else "";
+    const yellow = if (use_color) ansi_term.yellow else "";
+    const reset = if (use_color) ansi_term.reset else "";
+
+    try writer.print("{s}{} error{s}{s} and {s}{} warning{s}{s}", .{
+        red,
+        error_count,
+        error_suffix,
+        reset,
+        yellow,
+        warning_count,
+        warning_suffix,
+        reset,
+    });
+}
+
+fn writeNoErrors(writer: *std.Io.Writer, use_color: bool) std.Io.Writer.Error!void {
+    const green = if (use_color) ansi_term.green else "";
+    const reset = if (use_color) ansi_term.reset else "";
+    try writer.print("{s}No errors{s}", .{ green, reset });
+}
+
+test "diagnostic summaries support colored and plain output" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+
+    try writeDiagnosticCounts(&output.writer, 1, 0, true);
+    try output.writer.writeByte('\n');
+    try writeDiagnosticCounts(&output.writer, 2, 3, false);
+    try output.writer.writeByte('\n');
+    try writeDiagnosticCounts(&output.writer, 0, 1, true);
+    try output.writer.writeByte('\n');
+    try writeNoErrors(&output.writer, true);
+    try output.writer.writeByte('\n');
+    try writeNoErrors(&output.writer, false);
+
+    try std.testing.expectEqualStrings(
+        ansi_term.red ++ "1 error" ++ ansi_term.reset ++ " and " ++ ansi_term.yellow ++ "0 warnings" ++ ansi_term.reset ++ "\n" ++
+            "2 errors and 3 warnings\n" ++
+            ansi_term.red ++ "0 errors" ++ ansi_term.reset ++ " and " ++ ansi_term.yellow ++ "1 warning" ++ ansi_term.reset ++ "\n" ++
+            ansi_term.green ++ "No errors" ++ ansi_term.reset ++ "\n" ++
+            "No errors",
+        output.written(),
+    );
+}
+
 const LoweredCoordinatorResult = struct {
     lowered: ?lir.CheckedPipeline.LoweredProgram,
     internal_static_data: ?[]backend.StaticDataExport,
@@ -5155,11 +5222,9 @@ fn renderDrainedBuildEnvReports(ctx: *CliCtx, build_env: *BuildEnv, display_path
     if (counts.errors > 0 or counts.warnings > 0) {
         const stderr = ctx.io.stderr();
         stderr.writeAll("\n") catch {};
-        stderr.print("Found {} error(s) and {} warning(s) for {s}.\n", .{
-            counts.errors,
-            counts.warnings,
-            display_path,
-        }) catch {};
+        stderr.writeAll("Found ") catch {};
+        writeDiagnosticCounts(stderr, counts.errors, counts.warnings, try summaryUsesColor(ctx, .stderr)) catch {};
+        stderr.print(" for {s}.\n", .{display_path}) catch {};
     }
 
     ctx.io.flush();
@@ -12306,7 +12371,10 @@ fn replayWatchChildOutput(ctx: *CliCtx, child: *WatchChild, print_separator: boo
     const stdout = ctx.io.stdout();
     const stderr = ctx.io.stderr();
 
-    if (print_separator) try stderr.writeAll(watch_separator);
+    if (print_separator) {
+        try stderr.writeAll(watch_separator);
+        try stderr.flush();
+    }
     if (child.stdout.len > 0) try stdout.writeAll(child.stdout);
     if (child.stderr.len > 0) try stderr.writeAll(child.stderr);
     ctx.io.flush();
@@ -14385,10 +14453,9 @@ fn finishRocCheck(
 
     if (check_result.error_count > 0 or check_result.warning_count > 0) {
         stderr.writeAll("\n") catch {};
-        stderr.print("Found {} error(s) and {} warning(s) in ", .{
-            check_result.error_count,
-            check_result.warning_count,
-        }) catch {};
+        stderr.writeAll("Found ") catch {};
+        writeDiagnosticCounts(stderr, check_result.error_count, check_result.warning_count, try summaryUsesColor(ctx, .stderr)) catch {};
+        stderr.writeAll(" in ") catch {};
         formatElapsedTimeMs(stderr, elapsed) catch {};
         stderr.print(" for {s}.\n", .{args.path}) catch {};
 
@@ -14404,7 +14471,8 @@ fn finishRocCheck(
             exitOnWarnings(ctx, check_result.warning_count);
         }
     } else {
-        stdout.print("No errors found in ", .{}) catch {};
+        writeNoErrors(stdout, try summaryUsesColor(ctx, .stdout)) catch {};
+        stdout.writeAll(" found in ") catch {};
         formatElapsedTimeMs(stdout, elapsed) catch {};
         stdout.print(" for {s}\n", .{args.path}) catch {};
 
