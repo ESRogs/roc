@@ -229,6 +229,19 @@ pub const BuildEnv = struct {
     synthetic_root_identity: bool = false,
     synthetic_root_platform_identity: bool = false,
 
+    /// The bundle URL the root itself came from, when the build was launched
+    /// from a URL or installed source. The URL — never the extracted path —
+    /// is then the root's package identity, so direct-URL use and installed
+    /// use of the same URL share one identity, and moving the extracted
+    /// directory cannot change it.
+    root_url: ?package_source.UrlSource = null,
+
+    /// The bundle URL an explicitly supplied `--main` came from. Promoted to
+    /// `root_url` if and only if that main file becomes the discovery root
+    /// (see `buildResolvingMain`), since root identity must follow whichever
+    /// file actually roots the build.
+    main_url: ?package_source.UrlSource = null,
+
     /// Size limits applied during package version resolution.
     resolution_config: package_resolution.Config = .{},
 
@@ -342,6 +355,9 @@ pub const BuildEnv = struct {
         }
 
         if (self.package_cache_dir) |dir| self.gpa.free(@constCast(dir));
+
+        if (self.root_url) |*url| url.deinit(self.gpa);
+        if (self.main_url) |*url| url.deinit(self.gpa);
 
         // Deinit and free owned builtin modules. Borrowed builtins outlive this
         // BuildEnv and are released by their owner.
@@ -554,6 +570,31 @@ pub const BuildEnv = struct {
         self.synthetic_root_platform_identity = true;
     }
 
+    /// Declare that the root being compiled came from this bundle URL; see
+    /// the `root_url` field. The URL must carry a valid trailing content
+    /// hash, matching what download validation already enforced.
+    pub fn setRootUrl(self: *BuildEnv, url: []const u8) error{ OutOfMemory, InvalidUrl }!void {
+        const parsed = base.url.parseUrlPath(url) catch return error.InvalidUrl;
+        if (self.root_url) |*existing| {
+            existing.deinit(self.gpa);
+            // Cleared before the fallible init so a failure cannot leave a
+            // dangling pointer for deinit to double-free.
+            self.root_url = null;
+        }
+        self.root_url = try package_source.UrlSource.init(self.gpa, .{ .url = url, .url_id = parsed.url_id });
+    }
+
+    /// Declare that an explicitly supplied `--main` came from this bundle
+    /// URL; see the `main_url` field.
+    pub fn setMainUrl(self: *BuildEnv, url: []const u8) error{ OutOfMemory, InvalidUrl }!void {
+        const parsed = base.url.parseUrlPath(url) catch return error.InvalidUrl;
+        if (self.main_url) |*existing| {
+            existing.deinit(self.gpa);
+            self.main_url = null;
+        }
+        self.main_url = try package_source.UrlSource.init(self.gpa, .{ .url = url, .url_id = parsed.url_id });
+    }
+
     pub fn setWatchInputTracking(self: *BuildEnv, enabled: bool) void {
         self.track_watch_inputs = enabled;
         if (self.coordinator) |coord| coord.setWatchInputTracking(enabled);
@@ -655,6 +696,15 @@ pub const BuildEnv = struct {
             if (std.mem.eql(u8, root_abs, main_abs)) {
                 try self.build(root_file);
             } else {
+                // The main file is the discovery root here, so its bundle
+                // provenance — not the checked file's — is the root identity.
+                if (self.main_url) |*main_url| {
+                    if (self.root_url) |*existing| {
+                        existing.deinit(self.gpa);
+                        self.root_url = null;
+                    }
+                    self.root_url = try package_source.UrlSource.init(self.gpa, main_url.view());
+                }
                 try self.buildWithMain(root_file, main_path);
             }
             return;
@@ -770,12 +820,19 @@ pub const BuildEnv = struct {
         }
 
         // Create package entry keyed by stable package identity. Real roots use
-        // their canonical path; synthetic default-app roots keep the explicit
-        // synthetic identity because their temporary paths are ephemeral.
+        // their canonical path; URL-launched roots use their bundle URL because
+        // the extracted directory is a storage detail; synthetic default-app
+        // roots keep the explicit synthetic identity because their temporary
+        // paths are ephemeral.
         const root_identity = try package_identity.packageIdentityFor(
             self.gpa,
             self.filesystem,
-            if (self.synthetic_root_identity) .synthetic_app else .{ .local_path = root_abs },
+            if (self.synthetic_root_identity)
+                .synthetic_app
+            else if (self.root_url) |*root_url|
+                .{ .url = root_url.url }
+            else
+                .{ .local_path = root_abs },
         );
         defer self.gpa.free(root_identity);
 
@@ -789,6 +846,7 @@ pub const BuildEnv = struct {
             .root_file = pkg_root_file,
             .root_file_state = header_info.source_file_state,
             .root_dir = pkg_root_dir,
+            .url = if (self.root_url) |*root_url| try package_source.UrlSource.init(self.gpa, root_url.view()) else null,
         });
         self.discovered_pkg_name = key_pkg;
 
@@ -800,9 +858,11 @@ pub const BuildEnv = struct {
                 header_info.provides_entries = .empty; // Prevent double-free in deinit
                 pkg.targets_config = header_info.targets_config;
                 header_info.targets_config = null; // Prevent double-free in deinit
-                if (header_info.kind == .platform) {
-                    self.moveHeaderExposesToPackage(pkg, &header_info);
-                }
+            }
+        }
+        if (header_info.kind == .package or header_info.kind == .platform) {
+            if (self.packages.getPtr(key_pkg)) |pkg| {
+                self.moveHeaderPublicModulesToPackage(pkg, &header_info);
             }
         }
 
@@ -1368,19 +1428,18 @@ pub const BuildEnv = struct {
         root_dir: []u8,
         url: ?package_source.UrlSource = null,
         shorthands: std.StringHashMapUnmanaged(PackageRef) = .{},
-        /// Platform-exposed modules from the platform header. Only populated
-        /// for platform packages.
-        exposes: std.ArrayListUnmanaged([]const u8) = .empty,
+        /// Modules in the public API declared by a package or platform header.
+        public_modules: std.ArrayListUnmanaged([]const u8) = .empty,
         provides_entries: std.ArrayListUnmanaged(ProvidesEntry) = .empty,
         targets_config: ?targets_config_mod.TargetsConfig = null,
 
         fn deinit(self: *Package, gpa: Allocator) void {
             if (self.url) |*url| url.deinit(gpa);
             if (self.targets_config) |tc| tc.deinit(gpa);
-            for (self.exposes.items) |exposed| {
-                freeConstSlice(gpa, exposed);
+            for (self.public_modules.items) |module_name| {
+                freeConstSlice(gpa, module_name);
             }
-            self.exposes.deinit(gpa);
+            self.public_modules.deinit(gpa);
             for (self.provides_entries.items) |entry| {
                 freeConstSlice(gpa, entry.roc_ident);
                 freeConstSlice(gpa, entry.ffi_symbol);
@@ -1402,9 +1461,9 @@ pub const BuildEnv = struct {
     const HeaderInfo = struct {
         kind: PackageKind,
         source_file_state: ?watch_inputs.State,
+        /// Modules in the public API declared by a package or platform header.
+        public_modules: std.ArrayListUnmanaged([]const u8) = .empty,
         resolver_root: package_resolution.FetchedPackage,
-        /// Platform-exposed modules (e.g., Stdout, Stderr) that apps can import
-        exposes: std.ArrayListUnmanaged([]const u8) = .empty,
         /// Platform provides entries (roc_ident -> ffi_symbol mapping)
         provides_entries: std.ArrayListUnmanaged(ProvidesEntry) = .empty,
         /// Targets configuration extracted from platform header
@@ -1413,10 +1472,10 @@ pub const BuildEnv = struct {
         fn deinit(self: *HeaderInfo, gpa: Allocator) void {
             if (self.targets_config) |tc| tc.deinit(gpa);
             self.resolver_root.deinit(gpa);
-            for (self.exposes.items) |e| {
-                freeConstSlice(gpa, e);
+            for (self.public_modules.items) |module_name| {
+                freeConstSlice(gpa, module_name);
             }
-            self.exposes.deinit(gpa);
+            self.public_modules.deinit(gpa);
             for (self.provides_entries.items) |entry| {
                 freeConstSlice(gpa, entry.roc_ident);
                 freeConstSlice(gpa, entry.ffi_symbol);
@@ -1425,18 +1484,38 @@ pub const BuildEnv = struct {
         }
     };
 
-    fn clearPackageExposes(self: *BuildEnv, pkg: *Package) void {
-        for (pkg.exposes.items) |exposed| {
-            freeConstSlice(self.gpa, exposed);
+    fn clearPackagePublicModules(self: *BuildEnv, pkg: *Package) void {
+        for (pkg.public_modules.items) |module_name| {
+            freeConstSlice(self.gpa, module_name);
         }
-        pkg.exposes.deinit(self.gpa);
-        pkg.exposes = .empty;
+        pkg.public_modules.deinit(self.gpa);
+        pkg.public_modules = .empty;
     }
 
-    fn moveHeaderExposesToPackage(self: *BuildEnv, pkg: *Package, header_info: *HeaderInfo) void {
-        self.clearPackageExposes(pkg);
-        pkg.exposes = header_info.exposes;
-        header_info.exposes = .empty;
+    fn moveHeaderPublicModulesToPackage(self: *BuildEnv, pkg: *Package, header_info: *HeaderInfo) void {
+        self.clearPackagePublicModules(pkg);
+        pkg.public_modules = header_info.public_modules;
+        header_info.public_modules = .empty;
+    }
+
+    fn appendHeaderPublicModules(
+        self: *BuildEnv,
+        info: *HeaderInfo,
+        ast: *const parse.AST,
+        exposes: parse.AST.Collection.Idx,
+    ) Allocator.Error!void {
+        const collection = ast.store.getCollection(exposes);
+        for (ast.store.exposedItemSlice(.{ .span = collection.span })) |item_idx| {
+            const item = ast.store.getExposedItem(item_idx);
+            const token_idx = switch (item) {
+                .upper_ident => |upper| upper.ident,
+                .upper_ident_star => |upper| upper.ident,
+                .lower_ident, .malformed => continue,
+            };
+            const module_name = try self.gpa.dupe(u8, ast.resolve(token_idx));
+            errdefer self.gpa.free(module_name);
+            try info.public_modules.append(self.gpa, module_name);
+        }
     }
 
     fn parseHeaderDeps(self: *BuildEnv, file_path: []const u8) BuildError!HeaderInfo {
@@ -1522,26 +1601,13 @@ pub const BuildEnv = struct {
             .app => {
                 info.kind = .app;
             },
-            .package => {
+            .package => |p| {
                 info.kind = .package;
+                try self.appendHeaderPublicModules(&info, ast, p.exposes);
             },
             .platform => |p| {
                 info.kind = .platform;
-                // Extract platform-exposed modules (e.g., Stdout, Stderr)
-                // These are modules that apps can import from the platform
-                const exposes_coll = ast.store.getCollection(p.exposes);
-                const exposes_items = ast.store.exposedItemSlice(.{ .span = exposes_coll.span });
-                for (exposes_items) |item_idx| {
-                    const item = ast.store.getExposedItem(item_idx);
-                    const token_idx = switch (item) {
-                        .upper_ident => |ui| ui.ident,
-                        .upper_ident_star => |uis| uis.ident,
-                        .lower_ident => |li| li.ident,
-                        .malformed => continue, // Skip malformed items
-                    };
-                    const item_name = ast.resolve(token_idx);
-                    try info.exposes.append(self.gpa, try self.gpa.dupe(u8, item_name));
-                }
+                try self.appendHeaderPublicModules(&info, ast, p.exposes);
 
                 // Extract provides entries (roc_ident -> linker symbol mapping)
                 for (ast.store.symbolMapEntrySlice(p.provides)) |entry_idx| {
@@ -1878,6 +1944,7 @@ pub const BuildEnv = struct {
         };
         var resolver = package_resolution.Resolver.init(self.gpa, ctx_fetcher.fetcher(), self.resolution_config);
         defer resolver.deinit();
+        if (self.root_url) |*root_url| resolver.setRootUrl(root_url.url);
 
         var resolved = resolver.resolveScannedRoot(scanned_root) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1972,8 +2039,8 @@ pub const BuildEnv = struct {
             }
 
             if (self.packages.getPtr(package_keys.identity(i))) |plat_pkg| {
-                if (plat_pkg.exposes.items.len == 0) {
-                    self.moveHeaderExposesToPackage(plat_pkg, &child_info);
+                if (plat_pkg.public_modules.items.len == 0) {
+                    self.moveHeaderPublicModulesToPackage(plat_pkg, &child_info);
                 }
             }
         }
@@ -2004,7 +2071,7 @@ pub const BuildEnv = struct {
         platform_dir: []const u8,
         child_info: *const HeaderInfo,
     ) BuildError!void {
-        for (child_info.exposes.items) |module_name| {
+        for (child_info.public_modules.items) |module_name| {
             // Create path to the module file (e.g., Stdout.roc)
             const module_filename = try std.fmt.allocPrint(self.gpa, "{s}.roc", .{module_name});
             defer self.gpa.free(module_filename);
@@ -2833,19 +2900,58 @@ pub const BuildEnv = struct {
         return modules.toOwnedSlice(allocator);
     }
 
-    /// Return the compiled modules that belong in generated documentation.
-    ///
-    /// For platform roots, the documentation surface is the platform header's
-    /// `exposes` list. Implementation-only modules may still be compiled because
-    /// public wrappers import them, but they are not part of the public platform
-    /// API and must not become docs pages.
-    ///
-    /// For non-platform roots, retain the existing CLI surface: all compiled
-    /// documentable modules except package headers and platform root modules.
-    pub fn getDocumentationModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
-        const all_modules = try self.getCompiledModules(allocator);
-        errdefer allocator.free(all_modules);
+    /// Resolve the root package or platform's explicit public module list to
+    /// completed compiler outputs. Dependency modules are deliberately absent.
+    pub fn getPublicRootModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
+        const root_name = self.discovered_pkg_name orelse {
+            std.debug.panic("build env invariant violated: public modules requested before dependency discovery", .{});
+        };
+        const root_pkg = self.packages.getPtr(root_name) orelse {
+            std.debug.panic("build env invariant violated: public-module root package is unavailable", .{});
+        };
+        if (root_pkg.kind != .package and root_pkg.kind != .platform) {
+            std.debug.panic("build env invariant violated: public modules requested for a non-package root", .{});
+        }
+        const root_scheduler = self.schedulers.get(root_name) orelse {
+            std.debug.panic("build env invariant violated: public-module root scheduler is unavailable", .{});
+        };
 
+        var public_modules = std.ArrayList(CompiledModuleInfo).empty;
+        errdefer public_modules.deinit(allocator);
+
+        for (root_pkg.public_modules.items) |module_name| {
+            const module_state = root_scheduler.getModuleState(module_name) orelse {
+                std.debug.panic(
+                    "build env invariant violated: public module '{s}' was not compiled",
+                    .{module_name},
+                );
+            };
+            const module_data = module_state.semanticData() orelse {
+                std.debug.panic(
+                    "build env invariant violated: public module '{s}' has no completed compiler output",
+                    .{module_name},
+                );
+            };
+            try public_modules.append(allocator, .{
+                .name = module_state.name,
+                .path = module_state.path,
+                .semantic = module_data,
+                .source = module_data.env.common.source,
+                .package_name = root_name,
+                .is_platform_main = false,
+                .is_app = false,
+                .is_platform_sibling = root_pkg.kind == .platform,
+                .depth = module_state.depth,
+            });
+        }
+
+        return public_modules.toOwnedSlice(allocator);
+    }
+
+    /// Return the compiled modules that belong in generated documentation.
+    /// Package and platform roots use their explicit public module list.
+    /// Other roots retain the CLI surface of all compiled documentable modules.
+    pub fn getDocumentationModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
         const root_name = self.discovered_pkg_name orelse {
             std.debug.panic("build env invariant violated: documentation requested before dependency discovery", .{});
         };
@@ -2853,44 +2959,26 @@ pub const BuildEnv = struct {
             std.debug.panic("build env invariant violated: documentation root package is unavailable", .{});
         };
 
+        if (root_pkg.kind == .package or root_pkg.kind == .platform) {
+            return self.getPublicRootModules(allocator);
+        }
+
+        const all_modules = try self.getCompiledModules(allocator);
+        errdefer allocator.free(all_modules);
+
         var docs_modules = std.ArrayList(CompiledModuleInfo).empty;
         errdefer docs_modules.deinit(allocator);
 
-        if (root_pkg.kind == .platform) {
-            for (root_pkg.exposes.items) |exposed_name| {
-                const exposed_module = findCompiledModuleInPackage(all_modules, root_name, exposed_name) orelse {
-                    std.debug.panic(
-                        "build env invariant violated: platform exposes module '{s}' but it was not compiled",
-                        .{exposed_name},
-                    );
-                };
-                try docs_modules.append(allocator, exposed_module);
+        for (all_modules) |mod| {
+            switch (mod.semantic.env.module_kind) {
+                .package, .platform => continue,
+                else => {},
             }
-        } else {
-            for (all_modules) |mod| {
-                switch (mod.semantic.env.module_kind) {
-                    .package, .platform => continue,
-                    else => {},
-                }
-                try docs_modules.append(allocator, mod);
-            }
+            try docs_modules.append(allocator, mod);
         }
 
         allocator.free(all_modules);
         return docs_modules.toOwnedSlice(allocator);
-    }
-
-    fn findCompiledModuleInPackage(
-        modules: []const CompiledModuleInfo,
-        package_name: []const u8,
-        module_name: []const u8,
-    ) ?CompiledModuleInfo {
-        for (modules) |mod| {
-            if (std.mem.eql(u8, mod.package_name, package_name) and std.mem.eql(u8, mod.name, module_name)) {
-                return mod;
-            }
-        }
-        return null;
     }
 
     /// Get modules in serialization order: platform siblings → platform main → app siblings → app.

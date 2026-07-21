@@ -428,6 +428,29 @@ shared. Records that contain static lists should point at shared static list
 bytes; equivalent named and inline constants should produce equivalent static
 data.
 
+When checking finalization lowers a root that refers to an already-stored,
+representation-stable `ConstStore` value, it must preserve that sharing by
+emitting an explicit LIR static-data value. It must not recursively rebuild that
+value as runtime list, record, tuple, tag, box, string, or callable construction.
+Callable-containing const graphs are not representation-stable at this boundary:
+post-check specialization may replace callable identities and capture graphs, so
+they remain explicit reconstructions. Eligibility is computed by a memoized walk
+over explicit `ConstStore` edges, never inferred from runtime bytes or layout
+coincidence.
+
+Object emission, native compile-time execution, and interpreter compile-time
+execution consume the same target-layout static-data materializer. In-process
+evaluators own a relocated immutable data image and index its root addresses
+directly by compact `StaticDataId`; callable relocations carry explicit
+capture-offset metadata so the interpreter does not reconstruct ABI meaning from
+bytes or symbols. A static-data candidate is identified by its stored const node
+and concrete Monotype type; a checked type id alone cannot identify its
+representation across distinct specialization contexts. Direct LIR lowering
+deduplicates those candidates only when their concrete destination const plan and
+runtime layout also match. This preserves distinct specialized and narrowed
+representations of the same stored value while allowing each one to be emitted
+directly in the representation its consumer requires.
+
 Compile-time evaluation is allowed to fail with user diagnostics only during
 checking. After checking, stored constant data is ordinary checked output. A
 target static-data builder may decide which reachable evaluated values have a
@@ -1023,6 +1046,30 @@ body may have constrained the annotation backing type, underscore variables, or
 alias arguments, but references to the annotated value consume the annotation
 root. This is how alias spelling from annotations is preserved without making
 alias roots union-find representatives for concrete structures.
+
+## Module Completion Boundary
+
+The compile coordinator records phase progress separately from terminal module
+outcome. A terminal module has exactly one explicit outcome: success or failure.
+Successful completion means the module produced the complete semantic state
+required by importers, including its final content identity. Failed completion
+is terminal only for scheduling and accounting; any partial `ModuleEnv` retained
+for diagnostics or watch inputs is not semantic import data.
+
+Every semantic scheduling edge requires successful completion. Canonicalization,
+content-identity construction, checking, checked-cache publication, and platform
+requirement checking may consume only successful imported modules. A known
+failed module causes failure to propagate iteratively through all local-import,
+cross-package-import, and registered platform/app dependency edges. An import
+that cannot be resolved is distinct from a known failed module and proceeds only
+far enough for canonicalization to emit its source diagnostic.
+
+When a local import closes a cycle, the coordinator records the closing edge
+before reporting it. It then identifies the exact strongly connected component
+by mutual reachability, marks every member failed, and applies ordinary iterative
+failure propagation to all transitive dependents. Cycle members never masquerade
+as successfully completed modules and never provide partial environments or
+missing content identities to downstream stages.
 
 ## Cache Boundary
 
@@ -1673,7 +1720,7 @@ THE RECEIVER HAS A FUNCTION-VALUED FIELD NAMED `field` BUT NO METHOD NAMED
 `field`, `value.field(arg)` MUST REPORT A MISSING METHOD. THE EXISTENCE OR TYPE
 OF THE RECORD FIELD IS IRRELEVANT TO THAT METHOD LOOKUP.
 
-THE CANONICAL SPELLING HAS NO WHITESPACE BETWEEN THE RECEIVER AND DOT, BETWEEN
+THE DOT-CALL SPELLING HAS NO WHITESPACE BETWEEN THE RECEIVER AND DOT, BETWEEN
 THE DOT AND NAME, OR BETWEEN A METHOD NAME AND ITS OPENING PARENTHESIS. TRIVIA
 RECOVERY AND FORMAT NORMALIZATION MUST NEVER BE USED AS A SIGNAL FOR CHOOSING
 FIELD ACCESS VERSUS METHOD DISPATCH.
@@ -2098,12 +2145,31 @@ mode. SpecConstr improves optimized loop and call shape so later lowering and
 LLVM see scalar state and direct operations.
 
 SpecConstr preserves shared control explicitly. When a rewrite would move one
-continuation under multiple `match` or `if` arms, it introduces one typed lifted
-join point and replaces each arm result with a jump that supplies the result as
-an argument. It must never copy the continuation into the arms. This makes the
-amount of stored continuation code independent of branch count and nesting;
-later specialization may inspect the jump arguments without destroying that
-sharing.
+continuation under multiple `match` or `if` arms, it introduces typed lifted
+join points and replaces each arm result with a jump. It must never copy
+continuation code into more than one arm, which keeps the amount of stored
+continuation code independent of branch count and nesting. Within that rule the
+rewrite preserves the arms' statically known value structure: it declines
+entirely when an arm's result is opaque (an ordinary let binding keeps
+downstream tail-call and loop-shape recognition intact); a continuation that
+immediately matches the bound value gets one join per continuation branch, and
+only the small dispatching match is copied into the arms, where it folds
+against each arm's known constructor into a direct jump; a join's parameters
+are the decomposed leaves of the values its jump sites supply whenever those
+values agree on one structure skeleton, so specialization inside the shared
+body still sees the shape; and a join with exactly one jump site is not shared
+control at all — its body is cloned directly at that site against the site's
+full symbolic values.
+
+Every SpecConstr clone is hygienic. A retained pattern, loop parameter, join
+parameter, try-sequence local, or other runtime binder receives a fresh lifted
+local identity in each emitted copy, and every occurrence in that binder's
+lexical scope is rewritten to the fresh identity. A binder whose uses were
+fully replaced by a known value still receives a fresh identity in the emitted
+pattern, but that unused output identity does not replace the known-value
+substitution. Cloning never relies on later lowering to reconstruct lexical
+scope from reused local ids: distinct emitted binders are distinct explicit
+identities before Lambda Solved or LIR lowering consumes them.
 
 #### Constant Storage
 
@@ -3272,6 +3338,18 @@ rows). Monotype resolves such a target's requirements by walking those paths
 over the concrete monomorphic callable at the consumption site, recursively:
 component owners consume the registry's explicit callable-or-structural result;
 ownerless shapes take the structural implementations.
+
+Evidence paths describe the normalized logical type, never checked-store row
+topology. Record and tag extension chains, including transparent aliases along
+those chains, are traversed by the evidence-param producer but are not emitted
+as path steps; a field or tag payload in any tail is addressed directly by its
+label from the logical row root. A static-dispatch requirement on an open-row
+remainder is pathless because closure erases that remainder as a standalone
+component; ordinary checked edges can still supply it, while a
+compiler-generated edge cannot synthesize it from the closed callable. The
+CheckedModule boundary validates both the path grammar and that every nonempty
+path resolves over its template's checked callable type before Monotype may
+consume it.
 
 Exact registry lookups — `(MethodOwner, MethodNameId)` — happen during
 checking, and during path synthesis for compiler-generated

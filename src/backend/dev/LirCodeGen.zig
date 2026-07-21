@@ -518,6 +518,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
         /// Readonly data symbols for non-SSO strings in object-file output.
         static_strings: []const StaticStringData.Entry,
+        /// Resolved readonly values used only by in-process native execution.
+        native_static_data: []const usize,
         /// Owned names for generated internal static-data relocation targets.
         static_data_symbol_names: std.ArrayList([]u8),
 
@@ -906,6 +908,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .store = store,
                 .layout_store = layout_store_opt,
                 .static_strings = static_strings,
+                .native_static_data = &.{},
                 .static_data_symbol_names = .empty,
                 .local_locations = std.AutoHashMap(u32, ValueLocation).init(allocator),
                 .join_points = std.AutoHashMap(u32, usize).init(allocator),
@@ -938,6 +941,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
         pub fn setComptimeHooks(self: *Self, hooks: ?ComptimeHooks) void {
             self.comptime_hooks = hooks;
+        }
+
+        pub fn setNativeStaticData(self: *Self, addresses: []const usize) void {
+            self.native_static_data = addresses;
         }
 
         /// Clean up resources
@@ -5464,13 +5471,31 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const slot = self.codegen.allocStackSlot(size);
             const src_reg = try self.allocTempGeneral();
             defer self.codegen.freeGeneral(src_reg);
-            try self.emitStaticDataAddress(src_reg, id);
+            switch (self.generation_mode) {
+                .native_execution => {
+                    const address = self.nativeStaticDataAddress(id);
+                    try self.codegen.emitLoadImm(src_reg, @bitCast(@as(u64, address)));
+                },
+                .shim_execution, .object_file => try self.emitStaticDataAddress(src_reg, id),
+            }
 
             const temp_reg = try self.allocTempGeneral();
             defer self.codegen.freeGeneral(temp_reg);
             try self.copyChunked(temp_reg, src_reg, 0, frame_ptr, slot, size);
 
             return self.stackLocationForLayout(runtime_layout, slot);
+        }
+
+        fn nativeStaticDataAddress(self: *const Self, id: lir.LIR.StaticDataId) usize {
+            const index: usize = @intFromEnum(id);
+            if (index < self.native_static_data.len) return self.native_static_data[index];
+            if (builtin.mode == .Debug) {
+                std.debug.panic(
+                    "Dev/codegen invariant violated: static data value {d} has no native address",
+                    .{@intFromEnum(id)},
+                );
+            }
+            unreachable;
         }
 
         /// Generate code for a local lookup.
@@ -9918,9 +9943,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const skip_patch = blk: {
                 if (comptime target.toCpuArch() == .aarch64) {
                     try self.codegen.emit.cmpRegImm12(.w64, cap_reg, 0);
-                    const patch_loc = self.codegen.currentOffset();
-                    try self.codegen.emit.bcond(.mi, 0);
-                    break :blk patch_loc;
+                    break :blk try self.codegen.emitCondJump(.mi);
                 } else {
                     try self.codegen.emit.testRegReg(.w64, cap_reg, cap_reg);
                     break :blk try self.codegen.emitCondJump(.sign);
@@ -9958,9 +9981,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const skip_patch = blk: {
                 if (comptime target.toCpuArch() == .aarch64) {
                     try self.codegen.emit.cmpRegImm12(.w64, cap_reg, 0);
-                    const patch_loc = self.codegen.currentOffset();
-                    try self.codegen.emit.bcond(.mi, 0);
-                    break :blk patch_loc;
+                    break :blk try self.codegen.emitCondJump(.mi);
                 } else {
                     try self.codegen.emit.testRegReg(.w64, cap_reg, cap_reg);
                     break :blk try self.codegen.emitCondJump(.sign);
@@ -11706,7 +11727,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             const piece_off = slot_off + @as(i32, @intCast(piece.offset));
                             switch (piece.class) {
                                 .integer => try builder.addMemArg(frame_ptr, piece_off),
-                                .float => try builder.addFloatMemArg(frame_ptr, piece_off, piece.size == 8),
+                                .float => try builder.addFloatMemArg(frame_ptr, piece_off, piece.size),
                             }
                         }
                     },
@@ -11745,7 +11766,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 gp_i += 1;
                             },
                             .float => {
-                                try self.emitHostedFloatResultStore(dst_off, sse_i, piece.size == 8);
+                                try self.emitHostedFloatResultStore(dst_off, sse_i, piece.size);
                                 sse_i += 1;
                             },
                         }
@@ -11768,20 +11789,23 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         /// Store hosted-call float result register `index` (0 or 1) into the return slot.
-        fn emitHostedFloatResultStore(self: *Self, dst_off: i32, index: usize, is_f64: bool) Allocator.Error!void {
+        fn emitHostedFloatResultStore(self: *Self, dst_off: i32, index: usize, size: u8) Allocator.Error!void {
             const freg0: FloatReg = if (arch == .x86_64) .XMM0 else .V0;
             const freg1: FloatReg = if (arch == .x86_64) .XMM1 else .V1;
             const freg = if (index == 0) freg0 else freg1;
             if (comptime target.toCpuArch() == .aarch64) {
-                if (is_f64) {
-                    try self.codegen.emitStoreStackF64(dst_off, freg);
-                } else {
-                    try self.codegen.emitStoreStackF32(dst_off, freg);
+                switch (size) {
+                    4 => try self.codegen.emitStoreStackF32(dst_off, freg),
+                    8 => try self.codegen.emitStoreStackF64(dst_off, freg),
+                    else => unreachable,
                 }
-            } else if (is_f64) {
-                try self.codegen.emit.movsdMemReg(frame_ptr, dst_off, freg);
             } else {
-                try self.codegen.emit.movssMemReg(frame_ptr, dst_off, freg);
+                switch (size) {
+                    4 => try self.codegen.emit.movssMemReg(frame_ptr, dst_off, freg),
+                    8 => try self.codegen.emit.movsdMemReg(frame_ptr, dst_off, freg),
+                    16 => try self.codegen.emit.movdquMemReg(frame_ptr, dst_off, freg),
+                    else => unreachable,
+                }
             }
         }
 
@@ -11813,25 +11837,21 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// BRANCH PATCHING MECHANISM:
         /// When generating switch dispatch, we don't know the jump target offset until
         /// we've generated the code for the branch body. So we:
-        /// 1. Emit the branch instruction with offset=0 (placeholder)
+        /// 1. Emit the architecture-specific branch placeholder
         /// 2. Record the instruction's location (patch_loc)
         /// 3. Generate the branch body code
         /// 4. Calculate the actual offset: current_offset - patch_loc
         /// 5. Patch the instruction at patch_loc with the real offset
         ///
-        /// WHY OFFSET 0 IS SAFE:
-        /// Offset 0 means "jump to the next instruction" which is harmless if we
-        /// somehow fail to patch. But in normal operation, codegen.patchJump()
-        /// overwrites the placeholder before execution.
+        /// PLACEHOLDER SAFETY:
+        /// The architecture-specific emitters choose harmless placeholder bytes
+        /// and reserve whatever space their patching strategy requires. In normal
+        /// operation, codegen.patchJump() overwrites the placeholder before execution.
         ///
         /// RETURNS: The patch location (where the displacement bytes are) for later patching.
         fn emitJumpIfNotEqual(self: *Self) Allocator.Error!usize {
             if (comptime target.toCpuArch() == .aarch64) {
-                // B.NE (branch if not equal) with placeholder offset
-                // On aarch64, the entire 4-byte instruction encodes the offset
-                const patch_loc = self.codegen.currentOffset();
-                try self.codegen.emit.bcond(.ne, 0);
-                return patch_loc;
+                return self.codegen.emitCondJump(.ne);
             } else {
                 // JNE (jump if not equal) with placeholder offset
                 // x86_64: JNE rel32 is 0F 85 xx xx xx xx (6 bytes)
@@ -11845,10 +11865,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Emit a conditional jump for unsigned less than (for list length comparisons)
         fn emitJumpIfEqual(self: *Self) Allocator.Error!usize {
             if (comptime target.toCpuArch() == .aarch64) {
-                // B.EQ (branch if equal) with placeholder offset
-                const patch_loc = self.codegen.currentOffset();
-                try self.codegen.emit.bcond(.eq, 0);
-                return patch_loc;
+                return self.codegen.emitCondJump(.eq);
             } else {
                 // JE (jump if equal) with placeholder offset
                 const patch_loc = self.codegen.currentOffset() + 2;
@@ -17371,7 +17388,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                     }
                                 },
                                 .float => {
-                                    const width: u8 = if (piece.size == 8) 8 else 4;
+                                    const width = piece.size;
                                     const pos = if (shared_arg_positions) blk: {
                                         const taken = int_idx;
                                         int_idx += 1;
@@ -17468,7 +17485,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             for (reg_captures.items) |cap| {
                 if (cap.is_float) {
                     const freg = float_param_regs[cap.reg_index];
-                    try self.emitEntryFloatStore(cap.dest_off, freg, cap.width == 8);
+                    try self.emitEntryFloatStore(cap.dest_off, freg, cap.width);
                 } else {
                     const reg = int_param_regs[cap.reg_index];
                     if (cap.width <= 4) {
@@ -17556,7 +17573,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 }
                             },
                             .float => {
-                                try self.emitEntryFloatLoad(src_off, fp_i, piece.size == 8);
+                                try self.emitEntryFloatLoad(src_off, fp_i, piece.size);
                                 fp_i += 1;
                             },
                         }
@@ -17566,38 +17583,42 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         /// Store an incoming float argument register into the frame.
-        fn emitEntryFloatStore(self: *Self, dest_off: i32, freg: FloatReg, is_f64: bool) Allocator.Error!void {
+        fn emitEntryFloatStore(self: *Self, dest_off: i32, freg: FloatReg, size: u8) Allocator.Error!void {
             if (comptime target.toCpuArch() == .aarch64) {
-                if (is_f64) {
-                    try self.codegen.emitStoreStackF64(dest_off, freg);
-                } else {
-                    try self.codegen.emitStoreStackF32(dest_off, freg);
+                switch (size) {
+                    4 => try self.codegen.emitStoreStackF32(dest_off, freg),
+                    8 => try self.codegen.emitStoreStackF64(dest_off, freg),
+                    else => unreachable,
                 }
-            } else if (is_f64) {
-                try self.codegen.emit.movsdMemReg(frame_ptr, dest_off, freg);
             } else {
-                try self.codegen.emit.movssMemReg(frame_ptr, dest_off, freg);
+                switch (size) {
+                    4 => try self.codegen.emit.movssMemReg(frame_ptr, dest_off, freg),
+                    8 => try self.codegen.emit.movsdMemReg(frame_ptr, dest_off, freg),
+                    16 => try self.codegen.emit.movdquMemReg(frame_ptr, dest_off, freg),
+                    else => unreachable,
+                }
             }
         }
 
         /// Load C-ABI float return piece `index` from the frame into the
         /// float return register sequence (V0..V3 / XMM0..XMM1).
-        fn emitEntryFloatLoad(self: *Self, src_off: i32, index: usize, is_f64: bool) Allocator.Error!void {
+        fn emitEntryFloatLoad(self: *Self, src_off: i32, index: usize, size: u8) Allocator.Error!void {
             if (comptime target.toCpuArch() == .aarch64) {
                 const fregs = [_]FloatReg{ .V0, .V1, .V2, .V3 };
                 const freg = fregs[index];
-                if (is_f64) {
-                    try self.codegen.emitLoadStackF64(freg, src_off);
-                } else {
-                    try self.codegen.emitLoadStackF32(freg, src_off);
+                switch (size) {
+                    4 => try self.codegen.emitLoadStackF32(freg, src_off),
+                    8 => try self.codegen.emitLoadStackF64(freg, src_off),
+                    else => unreachable,
                 }
             } else {
                 const fregs = [_]FloatReg{ .XMM0, .XMM1 };
                 const freg = fregs[index];
-                if (is_f64) {
-                    try self.codegen.emit.movsdRegMem(freg, frame_ptr, src_off);
-                } else {
-                    try self.codegen.emit.movssRegMem(freg, frame_ptr, src_off);
+                switch (size) {
+                    4 => try self.codegen.emit.movssRegMem(freg, frame_ptr, src_off),
+                    8 => try self.codegen.emit.movsdRegMem(freg, frame_ptr, src_off),
+                    16 => try self.codegen.emit.movdquRegMem(freg, frame_ptr, src_off),
+                    else => unreachable,
                 }
             }
         }
