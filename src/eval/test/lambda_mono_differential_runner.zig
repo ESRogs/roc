@@ -36,6 +36,7 @@ const eval = @import("eval");
 const collections = @import("collections");
 const postcheck = @import("postcheck");
 const test_harness = @import("test_harness");
+const build_options = @import("build_options");
 
 const helpers = eval.test_helpers;
 const eval_tests = @import("eval_tests.zig");
@@ -307,8 +308,8 @@ pub fn main(init: std.process.Init) RunnerError!void {
         return error.RequiresDebugBuild;
     }
 
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var args_arena = collections.SingleThreadArena.init(gpa);
@@ -512,7 +513,7 @@ fn printHelp() void {
             "persistent worker processes on Windows).\n\n" ++
             "Options:\n" ++
             "  --filter <substr>   only run cases whose name/source matches (repeatable)\n" ++
-            "  --threads <N>       max concurrent case processes (default: CPU count)\n" ++
+            "  --threads <N>       max concurrent case processes (default: min(cpu_count, cases))\n" ++
             "  --timeout <ms>      per-case watchdog budget (default: 120000)\n" ++
             "  --verbose           per-case logging\n" ++
             "  corpus-only         only the checked-in eval corpus\n" ++

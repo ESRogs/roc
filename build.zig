@@ -2873,6 +2873,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
+    minici_exe.root_module.addImport("build_options", roc_modules.build_options);
 
     const install_zig_lints = b.addInstallArtifact(zig_lints_exe, .{});
     const install_tidy = b.addInstallArtifact(tidy_exe, .{});
@@ -5086,8 +5087,7 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    // MiniCI output-filter tests. MiniCI is a standalone host build tool that
-    // only imports `std`, so it needs no module wiring.
+    // MiniCI output-filter tests.
     test_suites.register(.{
         .step_suffix = "minici",
         .description = "Run MiniCI output-filter Zig tests",
@@ -5097,6 +5097,9 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/build/minici.zig"),
                 .target = b.graph.host,
                 .optimize = .Debug,
+                .imports = &.{
+                    .{ .name = "build_options", .module = roc_modules.build_options },
+                },
             }),
             .filters = test_filters,
         }),
