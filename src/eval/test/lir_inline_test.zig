@@ -5424,6 +5424,30 @@ test "bare list iter collect carries scalar list state in the loop" {
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "box_box_count"));
 }
 
+test "issue 10181 explicit Str interpolation suffix checks cleanly" {
+    // Repro for https://github.com/roc-lang/roc/issues/10181
+    const allocator = std.testing.allocator;
+    const source =
+        \\main! = |_| {
+        \\    x = "world"
+        \\    y = "hello ${x}".Str
+        \\    Ok({})
+        \\}
+    ;
+
+    const resources = try helpers.parseAndCanonicalizeProgramPublishedRootsWithBuiltin(
+        allocator,
+        .module,
+        source,
+        &.{},
+        try sharedPrePublishedBuiltin(),
+        null,
+    );
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    try std.testing.expectEqual(@as(usize, 0), resources.checker.problems.problems.items.len);
+}
+
 const dispatch_boundary_source =
     \\Thing := [Val(Str)].{
     \\    to_str : Thing -> Str
