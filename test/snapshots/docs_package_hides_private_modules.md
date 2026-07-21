@@ -13,7 +13,10 @@ package [Date, Time] {}
 import Util
 
 ## A calendar date.
-Date :: {}
+Date :: {}.{
+    ## Date formatting options.
+    Format :: {}
+}
 
 ## Private implementation details.
 Help :: {}
@@ -41,6 +44,12 @@ Util :: {}
       (kind opaque)
       (type "Date :: " (record))
       (doc "A calendar date.")
+      (entry
+        (name "Format")
+        (kind opaque)
+        (type "Format :: " (record))
+        (doc "Date formatting options.")
+      )
     )
   )
   (mod
