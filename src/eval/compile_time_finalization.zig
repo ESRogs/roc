@@ -12,6 +12,7 @@ const builtins = @import("builtins");
 const check = @import("check");
 const collections = @import("collections");
 const lir = @import("lir");
+const roc_target = @import("roc_target");
 
 const Allocator = std.mem.Allocator;
 const checked = check.CheckedArtifact;
@@ -20,6 +21,7 @@ const CompilerHost = @import("compiler_host.zig");
 const ConstStoreWriter = @import("const_store_writer.zig");
 const CompileTimeHost = @import("compile_time_host.zig");
 const interpreter_mod = @import("interpreter.zig");
+const static_data_exports = @import("static_data");
 const Interpreter = interpreter_mod.Interpreter;
 const ExpectFailure = interpreter_mod.ExpectFailure;
 const FinalizeError = checked.CompileTimeFinalizer.Error;
@@ -489,7 +491,7 @@ fn lowerEvalAndFinishRoots(
         finalizationInvariant("compile-time finalization request/root-id batch length mismatch");
     }
 
-    if (comptime !compilerHostMustUseInterpreterForCtfe()) {
+    if (!compilerHostMustUseInterpreterForCtfe()) {
         if (comptime !backend.host_lir_codegen_available) return error.UnsupportedPlatform;
         return lowerDevEvalAndFinishRoots(
             allocator,
@@ -519,6 +521,98 @@ fn lowerEvalAndFinishRoots(
     );
     defer lowered.deinit();
 
+    const materialized_static_data = static_data_exports.buildStaticData(
+        allocator,
+        .{
+            .root = checked.loweringViewWithRelations(module, relation_modules),
+            .imports = lowering_imports,
+        },
+        &lowered,
+        roc_target.RocTarget.detectNative(),
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedTarget => return error.UnsupportedPlatform,
+    };
+    defer static_data_exports.deinitStaticData(allocator, materialized_static_data);
+
+    var static_data_image = backend.StaticDataImage.init(allocator, materialized_static_data) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateStaticDataSymbol,
+        error.InvalidStaticDataAlignment,
+        error.InvalidStaticDataRelocation,
+        error.MissingStaticDataSymbol,
+        error.UnresolvedStaticFunction,
+        => finalizationInvariant("invalid interpreter static-data image during compile-time finalization"),
+    };
+    defer static_data_image.deinit();
+
+    const interpreter_static_data = static_data_image.lirValueAddresses(
+        allocator,
+        lowered.lir_result.static_data_values.items.len,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateStaticDataSymbol,
+        error.InvalidStaticDataAlignment,
+        error.InvalidStaticDataRelocation,
+        error.MissingStaticDataSymbol,
+        error.UnresolvedStaticFunction,
+        => finalizationInvariant("materialized interpreter static data omitted an LIR static-data symbol"),
+    };
+    defer allocator.free(interpreter_static_data);
+
+    var static_erased_callable_count: usize = 0;
+    for (materialized_static_data) |static_export| {
+        for (static_export.relocations) |relocation| {
+            if (relocation.callable_capture_offset != null) static_erased_callable_count += 1;
+        }
+    }
+    const static_erased_callables = try allocator.alloc(Interpreter.StaticErasedCallable, static_erased_callable_count);
+    defer allocator.free(static_erased_callables);
+    var static_erased_callable_index: usize = 0;
+    for (materialized_static_data) |static_export| {
+        const symbol_address = static_data_image.symbolAddress(static_export.symbol_name) orelse
+            finalizationInvariant("interpreter static-data image omitted a materialized export symbol");
+        const allocation_address = std.math.sub(usize, symbol_address, static_export.symbol_offset) catch
+            finalizationInvariant("interpreter static-data symbol offset exceeded its allocation address");
+        for (static_export.relocations) |relocation| {
+            const capture_offset = relocation.callable_capture_offset orelse continue;
+            if (relocation.kind != .function_pointer or relocation.rc_helper != null) {
+                finalizationInvariant("interpreter static callable relocation had inconsistent function metadata");
+            }
+            const callable_address = std.math.add(usize, allocation_address, @intCast(relocation.offset)) catch
+                finalizationInvariant("interpreter static callable address overflowed");
+            const capture_address = std.math.add(usize, callable_address, capture_offset) catch
+                finalizationInvariant("interpreter static callable capture address overflowed");
+            static_erased_callables[static_erased_callable_index] = .{
+                .capture_ptr = @ptrFromInt(capture_address),
+                .proc_id = relocation.procedure orelse
+                    finalizationInvariant("interpreter static callable relocation omitted its LIR procedure"),
+            };
+            static_erased_callable_index += 1;
+        }
+    }
+
+    const InterpreterStaticFunctionResolver = struct {
+        fn resolve(_: ?*anyopaque, relocation: backend.StaticDataRelocation) ?usize {
+            if (relocation.rc_helper != null) return Interpreter.staticErasedCallableOnDropAddress();
+            if (relocation.callable_capture_offset == null) return null;
+            _ = relocation.procedure orelse return null;
+            return Interpreter.staticErasedCallableTrampolineAddress();
+        }
+    };
+    static_data_image.resolveFunctionRelocations(.{
+        .resolve = InterpreterStaticFunctionResolver.resolve,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateStaticDataSymbol,
+        error.InvalidStaticDataAlignment,
+        error.InvalidStaticDataRelocation,
+        error.MissingStaticDataSymbol,
+        error.UnresolvedStaticFunction,
+        => finalizationInvariant("interpreter static data referenced an unresolved LIR procedure"),
+    };
+
     var host = CompilerHost.init(allocator);
     defer host.deinit();
 
@@ -529,6 +623,7 @@ fn lowerEvalAndFinishRoots(
         host.ops(),
     );
     defer interpreter.deinit();
+    interpreter.setStaticData(interpreter_static_data, static_erased_callables);
 
     var writer = ConstStoreWriter.Writer.init(allocator, module, &lowered.lir_result);
     defer writer.deinit();
@@ -902,6 +997,46 @@ fn lowerDevEvalAndFinishRoots(
     var static_strings = try backend.StaticStringData.build(allocator, &lowered.lir_result.store, backend.dev.LirCodeGenMod.host_lir_codegen_target);
     defer static_strings.deinit();
 
+    const materialized_static_data = static_data_exports.buildStaticData(
+        allocator,
+        .{
+            .root = checked.loweringViewWithRelations(module, relation_modules),
+            .imports = lowering_imports,
+        },
+        &lowered,
+        backend.dev.LirCodeGenMod.host_lir_codegen_target,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedTarget => return error.UnsupportedPlatform,
+    };
+    defer static_data_exports.deinitStaticData(allocator, materialized_static_data);
+
+    var static_data_image = backend.StaticDataImage.init(allocator, materialized_static_data) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateStaticDataSymbol,
+        error.InvalidStaticDataAlignment,
+        error.InvalidStaticDataRelocation,
+        error.MissingStaticDataSymbol,
+        error.UnresolvedStaticFunction,
+        => finalizationInvariant("invalid native static-data image during compile-time finalization"),
+    };
+    defer static_data_image.deinit();
+
+    const native_static_data = static_data_image.lirValueAddresses(
+        allocator,
+        lowered.lir_result.static_data_values.items.len,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateStaticDataSymbol,
+        error.InvalidStaticDataAlignment,
+        error.InvalidStaticDataRelocation,
+        error.MissingStaticDataSymbol,
+        error.UnresolvedStaticFunction,
+        => finalizationInvariant("materialized compile-time static data omitted an LIR static-data symbol"),
+    };
+    defer allocator.free(native_static_data);
+
     var codegen = try backend.HostLirCodeGen.init(
         allocator,
         &lowered.lir_result.store,
@@ -909,6 +1044,7 @@ fn lowerDevEvalAndFinishRoots(
         static_strings.entries,
     );
     defer codegen.deinit();
+    codegen.setNativeStaticData(native_static_data);
     codegen.setComptimeHooks(.{
         .branch_taken = CompileTimeHost.rocComptimeBranchTaken,
         .exhaustiveness_failed = CompileTimeHost.rocComptimeExhaustivenessFailed,
@@ -917,6 +1053,9 @@ fn lowerDevEvalAndFinishRoots(
         .call_exit = CompileTimeHost.rocComptimeCallExit,
     });
     try codegen.compileAllProcSpecs(lowered.lir_result.store.getProcSpecs());
+    const static_rc_helpers = try static_data_exports.collectRequiredRcHelpers(allocator, materialized_static_data);
+    defer allocator.free(static_rc_helpers);
+    try codegen.compileStaticDataRcHelpers(static_rc_helpers);
 
     var host_allocator_impl = ThreadSafeAllocator.init(allocator);
     const host_allocator = host_allocator_impl.allocator();
@@ -979,6 +1118,39 @@ fn lowerDevEvalAndFinishRoots(
         codegen.getUnwindFunctions(),
     );
     defer executable.deinit();
+
+    const StaticFunctionResolver = struct {
+        codegen: *const backend.HostLirCodeGen,
+        executable: *const backend.ExecutableMemory,
+
+        fn resolve(raw: ?*anyopaque, relocation: backend.StaticDataRelocation) ?usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (relocation.rc_helper) |helper| {
+                const offset = self.codegen.compiledStaticDataRcHelperOffset(helper) orelse return null;
+                return @intFromPtr(self.executable.codePtr() + offset);
+            }
+            if (relocation.callable_capture_offset == null) return null;
+            const proc_id = relocation.procedure orelse return null;
+            const compiled = self.codegen.compiledProcSymbol(proc_id) orelse return null;
+            return @intFromPtr(self.executable.codePtr() + compiled.code_start);
+        }
+    };
+    var static_function_resolver = StaticFunctionResolver{
+        .codegen = &codegen,
+        .executable = &executable,
+    };
+    static_data_image.resolveFunctionRelocations(.{
+        .context = @ptrCast(&static_function_resolver),
+        .resolve = StaticFunctionResolver.resolve,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateStaticDataSymbol,
+        error.InvalidStaticDataAlignment,
+        error.InvalidStaticDataRelocation,
+        error.MissingStaticDataSymbol,
+        error.UnresolvedStaticFunction,
+        => finalizationInvariant("compile-time static data referenced an unresolved generated function"),
+    };
 
     var progress = DevProgressReporter.init(options, jobs[0..jobs_len]);
     defer progress.deinit();

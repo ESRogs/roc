@@ -51,7 +51,9 @@ pub const Constants = struct {
     /// 25: Canonical node storage records where-clause rigid ownership.
     /// 26: ModuleEnv scheme instantiation evidence was renamed to scheme-use evidence.
     /// 27: Field access canonicalization no longer contains method or qualified-dispatch fallbacks.
-    pub const CACHE_VERSION = 28;
+    /// 28: String interpolation constraint metadata moved into the type store.
+    /// 30: Checked interpolation nodes retain their explicit dispatcher type variable.
+    pub const CACHE_VERSION = 30;
 };
 
 /// Configuration for the Roc cache system.

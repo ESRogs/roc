@@ -886,6 +886,43 @@ test "issue 10153 nested loops do not multiply SpecConstr callable functions" {
     try std.testing.expect(nested_loop.lifted.exprCount() <= single_loop.lifted.exprCount() * 2);
 }
 
+test "issue 10165 higher-order decoder widens propagated error row" {
+    const allocator = std.testing.allocator;
+    // Repro for https://github.com/roc-lang/roc/issues/10165. A decoder that
+    // propagates a leaf error with `?` may add its own error tag, and the
+    // resulting higher-order callable must lower with that wider error row.
+    const source =
+        \\Stmt : {}
+        \\
+        \\str_dec : Str -> (List(Str) -> (Stmt -> Try(Str, [NoSuchField(Str), ..])))
+        \\str_dec = |_name| |_cols| |_stmt| Ok("todo")
+        \\
+        \\main : {} -> Try({}, _)
+        \\main = |_args| {
+        \\    dec = decode_row(["status"])
+        \\    row = dec({})?
+        \\    _ = row
+        \\    Ok({})
+        \\}
+        \\
+        \\decode_row = |cols|
+        \\    |stmt| {
+        \\        status_str = str_dec("status")(cols)(stmt)?
+        \\        match status_str {
+        \\            "todo" => Ok(Todo)
+        \\            _ => Err(ParseError("unknown status"))
+        \\        }
+        \\    }
+    ;
+
+    var lowered = try lowerModule(allocator, source, .none);
+    defer lowered.deinit(allocator);
+
+    var run = try runLoweredWithHostEvents(allocator, &lowered.lowered);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(eval.RuntimeHostEnv.Termination.returned, run.termination);
+}
+
 fn expectInlinePlanDecision(
     source: []const u8,
     fn_name: []const u8,
@@ -5387,6 +5424,30 @@ test "bare list iter collect carries scalar list state in the loop" {
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "box_box_count"));
 }
 
+test "issue 10181 explicit Str interpolation suffix checks cleanly" {
+    // Repro for https://github.com/roc-lang/roc/issues/10181
+    const allocator = std.testing.allocator;
+    const source =
+        \\main! = |_| {
+        \\    x = "world"
+        \\    y = "hello ${x}".Str
+        \\    Ok({})
+        \\}
+    ;
+
+    const resources = try helpers.parseAndCanonicalizeProgramPublishedRootsWithBuiltin(
+        allocator,
+        .module,
+        source,
+        &.{},
+        try sharedPrePublishedBuiltin(),
+        null,
+    );
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    try std.testing.expectEqual(@as(usize, 0), resources.checker.problems.problems.items.len);
+}
+
 const dispatch_boundary_source =
     \\Thing := [Val(Str)].{
     \\    to_str : Thing -> Str
@@ -5403,6 +5464,41 @@ test "dispatch evidence boundary validator accepts a published artifact" {
     defer helpers.cleanupParseAndCanonical(allocator, resources);
 
     try std.testing.expect(resources.checked_artifact.validateDispatchEvidence() == null);
+}
+
+test "dispatch evidence boundary validator rejects non-normalized and malformed paths" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\helper : a -> Str where [a.to_str : a -> Str]
+        \\helper = |_x| "ok"
+        \\
+        \\main : Str
+        \\main = helper("hi")
+    ;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    const paths = resources.checked_artifact.checked_procedure_templates.evidence_param_paths;
+    try std.testing.expect(paths.len > 0);
+
+    // Raw discriminant 8 is the retired checked-store `record_ext` step.
+    paths[0].kind = 8;
+    var failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.evidence_param_path_invalid_kind, failure.kind);
+
+    // A tag label must be immediately paired with a payload-index step.
+    paths[0].kind = 9;
+    failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.evidence_param_path_invalid_shape, failure.kind);
+
+    // A well-formed selector must still resolve over the checked callable.
+    paths[0].kind = 0;
+    paths[0].data = std.math.maxInt(u32);
+    failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.evidence_param_path_diverges_from_checked_type, failure.kind);
 }
 
 test "dispatch evidence boundary validator reports a removed dispatch plan by expression" {
@@ -5532,4 +5628,29 @@ test "compiler-generated dispatch classes lower via checked evidence" {
     const output = try helpers.lirInterpreterInspectedStr(allocator, &compiled.lowered);
     defer allocator.free(output);
     try std.testing.expectEqualStrings("True", output);
+}
+
+// Repro for https://github.com/roc-lang/roc/issues/10253: the recursive call
+// must carry the current position, 1, into the next iteration's `prev_len`.
+test "issue 10253 optimized tail recursion preserves the previous scalar argument" {
+    try expectOptimizedDbgEvents(
+        \\go : U64, List(U64), U64, Bool -> U64
+        \\go = |pos, heads, prev_len, _pending| {
+        \\    heads2 = heads.set(0, 7) ?? []
+        \\    cur = if pos != 0 { pos } else { 0 }
+        \\    if prev_len != 0 {
+        \\        prev_len
+        \\    } else {
+        \\        go(pos + 1, heads2, cur, Bool.False)
+        \\    }
+        \\}
+        \\
+        \\main : U64 -> {}
+        \\main = |zero| {
+        \\    dbg go(zero + 1, [], 0, Bool.False)
+        \\    {}
+        \\}
+    ,
+        &.{"1"},
+    );
 }
