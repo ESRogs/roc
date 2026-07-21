@@ -412,6 +412,7 @@ const CustomCase = enum {
     bundle_complex_package,
     install_run_roundtrip,
     install_hash_mismatch,
+    install_glue_roundtrip,
     glue_debug,
     glue_debug_dev,
     glue_dylib_cache_hit,
@@ -1197,6 +1198,7 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc run rejects --watch for installed shorthands", .body = .{ .command = .{ .args = &.{ "run", "sometool", "--watch" }, .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "--watch is not supported for installed shorthands" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc install/run roundtrip over loopback HTTP", .body = .{ .custom = .install_run_roundtrip } },
     .{ .id = 0, .suite = .subcommands, .name = "roc install rejects a hash mismatch and leaves no entry", .body = .{ .custom = .install_hash_mismatch } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc install/glue roundtrip for a glue spec dylib", .body = .{ .custom = .install_glue_roundtrip } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test runs pure expects for a wasm-only platform (issue 9668)", .body = .{ .command = .{ .args = &.{ "test", "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue_9668_wasm_only_platform.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (1) tests passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "shared libraries" }, .{ .stream = .stderr, .text = ".so/.dylib/.dll" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc explains wasm-only Shared output as a wasm module (issue 9668)", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9668_wasm_only_platform.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "targets wasm32" }, .{ .stream = .stderr, .text = ".wasm module" }, .{ .stream = .stderr, .text = "roc build" }, .{ .stream = .stderr, .text = "wasm artifact" } }, .not_contains = &.{.{ .stream = .stderr, .text = ".so/.dylib/.dll" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc --opt=dev rejects non executable targets", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--target=wasm32" }, .roc_file = "test/wasm/app.roc", .exit = .failure, .contains_any = &.{.{ .needles = &.{ .{ .stream = .stderr, .text = "only produces static libraries" }, .{ .stream = .stderr, .text = "TARGET NOT SUPPORTED" }, .{ .stream = .stderr, .text = "unsupported target" } } }} } } },
@@ -2232,6 +2234,7 @@ fn runCustomCase(
         .bundle_complex_package => customBundleComplexPackage(io, allocator, &env, &timer, timeout_ms),
         .install_run_roundtrip => customInstallRunRoundtrip(io, allocator, &env, &timer, timeout_ms),
         .install_hash_mismatch => customInstallHashMismatch(io, allocator, &env, &timer, timeout_ms),
+        .install_glue_roundtrip => customInstallGlueRoundtrip(io, allocator, &env, &timer, timeout_ms),
         .glue_debug => customGlueDebug(io, allocator, &env, &timer, timeout_ms),
         .glue_debug_dev => customGlueDebugDev(io, allocator, &env, &timer, timeout_ms),
         .glue_dylib_cache_hit => customGlueDylibCacheHit(io, allocator, &env, &timer, timeout_ms),
@@ -6452,6 +6455,104 @@ fn customInstallRunRoundtrip(io: std.Io, allocator: Allocator, env: *const CaseE
         .args = &.{ "run", "hello_tool", "--opt=speed" },
         .exit = .failure,
         .contains = &.{.{ .stream = .stderr, .text = "--opt has no effect" }},
+    })) |failure| return failure;
+
+    return null;
+}
+
+fn customInstallGlueRoundtrip(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    // A glue spec on the compiler-owned glue platform, bundled from its own
+    // directory. The bundle carries only the spec: the platform is embedded
+    // in every compiler.
+    const spec_dir = createWorkSubdir(io, allocator, env, "glue-spec") catch |err|
+        return customInfraFailure(allocator, timer, "failed to create spec dir: {}", .{err});
+    const spec_main = std.fs.path.join(allocator, &.{ spec_dir, "main.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate spec path: {}", .{err});
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = spec_main, .data = "app [make_glue] { pf: platform glue }\n\nimport pf.Types exposing [Types]\nimport pf.File exposing [File]\n\nmake_glue : List(Types) -> Try(List(File), Str)\nmake_glue = |_types| Ok([File.{ name: \"generated.txt\", content: \"installed glue ran\" }])\n" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to write glue spec: {}", .{err});
+
+    const serve_dir = createWorkSubdir(io, allocator, env, "glue-serve") catch |err|
+        return customInfraFailure(allocator, timer, "failed to create serve dir: {}", .{err});
+
+    const roc_abs = if (std.fs.path.isAbsolute(roc_binary_path))
+        roc_binary_path
+    else
+        std.fs.path.join(allocator, &.{ project_root_path, roc_binary_path }) catch |err|
+            return customInfraFailure(allocator, timer, "failed to allocate roc path: {}", .{err});
+
+    const bundle_timeout = childCommandTimeoutMs(timer, timeout_ms) orelse
+        return timeoutFailure(allocator, timer, .run, "case timeout exhausted before bundling");
+    const bundle_result = runRawInEnv(io, allocator, env, &.{ roc_abs, "bundle", "--output-dir", serve_dir, "main.roc" }, spec_dir, null, bundle_timeout) catch |err|
+        return customInfraFailure(allocator, timer, "bundle spawn error: {}", .{err});
+    if (exitCode(bundle_result.term) != 0) {
+        return failureFromRun(allocator, timer, bundle_result, "roc bundle of glue spec failed");
+    }
+    const created_prefix = "Created: ";
+    const created_idx = std.mem.find(u8, bundle_result.stdout, created_prefix) orelse
+        return failureFromRun(allocator, timer, bundle_result, "roc bundle did not report a created file");
+    const created_rest = bundle_result.stdout[created_idx + created_prefix.len ..];
+    const created_eol = std.mem.find(u8, created_rest, "\n") orelse created_rest.len;
+    const bundle_path = std.mem.trim(u8, created_rest[0..created_eol], " \r");
+    const bundle_filename = std.fs.path.basename(bundle_path);
+
+    const bundle_bytes = std.Io.Dir.cwd().readFileAlloc(io, bundle_path, allocator, .unlimited) catch |err|
+        return customInfraFailure(allocator, timer, "failed to read bundle {s}: {}", .{ bundle_path, err });
+
+    const loopback = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch |err|
+        return customInfraFailure(allocator, timer, "failed to parse loopback address: {}", .{err});
+    var server = loopback.listen(io, .{ .reuse_address = true }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to listen on loopback: {}", .{err});
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    var server_ctx = InstallBundleServer{
+        .server = &server,
+        .bundle_data = bundle_bytes,
+        .io = io,
+    };
+    const server_thread = std.Thread.spawn(.{}, InstallBundleServer.run, .{&server_ctx}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to spawn server thread: {}", .{err});
+
+    const url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/{s}", .{ port, bundle_filename }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate url: {}", .{err});
+
+    // 1. Install: detects the glue spec and builds the plugin dylib with
+    //    --opt=speed (the only download in this test).
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "install", "glue_tool", url },
+        .contains = &.{ .{ .stream = .stdout, .text = "glue plugin" }, .{ .stream = .stdout, .text = "Installed glue_tool" }, .{ .stream = .stdout, .text = "roc glue glue_tool" } },
+    })) |failure| {
+        pokeInstallBundleServer(io, port);
+        server_thread.join();
+        return failure;
+    }
+    server_thread.join();
+
+    // 2. Use the installed shorthand against a real platform.
+    const glue_out = createWorkSubdir(io, allocator, env, "glue-out") catch |err|
+        return customInfraFailure(allocator, timer, "failed to create glue out dir: {}", .{err});
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "glue", "glue_tool", glue_out, "test/fx/platform/main.roc" },
+        .contains = &.{.{ .stream = .stdout, .text = "generated.txt" }},
+    })) |failure| return failure;
+
+    // 3. Desert island: delete the cache; the installed spec source and
+    //    prebuilt dylib must still work (the glue platform is embedded, and
+    //    the server is gone).
+    std.Io.Dir.cwd().deleteTree(io, env.dirs.roc_cache_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to delete cache dir: {}", .{err});
+    const glue_out2 = createWorkSubdir(io, allocator, env, "glue-out2") catch |err|
+        return customInfraFailure(allocator, timer, "failed to create glue out dir: {}", .{err});
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "glue", "glue_tool", glue_out2, "test/fx/platform/main.roc" },
+        .contains = &.{.{ .stream = .stdout, .text = "generated.txt" }},
+    })) |failure| return failure;
+
+    // 4. Kind mismatch is a specific error, not a fallback.
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "run", "glue_tool" },
+        .exit = .failure,
+        .contains = &.{.{ .stream = .stderr, .text = "installed as a glue spec" }},
     })) |failure| return failure;
 
     return null;

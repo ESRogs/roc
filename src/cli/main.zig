@@ -1228,7 +1228,12 @@ fn mainArgs(gpa: Allocator, arena: Allocator, args: []const []const u8, std_io: 
         .fmt => |format_args| rocFormat(&ctx, format_args),
         .test_cmd => |test_args| try rocTest(&ctx, test_args, args[0]),
         .repl => |repl_args| rocRepl(&ctx, repl_args),
-        .glue => |glue_args| try rocGlue(&ctx, glue_args),
+        .glue => |glue_args| rocGlue(&ctx, glue_args) catch |err| switch (err) {
+            error.CliError => {
+                // Problems already recorded in context, render them below
+            },
+            else => return err,
+        },
         .version => ctx.io.stdout().print("Roc compiler version {s}\n", .{build_options.compiler_version}),
         .docs => |docs_args| rocDocs(&ctx, docs_args),
         .bump => |bump_args| rocBump(&ctx, bump_args) catch |err| switch (err) {
@@ -2319,8 +2324,15 @@ fn rocRunInstalled(ctx: *CliCtx, args: cli_args.RunArgs) CliMainError!void {
     }
 
     const entry = try resolveInstalledEntry(ctx, name);
-    const term = try runCompiledExecutable(ctx, entry.paths.exe_path, args.app_args);
-    try finishCompiledRun(ctx, entry.paths.exe_path, term, 0);
+    if (entry.kind != .executable) {
+        try ctx.io.stderr().print(
+            "Error: `{s}` is installed as a glue spec, not an application. Use it with: roc glue {s} <output-dir> <platform>\n",
+            .{ name, name },
+        );
+        return error.InvalidArguments;
+    }
+    const term = try runCompiledExecutable(ctx, entry.artifact_path, args.app_args);
+    try finishCompiledRun(ctx, entry.artifact_path, term, 0);
 }
 
 const install_manifest_size_limit = 64 * 1024;
@@ -2363,10 +2375,13 @@ fn resolveSourceArg(ctx: *CliCtx, path: []const u8, watch: bool) SourceRefResolv
     }
 }
 
-/// A validated install entry: its paths plus the bundle URL recorded in its
-/// manifest (the entry's compiler-level identity).
+/// A validated install entry: its paths, the kind of artifact it carries,
+/// and the bundle URL recorded in its manifest (the entry's compiler-level
+/// identity).
 const ResolvedInstalledEntry = struct {
     paths: install_store.EntryPaths,
+    kind: install_store.InstallKind,
+    artifact_path: []const u8,
     url: []const u8,
 };
 
@@ -2421,16 +2436,19 @@ fn resolveInstalledEntry(ctx: *CliCtx, name: []const u8) (CliError || Allocator.
         } });
     };
     const manifest_url = try ctx.arena.dupe(u8, parsed.manifest().url);
+    // parseManifest already validated the kind string.
+    const kind = install_store.manifestKind(parsed.manifest()).?;
 
-    std.Io.Dir.cwd().access(ctx.io.std_io, entry.exe_path, .{}) catch {
+    const artifact_path = entry.artifactPath(kind);
+    std.Io.Dir.cwd().access(ctx.io.std_io, artifact_path, .{}) catch {
         return ctx.fail(.{ .install_entry_corrupt = .{
             .name = name,
             .path = entry.entry_dir,
-            .reason = "its built executable is missing",
+            .reason = "its built artifact is missing",
         } });
     };
 
-    return .{ .paths = entry, .url = manifest_url };
+    return .{ .paths = entry, .kind = kind, .artifact_path = artifact_path, .url = manifest_url };
 }
 
 fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8) CliMainError!void {
@@ -6397,19 +6415,24 @@ fn rocInstall(ctx: *CliCtx, args: cli_args.InstallArgs, arg0: []const u8) CliMai
         if (std.mem.eql(u8, parsed.manifest().url, args.url)) {
             // Same name + same URL: an intact entry makes this a no-op, and a
             // damaged one is safe to repair since the URL matches.
-            const exe_intact = intact: {
-                std.Io.Dir.cwd().access(ctx.io.std_io, entry.exe_path, .{}) catch break :intact false;
+            // parseManifest already validated the kind string.
+            const existing_kind = install_store.manifestKind(parsed.manifest()).?;
+            const artifact_intact = intact: {
+                std.Io.Dir.cwd().access(ctx.io.std_io, entry.artifactPath(existing_kind), .{}) catch break :intact false;
                 break :intact true;
             };
-            if (exe_intact) {
-                try ctx.io.stdout().print("`{s}` is already installed. Run it with: roc run {s}\n", .{ args.shorthand, args.shorthand });
+            if (artifact_intact) {
+                switch (existing_kind) {
+                    .executable => try ctx.io.stdout().print("`{s}` is already installed. Run it with: roc run {s}\n", .{ args.shorthand, args.shorthand }),
+                    .glue => try ctx.io.stdout().print("`{s}` is already installed. Use it with: roc glue {s} <output-dir> <platform>\n", .{ args.shorthand, args.shorthand }),
+                }
                 return;
             }
             std.Io.Dir.cwd().deleteTree(ctx.io.std_io, entry.entry_dir) catch {
                 return ctx.fail(.{ .install_entry_corrupt = .{
                     .name = args.shorthand,
                     .path = entry.entry_dir,
-                    .reason = "its built executable is missing, and the damaged entry could not be removed for repair",
+                    .reason = "its built artifact is missing, and the damaged entry could not be removed for repair",
                 } });
             };
         } else {
@@ -6467,37 +6490,63 @@ fn rocInstall(ctx: *CliCtx, args: cli_args.InstallArgs, arg0: []const u8) CliMai
         } });
     };
 
-    try ctx.io.stdout().print("Building {s} with --opt=speed ...\n", .{args.shorthand});
-    ctx.io.flush();
+    // An app on a compiler-owned plugin platform (a glue spec) builds to a
+    // plugin dylib; every other bundle goes through the executable pipeline,
+    // which owns the diagnostics for non-app headers. Header-parse failures
+    // are classified as executable for the same reason: that pipeline
+    // reports them properly.
+    const install_kind: install_store.InstallKind = kind: {
+        const header = compile.app_header.parseAppHeader(ctx.coreCtx(), ctx.gpa, ctx.arena, staging.main_roc_path) catch break :kind .executable;
+        break :kind switch (header.platform_ref) {
+            .compiler_owned => |plugin_platform| switch (plugin_platform) {
+                .glue => .glue,
+            },
+            else => .executable,
+        };
+    };
 
-    var warning_count: usize = 0;
-    try rocBuild(ctx, .{
-        .path = staging.main_roc_path,
-        .opt = .speed,
-        .target = null,
-        .output = staging.exe_path,
-        .debug = false,
-        .allow_errors = false,
-        .verbose = false,
-        .no_cache = false,
-        .max_threads = args.max_threads,
-        .wasm_memory = null,
-        .wasm_stack_size = null,
-        .exit_on_warnings = false,
-        .warning_count_out = &warning_count,
-        .require_executable_output = true,
-        .require_host_runnable_output = true,
-        .suppress_build_status = true,
-        .resolve_limits = args.resolve_limits,
-        .synthetic_default_platform = false,
-        .source_dir_override = null,
-        .root_source_url = args.url,
-    }, arg0);
+    switch (install_kind) {
+        .executable => {
+            try ctx.io.stdout().print("Building {s} with --opt=speed ...\n", .{args.shorthand});
+            ctx.io.flush();
+
+            var warning_count: usize = 0;
+            try rocBuild(ctx, .{
+                .path = staging.main_roc_path,
+                .opt = .speed,
+                .target = null,
+                .output = staging.exe_path,
+                .debug = false,
+                .allow_errors = false,
+                .verbose = false,
+                .no_cache = false,
+                .max_threads = args.max_threads,
+                .wasm_memory = null,
+                .wasm_stack_size = null,
+                .exit_on_warnings = false,
+                .warning_count_out = &warning_count,
+                .require_executable_output = true,
+                .require_host_runnable_output = true,
+                .suppress_build_status = true,
+                .resolve_limits = args.resolve_limits,
+                .synthetic_default_platform = false,
+                .source_dir_override = null,
+                .root_source_url = args.url,
+            }, arg0);
+        },
+        .glue => {
+            try ctx.io.stdout().print("Building {s} glue plugin with --opt=speed ...\n", .{args.shorthand});
+            ctx.io.flush();
+
+            try glue.buildGlueSpecDylibFile(ctx.gpa, ctx.io.stderr(), staging.main_roc_path, staging.glue_dylib_path, .speed, ctx.io.std_io);
+        },
+    }
 
     // The manifest is written last, so a staged entry is complete by the time
     // it can be published.
     const manifest_json = try install_store.manifestToJson(ctx.arena, .{
         .format_version = install_store.manifest_format_version,
+        .kind = @tagName(install_kind),
         .url = args.url,
         .hash = parsed_url.hash,
         .compiler_version = build_options.compiler_version,
@@ -6526,7 +6575,10 @@ fn rocInstall(ctx: *CliCtx, args: cli_args.InstallArgs, arg0: []const u8) CliMai
         }
     };
 
-    try ctx.io.stdout().print("Installed {s}. Run it with: roc run {s}\n", .{ args.shorthand, args.shorthand });
+    switch (install_kind) {
+        .executable => try ctx.io.stdout().print("Installed {s}. Run it with: roc run {s}\n", .{ args.shorthand, args.shorthand }),
+        .glue => try ctx.io.stdout().print("Installed {s}. Use it with: roc glue {s} <output-dir> <platform>\n", .{ args.shorthand, args.shorthand }),
+    }
 }
 
 /// Resolve a URL platform specification by downloading and caching the bundle.
@@ -13543,23 +13595,61 @@ fn envVarEquals(allocator: Allocator, name: []const u8, expected: []const u8) Al
 
 const glue = @import("glue");
 
-fn rocGlue(ctx: *CliCtx, args: cli_args.GlueArgs) glue.GlueError!void {
+const RocGlueError = glue.GlueError || CliError || SourceRefResolveError || error{InvalidArguments};
+
+fn rocGlue(ctx: *CliCtx, args: cli_args.GlueArgs) RocGlueError!void {
+    // The glue spec accepts a local path, a bundle URL, or an installed
+    // shorthand. An installed glue entry also carries the plugin dylib that
+    // was built with --opt=speed at install time, so it is loaded directly
+    // instead of compiling a dylib on the fly.
+    var glue_spec = args.glue_spec;
+    var installed_dylib_path: ?[]const u8 = null;
+    switch (install_store.classifySourceRef(args.glue_spec)) {
+        .local_path => {},
+        .url => glue_spec = (try resolveUrlBundle(ctx, args.glue_spec)).source_path,
+        .shorthand => {
+            const entry = try resolveInstalledEntry(ctx, args.glue_spec);
+            if (entry.kind != .glue) {
+                try ctx.io.stderr().print(
+                    "Error: `{s}` is installed as an application, not a glue spec. Run it with: roc run {s}\n",
+                    .{ args.glue_spec, args.glue_spec },
+                );
+                return error.InvalidArguments;
+            }
+            glue_spec = entry.paths.main_roc_path;
+            installed_dylib_path = entry.artifact_path;
+        },
+    }
+    const platform_path = (try resolveSourceArg(ctx, args.platform_path, false)).path;
+
     const temp_dir = createUniqueTempDir(ctx) catch {
         return error.TempDirCreation;
     };
     defer std.Io.Dir.cwd().deleteTree(ctx.io.std_io, temp_dir) catch {};
     return glue.rocGlue(ctx.gpa, ctx.io.stderr(), ctx.io.stdout(), .{
-        .glue_spec = args.glue_spec,
+        .glue_spec = glue_spec,
         .output_dir = args.output_dir,
-        .platform_path = args.platform_path,
+        .platform_path = platform_path,
         .no_cache = args.no_cache,
+        .installed_dylib_path = installed_dylib_path,
         .opt = switch (args.opt) {
             .dev => .dev,
             .size => .size,
             .speed => .speed,
             .interpreter => unreachable,
         },
-    }, temp_dir, ctx.io.std_io);
+    }, ctx.coreCtx(), temp_dir, ctx.io.std_io) catch |err| {
+        switch (err) {
+            error.GlueDylibStampMismatch, error.GlueDylibUnavailable => if (installed_dylib_path != null) {
+                try ctx.io.stderr().print(
+                    "The installed glue plugin for `{s}` cannot be used by this compiler. Reinstall it with: roc install {s} <URL>\n",
+                    .{ args.glue_spec, args.glue_spec },
+                );
+            },
+            else => {},
+        }
+        return err;
+    };
 }
 
 /// Reads, parses, formats, and overwrites all Roc files at the given paths.

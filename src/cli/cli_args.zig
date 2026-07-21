@@ -322,7 +322,7 @@ const main_help =
     \\
     \\Commands:
     \\  run              Run a .roc file, a bundle URL, or an installed shorthand
-    \\  install          Install a Roc app from a bundle URL under a shorthand name
+    \\  install          Install a Roc app or glue spec from a bundle URL under a shorthand name
     \\  build            Build a binary from the given .roc file, but don't run it
     \\  bundle           Bundle .roc files into a compressed archive
     \\  unbundle         Extract files from compressed .tar.zst archives
@@ -368,14 +368,16 @@ const run_help =
 ;
 
 const install_help =
-    \\Install a Roc app from a bundle URL under a shorthand name
+    \\Install a Roc app or glue spec from a bundle URL under a shorthand name
     \\
     \\Usage: roc install [OPTIONS] <SHORTHAND> <URL>
     \\
     \\Downloads the bundle, verifies its content hash, and builds it with
-    \\--opt=speed so that `roc run <SHORTHAND>` executes an optimized binary
-    \\with no compile step. Installations persist outside the cache and are
-    \\scoped to the compiler version that installed them.
+    \\--opt=speed. An app becomes an optimized binary that `roc run
+    \\<SHORTHAND>` executes with no compile step; a glue spec becomes an
+    \\optimized plugin dylib that `roc glue <SHORTHAND> ...` loads directly.
+    \\Installations persist outside the cache and are scoped to the compiler
+    \\version that installed them.
     \\
     \\Arguments:
     \\  <SHORTHAND>  A name of your choice: a lowercase letter followed by

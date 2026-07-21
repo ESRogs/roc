@@ -38,6 +38,11 @@ pub fn identity(platform: CompilerOwnedPlatform) []const u8 {
     };
 }
 
+pub fn fromIdentity(text: []const u8) ?CompilerOwnedPlatform {
+    if (std.mem.eql(u8, text, identity(.glue))) return .glue;
+    return null;
+}
+
 pub fn groupKey(platform: CompilerOwnedPlatform) []const u8 {
     return switch (platform) {
         .glue => "c@roc:compiler/platform/glue",

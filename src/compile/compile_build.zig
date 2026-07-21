@@ -50,6 +50,7 @@ const ImportResolver = compile_package.ImportResolver;
 const ScheduleHook = compile_package.ScheduleHook;
 const CacheManager = @import("cache_manager.zig").CacheManager;
 const package_source = @import("package_source.zig");
+const compiler_platforms = @import("compiler_platforms.zig");
 const package_resolution = @import("package_resolution.zig");
 const package_identity = @import("package_identity.zig");
 const watch_inputs = @import("watch_inputs.zig");
@@ -2845,6 +2846,10 @@ pub const BuildEnv = struct {
     /// cache-directory check also excludes path dependencies that live
     /// inside an extracted bundle.
     pub fn isBundleableModule(self: *BuildEnv, pkg_name: []const u8, module_path: []const u8) bool {
+        // Compiler-owned platforms are embedded in every compiler; their
+        // materialized sources live outside the bundle root and must never
+        // be bundled.
+        if (compiler_platforms.fromIdentity(pkg_name) != null) return false;
         if (self.packages.getPtr(pkg_name)) |pkg| {
             if (pkg.url != null) return false;
         }
