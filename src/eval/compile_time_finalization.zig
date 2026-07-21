@@ -585,7 +585,7 @@ fn lowerEvalAndFinishRoots(
                 finalizationInvariant("interpreter static callable capture address overflowed");
             static_erased_callables[static_erased_callable_index] = .{
                 .capture_ptr = @ptrFromInt(capture_address),
-                .proc_id = procIdForStaticFunctionSymbol(&lowered.lir_result.store, relocation.target_symbol_name) orelse
+                .proc_id = relocation.target_proc orelse
                     finalizationInvariant("interpreter static callable referenced an unknown LIR procedure"),
             };
             static_erased_callable_index += 1;
@@ -595,9 +595,9 @@ fn lowerEvalAndFinishRoots(
     const InterpreterStaticFunctionResolver = struct {
         store: *const lir.LirStore,
 
-        fn resolve(raw: ?*anyopaque, symbol_name: []const u8) ?usize {
+        fn resolve(raw: ?*anyopaque, proc_id: lir.LirProcSpecId) ?usize {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            _ = procIdForStaticFunctionSymbol(self.store, symbol_name) orelse return null;
+            if (@intFromEnum(proc_id) >= self.store.getProcSpecs().len) return null;
             return Interpreter.staticErasedCallableTrampolineAddress();
         }
     };
@@ -706,17 +706,6 @@ fn lowerEvalAndFinishRoots(
 fn compilerHostMustUseInterpreterForCtfe() bool {
     return builtin.target.os.tag == .freestanding or
         builtin.target.cpu.arch == .wasm32;
-}
-
-fn procIdForStaticFunctionSymbol(store: *const lir.LirStore, symbol_name: []const u8) ?lir.LIR.LirProcSpecId {
-    for (store.getProcSpecs(), 0..) |proc, index| {
-        var name_buf: [64]u8 = undefined;
-        const expected = std.fmt.bufPrint(&name_buf, "roc__proc_{x}", .{proc.name.raw()}) catch return null;
-        if (std.mem.eql(u8, expected, symbol_name)) {
-            return @enumFromInt(@as(u32, @intCast(index)));
-        }
-    }
-    return null;
 }
 
 const DevRootProgressState = enum(u8) {
@@ -1134,9 +1123,9 @@ fn lowerDevEvalAndFinishRoots(
         store: *const lir.LirStore,
         executable: *const backend.ExecutableMemory,
 
-        fn resolve(raw: ?*anyopaque, symbol_name: []const u8) ?usize {
+        fn resolve(raw: ?*anyopaque, proc_id: lir.LirProcSpecId) ?usize {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            const proc_id = procIdForStaticFunctionSymbol(self.store, symbol_name) orelse return null;
+            if (@intFromEnum(proc_id) >= self.store.getProcSpecs().len) return null;
             const compiled = self.codegen.compiledProcSymbol(proc_id) orelse return null;
             return @intFromPtr(self.executable.codePtr() + compiled.code_start);
         }

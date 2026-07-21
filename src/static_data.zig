@@ -54,6 +54,8 @@ pub const StaticDataRelocation = struct {
     addend: i64 = 0,
     /// Runtime meaning of the stored pointer.
     kind: Kind = .address,
+    /// Exact LIR procedure named by a function-pointer relocation.
+    target_proc: ?lir.LirProcSpecId = null,
     /// For an erased-callable function pointer, the byte distance from this
     /// pointer field to the callable's capture bytes.
     callable_capture_offset: ?u32 = null,
@@ -917,6 +919,7 @@ const StaticDataBuilder = struct {
             proc_symbol,
             0,
             .function_pointer,
+            entry.entry,
             builtins.erased_callable.capture_offset,
         );
         proc_symbol_owned = false;
@@ -1056,6 +1059,7 @@ const StaticDataBuilder = struct {
                 .target_symbol_name = relocation.target_symbol_name,
                 .addend = relocation.addend,
                 .kind = relocation.kind,
+                .target_proc = relocation.target_proc,
                 .callable_capture_offset = relocation.callable_capture_offset,
                 .owns_target_symbol_name = relocation.owns_target_symbol_name,
             };
@@ -1114,6 +1118,7 @@ const StaticDataBuilder = struct {
         target_symbol_name: []const u8,
         addend: i64,
         kind: StaticDataRelocation.Kind,
+        target_proc: ?lir.LirProcSpecId,
         callable_capture_offset: ?u32,
     ) Allocator.Error!void {
         self.writeTargetWord(bytes, offset, 0);
@@ -1122,6 +1127,7 @@ const StaticDataBuilder = struct {
             .target_symbol_name = target_symbol_name,
             .addend = addend,
             .kind = kind,
+            .target_proc = target_proc,
             .callable_capture_offset = callable_capture_offset,
             .owns_target_symbol_name = true,
         });
