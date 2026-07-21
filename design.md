@@ -3332,6 +3332,18 @@ over the concrete monomorphic callable at the consumption site, recursively:
 component owners consume the registry's explicit callable-or-structural result;
 ownerless shapes take the structural implementations.
 
+Evidence paths describe the normalized logical type, never checked-store row
+topology. Record and tag extension chains, including transparent aliases along
+those chains, are traversed by the evidence-param producer but are not emitted
+as path steps; a field or tag payload in any tail is addressed directly by its
+label from the logical row root. A static-dispatch requirement on an open-row
+remainder is pathless because closure erases that remainder as a standalone
+component; ordinary checked edges can still supply it, while a
+compiler-generated edge cannot synthesize it from the closed callable. The
+CheckedModule boundary validates both the path grammar and that every nonempty
+path resolves over its template's checked callable type before Monotype may
+consume it.
+
 Exact registry lookups — `(MethodOwner, MethodNameId)` — happen during
 checking, and during path synthesis for compiler-generated
 edges. The registry only ever answers exact lookups after the owner is known

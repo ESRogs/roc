@@ -20700,7 +20700,6 @@ const BodyContext = struct {
                     else => return null,
                 },
                 .tag_payload_index => return null, // only valid after tag_payload_tag
-                .record_ext, .tag_ext => return null, // rows are closed in mono
             }
         }
         return ty;

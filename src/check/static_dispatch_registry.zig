@@ -925,8 +925,9 @@ pub const EvidencePathStep = dispatch_evidence.PathStep;
 /// method name identifies the obligation, and `path` locates the dispatcher
 /// within the scheme's callable so compiler-generated call edges (which have
 /// no checked instantiation records) can resolve the obligation from the
-/// concrete monomorphic callable. An empty path means the dispatcher is only
-/// reachable through a constraint's fn type.
+/// concrete monomorphic callable. An empty path means the dispatcher has no
+/// component path over the normalized callable (it is reachable only through
+/// a constraint's fn type, or is an open-row remainder erased on closure).
 pub const EvidenceParamRecord = struct {
     method: canonical.MethodNameId,
     path: artifact_serialize.Span = .{},
