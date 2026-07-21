@@ -8,8 +8,11 @@ const eval_loader = @import("vendor_eval_loader");
 const Allocator = std.mem.Allocator;
 const native_runtime_libcalls = builtins.native_runtime_libcalls;
 
+/// Errors from opening or resolving symbols in a dynamic library.
 pub const Error = Allocator.Error || std.DynLib.Error || error{ InvalidUtf8, LlvmBackendUnavailable };
 
+/// Cross-platform dynamic library loader shared by optimized eval and
+/// the glue plugin pipeline.
 pub const DynLib = switch (builtin.target.os.tag) {
     .windows => struct {
         handle: std.os.windows.HMODULE,

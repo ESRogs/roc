@@ -12,12 +12,15 @@ const compiler_platform_sources = @import("compiler_platform_sources");
 
 const Allocator = std.mem.Allocator;
 
+/// The platforms whose sources the compiler embeds and owns.
 pub const CompilerOwnedPlatform = enum {
     glue,
 };
 
+/// Errors from materializing embedded platform sources to disk.
 pub const MaterializeError = Allocator.Error || CoreCtx.MakePathError || CoreCtx.WriteError || error{NoHomeDirectory};
 
+/// An embedded platform written out to the internal source directory.
 pub const MaterializedPlatform = struct {
     root_file: []const u8,
     root_dir: []const u8,
@@ -27,45 +30,54 @@ pub const MaterializedPlatform = struct {
 
 const EmbeddedFile = compiler_platform_sources.File;
 
+/// Look up a compiler-owned platform from its app-header ident (`glue`).
 pub fn fromHeaderIdent(text: []const u8) ?CompilerOwnedPlatform {
     if (std.mem.eql(u8, text, "glue")) return .glue;
     return null;
 }
 
+/// The platform's stable package identity, independent of any file path.
 pub fn identity(platform: CompilerOwnedPlatform) []const u8 {
     return switch (platform) {
         .glue => "roc:compiler/platform/glue",
     };
 }
 
+/// Look up a compiler-owned platform from its package identity string.
 pub fn fromIdentity(text: []const u8) ?CompilerOwnedPlatform {
     if (std.mem.eql(u8, text, identity(.glue))) return .glue;
     return null;
 }
 
+/// The resolver group key for the platform's dependency-graph node.
 pub fn groupKey(platform: CompilerOwnedPlatform) []const u8 {
     return switch (platform) {
         .glue => "c@roc:compiler/platform/glue",
     };
 }
 
+/// Look up a compiler-owned platform from its resolver group key.
 pub fn fromGroupKey(group: []const u8) ?CompilerOwnedPlatform {
     if (std.mem.eql(u8, group, groupKey(.glue))) return .glue;
     return null;
 }
 
+/// The header spec text an app writes to reference this platform.
 pub fn headerSpecText(platform: CompilerOwnedPlatform) []const u8 {
     return switch (platform) {
         .glue => "platform glue",
     };
 }
 
+/// The platform's embedded source files.
 pub fn files(platform: CompilerOwnedPlatform) []const EmbeddedFile {
     return switch (platform) {
         .glue => &compiler_platform_sources.glue_files,
     };
 }
 
+/// A BLAKE3 hash over the platform's embedded sources, for cache keys
+/// and plugin stamps.
 pub fn sourceHash(platform: CompilerOwnedPlatform) [32]u8 {
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(identity(platform));
@@ -81,6 +93,8 @@ pub fn sourceHash(platform: CompilerOwnedPlatform) [32]u8 {
     return digest;
 }
 
+/// Write the platform's embedded sources into the internal source
+/// directory so the package pipeline can consume them as files.
 pub fn materialize(
     allocator: Allocator,
     fs: CoreCtx,

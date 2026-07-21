@@ -32,6 +32,8 @@ pub const PackageEntry = struct {
     spec: []const u8,
 };
 
+/// The platform an `app` header references: none, a path/URL spec as
+/// written in source, or a compiler-owned platform ident such as `glue`.
 pub const PlatformRef = union(enum) {
     none,
     path_or_url: []const u8,
