@@ -6197,6 +6197,15 @@ fn appendStaticDispatchTypeRoots(
                     imports,
                     store,
                     active,
+                    interpolation.dispatcher_var orelse checkedArtifactInvariant("checked interpolation expression had no static dispatch dispatcher type", .{}),
+                );
+                _ = try appendCheckedTypeRoot(
+                    allocator,
+                    module,
+                    names,
+                    imports,
+                    store,
+                    active,
                     interpolation.constraint_fn_var orelse checkedArtifactInvariant("checked interpolation expression had no static dispatch constraint type", .{}),
                 );
                 _ = try appendCheckedTypeRoot(
