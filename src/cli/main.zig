@@ -13636,10 +13636,6 @@ fn rocGlue(ctx: *CliCtx, args: cli_args.GlueArgs) RocGlueError!void {
     }
     const platform_path = (try resolveSourceArg(ctx, args.platform_path, false)).path;
 
-    const temp_dir = createUniqueTempDir(ctx) catch {
-        return error.TempDirCreation;
-    };
-    defer std.Io.Dir.cwd().deleteTree(ctx.io.std_io, temp_dir) catch {};
     return glue.rocGlue(ctx.gpa, ctx.io.stderr(), ctx.io.stdout(), .{
         .glue_spec = glue_spec,
         .output_dir = args.output_dir,
@@ -13652,7 +13648,7 @@ fn rocGlue(ctx: *CliCtx, args: cli_args.GlueArgs) RocGlueError!void {
             .speed => .speed,
             .interpreter => unreachable,
         },
-    }, ctx.coreCtx(), temp_dir, ctx.io.std_io) catch |err| {
+    }, ctx.coreCtx(), ctx.io.std_io) catch |err| {
         switch (err) {
             error.GlueDylibStampMismatch, error.GlueDylibUnavailable => if (installed_dylib_path != null) {
                 try ctx.io.stderr().print(

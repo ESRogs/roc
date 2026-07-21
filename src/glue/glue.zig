@@ -92,8 +92,8 @@ pub const GlueError = error{
 
 /// Print platform glue information for a platform's main.roc file using the checked-artifact pipeline.
 /// Hosted function ordering comes from published `HostedProcTable` records.
-pub fn rocGlue(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, args: GlueArgs, roc_ctx: compile.CoreCtx, temp_dir: []const u8, std_io: std.Io) GlueError!void {
-    rocGlueInner(gpa, stderr, stdout, args, roc_ctx, temp_dir, std_io) catch |err| {
+pub fn rocGlue(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, args: GlueArgs, roc_ctx: compile.CoreCtx, std_io: std.Io) GlueError!void {
+    rocGlueInner(gpa, stderr, stdout, args, roc_ctx, std_io) catch |err| {
         (switch (err) {
             error.GlueSpecNotFound => stderr.print("Error: Glue spec file not found: '{s}'\n", .{args.glue_spec}),
             error.NotPlatformFile => blk: {
@@ -117,7 +117,7 @@ pub fn rocGlue(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, a
     };
 }
 
-fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, args: GlueArgs, roc_ctx: compile.CoreCtx, temp_dir: []const u8, std_io: std.Io) GlueError!void {
+fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, args: GlueArgs, roc_ctx: compile.CoreCtx, std_io: std.Io) GlueError!void {
 
     // 0. Validate glue spec file exists
     std.Io.Dir.cwd().access(std_io, args.glue_spec, .{}) catch {
@@ -324,7 +324,6 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
             root_artifact.key,
             args,
             roc_ctx,
-            temp_dir,
             std_io,
         ),
     }
@@ -588,10 +587,8 @@ fn runGlueSpecDylib(
     root_artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
     args: GlueArgs,
     roc_ctx: compile.CoreCtx,
-    temp_dir: []const u8,
     std_io: std.Io,
 ) GlueError!void {
-    _ = temp_dir;
     if (builtin.target.os.tag == .freestanding) return error.GlueDylibUnavailable;
 
     const stamp = gluePluginStamp(root_artifact_key);
