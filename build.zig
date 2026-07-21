@@ -3030,7 +3030,8 @@ pub fn build(b: *std.Build) void {
     llvm_codegen_module.addImport("roc_target", roc_modules.roc_target);
     llvm_codegen_module.addImport("vendor_llvm_ir", roc_modules.vendor_llvm_ir);
 
-    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true, if (enumerate_tests_for_wiring_check) run_test_wiring else null, valgrind_support) orelse return;
+    const main_exe_result = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, test_filters, true, valgrind_support) orelse return;
+    const roc_exe = main_exe_result.exe;
     roc_modules.addAll(roc_exe);
     _ = install_and_run(b, no_bin, roc_exe, build_roc_step, run_roc_step, run_args);
 
@@ -3090,7 +3091,7 @@ pub fn build(b: *std.Build) void {
             .target = release_target,
             .optimize = .ReleaseFast,
         });
-        const release_exe = addMainExe(
+        const release_exe_result = addMainExe(
             b,
             roc_modules,
             release_target,
@@ -3105,11 +3106,12 @@ pub fn build(b: *std.Build) void {
             write_compiled_builtins,
             llvm_codegen_module,
             null, // No tracy
+            test_filters,
             false,
-            null, // No machine-code shim test, so nothing to enumerate
             valgrind_support,
         );
-        if (release_exe) |exe| {
+        if (release_exe_result) |result| {
+            const exe = result.exe;
             roc_modules.addAll(exe);
             exe.root_module.addImport("compiled_builtins", compiled_builtins_module);
             exe.step.dependOn(&write_compiled_builtins.step);
@@ -4564,6 +4566,14 @@ pub fn build(b: *std.Build) void {
         .run_args = run_args,
     };
 
+    if (main_exe_result.machine_code_shim_test) |machine_code_shim_test| {
+        test_suites.register(.{
+            .step_suffix = "machine-code-shim",
+            .description = "Run machine-code shim Zig tests",
+            .compile = machine_code_shim_test,
+        });
+    }
+
     const guarded_list_violation_exe = b.addExecutable(.{
         .name = "guarded_list_violation_test",
         .root_module = b.createModule(.{
@@ -6016,6 +6026,11 @@ fn addMacosAflFuzzExe(
     return exe.getEmittedBin();
 }
 
+const MainExeResult = struct {
+    exe: *Step.Compile,
+    machine_code_shim_test: ?*Step.Compile,
+};
+
 fn addMainExe(
     b: *std.Build,
     roc_modules: modules.RocModules,
@@ -6031,12 +6046,10 @@ fn addMainExe(
     write_compiled_builtins: *Step.WriteFile,
     llvm_codegen_module: *std.Build.Module,
     flag_enable_tracy: ?[]const u8,
+    test_filters: []const []const u8,
     add_machine_code_shim_test: bool,
-    /// When set, the machine-code shim test binary is registered with the
-    /// test-wiring checker's semantic enumeration.
-    test_wiring_run: ?*Step.Run,
     valgrind_support: ?bool,
-) ?*Step.Compile {
+) ?MainExeResult {
     const exe = b.addExecutable(.{
         .name = "roc",
         .root_module = b.createModule(.{
@@ -6240,6 +6253,7 @@ fn addMainExe(
     machine_code_shim_lib.root_module.addObjectFile(builtins_obj.getEmittedBin());
     machine_code_shim_lib.bundle_compiler_rt = true;
 
+    var machine_code_shim_test_for_registry: ?*Step.Compile = null;
     if (add_machine_code_shim_test) {
         const machine_code_shim_test = b.addTest(.{
             .name = "machine_code_shim",
@@ -6249,6 +6263,7 @@ fn addMainExe(
                 .optimize = optimize,
                 .link_libc = true,
             }),
+            .filters = test_filters,
         });
         configureBackend(machine_code_shim_test, target);
         roc_modules.addAll(machine_code_shim_test);
@@ -6274,14 +6289,7 @@ fn addMainExe(
         machine_code_shim_test.root_module.addObject(machine_code_shim_test_host);
         machine_code_shim_test.bundle_compiler_rt = true;
         add_tracy(b, roc_modules.build_options, machine_code_shim_test, b.graph.host, false, flag_enable_tracy);
-        if (test_wiring_run) |wiring_run| wiring_run.addArtifactArg(machine_code_shim_test);
-
-        const run_machine_code_shim_test = b.addRunArtifact(machine_code_shim_test);
-        const run_machine_code_shim_test_step = b.step(
-            "run-test-zig-machine-code-shim",
-            "Run machine-code shim Zig tests",
-        );
-        run_machine_code_shim_test_step.dependOn(&run_machine_code_shim_test.step);
+        machine_code_shim_test_for_registry = machine_code_shim_test;
     }
 
     const install_machine_code_shim = b.addInstallArtifact(machine_code_shim_lib, .{});
@@ -6483,7 +6491,10 @@ fn addMainExe(
 
     exe.root_module.linkLibrary(zstd.artifact("zstd"));
 
-    return exe;
+    return .{
+        .exe = exe,
+        .machine_code_shim_test = machine_code_shim_test_for_registry,
+    };
 }
 
 fn install_and_run(
