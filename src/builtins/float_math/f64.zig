@@ -395,3 +395,77 @@ test "deterministic F64 trigonometric result bits" {
     try std.testing.expectEqual(@as(u64, 0x3ff0_c152_382d_7366), @as(u64, @bitCast(acos(0.5))));
     try std.testing.expectEqual(@as(u64, 0x3fe9_21fb_5444_2d18), @as(u64, @bitCast(atan(1.0))));
 }
+
+test "deterministic F64 trig branch and reduction bits" {
+    const Case = struct { input: u64, sin_bits: u64, cos_bits: u64, tan_bits: u64 };
+    const cases = [_]Case{
+        .{ .input = 0x3e3f_ffff_ffff_ffff, .sin_bits = 0x3e3f_ffff_ffff_ffff, .cos_bits = 0x3ff0_0000_0000_0000, .tan_bits = 0x3e3f_ffff_ffff_ffff },
+        .{ .input = 0x3e40_0000_0000_0000, .sin_bits = 0x3e40_0000_0000_0000, .cos_bits = 0x3ff0_0000_0000_0000, .tan_bits = 0x3e40_0000_0000_0000 },
+        .{ .input = 0x3fe9_21fb_5444_2d17, .sin_bits = 0x3fe6_a09e_667f_3bcc, .cos_bits = 0x3fe6_a09e_667f_3bce, .tan_bits = 0x3fef_ffff_ffff_fffd },
+        .{ .input = 0x3fe9_21fb_5444_2d18, .sin_bits = 0x3fe6_a09e_667f_3bcc, .cos_bits = 0x3fe6_a09e_667f_3bcd, .tan_bits = 0x3fef_ffff_ffff_ffff },
+        .{ .input = 0x3fe9_21fb_5444_2d19, .sin_bits = 0x3fe6_a09e_667f_3bcd, .cos_bits = 0x3fe6_a09e_667f_3bcc, .tan_bits = 0x3ff0_0000_0000_0001 },
+        .{ .input = 0x3ff9_21fb_5444_2d17, .sin_bits = 0x3ff0_0000_0000_0000, .cos_bits = 0x3cb4_6989_8cc5_1702, .tan_bits = 0x4329_153d_9443_ed0b },
+        .{ .input = 0x3ff9_21fb_5444_2d18, .sin_bits = 0x3ff0_0000_0000_0000, .cos_bits = 0x3c91_a626_3314_5c07, .tan_bits = 0x434d_0296_7c31_cdb5 },
+        .{ .input = 0x3ff9_21fb_5444_2d19, .sin_bits = 0x3ff0_0000_0000_0000, .cos_bits = 0xbca7_2cec_e675_d1fd, .tan_bits = 0xc336_17a1_5494_767a },
+        .{ .input = 0x4008_0000_0000_0000, .sin_bits = 0x3fc2_1038_6db6_d55b, .cos_bits = 0xbfef_ae04_be85_e5d2, .tan_bits = 0xbfc2_3ef7_1254_b86f },
+        .{ .input = 0x4014_0000_0000_0000, .sin_bits = 0xbfee_af81_f5e0_9933, .cos_bits = 0x3fd2_2785_706b_4ad9, .tan_bits = 0xc00b_0b4b_739b_bb07 },
+        .{ .input = 0x4042_b999_9999_999a, .sin_bits = 0xbfcf_8ebb_3a97_1b21, .cos_bits = 0x3fef_0320_a2db_4fbe, .tan_bits = 0xbfd0_4806_7579_abdc },
+        .{ .input = 0x412e_8480_0000_0000, .sin_bits = 0xbfd6_664b_2568_d867, .cos_bits = 0x3fed_f9df_9906_d32c, .tan_bits = 0xbfd7_e976_8ab7_34c0 },
+        .{ .input = 0x4415_af1d_78b5_8c40, .sin_bits = 0xbfe4_a5e6_05fd_6450, .cos_bits = 0x3fe8_7272_0fc6_0d3d, .tan_bits = 0xbfeb_06fb_be99_5394 },
+        .{ .input = 0xc415_af1d_78b5_8c40, .sin_bits = 0x3fe4_a5e6_05fd_6450, .cos_bits = 0x3fe8_7272_0fc6_0d3d, .tan_bits = 0x3feb_06fb_be99_5394 },
+        .{ .input = 0x54b2_49ad_2594_c37d, .sin_bits = 0xbfd8_5c5e_5b92_9359, .cos_bits = 0x3fed_9757_4968_41f5, .tan_bits = 0xbfda_5807_d6f7_6f7d },
+        .{ .input = 0x7fef_ffff_ffff_ffff, .sin_bits = 0x3f74_52fc_98b3_4e97, .cos_bits = 0xbfef_ffe6_2ecf_ab75, .tan_bits = 0xbf74_530c_fe72_9484 },
+    };
+
+    for (cases) |case| {
+        const input: f64 = @bitCast(case.input);
+        try std.testing.expectEqual(case.sin_bits, @as(u64, @bitCast(sin(input))));
+        try std.testing.expectEqual(case.cos_bits, @as(u64, @bitCast(cos(input))));
+        try std.testing.expectEqual(case.tan_bits, @as(u64, @bitCast(tan(input))));
+    }
+}
+
+test "deterministic F64 inverse trig branch bits" {
+    const Case = struct { input: u64, asin_bits: u64, acos_bits: u64, atan_bits: u64 };
+    const cases = [_]Case{
+        .{ .input = 0x3c5f_ffff_ffff_ffff, .asin_bits = 0x3c5f_ffff_ffff_ffff, .acos_bits = 0x3ff9_21fb_5444_2d18, .atan_bits = 0x3c5f_ffff_ffff_ffff },
+        .{ .input = 0x3c60_0000_0000_0000, .asin_bits = 0x3c60_0000_0000_0000, .acos_bits = 0x3ff9_21fb_5444_2d18, .atan_bits = 0x3c60_0000_0000_0000 },
+        .{ .input = 0x3c60_0000_0000_0001, .asin_bits = 0x3c60_0000_0000_0001, .acos_bits = 0x3ff9_21fb_5444_2d18, .atan_bits = 0x3c60_0000_0000_0001 },
+        .{ .input = 0x3e3f_ffff_ffff_ffff, .asin_bits = 0x3e3f_ffff_ffff_ffff, .acos_bits = 0x3ff9_21fb_5244_2d18, .atan_bits = 0x3e3f_ffff_ffff_ffff },
+        .{ .input = 0x3e40_0000_0000_0000, .asin_bits = 0x3e40_0000_0000_0000, .acos_bits = 0x3ff9_21fb_5244_2d18, .atan_bits = 0x3e40_0000_0000_0000 },
+        .{ .input = 0x3e4f_ffff_ffff_ffff, .asin_bits = 0x3e4f_ffff_ffff_ffff, .acos_bits = 0x3ff9_21fb_5044_2d18, .atan_bits = 0x3e4f_ffff_ffff_fffe },
+        .{ .input = 0x3e50_0000_0000_0000, .asin_bits = 0x3e50_0000_0000_0000, .acos_bits = 0x3ff9_21fb_5044_2d18, .atan_bits = 0x3e4f_ffff_ffff_ffff },
+        .{ .input = 0x3fdb_ffff_ffff_ffff, .asin_bits = 0x3fdc_faf2_7460_fe9e, .acos_bits = 0x3ff1_e33e_b72b_ed71, .atan_bits = 0x3fda_64ee_c3cc_23fc },
+        .{ .input = 0x3fdc_0000_0000_0000, .asin_bits = 0x3fdc_faf2_7460_fe9f, .acos_bits = 0x3ff1_e33e_b72b_ed70, .atan_bits = 0x3fda_64ee_c3cc_23fd },
+        .{ .input = 0x3fdf_ffff_ffff_ffff, .asin_bits = 0x3fe0_c152_382d_7365, .acos_bits = 0x3ff0_c152_382d_7366, .atan_bits = 0x3fdd_ac67_0561_bb4f },
+        .{ .input = 0x3fe0_0000_0000_0000, .asin_bits = 0x3fe0_c152_382d_7366, .acos_bits = 0x3ff0_c152_382d_7366, .atan_bits = 0x3fdd_ac67_0561_bb4f },
+        .{ .input = 0x3fe0_0000_0000_0001, .asin_bits = 0x3fe0_c152_382d_7367, .acos_bits = 0x3ff0_c152_382d_7365, .atan_bits = 0x3fdd_ac67_0561_bb51 },
+        .{ .input = 0x3fe5_ffff_ffff_ffff, .asin_bits = 0x3fe8_41de_b511_4bb2, .acos_bits = 0x3fea_0217_f377_0e7e, .atan_bits = 0x3fe3_45f0_1cce_37ba },
+        .{ .input = 0x3fe6_0000_0000_0000, .asin_bits = 0x3fe8_41de_b511_4bb4, .acos_bits = 0x3fea_0217_f377_0e7d, .atan_bits = 0x3fe3_45f0_1cce_37bb },
+        .{ .input = 0x3fef_3332_ffff_ffff, .asin_bits = 0x3ff5_8c2a_e9ab_49e8, .acos_bits = 0x3fcc_ae83_54c7_1987, .atan_bits = 0x3fe8_ba4a_6a9f_194a },
+        .{ .input = 0x3fef_3333_0000_0000, .asin_bits = 0x3ff5_8c2a_e9ab_49ea, .acos_bits = 0x3fcc_ae83_54c7_1975, .atan_bits = 0x3fe8_ba4a_6a9f_194a },
+        .{ .input = 0xbfe0_0000_0000_0000, .asin_bits = 0xbfe0_c152_382d_7366, .acos_bits = 0x4000_c152_382d_7366, .atan_bits = 0xbfdd_ac67_0561_bb4f },
+        .{ .input = 0xbfe8_0000_0000_0000, .asin_bits = 0xbfeb_2353_15c6_80dc, .acos_bits = 0x4003_59d2_6f93_b6c3, .atan_bits = 0xbfe4_978f_a326_9ee1 },
+    };
+
+    for (cases) |case| {
+        const input: f64 = @bitCast(case.input);
+        try std.testing.expectEqual(case.asin_bits, @as(u64, @bitCast(asin(input))));
+        try std.testing.expectEqual(case.acos_bits, @as(u64, @bitCast(acos(input))));
+        try std.testing.expectEqual(case.atan_bits, @as(u64, @bitCast(atan(input))));
+    }
+
+    const AtanCase = struct { input: u64, expected: u64 };
+    const atan_cases = [_]AtanCase{
+        .{ .input = 0x3ff2_ffff_ffff_ffff, .expected = 0x3feb_de70_ed43_9fe6 },
+        .{ .input = 0x3ff3_0000_0000_0000, .expected = 0x3feb_de70_ed43_9fe7 },
+        .{ .input = 0x4003_7fff_ffff_ffff, .expected = 0x3ff2_e757_2883_3a54 },
+        .{ .input = 0x4003_8000_0000_0000, .expected = 0x3ff2_e757_2883_3a54 },
+        .{ .input = 0x440f_ffff_ffff_ffff, .expected = 0x3ff9_21fb_5444_2d18 },
+        .{ .input = 0x4410_0000_0000_0000, .expected = 0x3ff9_21fb_5444_2d18 },
+        .{ .input = 0xc003_8000_0000_0000, .expected = 0xbff2_e757_2883_3a54 },
+    };
+    for (atan_cases) |case| {
+        try std.testing.expectEqual(case.expected, @as(u64, @bitCast(atan(@bitCast(case.input)))));
+    }
+}

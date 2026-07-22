@@ -2148,10 +2148,39 @@ pub fn generateEntrypointWrapper(
 
 /// Generate a complete wasm module for a zero-argument root proc.
 /// The exported `main` function initializes RocOps and tail-calls the root proc.
-pub fn generateModule(self: *Self, root_proc_id: LIR.LirProcSpecId, result_layout: layout.Idx) Allocator.Error!GenerateResult {
+/// Builtin call sites target definitions merged from `wasm32_builtins_object`.
+/// Dead-code elimination removes the superseded builtin callback imports, so
+/// the encoded module retains only the reachable platform runtime callbacks.
+pub fn generateModule(
+    self: *Self,
+    root_proc_id: LIR.LirProcSpecId,
+    result_layout: layout.Idx,
+    wasm32_builtins_object: []const u8,
+) Allocator.Error!GenerateResult {
     // Register host function imports (must be done before addFunction calls)
     self.registerHostImports() catch return error.OutOfMemory;
     self.registerHostedSymbolTargets(self.store.getProcSpecs()) catch return error.OutOfMemory;
+
+    if (wasm32_builtins_object.len == 0) {
+        wasmInvariantFmt("WASM/codegen invariant violated: eval builtin object is empty", .{});
+    }
+
+    var builtins_module = WasmModule.preload(self.allocator, wasm32_builtins_object, true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => wasmInvariantFmt("WASM/codegen invariant violated: invalid eval builtin object: {s}", .{@errorName(err)}),
+    };
+    defer builtins_module.deinit();
+
+    var merge_result = self.module.mergeModule(&builtins_module) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => wasmInvariantFmt("WASM/codegen invariant violated: eval builtin merge failed: {s}", .{@errorName(err)}),
+    };
+    merge_result.deinit();
+
+    const builtin_symbols = BuiltinSignatures.populateForRelocs(&self.module) catch {
+        wasmInvariantFmt("WASM/codegen invariant violated: merged eval module is missing a builtin symbol", .{});
+    };
+    self.configureBuiltinRelocs(builtin_symbols);
 
     // Compile all procedures before the synthetic main wrapper.
     const proc_specs = self.store.getProcSpecs();
@@ -2275,11 +2304,25 @@ pub fn generateModule(self: *Self, root_proc_id: LIR.LirProcSpecId, result_layou
     self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
     self.endFunction();
     try self.flushPendingBodies();
+    self.module.addExport("main", .func, func_idx) catch return error.OutOfMemory;
+    self.module.resolveRelocations() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidRelocation => wasmInvariantFmt("WASM/codegen invariant violated: eval builtin relocation failed", .{}),
+    };
+
+    const called_fns = self.allocator.alloc(bool, self.module.liveFunctionCount()) catch return error.OutOfMemory;
+    defer self.allocator.free(called_fns);
+    @memset(called_fns, false);
+    self.module.eliminateDeadCode(called_fns) catch return error.OutOfMemory;
+    self.module.verifyNoBuiltinImports() catch {
+        wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
+    };
     try self.module.materializeFuncBodies();
 
-    self.module.addExport("main", .func, func_idx) catch return error.OutOfMemory;
-
-    const wasm_bytes = self.module.encode(self.allocator) catch return error.OutOfMemory;
+    const wasm_bytes = self.module.encode(self.allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NonZeroZeroFillSegment => wasmInvariantFmt("WASM/codegen invariant violated: eval module contains nonzero omitted data", .{}),
+    };
 
     return .{
         .wasm_bytes = wasm_bytes,
