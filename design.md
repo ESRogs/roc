@@ -465,6 +465,17 @@ not silently demote the value from compile-time evaluation. No backend may
 rediscover or guess root eligibility by scanning source syntax, function
 bodies, object symbols, or generated code.
 
+Release builds of the compiler must never impose artificial resource limits on
+compile-time evaluation. In particular, the interpreter's call-depth guard
+(`max_call_depth` in `src/eval/interpreter.zig`) is enforced only in Debug
+builds of the compiler, where it turns runaway recursion into a deterministic
+Roc crash with interpreter context attached. In release builds, evaluation
+depth is bounded only by actual native stack memory, with exhaustion reported
+by the stack overflow guard in `src/base`. An arbitrary depth budget in
+release would make a program's compile-time-evaluability depend on a compiler
+build constant rather than on the program itself, and would let Debug and
+release builds disagree about whether the same program compiles.
+
 ## Backend Builtins
 
 Backend builtin linking is part of backend code generation, not a later repair
