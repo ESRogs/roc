@@ -1,65 +1,69 @@
 //! Deterministic, binary64-only implementation of Roc's F64 power builtin.
 //!
-//! The logarithm and exponential kernels are ported from Zig compiler_rt,
-//! which in turn ports them from musl's MIT-licensed math implementation:
-//! https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT
+//! The finite power kernel is ported from FreeBSD's fdlibm-derived `e_pow.c`,
+//! via Rust libm's `src/math/pow.rs`. It computes `log2(base)` and the
+//! exponent product in split high/low pieces instead of composing
+//! independently-rounded log and exp
+//! functions. The non-FMA evaluation path is used unconditionally so targets
+//! with and without fused multiply-add instructions produce identical bits.
 //!
 //! Every floating-point value and operation in this file is binary64. Keeping
 //! the complete algorithm in Roc's builtin payload prevents a backend from
 //! substituting a target libm or LLVM intrinsic with different finite bits.
+
+// Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.
+//
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
 
 const std = @import("std");
 
 const canonical_nan: f64 = @bitCast(@as(u64, 0x7ff8_0000_0000_0000));
 const positive_infinity: f64 = @bitCast(@as(u64, 0x7ff0_0000_0000_0000));
 
-fn log(value: f64) f64 {
-    const ln2_hi: f64 = 6.93147180369123816490e-01;
-    const ln2_lo: f64 = 1.90821492927058770002e-10;
-    const lg1: f64 = 6.666666666666735130e-01;
-    const lg2: f64 = 3.999999999940941908e-01;
-    const lg3: f64 = 2.857142874366239149e-01;
-    const lg4: f64 = 2.222219843214978396e-01;
-    const lg5: f64 = 1.818357216161805012e-01;
-    const lg6: f64 = 1.531383769920937332e-01;
-    const lg7: f64 = 1.479819860511658591e-01;
+const bp = [2]f64{ 1.0, 1.5 };
+const dp_high = [2]f64{ 0.0, 5.84962487220764160156e-01 };
+const dp_low = [2]f64{ 0.0, 1.35003920212974897128e-08 };
+const two_to_53: f64 = 9007199254740992.0;
 
-    var x = value;
-    var bits: u64 = @bitCast(x);
-    var high: u32 = @truncate(bits >> 32);
-    var exponent: i32 = 0;
+// Polynomial coefficients for (3/2) * (log(x) - 2s - 2/3*s^3).
+const l1: f64 = 5.99999999999994648725e-01;
+const l2: f64 = 4.28571428578550184252e-01;
+const l3: f64 = 3.33333329818377432918e-01;
+const l4: f64 = 2.72728123808534006489e-01;
+const l5: f64 = 2.30660745775561754067e-01;
+const l6: f64 = 2.06975017800338417784e-01;
 
-    if (high < 0x0010_0000 or high >> 31 != 0) {
-        if (bits << 1 == 0) return -positive_infinity;
-        if (high >> 31 != 0) return canonical_nan;
+const p1: f64 = 1.66666666666666019037e-01;
+const p2: f64 = -2.77777777770155933842e-03;
+const p3: f64 = 6.61375632143793436117e-05;
+const p4: f64 = -1.65339022054652515390e-06;
+const p5: f64 = 4.13813679705723846039e-08;
 
-        exponent -= 54;
-        x *= 0x1.0p54;
-        bits = @bitCast(x);
-        high = @truncate(bits >> 32);
-    } else if (high >= 0x7ff0_0000) {
-        return x;
-    } else if (high == 0x3ff0_0000 and bits << 32 == 0) {
-        return 0.0;
-    }
+const ln2: f64 = 6.93147180559945286227e-01;
+const ln2_high: f64 = 6.93147182464599609375e-01;
+const ln2_low: f64 = -1.90465429995776804525e-09;
+const overflow_tail: f64 = 8.0085662595372944372e-017;
+const inv_ln2: f64 = 1.44269504088896338700e+00;
+const inv_ln2_high: f64 = 1.44269502162933349609e+00;
+const inv_ln2_low: f64 = 1.92596299112661746887e-08;
+const cp: f64 = 9.61796693925975554329e-01;
+const cp_high: f64 = 9.61796700954437255859e-01;
+const cp_low: f64 = -7.02846165095275826516e-09;
 
-    high += 0x3ff0_0000 - 0x3fe6_a09e;
-    exponent += @as(i32, @intCast(high >> 20)) - 0x3ff;
-    high = (high & 0x000f_ffff) + 0x3fe6_a09e;
-    bits = (@as(u64, high) << 32) | (bits & 0xffff_ffff);
-    x = @bitCast(bits);
+fn highWord(value: f64) u32 {
+    return @truncate(@as(u64, @bitCast(value)) >> 32);
+}
 
-    const f = x - 1.0;
-    const half_square = 0.5 * f * f;
-    const s = f / (2.0 + f);
-    const z = s * s;
-    const w = z * z;
-    const even = w * (lg2 + w * (lg4 + w * lg6));
-    const odd = z * (lg1 + w * (lg3 + w * (lg5 + w * lg7)));
-    const approximation = odd + even;
-    const float_exponent: f64 = @floatFromInt(exponent);
+fn withHighWord(value: f64, high: u32) f64 {
+    const bits: u64 = @bitCast(value);
+    return @bitCast((@as(u64, high) << 32) | (bits & 0xffff_ffff));
+}
 
-    return s * (half_square + approximation) + float_exponent * ln2_lo - half_square + f + float_exponent * ln2_hi;
+fn withLowWord(value: f64, low: u32) f64 {
+    const bits: u64 = @bitCast(value);
+    return @bitCast((bits & 0xffff_ffff_0000_0000) | low);
 }
 
 fn scalePowerOfTwo(value: f64, power: i32) f64 {
@@ -68,68 +72,21 @@ fn scalePowerOfTwo(value: f64, power: i32) f64 {
     var exponent: i32 = @intCast((bits >> 52) & 0x7ff);
     if (exponent == 0x7ff or bits & 0x7fff_ffff_ffff_ffff == 0) return value;
 
-    var adjusted_power = power;
     if (exponent == 0) {
         const scaled = value * 0x1.0p54;
         bits = @bitCast(scaled);
         exponent = @as(i32, @intCast((bits >> 52) & 0x7ff)) - 54;
     }
 
-    const new_exponent = exponent + adjusted_power;
+    const new_exponent = exponent + power;
     if (new_exponent >= 0x7ff) return @bitCast(sign | 0x7ff0_0000_0000_0000);
     if (new_exponent > 0) return @bitCast((bits & 0x800f_ffff_ffff_ffff) | (@as(u64, @intCast(new_exponent)) << 52));
     if (new_exponent <= -54) return @bitCast(sign);
 
-    adjusted_power = new_exponent + 54;
+    const adjusted_power = new_exponent + 54;
     const normal_bits = (bits & 0x800f_ffff_ffff_ffff) | (@as(u64, @intCast(adjusted_power)) << 52);
     const normal: f64 = @bitCast(normal_bits);
     return normal * 0x1.0p-54;
-}
-
-fn exp(value: f64) f64 {
-    const half = [_]f64{ 0.5, -0.5 };
-    const ln2_hi: f64 = 6.93147180369123816490e-01;
-    const ln2_lo: f64 = 1.90821492927058770002e-10;
-    const inv_ln2: f64 = 1.44269504088896338700e+00;
-    const p1: f64 = 1.66666666666666019037e-01;
-    const p2: f64 = -2.77777777770155933842e-03;
-    const p3: f64 = 6.61375632143793436117e-05;
-    const p4: f64 = -1.65339022054652515390e-06;
-    const p5: f64 = 4.13813679705723846039e-08;
-
-    var x = value;
-    const bits: u64 = @bitCast(x);
-    var high = bits >> 32;
-    const sign: usize = @intCast(high >> 31);
-    high &= 0x7fff_ffff;
-
-    if (high > 0x7ff0_0000) return canonical_nan;
-    if (high >= 0x4086_232b) {
-        if (x > 709.782712893383973096) return positive_infinity;
-        if (x < -745.13321910194110842) return 0.0;
-    }
-
-    var power: i32 = 0;
-    var reduction_high: f64 = x;
-    var reduction_low: f64 = 0.0;
-    if (high > 0x3fd6_2e42) {
-        if (high > 0x3ff0_a2b2) {
-            power = @intFromFloat(inv_ln2 * x + half[sign]);
-        } else {
-            power = if (sign == 0) 1 else -1;
-        }
-        const float_power: f64 = @floatFromInt(power);
-        reduction_high = x - float_power * ln2_hi;
-        reduction_low = float_power * ln2_lo;
-        x = reduction_high - reduction_low;
-    } else if (high <= 0x3e30_0000) {
-        return 1.0 + x;
-    }
-
-    const square = x * x;
-    const correction = x - square * (p1 + square * (p2 + square * (p3 + square * (p4 + square * p5))));
-    const result = 1.0 + (x * correction / (2.0 - correction) - reduction_low + reduction_high);
-    return if (power == 0) result else scalePowerOfTwo(result, power);
 }
 
 fn isOddInteger(value: f64) bool {
@@ -140,19 +97,138 @@ fn isOddInteger(value: f64) bool {
     return integer & 1 != 0;
 }
 
-fn integerPower(base: f64, exponent: f64) f64 {
-    var remaining: u64 = @intFromFloat(@abs(exponent));
-    var factor = base;
-    var result: f64 = 1.0;
-    while (remaining != 0) : (remaining >>= 1) {
-        if (remaining & 1 != 0) result *= factor;
-        factor *= factor;
+/// Computes the magnitude of `base^exponent` for a positive, finite, nonzero
+/// base and a finite, nonzero exponent. This is the non-FMA fdlibm path.
+fn finitePowerMagnitude(base: f64, exponent: f64) f64 {
+    @setFloatMode(.strict);
+
+    var abs_base = base;
+    var base_high = highWord(abs_base);
+    const exponent_high = highWord(exponent);
+    const exponent_abs_high = exponent_high & 0x7fff_ffff;
+    const exponent_is_negative = exponent_high >> 31 != 0;
+
+    var log2_high_part: f64 = undefined;
+    var log2_low_part: f64 = undefined;
+
+    if (exponent_abs_high > 0x41e0_0000) {
+        // For |exponent| > 2^31, values not extremely close to one must
+        // overflow or underflow. Larger exponents can decide from the side of
+        // one alone.
+        if (exponent_abs_high > 0x43f0_0000) {
+            if (base_high <= 0x3fef_ffff) return if (exponent_is_negative) positive_infinity else 0.0;
+            if (base_high >= 0x3ff0_0000) return if (exponent_is_negative) 0.0 else positive_infinity;
+        }
+        if (base_high < 0x3fef_ffff) return if (exponent_is_negative) positive_infinity else 0.0;
+        if (base_high > 0x3ff0_0000) return if (exponent_is_negative) 0.0 else positive_infinity;
+
+        // Here |1-base| <= 2^-20. Compute log2(base) as two pieces from the
+        // short log1p series so multiplying by the large exponent retains its
+        // low-order information.
+        const difference = abs_base - 1.0;
+        const correction = difference * difference * (0.5 - difference * (0.3333333333333333333333 - difference * 0.25));
+        const high_product = inv_ln2_high * difference;
+        const low_product = difference * inv_ln2_low - correction * inv_ln2;
+        log2_high_part = withLowWord(high_product + low_product, 0);
+        log2_low_part = low_product - (log2_high_part - high_product);
+    } else {
+        var base_exponent: i32 = 0;
+        if (base_high < 0x0010_0000) {
+            abs_base *= two_to_53;
+            base_exponent -= 53;
+            base_high = highWord(abs_base);
+        }
+
+        base_exponent += @as(i32, @intCast(base_high >> 20)) - 0x3ff;
+        const fraction_high = base_high & 0x000f_ffff;
+        const interval: usize = if (fraction_high <= 0x3988e)
+            0
+        else if (fraction_high < 0xbb67a)
+            1
+        else blk: {
+            base_exponent += 1;
+            break :blk 0;
+        };
+
+        base_high = fraction_high | 0x3ff0_0000;
+        if (fraction_high >= 0xbb67a) base_high -= 0x0010_0000;
+        abs_base = withHighWord(abs_base, base_high);
+
+        // s = (base-bp)/(base+bp), retained as high and low pieces.
+        const numerator = abs_base - bp[interval];
+        const reciprocal = 1.0 / (abs_base + bp[interval]);
+        const s = numerator * reciprocal;
+        const s_high = withLowWord(s, 0);
+        const t_high = withHighWord(0.0, ((base_high >> 1) | 0x2000_0000) + 0x0008_0000 + (@as(u32, @intCast(interval)) << 18));
+        const t_low = abs_base - (t_high - bp[interval]);
+        const s_low = reciprocal * ((numerator - s_high * t_high) - s_high * t_low);
+
+        const s_squared = s * s;
+        var remainder = s_squared * s_squared * (l1 + s_squared * (l2 + s_squared * (l3 + s_squared * (l4 + s_squared * (l5 + s_squared * l6)))));
+        remainder += s_low * (s_high + s);
+        const s_high_squared = s_high * s_high;
+        const series_high = withLowWord(3.0 + s_high_squared + remainder, 0);
+        const series_low = remainder - ((series_high - 3.0) - s_high_squared);
+        const product_high = s_high * series_high;
+        const product_low = s_low * series_high + series_low * s;
+        const p_high = withLowWord(product_high + product_low, 0);
+        const p_low = product_low - (p_high - product_high);
+        const z_high = cp_high * p_high;
+        const z_low = cp_low * p_high + p_low * cp + dp_low[interval];
+        const float_base_exponent: f64 = @floatFromInt(base_exponent);
+        log2_high_part = withLowWord((z_high + z_low) + dp_high[interval] + float_base_exponent, 0);
+        log2_low_part = z_low - (((log2_high_part - float_base_exponent) - dp_high[interval]) - z_high);
     }
-    return if (exponent < 0.0) 1.0 / result else result;
+
+    // Multiply the two-piece logarithm by a split exponent.
+    const exponent_high_part = withLowWord(exponent, 0);
+    const product_low = (exponent - exponent_high_part) * log2_high_part + exponent * log2_low_part;
+    var product_high = exponent_high_part * log2_high_part;
+    const product = product_high + product_low;
+    const product_bits: u64 = @bitCast(product);
+    const product_high_word: u32 = @truncate(product_bits >> 32);
+    const product_low_word: u32 = @truncate(product_bits);
+
+    if (product_high_word >> 31 == 0 and product_high_word >= 0x4090_0000) {
+        if (product_high_word != 0x4090_0000 or product_low_word != 0) return positive_infinity;
+        if (product_low + overflow_tail > product - product_high) return positive_infinity;
+    } else if (product_high_word >> 31 != 0 and (product_high_word & 0x7fff_ffff) >= 0x4090_cc00) {
+        if (product_high_word != 0xc090_cc00 or product_low_word != 0) return 0.0;
+        if (product_low <= product - product_high) return 0.0;
+    }
+
+    // Reduce the power-of-two exponent to a residual in [-0.5, 0.5].
+    const product_abs_high = product_high_word & 0x7fff_ffff;
+    var reduced_exponent = @as(i32, @intCast(product_abs_high >> 20)) - 0x3ff;
+    var scale_exponent: i32 = 0;
+    if (product_abs_high > 0x3fe0_0000) {
+        const signed_product_high: i32 = @bitCast(product_high_word);
+        const rounded_high = signed_product_high + (@as(i32, 0x0010_0000) >> @intCast(reduced_exponent + 1));
+        reduced_exponent = @as(i32, @intCast((@as(u32, @bitCast(rounded_high)) & 0x7fff_ffff) >> 20)) - 0x3ff;
+        const truncated_high = @as(u32, @bitCast(rounded_high)) & ~(@as(u32, 0x000f_ffff) >> @intCast(reduced_exponent));
+        const rounded_value = withHighWord(0.0, truncated_high);
+        scale_exponent = @intCast((@as(u32, @bitCast(rounded_high)) & 0x000f_ffff | 0x0010_0000) >> @intCast(20 - reduced_exponent));
+        if (signed_product_high < 0) scale_exponent = -scale_exponent;
+        product_high -= rounded_value;
+    }
+
+    // Compute 2^(product_high+product_low) for the reduced residual.
+    const residual = withLowWord(product_low + product_high, 0);
+    const residual_high = residual * ln2_high;
+    const residual_low = (product_low - (residual - product_high)) * ln2 + residual * ln2_low;
+    var exp_argument = residual_high + residual_low;
+    const exp_tail = residual_low - (exp_argument - residual_high);
+    const square = exp_argument * exp_argument;
+    const correction = exp_argument - square * (p1 + square * (p2 + square * (p3 + square * (p4 + square * p5))));
+    const approximation = (exp_argument * correction) / (correction - 2.0) - (exp_tail + exp_argument * exp_tail);
+    exp_argument = 1.0 - (approximation - exp_argument);
+    return scalePowerOfTwo(exp_argument, scale_exponent);
 }
 
 /// Returns `base` raised to `exponent`, computed entirely with binary64 operations.
 pub fn pow(base: f64, exponent: f64) f64 {
+    @setFloatMode(.strict);
+
     if (exponent == 0.0 or base == 1.0) return 1.0;
     const base_bits: u64 = @bitCast(base);
     const exponent_bits: u64 = @bitCast(exponent);
@@ -183,9 +259,8 @@ pub fn pow(base: f64, exponent: f64) f64 {
 
     const exponent_is_integer = @trunc(exponent) == exponent;
     if (base < 0.0 and !exponent_is_integer) return canonical_nan;
-    if (exponent_is_integer and exponent_abs_bits < 0x4340_0000_0000_0000) return integerPower(base, exponent);
 
-    var result = exp(exponent * log(@abs(base)));
+    var result = finitePowerMagnitude(@abs(base), exponent);
     if (base < 0.0 and isOddInteger(exponent)) result = -result;
     return result;
 }
@@ -223,7 +298,53 @@ test "F64 power approximations" {
     try std.testing.expectApproxEqRel(@as(f64, 13530.513990233081), pow(17.54697502703452, 3.3204523365293763), 0x1p-48);
 }
 
+test "F64 power stays within one ULP of high-precision oracles" {
+    const Case = struct {
+        base: f64,
+        exponent: f64,
+        nearest_bits: u64,
+    };
+    // These nearest-binary64 oracle bits were stable when independently
+    // evaluated at 100, 180, and 280 decimal digits of precision.
+    const cases = [_]Case{
+        .{ .base = 0.2, .exponent = 3.3, .nearest_bits = 0x3f74_380e_2165_6684 },
+        .{ .base = 17.54697502703452, .exponent = 3.3204523365293763, .nearest_bits = 0x40ca_6d41_ca6e_94c6 },
+        .{ .base = 1.8742325878262631, .exponent = 1111.0207098305914, .nearest_bits = 0x7ede_3bbc_0ae0_45cb },
+        .{ .base = 0.5797239088410756, .exponent = 1159.5420969274194, .nearest_bits = 0x06ee_dea9_9173_6578 },
+        .{ .base = 1.0000000000000002, .exponent = 2251799813685248.5, .nearest_bits = 0x3ffa_6129_8e1e_069c },
+        .{ .base = 0.9999999999999999, .exponent = 2251799813685248.5, .nearest_bits = 0x3fe8_ebef_9eac_820a },
+        .{ .base = 1.0000000000000002, .exponent = -2251799813685248.5, .nearest_bits = 0x3fe3_68b2_fc6f_960a },
+        .{ .base = 0.9999999999999999, .exponent = -2251799813685248.5, .nearest_bits = 0x3ff4_8b5e_3c3e_8187 },
+        .{ .base = 1e-200, .exponent = 1.5, .nearest_bits = 0x01a5_6e1f_c2f8_f359 },
+        .{ .base = 1e200, .exponent = 1.5, .nearest_bits = 0x7e37_e43c_8800_759b },
+        .{ .base = 1e-200, .exponent = -1.5, .nearest_bits = 0x7e37_e43c_8800_759c },
+        .{ .base = 1e200, .exponent = -1.5, .nearest_bits = 0x01a5_6e1f_c2f8_f359 },
+        .{ .base = 2.2250738585072014e-308, .exponent = 1.0000000000000002, .nearest_bits = 0x000f_ffff_ffff_fd3c },
+        .{ .base = 1.7976931348623157e308, .exponent = 0.9999999999999999, .nearest_bits = 0x7fef_ffff_ffff_fd39 },
+        .{ .base = 0.5, .exponent = 1073.5, .nearest_bits = 0x0000_0000_0000_0001 },
+        .{ .base = 2.0, .exponent = -1073.5, .nearest_bits = 0x0000_0000_0000_0001 },
+        .{ .base = 0.999, .exponent = 700000.25, .nearest_bits = 0x00c8_6229_cc1a_415d },
+        .{ .base = 1.001, .exponent = 700000.25, .nearest_bits = 0x7f04_dabc_29e8_60b2 },
+        .{ .base = 12345.6789, .exponent = -73.25, .nearest_bits = 0x01b5_358b_e320_e281 },
+        .{ .base = 1.23456789, .exponent = 1234.56789, .nearest_bits = 0x5763_ebec_f4b8_50e3 },
+    };
+
+    for (cases) |case| {
+        const actual_bits: u64 = @bitCast(pow(case.base, case.exponent));
+        const distance = if (actual_bits >= case.nearest_bits) actual_bits - case.nearest_bits else case.nearest_bits - actual_bits;
+        try std.testing.expect(distance <= 1);
+    }
+}
+
 test "deterministic F64 power result bits" {
-    try std.testing.expectEqual(@as(u64, 0x3f74_380e_2165_6686), @as(u64, @bitCast(pow(0.2, 3.3))));
-    try std.testing.expectEqual(@as(u64, 0x40ca_6d41_ca6e_94c8), @as(u64, @bitCast(pow(17.54697502703452, 3.3204523365293763))));
+    try std.testing.expectEqual(@as(u64, 0x3f74_380e_2165_6684), @as(u64, @bitCast(pow(0.2, 3.3))));
+    try std.testing.expectEqual(@as(u64, 0x40ca_6d41_ca6e_94c6), @as(u64, @bitCast(pow(17.54697502703452, 3.3204523365293763))));
+    try std.testing.expectEqual(@as(u64, 0x0010_0000_0000_0000), @as(u64, @bitCast(pow(2.0, -1022.0))));
+    try std.testing.expectEqual(@as(u64, 0x0004_0000_0000_0000), @as(u64, @bitCast(pow(2.0, -1024.0))));
+    try std.testing.expectEqual(@as(u64, 0x0000_0000_0000_0001), @as(u64, @bitCast(pow(2.0, -1074.0))));
+    try std.testing.expectEqual(@as(u64, 0x0000_0000_0000_0000), @as(u64, @bitCast(pow(2.0, -1075.0))));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0002), @as(u64, @bitCast(pow(-2.0, -1073.0))));
+    try std.testing.expectEqual(@as(u64, 0x0000_b815_7268_fdaf), @as(u64, @bitCast(pow(10.0, -309.0))));
+    try std.testing.expectEqual(@as(u64, 0x7ede_3bbc_0ae0_45cb), @as(u64, @bitCast(pow(1.8742325878262631, 1111.0207098305914))));
+    try std.testing.expectEqual(@as(u64, 0x06ee_dea9_9173_6578), @as(u64, @bitCast(pow(0.5797239088410756, 1159.5420969274194))));
 }

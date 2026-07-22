@@ -474,15 +474,27 @@ fn isOddInteger(value: f32) bool {
     return integer & 1 != 0;
 }
 
-fn integerPower(base: f32, exponent: f32) f32 {
-    var remaining: u32 = @intFromFloat(@abs(exponent));
+fn positiveIntegerPower(base: f32, exponent: u32) f32 {
+    var remaining = exponent;
     var factor = base;
     var result: f32 = 1.0;
     while (remaining != 0) : (remaining >>= 1) {
         if (remaining & 1 != 0) result *= factor;
         factor *= factor;
     }
-    return if (exponent < 0.0) 1.0 / result else result;
+    return result;
+}
+
+fn integerPower(base: f32, exponent: f32) f32 {
+    const magnitude: u32 = @intFromFloat(@abs(exponent));
+    const positive_power = positiveIntegerPower(base, magnitude);
+    if (exponent >= 0.0) return positive_power;
+
+    // Taking the reciprocal after exponentiation retains the best accuracy for
+    // ordinary results. If that positive power overflowed, exponentiating the
+    // reciprocal directly preserves any representable subnormal result.
+    if (!std.math.isInf(positive_power)) return 1.0 / positive_power;
+    return positiveIntegerPower(1.0 / base, magnitude);
 }
 
 /// Returns `base` raised to `exponent`, computed entirely with binary32 operations.
@@ -562,4 +574,9 @@ test "deterministic F32 result bits" {
     try std.testing.expectEqual(@as(u32, 0x3f49_0fdb), @as(u32, @bitCast(atan(1.0))));
     try std.testing.expectEqual(@as(u32, 0x3f31_7218), @as(u32, @bitCast(log(2.0))));
     try std.testing.expectEqual(@as(u32, 0x3ba1_c06f), @as(u32, @bitCast(pow(0.2, 3.3))));
+    try std.testing.expectEqual(@as(u32, 0x3de3_8e39), @as(u32, @bitCast(pow(3.0, -2.0))));
+    try std.testing.expectEqual(@as(u32, 0x0080_0000), @as(u32, @bitCast(pow(2.0, -126.0))));
+    try std.testing.expectEqual(@as(u32, 0x0020_0000), @as(u32, @bitCast(pow(2.0, -128.0))));
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), @as(u32, @bitCast(pow(2.0, -149.0))));
+    try std.testing.expectEqual(@as(u32, 0x0000_0000), @as(u32, @bitCast(pow(2.0, -150.0))));
 }

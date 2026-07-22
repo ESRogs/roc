@@ -251,10 +251,27 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "True" },
     },
     .{
+        .name = "low_level - F32 power subnormal exact bits agree across backends",
+        .source =
+        \\F32.to_bits(F32.pow(2.0, -126.0)) == 8388608
+        \\    and F32.to_bits(F32.pow(2.0, -128.0)) == 2097152
+        \\    and F32.to_bits(F32.pow(2.0, -149.0)) == 1
+        \\    and F32.to_bits(F32.pow(2.0, -150.0)) == 0
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
         .name = "low_level - F64 pow exact bits agree across backends",
         .source =
-        \\F64.to_bits(F64.pow(0.2, 3.3)) == 4572341155028887174
-        \\    and F64.to_bits(F64.pow(17.54697502703452, 3.3204523365293763)) == 4668664093059486920
+        \\F64.to_bits(F64.pow(0.2, 3.3)) == 4572341155028887172
+        \\    and F64.to_bits(F64.pow(17.54697502703452, 3.3204523365293763)) == 4668664093059486918
+        \\    and F64.to_bits(F64.pow(2.0, -1022.0)) == 4503599627370496
+        \\    and F64.to_bits(F64.pow(2.0, -1024.0)) == 1125899906842624
+        \\    and F64.to_bits(F64.pow(2.0, -1074.0)) == 1
+        \\    and F64.to_bits(F64.pow(2.0, -1075.0)) == 0
+        \\    and F64.to_bits(F64.pow(10.0, -309.0)) == 202402253307311
+        \\    and F64.to_bits(F64.pow(1.8742325878262631, 1111.0207098305914)) == 9141809972431046091
+        \\    and F64.to_bits(F64.pow(0.5797239088410756, 1159.5420969274194)) == 499581428555801976
         ,
         .expected = .{ .inspect_str = "True" },
     },
