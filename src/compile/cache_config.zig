@@ -54,7 +54,8 @@ pub const Constants = struct {
     /// 28: String interpolation constraint metadata moved into the type store.
     /// 30: Checked interpolation nodes retain their explicit dispatcher type variable.
     /// 31: Canonical expression storage includes compiler-derived method nodes.
-    pub const CACHE_VERSION = 31;
+    /// 32: Builtin indices include width-specific f32 conversion and math wrappers.
+    pub const CACHE_VERSION = 32;
 };
 
 /// Configuration for the Roc cache system.
