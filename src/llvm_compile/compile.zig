@@ -813,6 +813,10 @@ fn getTempDir(allocator: Allocator) (Allocator.Error || error{TempDirUnavailable
         }
     }
 
+    // POSIX does not require TMPDIR to be set. Match the other compiler temp
+    // paths and standard library behavior by using the conventional location.
+    if (builtin.os.tag != .windows) return allocator.dupe(u8, "/tmp");
+
     return error.TempDirUnavailable;
 }
 
