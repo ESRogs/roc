@@ -1508,6 +1508,18 @@ pub const Evaluator = struct {
     }
 
     fn floatMath1(comptime F: type, x: F, op: FloatMath1) F {
+        if (F == f32) {
+            return switch (op) {
+                .sqrt => @sqrt(x),
+                .sin => builtins.float_math_f32.sin(x),
+                .cos => builtins.float_math_f32.cos(x),
+                .tan => builtins.float_math_f32.tan(x),
+                .asin => builtins.float_math_f32.asin(x),
+                .acos => builtins.float_math_f32.acos(x),
+                .atan => builtins.float_math_f32.atan(x),
+                .log => builtins.float_math_f32.log(x),
+            };
+        }
         return switch (op) {
             .sqrt => @sqrt(x),
             .sin => std.math.sin(x),
@@ -1523,7 +1535,7 @@ pub const Evaluator = struct {
     fn numFloatMath2(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, _: enum { pow }) EvalError!Value {
         const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("pow operand without primitive type");
         switch (prim) {
-            .f32 => return .{ .float32 = std.math.pow(f32, args[0].float32, args[1].float32) },
+            .f32 => return .{ .float32 = builtins.float_math_f32.pow(args[0].float32, args[1].float32) },
             .f64 => return .{ .float64 = std.math.pow(f64, args[0].float64, args[1].float64) },
             .dec => return self.unsupported_("dec transcendental op"),
             else => return self.unsupported_("integer pow op"),
@@ -2195,7 +2207,7 @@ pub const Evaluator = struct {
                     break :blk switch (kind) {
                         .plain, .wrap => floatValueOf(dst, sv),
                         .try_unsafe => inner: {
-                            const in_range = std.math.isFinite(sv) and sv <= std.math.floatMax(f32) and sv >= -std.math.floatMax(f32);
+                            const in_range = builtins.numeric_conversions.f64FitsF32(sv);
                             const casted: f64 = if (in_range) @floatCast(sv) else 0;
                             break :inner self.buildTryRecord(result_ty, in_range, floatValueOf(dst, casted));
                         },

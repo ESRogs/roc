@@ -6002,9 +6002,7 @@ pub const Interpreter = struct {
             .f64_to_u128_try_unsafe => self.floatToIntTry(f64, u128, args[0], ll.ret_layout),
             .f64_to_f32_try_unsafe => blk: {
                 const sv = args[0].read(f64);
-                if (!std.math.isNan(sv) and !std.math.isInf(sv) and
-                    sv <= std.math.floatMax(f32) and sv >= -std.math.floatMax(f32))
-                {
+                if (builtins.numeric_conversions.f64FitsF32(sv)) {
                     break :blk try self.writeLowLevelTryRecord(f32, ll.ret_layout, @floatCast(sv));
                 } else {
                     break :blk try self.writeLowLevelTryRecord(f32, ll.ret_layout, null);
@@ -6520,7 +6518,7 @@ pub const Interpreter = struct {
                 val.write(i128, builtins.dec.powC(RocDec{ .num = a.read(i128) }, RocDec{ .num = b.read(i128) }, &self.roc_ops));
             },
             .float => |bits| switch (bits) {
-                32 => val.write(f32, std.math.pow(f32, a.read(f32), b.read(f32))),
+                32 => val.write(f32, builtins.float_math_f32.pow(a.read(f32), b.read(f32))),
                 64 => val.write(f64, std.math.pow(f64, a.read(f64), b.read(f64))),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported float pow width {d}", .{bits}),
             },
@@ -6566,7 +6564,7 @@ pub const Interpreter = struct {
                 val.write(i128, builtins.dec.logC(RocDec{ .num = a.read(i128) }, &self.roc_ops));
             },
             .float => |bits| switch (bits) {
-                32 => val.write(f32, @log(a.read(f32))),
+                32 => val.write(f32, builtins.float_math_f32.log(a.read(f32))),
                 64 => val.write(f64, @log(a.read(f64))),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported float log width {d}", .{bits}),
             },
@@ -6588,6 +6586,16 @@ pub const Interpreter = struct {
     };
 
     fn floatUnaryMath(comptime F: type, value: F, comptime op: FloatUnaryMathOp) F {
+        if (F == f32) {
+            return switch (op) {
+                .sin => builtins.float_math_f32.sin(value),
+                .cos => builtins.float_math_f32.cos(value),
+                .tan => builtins.float_math_f32.tan(value),
+                .asin => builtins.float_math_f32.asin(value),
+                .acos => builtins.float_math_f32.acos(value),
+                .atan => builtins.float_math_f32.atan(value),
+            };
+        }
         return switch (op) {
             .sin => std.math.sin(value),
             .cos => std.math.cos(value),

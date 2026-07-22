@@ -12410,7 +12410,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .native_execution => {
                     try builder.call(builtin_fn.wrapperAddress());
                 },
-                .shim_execution, .object_file => {
+                .shim_execution => {
+                    try builder.callRelocatable(builtin_fn.symbolName(), self.allocator, &self.codegen.relocations);
+                },
+                .object_file => {
+                    if (builtin_fn.payload() == .jit_only) {
+                        std.debug.panic(
+                            "dev object-file codegen referenced JIT-only builtin {s}",
+                            .{builtin_fn.symbolName()},
+                        );
+                    }
                     try builder.callRelocatable(builtin_fn.symbolName(), self.allocator, &self.codegen.relocations);
                 },
             }

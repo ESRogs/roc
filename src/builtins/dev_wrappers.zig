@@ -16,6 +16,7 @@ const dec = @import("dec.zig");
 const hash = @import("hash.zig");
 const crypto = @import("crypto.zig");
 const i128h = @import("compiler_rt_128.zig");
+const float_math_f32 = @import("float_math/f32.zig");
 const float_tan = @import("float_math/tan.zig");
 const numeric_conversions = @import("numeric_conversions.zig");
 
@@ -1552,7 +1553,7 @@ pub fn roc_builtins_dec_to_f32_try_unsafe(out: [*]u8, dec_low: u64, dec_high: u6
 /// f64 → f32 try unsafe
 pub fn roc_builtins_f64_to_f32_try_unsafe(out: [*]u8, val: f64, success_offset: u32, value_offset: u32) callconv(.c) void {
     const f32_val: f32 = @floatCast(val);
-    const success: bool = std.math.isFinite(val) and !std.math.isInf(f32_val);
+    const success = numeric_conversions.f64FitsF32(val);
     const f32_bytes: [4]u8 = @bitCast(f32_val);
     @memcpy(out[value_offset..][0..4], &f32_bytes);
     out[success_offset] = @intFromBool(success);
@@ -1901,7 +1902,7 @@ pub fn roc_builtins_float_rem(lhs: f64, rhs: f64) callconv(.c) f64 {
 
 /// Raise an F32 base to an F32 exponent.
 pub fn roc_builtins_float_pow_f32(base: f32, exponent: f32) callconv(.c) f32 {
-    return std.math.pow(f32, base, exponent);
+    return float_math_f32.pow(base, exponent);
 }
 
 /// Raise an F64 base to an F64 exponent.
@@ -1918,11 +1919,11 @@ const FloatUnaryMathOp = enum {
     atan,
 };
 
-fn floatUnaryMath(comptime Float: type, val: Float, comptime op: FloatUnaryMathOp) Float {
+fn floatUnaryMathF64(val: f64, comptime op: FloatUnaryMathOp) f64 {
     return switch (op) {
         .sin => std.math.sin(val),
         .cos => std.math.cos(val),
-        .tan => if (Float == f32) float_tan.tan32(val) else float_tan.tan64(val),
+        .tan => float_tan.tan64(val),
         .asin => std.math.asin(val),
         .acos => std.math.acos(val),
         .atan => std.math.atan(val),
@@ -1931,51 +1932,51 @@ fn floatUnaryMath(comptime Float: type, val: Float, comptime op: FloatUnaryMathO
 
 /// Compute the sine of an F32 value.
 pub fn roc_builtins_float_sin_f32(val: f32) callconv(.c) f32 {
-    return floatUnaryMath(f32, val, .sin);
+    return float_math_f32.sin(val);
 }
 /// Compute the sine of an F64 value.
 pub fn roc_builtins_float_sin(val: f64) callconv(.c) f64 {
-    return floatUnaryMath(f64, val, .sin);
+    return floatUnaryMathF64(val, .sin);
 }
 /// Compute the cosine of an F32 value.
 pub fn roc_builtins_float_cos_f32(val: f32) callconv(.c) f32 {
-    return floatUnaryMath(f32, val, .cos);
+    return float_math_f32.cos(val);
 }
 /// Compute the cosine of an F64 value.
 pub fn roc_builtins_float_cos(val: f64) callconv(.c) f64 {
-    return floatUnaryMath(f64, val, .cos);
+    return floatUnaryMathF64(val, .cos);
 }
 /// Compute the tangent of an F32 value.
 pub fn roc_builtins_float_tan_f32(val: f32) callconv(.c) f32 {
-    return floatUnaryMath(f32, val, .tan);
+    return float_math_f32.tan(val);
 }
 /// Compute the tangent of an F64 value.
 pub fn roc_builtins_float_tan(val: f64) callconv(.c) f64 {
-    return floatUnaryMath(f64, val, .tan);
+    return floatUnaryMathF64(val, .tan);
 }
 /// Compute the inverse sine of an F32 value.
 pub fn roc_builtins_float_asin_f32(val: f32) callconv(.c) f32 {
-    return floatUnaryMath(f32, val, .asin);
+    return float_math_f32.asin(val);
 }
 /// Compute the inverse sine of an F64 value.
 pub fn roc_builtins_float_asin(val: f64) callconv(.c) f64 {
-    return floatUnaryMath(f64, val, .asin);
+    return floatUnaryMathF64(val, .asin);
 }
 /// Compute the inverse cosine of an F32 value.
 pub fn roc_builtins_float_acos_f32(val: f32) callconv(.c) f32 {
-    return floatUnaryMath(f32, val, .acos);
+    return float_math_f32.acos(val);
 }
 /// Compute the inverse cosine of an F64 value.
 pub fn roc_builtins_float_acos(val: f64) callconv(.c) f64 {
-    return floatUnaryMath(f64, val, .acos);
+    return floatUnaryMathF64(val, .acos);
 }
 /// Compute the inverse tangent of an F32 value.
 pub fn roc_builtins_float_atan_f32(val: f32) callconv(.c) f32 {
-    return floatUnaryMath(f32, val, .atan);
+    return float_math_f32.atan(val);
 }
 /// Compute the inverse tangent of an F64 value.
 pub fn roc_builtins_float_atan(val: f64) callconv(.c) f64 {
-    return floatUnaryMath(f64, val, .atan);
+    return floatUnaryMathF64(val, .atan);
 }
 
 test "float floor and ceiling wrappers" {

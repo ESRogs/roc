@@ -4,6 +4,18 @@ const std = @import("std");
 const dec = @import("dec.zig");
 const i128h = @import("compiler_rt_128.zig");
 
+/// Exact F64 representation of the greatest finite F32 value.
+pub const f32_max_as_f64: f64 = std.math.floatMax(f32);
+
+/// Return whether an F64 can be narrowed by Roc's fallible F32 conversion.
+/// The source value itself must be finite and within the finite F32 range;
+/// values just beyond the boundary are rejected even when round-to-nearest
+/// would demote them back to `floatMax(f32)`.
+pub fn f64FitsF32(value: f64) bool {
+    return std.math.isFinite(value) and
+        value <= f32_max_as_f64 and value >= -f32_max_as_f64;
+}
+
 fn powerOfTwo(comptime Float: type, exponent: u32) Float {
     var result: Float = 1.0;
     var i: u32 = 0;
@@ -201,6 +213,23 @@ test "float to int conversions truncate and reject target boundary violations" {
     try std.testing.expectEqual(@as(?u8, null), floatToIntTry(f64, u8, -1.0));
     try std.testing.expectEqual(@as(?i8, null), floatToIntTry(f64, i8, std.math.inf(f64)));
     try std.testing.expectEqual(@as(?i8, null), floatToIntTry(f64, i8, std.math.nan(f64)));
+}
+
+test "f64 fallible narrowing checks the source against the exact f32 range" {
+    const max_bits: u64 = 0x47ef_ffff_e000_0000;
+    const above_max_bits: u64 = max_bits + 1;
+    const max: f64 = @bitCast(max_bits);
+    const above_max: f64 = @bitCast(above_max_bits);
+
+    try std.testing.expectEqual(f32_max_as_f64, max);
+    try std.testing.expect(f64FitsF32(max));
+    try std.testing.expect(f64FitsF32(-max));
+    try std.testing.expect(!f64FitsF32(above_max));
+    try std.testing.expect(!f64FitsF32(-above_max));
+    try std.testing.expect(!f64FitsF32(std.math.nan(f64)));
+    try std.testing.expect(!f64FitsF32(std.math.inf(f64)));
+    try std.testing.expect(!f64FitsF32(-std.math.inf(f64)));
+    try std.testing.expectEqual(@as(u32, 0x7f7f_ffff), @as(u32, @bitCast(@as(f32, @floatCast(above_max)))));
 }
 
 test "wrapping float to int conversions wrap modulo 2^bits and zero non-finite inputs" {

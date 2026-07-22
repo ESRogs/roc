@@ -14253,26 +14253,21 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), f32_val) catch return error.OutOfMemory;
             try self.emitStoreOp(.f32, offsets.value);
 
-            // success = !isInf(f32_val) && !isNaN(val). An f64 infinity
-            // demotes to an f32 infinity, while a finite out-of-range f64 also
-            // demotes to infinity; the first condition rejects both.
-
-            // not_inf = abs(f32_val) != inf
-            self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
-            WasmModule.leb128WriteU32(self.allocator, self.currentCode(), f32_val) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.f32_abs) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.f32_const) catch return error.OutOfMemory;
-            self.currentCode().appendSlice(self.allocator, &@as([4]u8, @bitCast(std.math.inf(f32)))) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.f32_ne) catch return error.OutOfMemory;
-
-            // is_not_nan = (val == val)  (NaN != NaN)
+            // Check the original F64 against the exact finite F32 range. Values
+            // just beyond F32.max are rejected even if demotion rounds them
+            // back down to F32.max. NaN makes both comparisons false.
             self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), val) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.f64_const) catch return error.OutOfMemory;
+            self.currentCode().appendSlice(self.allocator, &@as([8]u8, @bitCast(builtins.numeric_conversions.f32_max_as_f64))) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.f64_le) catch return error.OutOfMemory;
+
             self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), val) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.f64_eq) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.f64_const) catch return error.OutOfMemory;
+            self.currentCode().appendSlice(self.allocator, &@as([8]u8, @bitCast(-builtins.numeric_conversions.f32_max_as_f64))) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.f64_ge) catch return error.OutOfMemory;
 
-            // not_inf AND is_not_nan
             self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
 
             // Store success.

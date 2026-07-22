@@ -238,6 +238,19 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "True" },
     },
     .{
+        .name = "low_level - F32 transcendental exact bits agree across backends",
+        .source =
+        \\F32.to_bits(F32.sin(1.0)) == 1062693541
+        \\    and F32.to_bits(F32.cos(1.0)) == 1057640768
+        \\    and F32.to_bits(F32.tan(1.0)) == 1070029092
+        \\    and F32.to_bits(F32.asin(0.5)) == 1057360530
+        \\    and F32.to_bits(F32.acos(0.5)) == 1065749138
+        \\    and F32.to_bits(F32.atan(1.0)) == 1061752795
+        \\    and F32.to_bits(F32.pow(0.2, 3.3)) == 1000456303
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
         .name = "low_level - F32 tan matrix",
         .source =
         \\{
@@ -2609,6 +2622,20 @@ pub const tests = [_]TestCase{
         \\    and F64.to_f32_try(F64.infinity) == Err(OutOfRange)
         \\    and F64.to_f32_try(F64.negate(F64.infinity)) == Err(OutOfRange)
         \\    and F64.to_f32_try(F64.highest) == Err(OutOfRange)
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F64.to_f32_try checks the exact source boundary",
+        .source =
+        \\{
+        \\max = F64.from_bits(5183643170566569984)
+        \\above_max = F64.from_bits(5183643170566569985)
+        \\F64.to_f32_try(max) == Ok(F32.highest)
+        \\    and F64.to_f32_try(F64.negate(max)) == Ok(F32.lowest)
+        \\    and F64.to_f32_try(above_max) == Err(OutOfRange)
+        \\    and F64.to_f32_try(F64.negate(above_max)) == Err(OutOfRange)
+        \\}
         ,
         .expected = .{ .inspect_str = "True" },
     },
