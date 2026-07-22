@@ -30,20 +30,28 @@ behavior on any non-crash path.
 ## Current state
 
 There is no custom panic handler in the CLI binary. `src/cli/main.zig`'s
-`main` (`:1016`) installs the signal handler for stack overflow
-(`base.stack_overflow.installForCurrentThread()`, `:1028`) but declares no
+`main` (`:1019`) installs the signal handler for stack overflow
+(`base.stack_overflow.installForCurrentThread()`, `:1031`) but declares no
 `pub const panic`, so every explicit panic and every `unreachable` in a
 Debug or ReleaseSafe build routes to `std.debug.defaultPanic` and prints only
-a stack trace. `src/cli/main.zig` alone contains 21 `std.debug.panic(
-"… invariant violated: …")` sites (e.g. `:1672`, `:2611`, `:2734`, `:3346`,
-`:5507`) — each one a place where an ICE can surface today with no context.
+a stack trace. `src/cli/main.zig` alone contains 28 `std.debug.panic(
+"… invariant violated: …")` sites (of 46 `std.debug.panic` calls in the
+file) — for example `:1680` (`"default roc command invariant violated:
+hosted section size {d} differs from checked hosted catalog size {d}"`),
+`:2628` (`"default roc command invariant violated: no platform entrypoints
+in checked LIR root metadata"`), `:2751` (`"interpreter run invariant
+violated: missing LIR shared-memory handle"`), `:3363` (`"default app run
+invariant violated: no platform entrypoints"`), and `:5549` (`"dev run
+invariant violated: LIR proc {d} was not compiled before image symbol
+publication"`) — each one a place where an ICE can surface today with no
+context.
 
-Across `src/` (557 `.zig` files) the explicit-abort surface is large:
+Across `src/` (559 `.zig` files) the explicit-abort surface is large:
 
-- 96 `@panic` sites.
-- 598 `std.debug.panic` sites.
-- 694 combined explicit panic sites (`@panic` + `std.debug.panic`).
-- 1742 `unreachable` sites.
+- 99 `@panic` sites.
+- 627 `std.debug.panic` sites.
+- 726 combined explicit panic sites (`@panic` + `std.debug.panic`).
+- 1751 `unreachable` sites.
 
 A caveat on `unreachable`: reaching it in `ReleaseFast` is undefined
 behavior, not a panic, so a context handler cannot reliably fire there. The
@@ -69,13 +77,13 @@ connect them.
 
 - **The coordinator already holds the "what am I doing" facts, per module,
   in structured form.** `src/compile/coordinator.zig` defines the `Phase`
-  enum (`:417`): `Parse → Parsing → Canonicalize → WaitingOnImports →
+  enum (`:418`): `Parse → Parsing → Canonicalize → WaitingOnImports →
   WaitingOnPlatformRequirements → TypeCheck → Done`. Each `ModuleState`
-  carries `name` (`:459`), `path` (`:461`), and `phase` (`:483`). Worker
-  threads pull tasks in `workerThread` (`:4769`) and dispatch them in
-  `executeTaskInline` (`:2688`), whose three arms —
+  carries `name` (`:460`), `path` (`:462`), and `phase` (`:484`). Worker
+  threads pull tasks in `workerThread` (`:4830`) and dispatch them in
+  `executeTaskInline` (`:2734`), whose three arms —
   `.parse → executeParse`, `.canonicalize → executeCanonicalize`,
-  `.type_check → executeTypeCheck` (`:2690`–`:2692`) — are the natural
+  `.type_check → executeTypeCheck` (`:2736`–`:2738`) — are the natural
   push/pop boundaries: each task knows its module the whole time it runs.
 
 - **Signal handling for faults is already installed per thread.**
@@ -83,13 +91,13 @@ connect them.
   handlers with per-thread alternate stacks and stack bounds, dispatching to
   callbacks (`installForCurrentThread`, `:216`). `src/base/stack_overflow.zig`
   wires those callbacks and is installed on the main thread
-  (`main.zig:1028`), on every coordinator worker (`coordinator.zig:4770`),
+  (`main.zig:1031`), on every coordinator worker (`coordinator.zig:4831`),
   and in the shared thread pool (`base/parallel.zig:48`). A segfault therefore
   already runs Roc-authored code before the process dies — the hook point for
   the stretch goal below.
 
 - **The house style for contextual diagnostics is set by the interpreter.**
-  `src/eval/interpreter.zig`'s `invariantFailed` (`:803`) prints a formatted
+  `src/eval/interpreter.zig`'s `invariantFailed` (`:819`) prints a formatted
   message and asserts in Debug, `unreachable` in release — a terse, one-line,
   context-carrying failure. The crash-context block should read the same way:
   plain text, no ceremony, the facts and nothing else.
@@ -153,16 +161,20 @@ Push at cheap boundaries where the identity of the work is already known — one
 push per unit of work, `defer`-popped:
 
 - **Coordinator worker tasks** (`coordinator.zig` `executeTaskInline`,
-  `:2688`): each arm pushes `{ .phase = .Parse/.Canonicalize/.TypeCheck,
+  `:2734`): each arm pushes `{ .phase = .Parse/.Canonicalize/.TypeCheck,
   .module_path = mod.path, .module_name = mod.name }` for the duration of
   `executeParse` / `executeCanonicalize` / `executeTypeCheck`.
-- **Post-check stage entry** (`src/postcheck/*`): one push per stage
-  (`.phase = .Postcheck, .extra = "<stage name>"`, with the module carried
-  through), so a Monotype/Lambda-Solved/LIR-lowering crash names its stage.
+- **Post-check stage entry** — the stage sequence driven by
+  `lowerCheckedModulesToLir` (`src/lir/checked_pipeline.zig:214`), whose
+  `postcheck.*.run` calls fire in order (`:235`–`:273`: Monotype lower,
+  MonotypeLifted lift, SpecConstr, LambdaSolved solve, SolvedLirLower):
+  one push per stage (`.phase = .Postcheck, .extra = "<stage name>"`, with
+  the module carried through), so a Monotype/Lambda-Solved/LIR-lowering
+  crash names its stage.
 - **Backend codegen per proc**: at `MonoLlvmCodeGen.compileProcBody`
-  (`src/backend/llvm/MonoLlvmCodeGen.zig:1355`),
-  `LirCodeGen.compileProcSpec` (`src/backend/dev/LirCodeGen.zig:13839`), and
-  `WasmCodeGen.compileProcSpecBody` (`src/backend/wasm/WasmCodeGen.zig:7680`),
+  (`src/backend/llvm/MonoLlvmCodeGen.zig:1375`),
+  `LirCodeGen.compileProcSpec` (`src/backend/dev/LirCodeGen.zig:14303`), and
+  `WasmCodeGen.compileProcSpecBody` (`src/backend/wasm/WasmCodeGen.zig:7988`),
   push `{ .phase = .Codegen, .item = "<proc name/id>" }`.
 - **Interpreter entry points** (`src/eval/interpreter.zig`): push
   `{ .phase = .Interpret, .item = "<function/expr>" }` at the top-level eval
@@ -263,15 +275,15 @@ Small; on the order of a few days.
    `printFramesForCurrentThread(msg)` (fixed-buffer, allocation-free, stderr).
    Include the repro-command derivation from the innermost path-bearing frame.
 2. **Push at the coordinator task boundaries** — the three arms of
-   `executeTaskInline` (`coordinator.zig:2688`). This alone covers the most
+   `executeTaskInline` (`coordinator.zig:2734`). This alone covers the most
    common ICEs (parse/canonicalize/type-check).
 3. **Add the `pub const panic` override** in `src/cli/main.zig` that prints
    frames and chains to `std.debug.defaultPanic`. Optionally add the same
    override to the LSP binary and reconcile with the snapshot tool's existing
    override (it can call `printFramesForCurrentThread` before its longjmp path).
 4. **Push at post-check stage entry and backend codegen per proc**
-   (`MonoLlvmCodeGen.zig:1355`, dev `LirCodeGen.zig:13839`,
-   `WasmCodeGen.zig:7680`), and at the interpreter's top-level eval entry.
+   (`MonoLlvmCodeGen.zig:1375`, dev `LirCodeGen.zig:14303`,
+   `WasmCodeGen.zig:7988`), and at the interpreter's top-level eval entry.
 5. **Stretch:** call `printFramesForCurrentThread` from the access-violation
    callback in `stack_overflow.zig` so segfaults print context too.
 6. **Tests** (below).
@@ -335,7 +347,7 @@ wrapped in `crash_context.enter` flags gaps.
   compiler processes and asserts on their stderr (`stderr_exact`,
   `expected_build_stderr_contains`, and `not_contains` with
   `.{ .stream = .stderr, .text = "panic" }` / `"invariant violated"`, e.g. the
-  #9588 case at `:741`). Add spec entries that compile inputs which trip a
+  #9588 case at `:749`). Add spec entries that compile inputs which trip a
   *controlled* ICE in each phase (behind a debug-only test hook that forces a
   panic when a sentinel module/def is seen), and assert the child's stderr
   **contains** the expected context lines — the phase name, the module name,
@@ -356,5 +368,5 @@ wrapped in `crash_context.enter` flags gaps.
   mirror (thread-local state read in the handler, chain to the default).
 - `src/base/signal_handler.zig` / `src/base/stack_overflow.zig` — the
   per-thread fault-handling hooks the segfault stretch goal extends.
-- `src/eval/interpreter.zig:803` (`invariantFailed`) — the house style for a
+- `src/eval/interpreter.zig:819` (`invariantFailed`) — the house style for a
   terse, context-carrying failure the printed block should match.

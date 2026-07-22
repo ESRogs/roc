@@ -11,20 +11,20 @@ claim is only as good as the invariant that backs it, and today that
 invariant almost never appears next to the statement. It lives in the
 author's head.
 
-Under `src/`, `grep` finds **1742** lines containing `unreachable` in
+Under `src/`, `grep` finds **1751** lines containing `unreachable` in
 `.zig` files. Only **32** of them (under 2%) carry a same-line comment
 explaining why the case is impossible. The rest are bare. The forms break
 down as:
 
-- **1005** statement `unreachable;`
-- **426** switch-prong `=> unreachable,` — of which only **22** are
+- **995** statement `unreachable;`
+- **442** switch-prong `=> unreachable,` — of which only **22** are
   annotated
-- **471** `orelse unreachable`
-- **98** `catch unreachable`
+- **452** `orelse unreachable`
+- **107** `catch unreachable`
 
 (The forms overlap: `orelse unreachable;` counts in two rows.) By module,
-the concentration is `backend` 517, `canonicalize` 324, `check` 228,
-`builtins` 104, `cli` 93, `postcheck` 80, `compile` 72, `eval` 68.
+the concentration is `backend` 516, `canonicalize` 324, `check` 227,
+`builtins` 100, `cli` 96, `postcheck` 80, `compile` 83, `eval` 69.
 
 A bare `unreachable` is a maintenance hazard in three ways. A reader
 auditing the code cannot tell whether the case is genuinely impossible or
@@ -38,7 +38,7 @@ must be visible without running anything.
 
 The codebase already has one strong tool for the *dynamic* side of the
 same problem. The LIR interpreter's `invariantFailed`
-(`src/eval/interpreter.zig:803`) prints a formatted message and asserts in
+(`src/eval/interpreter.zig:819`) prints a formatted message and asserts in
 Debug builds, then falls through to `unreachable` in release. That gives a
 rich runtime diagnostic when an invariant breaks under test — but it does
 nothing for someone reading the source, and it exists in exactly one
@@ -52,7 +52,7 @@ The good sites already show the target shape. These are real and correct:
   `.erased_callable => unreachable, // Function values are not equality-comparable Roc values.`
 - `src/postcheck/match_tree.zig:443` —
   `.bind, .wildcard, .as_pattern, .record, .tuple, .nominal => unreachable, // normalized away`
-- `src/canonicalize/DependencyGraph.zig:1309` —
+- `src/canonicalize/DependencyGraph.zig:1311` —
   `const w = self.stack.pop() orelse unreachable; // Stack should not be empty`
 - `src/parse/AST.zig:1079` —
   `... catch unreachable; // Malformed handled above`
@@ -82,15 +82,15 @@ guess into an assertion.
 
 ## Evidence
 
-- `grep -rn unreachable src --include='*.zig' | wc -l` → 1742; the
+- `grep -rn unreachable src --include='*.zig' | wc -l` → 1751; the
   annotated subset (`unreachable` followed by punctuation then `//`,
   excluding the one string-literal match) → 32.
-- `grep -rnE '=> unreachable,' src --include='*.zig' | wc -l` → 426;
+- `grep -rnE '=> unreachable,' src --include='*.zig' | wc -l` → 442;
   with `// ` trailing → 22.
-- `src/eval/interpreter.zig:803` — the `invariantFailed` model: Debug
+- `src/eval/interpreter.zig:819` — the `invariantFailed` model: Debug
   message + assert, release `unreachable`.
 - The existing lint fleet this one joins: `CheckPanicStep`
-  (`build.zig:1044`), which scans named files/dirs for `@panic`, skips
+  (`build.zig:1173`), which scans named files/dirs for `@panic`, skips
   comment lines, honors a line-level allowlist and excluded line ranges,
   and fails the build step with per-site violations.
 
@@ -126,7 +126,7 @@ of what the code used to do.
 
 ### When to annotate vs. convert
 
-The migration is not "add a comment to all 1742 sites." For each site the
+The migration is not "add a comment to all 1751 sites." For each site the
 author asks: *can I name the invariant honestly?*
 
 - **Yes, and it is a true compile-time impossibility** → add the
@@ -159,7 +159,15 @@ A new check, modeled on `CheckPanicStep`, scanning all `.zig` under
    Debug message argument (the `invariantFailed`/assert conversion path)
    are compliant by virtue of the message, but the simplest rule is: a
    trailing `//` rationale, or the token is not lexically `unreachable`
-   at all.
+   at all. For expression-form sites the trailing `//` counts only when it
+   is attributed to the *last* unreachable-bearing token on the line:
+   close to thirty sites bury `orelse unreachable`/`catch unreachable`
+   mid-expression (e.g. `(map.get(x) orelse unreachable).field;`), where a
+   trailing comment could just as well pertain to the rest of the line, so
+   the lint requires that the `unreachable` be the final such token before
+   the `//`, or the site must be split onto its own line — otherwise an
+   unrelated trailing comment could satisfy the lint without justifying
+   the claim.
 3. **Shrinking allowlist.** A single tracked file,
    `ci/unreachable_allowlist.txt`, lists `path:line` sites still to be
    handled, one per line, each with a trailing `# owner/reason-todo`. The
@@ -183,18 +191,18 @@ Follow the established pattern exactly:
 
 - Add the check as a build Step next to `CheckPanicStep` in `build.zig`,
   and a `run-check-unreachable-rationale` step declared beside the other
-  `run-check-*` steps (`build.zig:2440-2456`), wired at the block near
-  `build.zig:5083-5110`.
+  `run-check-*` steps (`build.zig:2568-2585`), wired at the block near
+  `build.zig:5159-5160`.
 - Add one step to the `check-once` job in
   `.github/workflows/ci_zig.yml` (alongside "Check panic usage",
-  ~line 105): `run: zig build run-check-unreachable-rationale`.
+  ~lines 110-111): `run: zig build run-check-unreachable-rationale`.
 
 ## What success looks like
 
 Every criterion below must hold; the project is not done until all do:
 
 - `ci/unreachable_allowlist.txt` has **zero** entries and is deleted;
-  every one of the ~1742 sites is either annotated with a same-line
+  every one of the ~1751 sites is either annotated with a same-line
   rationale or converted (to a Debug-checked invariant or a returned
   error).
 - `zig build run-check-unreachable-rationale` passes and **fails** when a
@@ -207,7 +215,7 @@ Every criterion below must hold; the project is not done until all do:
 - The escalation category is real, not cosmetic: at least the sites where
   no honest invariant could be named were converted to Debug checks or
   error returns rather than given invented comments. (Spot-check the diff:
-  a PR that turned 1742 bare sites into 1742 one-liners with zero
+  a PR that turned 1751 bare sites into 1751 one-liners with zero
   conversions did the wrong thing.)
 - `git grep` for the banned restatement words as the entire rationale
   (`// unreachable`, `// impossible`, `// can't happen`) returns nothing.
@@ -235,7 +243,7 @@ invariants must keep the release path identical — message and assert
 compiled out, leaving the same `unreachable` the site had before — so
 `ReleaseFast` codegen is unchanged. Verify by confirming the converted
 functions' release output is unaffected (the `invariantFailed` shape at
-`interpreter.zig:803` already demonstrates this: release mode is a bare
+`interpreter.zig:819` already demonstrates this: release mode is a bare
 `unreachable`).
 
 ## Tests to add
