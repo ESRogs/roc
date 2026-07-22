@@ -3850,6 +3850,97 @@ Builtin :: [].{
 					},
 			)
 
+		## Like [List.map], but the transform can fail. Runs a `Try`-returning
+		## function on each element and collects the `Ok` values. Stops at the first
+		## `Err` and returns it, so the result is either all the transformed values
+		## or the first failure.
+		## ```roc
+		## expect [1.I64, 2, 3].map_try(|n| if n < 3 { Ok(n) } else { Err(TooBig) }) == Err(TooBig)
+		## ```
+		map_try : List(a), (a -> Try(b, err)) -> Try(List(b), err)
+		map_try = |list, transform| {
+			var $out = List.with_capacity(list.len())
+			for elem in list {
+				$out = list_append_unsafe($out, transform(elem)?)
+			}
+			Ok($out)
+		}
+
+		## Like [List.map_try], but the transform is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## rows.map_try!(|row| SQL.insert!("INSERT INTO t VALUES (?)", [row]))
+		## ```
+		map_try! : List(a), (a => Try(b, err)) => Try(List(b), err)
+		map_try! = |list, transform!| {
+			var $out = List.with_capacity(list.len())
+			for elem in list {
+				$out = list_append_unsafe($out, transform!(elem)?)
+			}
+			Ok($out)
+		}
+
+		## Like [List.keep_if], but the predicate can fail. Runs a `Try`-returning
+		## predicate on each element, keeping the ones it maps to `Ok(Bool.True)`.
+		## Stops at the first `Err` and returns it.
+		## ```roc
+		## expect [1.I64, 2, 3].keep_if_try(|n| Ok(n > 1)) == Ok([2, 3])
+		## ```
+		keep_if_try : List(a), (a -> Try(Bool, err)) -> Try(List(a), err)
+		keep_if_try = |list, predicate| {
+			var $out = []
+			for elem in list {
+				if predicate(elem)? {
+					$out = List.concat($out, [elem])
+				}
+			}
+			Ok($out)
+		}
+
+		## Like [List.keep_if_try], but the predicate is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## users.keep_if_try!(|user| SQL.query_bool!("SELECT is_active FROM users WHERE id = ?", [user.id]))
+		## ```
+		keep_if_try! : List(a), (a => Try(Bool, err)) => Try(List(a), err)
+		keep_if_try! = |list, predicate!| {
+			var $out = []
+			for elem in list {
+				if predicate!(elem)? {
+					$out = List.concat($out, [elem])
+				}
+			}
+			Ok($out)
+		}
+
+		## Like [List.fold], but the step function can fail. Threads `state` through
+		## the list, and if a step returns `Err`, stops and returns it.
+		## ```roc
+		## expect [1.I64, 2, 3].fold_try(0, |sum, n| if n < 3 { Ok(sum + n) } else { Err(Stop) }) == Err(Stop)
+		## ```
+		fold_try : List(item), state, (state, item -> Try(state, err)) -> Try(state, err)
+		fold_try = |list, initial, step| {
+			var $state = initial
+			for elem in list {
+				$state = step($state, elem)?
+			}
+			Ok($state)
+		}
+
+		## Like [List.fold_try], but the step function is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## events.fold_try!(State.init, |state, event| Store.apply!(state, event))
+		## ```
+		fold_try! : List(item), state, (state, item => Try(state, err)) => Try(state, err)
+		fold_try! = |list, initial, step!| {
+			var $state = initial
+			for elem in list {
+				$state = step!($state, elem)?
+			}
+			Ok($state)
+		}
+
 		## Build a value using each element in the list.
 		##
 		## Starting with a given `state` value, this folds through each element in the
