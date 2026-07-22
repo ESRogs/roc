@@ -1525,12 +1525,12 @@ pub const Evaluator = struct {
         }
         return switch (op) {
             .sqrt => @sqrt(x),
-            .sin => std.math.sin(x),
-            .cos => std.math.cos(x),
-            .tan => std.math.tan(x),
-            .asin => std.math.asin(x),
-            .acos => std.math.acos(x),
-            .atan => std.math.atan(x),
+            .sin => builtins.float_math_f64.sin(x),
+            .cos => builtins.float_math_f64.cos(x),
+            .tan => builtins.float_math_f64.tan(x),
+            .asin => builtins.float_math_f64.asin(x),
+            .acos => builtins.float_math_f64.acos(x),
+            .atan => builtins.float_math_f64.atan(x),
             .log => @log(x),
         };
     }

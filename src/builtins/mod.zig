@@ -20,7 +20,6 @@ pub const numeric_conversions = @import("numeric_conversions.zig");
 pub const sort = @import("sort.zig");
 pub const str = @import("str.zig");
 pub const utils = @import("utils.zig");
-pub const float_math_tan = @import("float_math/tan.zig");
 
 test "builtins tests" {
     std.testing.refAllDecls(@import("builtin_registry.zig"));

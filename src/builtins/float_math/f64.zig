@@ -1,4 +1,4 @@
-//! Deterministic, binary64-only implementation of Roc's F64 power builtin.
+//! Deterministic, binary64-only implementations of Roc's F64 transcendentals.
 //!
 //! The finite power kernel is ported from FreeBSD's fdlibm-derived `e_pow.c`,
 //! via Rust libm's `src/math/pow.rs`. It computes `log2(base)` and the
@@ -18,6 +18,7 @@
 // is preserved.
 
 const std = @import("std");
+const trig = @import("tan.zig");
 
 const canonical_nan: f64 = @bitCast(@as(u64, 0x7ff8_0000_0000_0000));
 const positive_infinity: f64 = @bitCast(@as(u64, 0x7ff0_0000_0000_0000));
@@ -236,6 +237,8 @@ pub fn pow(base: f64, exponent: f64) f64 {
     const exponent_abs_bits = exponent_bits & 0x7fff_ffff_ffff_ffff;
     if (base_abs_bits > 0x7ff0_0000_0000_0000 or exponent_abs_bits > 0x7ff0_0000_0000_0000) return canonical_nan;
     if (exponent == 1.0) return base;
+    if (exponent == -1.0) return 1.0 / base;
+    if (exponent == 2.0) return base * base;
 
     if (base_abs_bits == 0) {
         if (exponent < 0.0) return if (isOddInteger(exponent)) @bitCast((base_bits & 0x8000_0000_0000_0000) | 0x7ff0_0000_0000_0000) else positive_infinity;
@@ -265,6 +268,39 @@ pub fn pow(base: f64, exponent: f64) f64 {
     return result;
 }
 
+/// Returns the sine of `value`, computed entirely with binary64 operations.
+pub fn sin(value: f64) f64 {
+    return trig.sin64(value);
+}
+
+/// Returns the cosine of `value`, computed entirely with binary64 operations.
+pub fn cos(value: f64) f64 {
+    return trig.cos64(value);
+}
+
+/// Returns the tangent of `value`, computed entirely with binary64 operations.
+pub fn tan(value: f64) f64 {
+    return trig.tan64(value);
+}
+
+/// Returns the arcsine of `value` using Zig's explicit binary64 algorithm.
+pub fn asin(value: f64) f64 {
+    @setFloatMode(.strict);
+    return std.math.asin(value);
+}
+
+/// Returns the arccosine of `value` using Zig's explicit binary64 algorithm.
+pub fn acos(value: f64) f64 {
+    @setFloatMode(.strict);
+    return std.math.acos(value);
+}
+
+/// Returns the arctangent of `value` using Zig's explicit binary64 algorithm.
+pub fn atan(value: f64) f64 {
+    @setFloatMode(.strict);
+    return std.math.atan(value);
+}
+
 test "F64 power special cases" {
     const negative_infinity: f64 = @bitCast(@as(u64, 0xfff0_0000_0000_0000));
     const negative_zero: f64 = @bitCast(@as(u64, 0x8000_0000_0000_0000));
@@ -273,6 +309,8 @@ test "F64 power special cases" {
     try std.testing.expectEqual(@as(f64, -8.0), pow(-2.0, 3.0));
     try std.testing.expectEqual(@as(f64, 16.0), pow(-2.0, 4.0));
     try std.testing.expectEqual(@as(f64, 0.25), pow(2.0, -2.0));
+    try std.testing.expectEqual(@as(u64, 0x4de0_90a3_62a0_5c19), @as(u64, @bitCast(pow(7.165387657176249e-68, -1.0))));
+    try std.testing.expectEqual(@as(u64, 0x5574_34fc_b314_4853), @as(u64, @bitCast(pow(6.72744224805919e51, 2.0))));
     try std.testing.expectEqual(@as(f64, 1.0), pow(canonical_nan, 0.0));
     try std.testing.expectEqual(@as(f64, 1.0), pow(1.0, canonical_nan));
     try std.testing.expect(std.math.isNan(pow(canonical_nan, 1.0)));
@@ -347,4 +385,13 @@ test "deterministic F64 power result bits" {
     try std.testing.expectEqual(@as(u64, 0x0000_b815_7268_fdaf), @as(u64, @bitCast(pow(10.0, -309.0))));
     try std.testing.expectEqual(@as(u64, 0x7ede_3bbc_0ae0_45cb), @as(u64, @bitCast(pow(1.8742325878262631, 1111.0207098305914))));
     try std.testing.expectEqual(@as(u64, 0x06ee_dea9_9173_6578), @as(u64, @bitCast(pow(0.5797239088410756, 1159.5420969274194))));
+}
+
+test "deterministic F64 trigonometric result bits" {
+    try std.testing.expectEqual(@as(u64, 0x3fea_ed54_8f09_0cee), @as(u64, @bitCast(sin(1.0))));
+    try std.testing.expectEqual(@as(u64, 0x3fe1_4a28_0fb5_068c), @as(u64, @bitCast(cos(1.0))));
+    try std.testing.expectEqual(@as(u64, 0x3ff8_eb24_5cbe_e3a6), @as(u64, @bitCast(tan(1.0))));
+    try std.testing.expectEqual(@as(u64, 0x3fe0_c152_382d_7366), @as(u64, @bitCast(asin(0.5))));
+    try std.testing.expectEqual(@as(u64, 0x3ff0_c152_382d_7366), @as(u64, @bitCast(acos(0.5))));
+    try std.testing.expectEqual(@as(u64, 0x3fe9_21fb_5444_2d18), @as(u64, @bitCast(atan(1.0))));
 }

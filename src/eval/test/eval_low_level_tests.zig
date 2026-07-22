@@ -246,7 +246,7 @@ pub const tests = [_]TestCase{
         \\    and F32.to_bits(F32.asin(0.5)) == 1057360530
         \\    and F32.to_bits(F32.acos(0.5)) == 1065749138
         \\    and F32.to_bits(F32.atan(1.0)) == 1061752795
-        \\    and F32.to_bits(F32.pow(0.2, 3.3)) == 1000456303
+        \\    and F32.to_bits(F32.pow(0.2, 3.3)) == 1000456306
         ,
         .expected = .{ .inspect_str = "True" },
     },
@@ -257,6 +257,7 @@ pub const tests = [_]TestCase{
         \\    and F32.to_bits(F32.pow(2.0, -128.0)) == 2097152
         \\    and F32.to_bits(F32.pow(2.0, -149.0)) == 1
         \\    and F32.to_bits(F32.pow(2.0, -150.0)) == 0
+        \\    and F32.to_bits(F32.pow(1.002557635307312, -34869.0)) == 1484514
         ,
         .expected = .{ .inspect_str = "True" },
     },
@@ -272,6 +273,8 @@ pub const tests = [_]TestCase{
         \\    and F64.to_bits(F64.pow(10.0, -309.0)) == 202402253307311
         \\    and F64.to_bits(F64.pow(1.8742325878262631, 1111.0207098305914)) == 9141809972431046091
         \\    and F64.to_bits(F64.pow(0.5797239088410756, 1159.5420969274194)) == 499581428555801976
+        \\    and F64.to_bits(F64.pow(7.165387657176249e-68, -1.0)) == 5611644167112383513
+        \\    and F64.to_bits(F64.pow(6.72744224805919e51, 2.0)) == 6157604850463164499
         ,
         .expected = .{ .inspect_str = "True" },
     },
@@ -303,6 +306,18 @@ pub const tests = [_]TestCase{
         \\    and F64.acos(1.0).to_str() == "0"
         \\    and F64.atan(0.0).to_str() == "0"
         \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F64 transcendental exact bits agree across backends",
+        .source =
+        \\F64.to_bits(F64.sin(1.0)) == 4605754516372524270
+        \\    and F64.to_bits(F64.cos(1.0)) == 4603041830072026764
+        \\    and F64.to_bits(F64.tan(1.0)) == 4609692760021066662
+        \\    and F64.to_bits(F64.asin(0.5)) == 4602891378046628710
+        \\    and F64.to_bits(F64.acos(0.5)) == 4607394977673999206
+        \\    and F64.to_bits(F64.atan(1.0)) == 4605249457297304856
         ,
         .expected = .{ .inspect_str = "True" },
     },
