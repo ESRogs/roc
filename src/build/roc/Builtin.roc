@@ -17810,7 +17810,7 @@ scan_json_string_tail = |tail| {
 			_ => {
 				# JSON requires U+0000 through U+001F to be escaped inside strings.
 				if byte < 32 {
-					return Err(Json.invalid_json)
+					return Err(InvalidJson("unescaped control character in string"))
 				} else {
 					$index = $index + 1
 				}
@@ -17819,7 +17819,7 @@ scan_json_string_tail = |tail| {
 	}
 
 	# no unescaped closing quote anywhere: the string is unterminated
-	Err(Json.invalid_json)
+	Err(InvalidJson("unterminated string"))
 }
 
 ## Find the end of a JSON string, for skipped values whose content is discarded.
@@ -17883,7 +17883,7 @@ parse_json_escaped_code_point = |s, index| {
 	len = Str.count_utf8_bytes(s)
 	if index + 2 > len {
 		# the backslash ends the input: a truncated escape
-		return Err(Json.invalid_json)
+		return Err(InvalidJson("truncated escape"))
 	}
 
 	match str_get_utf8_byte_unsafe(s, index + 1) {
@@ -17904,7 +17904,7 @@ parse_json_escaped_code_point = |s, index| {
 		'u' => {
 			if index + 6 > len {
 				# truncated \uXXXX escape
-				return Err(Json.invalid_json)
+				return Err(InvalidJson("truncated \\uXXXX escape"))
 			}
 			unit = decode_json_hex4(
 				str_get_utf8_byte_unsafe(s, index + 2),
@@ -17916,10 +17916,10 @@ parse_json_escaped_code_point = |s, index| {
 				# a high surrogate (U+D800..U+DBFF) merges with the low
 				# surrogate escape that must follow
 				if index + 12 > len {
-					return Err(Json.invalid_json)
+					return Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 				}
 				if str_get_utf8_byte_unsafe(s, index + 6) != '\\' or str_get_utf8_byte_unsafe(s, index + 7) != 'u' {
-					return Err(Json.invalid_json)
+					return Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 				}
 				low = decode_json_hex4(
 					str_get_utf8_byte_unsafe(s, index + 8),
@@ -17930,18 +17930,18 @@ parse_json_escaped_code_point = |s, index| {
 				if low >= 0xDC00 and low <= 0xDFFF {
 					Ok({ code_point: 0x10000 + (unit - 0xD800) * 0x400 + (low - 0xDC00), consumed: 12 })
 				} else {
-					Err(Json.invalid_json)
+					Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 				}
 			} else if unit >= 0xDC00 and unit <= 0xDFFF {
 				# unpaired low surrogate (U+DC00..U+DFFF)
-				Err(Json.invalid_json)
+				Err(InvalidJson("unpaired low surrogate escape"))
 			} else {
 				# a BMP code unit already is the code point
 				Ok({ code_point: unit, consumed: 6 })
 			}
 		}
 		# unknown escape
-		_ => Err(Json.invalid_json)
+		_ => Err(InvalidJson("unknown escape character"))
 	}
 }
 
