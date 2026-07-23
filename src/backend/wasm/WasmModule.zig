@@ -976,6 +976,15 @@ pub fn ensureMemoryMinBytes(self: *Self, byte_count: usize) void {
     }
 }
 
+/// First byte after all statically assigned data addresses.
+///
+/// This remains conservative after data DCE because segments keep their
+/// assigned offsets; runtime allocation must never reuse any address that was
+/// part of the module's static-data address space.
+pub fn heapBase(self: *const Self) u32 {
+    return self.data_offset;
+}
+
 /// Add a data segment to linear memory. Returns the offset where the data
 /// will be placed. The data is copied and aligned to `align_bytes`.
 pub fn addDataSegment(self: *Self, data: []const u8, align_bytes: u32) Allocator.Error!u32 {
@@ -5172,6 +5181,17 @@ test "setup — table size matches element count after finalization" {
 
     // The table should exist
     try std.testing.expect(decoded.has_table);
+}
+
+test "heapBase follows the complete static-data address space" {
+    const allocator = std.testing.allocator;
+    var module = Self.init(allocator);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1024), module.heapBase());
+    try std.testing.expectEqual(@as(u32, 1024), try module.addDataSegment(&.{ 1, 2, 3 }, 1));
+    try std.testing.expectEqual(@as(u32, 1040), try module.addDataSegment(&.{4}, 16));
+    try std.testing.expectEqual(@as(u32, 1041), module.heapBase());
 }
 
 test "setup — memory exported as 'memory'" {

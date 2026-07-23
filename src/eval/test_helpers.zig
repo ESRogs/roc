@@ -2965,7 +2965,7 @@ pub fn wasmEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPr
     const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout, wasm32_builtins.bytes) catch return error.OutOfMemory;
     defer allocator.free(wasm_result.wasm_bytes);
 
-    const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.has_imports);
+    const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.heap_base, wasm_result.has_imports);
     return .{
         .output = result.output,
         .allocation_count = result.allocation_count,

@@ -1939,6 +1939,7 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
 pub const GenerateResult = struct {
     wasm_bytes: []u8,
     result_layout: layout.Idx,
+    heap_base: u32,
     has_imports: bool = false,
 };
 
@@ -2337,6 +2338,7 @@ pub fn generateModule(
     return .{
         .wasm_bytes = wasm_bytes,
         .result_layout = result_layout,
+        .heap_base = self.module.heapBase(),
         .has_imports = self.module.importCount() > 0,
     };
 }
