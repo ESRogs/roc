@@ -95,7 +95,7 @@ expect {
 		Err(_) => Err(Json.invalid_json)
 	}
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unescaped control character in string"))
 }
 
 # the control-character boundaries: raw 0x00 and raw 0x1F are both rejected
@@ -108,7 +108,7 @@ expect {
 		Err(_) => Err(Json.invalid_json)
 	}
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unescaped control character in string"))
 }
 
 expect {
@@ -120,7 +120,7 @@ expect {
 		Err(_) => Err(Json.invalid_json)
 	}
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unescaped control character in string"))
 }
 
 # raw DEL (0x7F) is just past the control range and is valid unescaped
@@ -145,7 +145,7 @@ expect {
 	result : Try({ s : Str }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"s\": \"a\\xb\"}")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unknown escape character"))
 }
 
 # input ends on a backslash
@@ -153,7 +153,7 @@ expect {
 	result : Try(Str, [InvalidJson(Str)])
 	result = Json.parse("\"a\\")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("truncated escape"))
 }
 
 # incomplete \u escape
@@ -177,7 +177,7 @@ expect {
 	result : Try({ s : Str }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"s\": \"a\\uD83Db\"}")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 }
 
 # unpaired low surrogate
@@ -185,7 +185,7 @@ expect {
 	result : Try({ s : Str }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"s\": \"a\\uDE00b\"}")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unpaired low surrogate escape"))
 }
 
 # --- escapes beyond top-level string values ---
@@ -252,7 +252,7 @@ expect {
 	result : Try(Str, [InvalidJson(Str)])
 	result = Json.parse("\"abc\\\"")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unterminated string"))
 }
 
 # a realistic API-response payload: escaped newlines in body text, quotes in
@@ -344,7 +344,7 @@ expect {
 	result : Try({ a : U64 }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"skip\":{\"deep\":[\"ok\",\"bad\\qx\"]},\"a\":7}")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unknown escape character"))
 }
 
 # a raw control byte inside a skipped string is still rejected
@@ -359,7 +359,7 @@ expect {
 		Err(_) => Err(Json.invalid_json)
 	}
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unescaped control character in string"))
 }
 
 # unterminated skipped string
@@ -367,7 +367,7 @@ expect {
 	result : Try({ a : U64 }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"a\":7,\"skip\":\"abc")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unterminated string"))
 }
 
 # skipped string ending in a lone backslash at end of input
@@ -375,7 +375,7 @@ expect {
 	result : Try({ a : U64 }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"a\":7,\"skip\":\"abc\\")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("truncated escape"))
 }
 
 # invalid escapes rejected in skipped positions, mirroring the value cases
@@ -383,7 +383,7 @@ expect {
 	result : Try({ a : U64 }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"skip\":\"a\\xb\",\"a\":7}")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unknown escape character"))
 }
 
 expect {
@@ -404,14 +404,14 @@ expect {
 	result : Try({ a : U64 }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"skip\":\"a\\uD83Db\",\"a\":7}")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 }
 
 expect {
 	result : Try({ a : U64 }, [InvalidJson(Str), MissingRequiredField(Str)])
 	result = Json.parse("{\"skip\":\"a\\uDE00b\",\"a\":7}")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("unpaired low surrogate escape"))
 }
 
 # escaped key on a skipped nested object (the skip_json_object key site)
@@ -429,7 +429,7 @@ expect {
 	result : Try(Str, [InvalidJson(Str)])
 	result = Json.parse("\"\\uD83D")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 }
 
 # high surrogate followed by a \u escape that is not a low surrogate
@@ -437,7 +437,7 @@ expect {
 	result : Try(Str, [InvalidJson(Str)])
 	result = Json.parse("\"\\uD83D\\u0041\"")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 }
 
 # input truncated in the middle of \u hex digits
@@ -445,7 +445,7 @@ expect {
 	result : Try(Str, [InvalidJson(Str)])
 	result = Json.parse("\"\\u12")
 
-	result == Err(Json.invalid_json)
+	result == Err(InvalidJson("truncated \\uXXXX escape"))
 }
 
 # --- UTF-8 encoding tier boundaries ---
@@ -550,4 +550,33 @@ expect {
 	round_tripped = Json.parse(Json.to_str(original))
 
 	round_tripped == Ok(original)
+}
+
+# the maximum code point (U+10FFFF) arrives as the highest surrogate pair
+expect {
+	result : Try(Str, [InvalidJson(Str)])
+	result = Json.parse("\"\\uDBFF\\uDFFF\"")
+
+	expected = Str.from_utf8([244, 143, 191, 191])
+
+	match (result, expected) {
+		(Ok(parsed), Ok(want)) => parsed == want
+		_ => False
+	}
+}
+
+# a surrogate pair truncated inside its second escape is rejected
+expect {
+	result : Try(Str, [InvalidJson(Str)])
+	result = Json.parse("\"\\uD83D\\uDE\"")
+
+	result == Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
+}
+
+# a high surrogate followed by literal characters is rejected
+expect {
+	result : Try(Str, [InvalidJson(Str)])
+	result = Json.parse("\"\\uD83Dxy\"")
+
+	result == Err(InvalidJson("high surrogate escape not followed by a low surrogate escape"))
 }
