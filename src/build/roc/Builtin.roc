@@ -542,36 +542,34 @@ Builtin :: [].{
 				}
 
 				digits = Str.concat(parts.whole_part, parts.frac_part)
+				whole_len = Str.count_utf8_bytes(parts.whole_part)
+				total_len = Str.count_utf8_bytes(digits)
+				leading_zeros_len = Json.json_dec_count_leading_zeros(digits)
 
-				if Json.json_dec_digits_are_zero(digits) {
+				if leading_zeros_len == total_len {
 					dec_from_str("0")
 				} else {
-					whole_len = Str.count_utf8_bytes(parts.whole_part).to_i64_wrap()
-					raw_point = whole_len + exponent
-					trimmed = Json.trim_json_dec_leading_zeros(digits, raw_point)
+					# where the point sits in the digit run as written
+					written_point_offset = whole_len.to_i64_wrap() - leading_zeros_len.to_i64_wrap() # Str len fits I64
 
-					if trimmed.point > 21 or trimmed.point < -18 {
+					# offset into the run of significant digits where the decimal point lives
+					# once the exponent is applied: 3 for 123.4, 0 for 0.1234, -2 for 0.001234
+					point_offset = written_point_offset + exponent
+
+					# the dropped prefix is ASCII zeros, so the cut is a UTF-8 boundary
+					trimmed_digits = str_drop_first_bytes_unsafe(digits, leading_zeros_len)
+
+					if point_offset > 21 or point_offset < -18 {
 						Err(BadNumStr)
 					} else {
-						normalized = Json.normalize_json_dec_digits(negative, trimmed.digits, trimmed.point)?
+						normalized = Json.normalize_json_dec_digits(negative, trimmed_digits, point_offset)?
 						dec_from_str(normalized)
 					}
 				}
 			}
 
-			json_dec_digits_are_zero : Str -> Bool
-			json_dec_digits_are_zero = |digits| {
-				for byte in Str.iter_utf8(digits) {
-					if byte != 48 {
-						return False
-					}
-				}
-
-				True
-			}
-
-			trim_json_dec_leading_zeros : Str, I64 -> { digits : Str, point : I64 }
-			trim_json_dec_leading_zeros = |digits, point| {
+			json_dec_count_leading_zeros : Str -> U64
+			json_dec_count_leading_zeros = |digits| {
 				len = Str.count_utf8_bytes(digits)
 				var $index = 0
 
@@ -579,11 +577,7 @@ Builtin :: [].{
 					$index = $index + 1
 				}
 
-				{
-					# the dropped prefix is ASCII zeros, so the cut is a UTF-8 boundary
-					digits: str_drop_first_bytes_unsafe(digits, $index),
-					point: point - $index.to_i64_wrap(),
-				}
+				$index
 			}
 
 			normalize_json_dec_digits : Bool, Str, I64 -> Try(Str, [BadNumStr])
