@@ -69,6 +69,13 @@ dec_parses_as = |json, expected| {
 	result == Ok(expected)
 }
 
+dec_rejects : Str -> Bool
+dec_rejects = |json| {
+	result : Try(Dec, [InvalidJson(Str)])
+	result = Json.parse(json)
+	result == Err(Json.invalid_json)
+}
+
 # --- literal spellings must be exact ---
 
 # wrong-case literals are rejected
@@ -128,6 +135,66 @@ expect f64_parses_as("0e0", 0.0)
 # sign, fraction, and exponent combined
 expect f64_parses_as("-1.5e-3", -0.0015)
 expect dec_parses_as("-1.5e-3", -0.0015)
+
+# --- Dec exponent placement ---
+
+# Dec applies the exponent by moving the decimal point through the mantissa's
+# digits; it can land inside them, past their end, or before their start.
+
+# inside the digits
+expect dec_parses_as("1.5e3", 1500.0)
+expect dec_parses_as("1.2345e2", 123.45)
+# past the last digit, so the value carries trailing zeros
+expect dec_parses_as("15e2", 1500.0)
+expect dec_parses_as("1e18", 1000000000000000000.0)
+# the most trailing zeros Dec's 21 whole digits allow
+expect dec_parses_as("1e20", 100000000000000000000.0)
+# before the first digit, so the value carries leading zeros
+expect dec_parses_as("1e-18", 0.000000000000000001)
+expect dec_parses_as("125e-18", 0.000000000000000125)
+
+# uppercase marker, explicit plus, and a zero exponent
+expect dec_parses_as("1E5", 100000.0)
+expect dec_parses_as("1e+5", 100000.0)
+expect dec_parses_as("15e0", 15.0)
+
+# an all-zero mantissa is zero at any exponent, either sign
+expect dec_parses_as("0e0", 0.0)
+expect dec_parses_as("0.000e25", 0.0)
+expect dec_parses_as("-0e-25", 0.0)
+
+# leading zeros in the mantissa do not shift the point
+expect dec_parses_as("0.0015e0", 0.0015)
+expect dec_parses_as("0.0015e2", 0.15)
+
+# Dec.lowest sits one 10^-18 step further from zero than Dec.highest, so it has
+# no positive counterpart: reaching it means carrying the sign through the
+# conversion, since building the magnitude first would overflow.
+expect dec_parses_as("1.70141183460469231731687303715884105727e20", Dec.highest)
+expect dec_parses_as("-1.70141183460469231731687303715884105728e20", Dec.lowest)
+
+# one step past either end is out of range
+expect dec_rejects("1.70141183460469231731687303715884105728e20")
+expect dec_rejects("-1.70141183460469231731687303715884105729e20")
+
+# A digit run can be wider than the 21 whole and 18 decimal digits a Dec holds
+# and still name a value that fits, so neither run is bounded on its own.
+expect dec_parses_as("1.12345678901234567890123e5", 112345.678901234567890123)
+expect dec_parses_as("123456789012345678901234.5e-10", 12345678901234.56789012345)
+
+# leading zeros are digits too: this run is 39 long but names 10^-18
+expect dec_parses_as("0.00000000000000000000000000000000000001e20", 0.000000000000000001)
+
+# 39 significant digits, past what the value can hold
+expect dec_rejects("1.99999999999999999999999999999999999999e20")
+
+# values needing more than 18 decimal places are out of range
+expect dec_rejects("1e-19")
+expect dec_rejects("15e-19")
+expect dec_rejects("1500000000000000000000e-40")
+
+# more than 21 whole digits is out of range
+expect dec_rejects("1e21")
 
 # negative zero is a valid JSON number (signed and float targets accept it;
 # unsigned targets reject any minus sign)
