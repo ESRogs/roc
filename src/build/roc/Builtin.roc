@@ -537,17 +537,17 @@ Builtin :: [].{
 				}
 
 				parts = match Str.split_first(unsigned_mantissa, ".") {
-					Ok(split) => { int_part: split.before, frac_part: split.after }
-					Err(NotFound) => { int_part: unsigned_mantissa, frac_part: "" }
+					Ok(split) => { whole_part: split.before, frac_part: split.after }
+					Err(NotFound) => { whole_part: unsigned_mantissa, frac_part: "" }
 				}
 
-				digits = Str.concat(parts.int_part, parts.frac_part)
+				digits = Str.concat(parts.whole_part, parts.frac_part)
 
 				if Json.json_dec_digits_are_zero(digits) {
 					dec_from_str("0")
 				} else {
-					int_len = Str.count_utf8_bytes(parts.int_part).to_i64_wrap()
-					raw_point = int_len + exponent
+					whole_len = Str.count_utf8_bytes(parts.whole_part).to_i64_wrap()
+					raw_point = whole_len + exponent
 					trimmed = Json.trim_json_dec_leading_zeros(digits, raw_point)
 
 					if trimmed.point > 21 or trimmed.point < -18 {
