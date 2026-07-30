@@ -541,10 +541,9 @@ Builtin :: [].{
 					Err(NotFound) => { whole_part: unsigned_mantissa, frac_part: "" }
 				}
 
-				digits = Str.concat(parts.whole_part, parts.frac_part)
 				whole_len = Str.count_utf8_bytes(parts.whole_part)
-				total_len = Str.count_utf8_bytes(digits)
-				leading_zeros_len = Json.json_dec_count_leading_zeros(digits)
+				total_len = whole_len + Str.count_utf8_bytes(parts.frac_part)
+				leading_zeros_len = Json.json_dec_count_leading_zeros(parts)
 				significant_len = (total_len - leading_zeros_len).to_i64_wrap() # Str len fits I64
 
 				if significant_len == 0 {
@@ -557,16 +556,28 @@ Builtin :: [].{
 					# once the exponent is applied: 3 for 123.4, 0 for 0.1234, -2 for 0.001234
 					point_offset = written_point_offset + exponent
 
-					Json.json_dec_value_at_point(digits, { leading_zeros_len, significant_len, point_offset }, negative)
+					Json.json_dec_value_at_point(parts, { leading_zeros_len, significant_len, point_offset }, negative)
 				}
 			}
 
-			json_dec_count_leading_zeros : Str -> U64
+			## One digit of the run, indexed as though the two parts were joined.
+			json_dec_digit_at : { whole_part : Str, frac_part : Str }, U64 -> U8
+			json_dec_digit_at = |digits, index| {
+				whole_len = Str.count_utf8_bytes(digits.whole_part)
+
+				if index < whole_len {
+					str_get_utf8_byte_unsafe(digits.whole_part, index)
+				} else {
+					str_get_utf8_byte_unsafe(digits.frac_part, index - whole_len)
+				}
+			}
+
+			json_dec_count_leading_zeros : { whole_part : Str, frac_part : Str } -> U64
 			json_dec_count_leading_zeros = |digits| {
-				len = Str.count_utf8_bytes(digits)
+				len = Str.count_utf8_bytes(digits.whole_part) + Str.count_utf8_bytes(digits.frac_part)
 				var $index = 0
 
-				while $index < len and str_get_utf8_byte_unsafe(digits, $index) == 48 {
+				while $index < len and Json.json_dec_digit_at(digits, $index) == 48 {
 					$index = $index + 1
 				}
 
@@ -576,7 +587,7 @@ Builtin :: [].{
 			## The digits read as a value with the decimal point at `point_offset`, which
 			## may sit outside them on either side: past the last digit for trailing
 			## zeros, or before the first for decimal places.
-			json_dec_value_at_point : Str, { leading_zeros_len : U64, significant_len : I64, point_offset : I64 }, Bool -> Try(Dec, [BadNumStr])
+			json_dec_value_at_point : { whole_part : Str, frac_part : Str }, { leading_zeros_len : U64, significant_len : I64, point_offset : I64 }, Bool -> Try(Dec, [BadNumStr])
 			json_dec_value_at_point = |digits, placement, negative| {
 				{ leading_zeros_len, significant_len, point_offset } = placement
 
@@ -599,7 +610,7 @@ Builtin :: [].{
 
 					while $index < significant_len {
 						digit_index = leading_zeros_len + $index.to_u64_wrap() # 0 <= index
-						digit = (str_get_utf8_byte_unsafe(digits, digit_index) - 48).to_i128()
+						digit = (Json.json_dec_digit_at(digits, digit_index) - 48).to_i128()
 
 						if $index < point_offset {
 							$whole = $whole * 10 + digit
