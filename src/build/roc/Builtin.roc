@@ -545,9 +545,10 @@ Builtin :: [].{
 				whole_len = Str.count_utf8_bytes(parts.whole_part)
 				total_len = Str.count_utf8_bytes(digits)
 				leading_zeros_len = Json.json_dec_count_leading_zeros(digits)
+				significant_len = (total_len - leading_zeros_len).to_i64_wrap() # Str len fits I64
 
-				if leading_zeros_len == total_len {
-					dec_from_str("0")
+				if significant_len == 0 {
+					Ok(0.0)
 				} else {
 					# where the point sits in the digit run as written
 					written_point_offset = whole_len.to_i64_wrap() - leading_zeros_len.to_i64_wrap() # Str len fits I64
@@ -556,15 +557,7 @@ Builtin :: [].{
 					# once the exponent is applied: 3 for 123.4, 0 for 0.1234, -2 for 0.001234
 					point_offset = written_point_offset + exponent
 
-					# the dropped prefix is ASCII zeros, so the cut is a UTF-8 boundary
-					trimmed_digits = str_drop_first_bytes_unsafe(digits, leading_zeros_len)
-
-					if point_offset > 21 or point_offset < -18 {
-						Err(BadNumStr)
-					} else {
-						normalized = Json.normalize_json_dec_digits(negative, trimmed_digits, point_offset)?
-						dec_from_str(normalized)
-					}
+					Json.json_dec_value_at_point(digits, { leading_zeros_len, significant_len, point_offset }, negative)
 				}
 			}
 
@@ -580,33 +573,105 @@ Builtin :: [].{
 				$index
 			}
 
-			normalize_json_dec_digits : Bool, Str, I64 -> Try(Str, [BadNumStr])
-			normalize_json_dec_digits = |negative, digits, point| {
-				sign = if negative "-" else ""
+			## The digits read as a value with the decimal point at `point_offset`, which
+			## may sit outside them on either side: past the last digit for trailing
+			## zeros, or before the first for decimal places.
+			json_dec_value_at_point : Str, { leading_zeros_len : U64, significant_len : I64, point_offset : I64 }, Bool -> Try(Dec, [BadNumStr])
+			json_dec_value_at_point = |digits, placement, negative| {
+				{ leading_zeros_len, significant_len, point_offset } = placement
 
-				if point <= 0 {
-					zero_count = point.negate().to_u64_wrap()
+				# Dec holds at most 21 integer digits and 18 decimal places. This bounds
+				# the loop and the table index; whether the value itself fits is settled
+				# when the parts are converted.
+				decimal_places = significant_len - point_offset
 
-					Ok(
-						Str.concat(
-							sign,
-							Str.concat("0.", Str.concat(Str.repeat("0", zero_count), digits)),
-						),
-					)
+				if point_offset > 21 or decimal_places > 18 {
+					Err(BadNumStr)
 				} else {
-					point_u64 = point.to_u64_wrap()
-					digits_len = Str.count_utf8_bytes(digits)
+					# The point can miss the digits in either direction: decimal places
+					# to divide by on one side, trailing zeros that were never written
+					# down to multiply by on the other. Only one is ever nonzero.
+					frac_count = decimal_places.max(0)
+					trailing_zeros = decimal_places.negate().max(0)
+					var $whole = 0
+					var $frac = 0
+					var $index = 0
 
-					if point_u64 >= digits_len {
-						zero_count = point_u64 - digits_len
-						Ok(Str.concat(sign, Str.concat(digits, Str.repeat("0", zero_count))))
-					} else {
-						# digits holds only ASCII digits, so any cut is a UTF-8 boundary
-						before = str_substring_unsafe(digits, 0, point_u64)
-						after = str_drop_first_bytes_unsafe(digits, point_u64)
+					while $index < significant_len {
+						digit_index = leading_zeros_len + $index.to_u64_wrap() # 0 <= index
+						digit = (str_get_utf8_byte_unsafe(digits, digit_index) - 48).to_i128()
 
-						Ok(Str.concat(sign, Str.concat(before, Str.concat(".", after))))
+						if $index < point_offset {
+							$whole = $whole * 10 + digit
+						} else {
+							$frac = $frac * 10 + digit
+						}
+
+						$index = $index + 1
 					}
+
+					whole_with_zeros = $whole * Json.json_dec_pow_ten(trailing_zeros.to_i128())
+
+					Json.json_dec_from_whole_and_frac(whole_with_zeros, $frac, frac_count.to_i128(), negative)
+				}
+			}
+
+			## 10^exponent for the range Dec spans: 18 decimal places to scale a
+			## fraction by, 20 trailing zeros to reach 21 integer digits. These are
+			## literals because `pow` is a call with a loop inside, and this sits on
+			## every parse.
+			json_dec_pow_ten : I128 -> I128
+			json_dec_pow_ten = |exponent|
+				match exponent {
+					0 => 1
+					1 => 10
+					2 => 100
+					3 => 1000
+					4 => 10000
+					5 => 100000
+					6 => 1000000
+					7 => 10000000
+					8 => 100000000
+					9 => 1000000000
+					10 => 10000000000
+					11 => 100000000000
+					12 => 1000000000000
+					13 => 10000000000000
+					14 => 100000000000000
+					15 => 1000000000000000
+					16 => 10000000000000000
+					17 => 100000000000000000
+					18 => 1000000000000000000
+					19 => 10000000000000000000
+					20 => 100000000000000000000
+					_ => {
+						crash "json_dec_pow_ten: exponent outside 0..20"
+					}
+				}
+
+			## whole + frac / 10^frac_count, negated as a whole if `negative`. The sign
+			## goes on the parts rather than the result: Dec.lowest has no positive
+			## representation, and negating it wraps instead of erroring.
+			json_dec_from_whole_and_frac : I128, I128, I128, Bool -> Try(Dec, [BadNumStr])
+			json_dec_from_whole_and_frac = |whole, frac, frac_count, negative| {
+				signed = |value| if negative {
+					value.negate()
+				} else {
+					value
+				}
+				in_range = |value|
+					match value.to_dec_try() {
+						Ok(dec) => Ok(dec)
+						Err(_) => Err(BadNumStr)
+					}
+
+				whole_dec = in_range(signed(whole))?
+				frac_dec = in_range(signed(frac))?
+				frac_scale_dec = in_range(Json.json_dec_pow_ten(frac_count))?
+
+				match whole_dec.plus_try(frac_dec.div_by(frac_scale_dec)) {
+					Ok(value) => Ok(value)
+					Err(_) => Err(BadNumStr)
 				}
 			}
 
