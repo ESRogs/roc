@@ -537,93 +537,110 @@ Builtin :: [].{
 				}
 
 				parts = match Str.split_first(unsigned_mantissa, ".") {
-					Ok(split) => { whole_part: split.before, frac_part: split.after }
-					Err(NotFound) => { whole_part: unsigned_mantissa, frac_part: "" }
+					Ok(split) => DecParts.{ whole_part: split.before, frac_part: split.after, exponent, negative }
+					Err(NotFound) => DecParts.{ whole_part: unsigned_mantissa, frac_part: "", exponent, negative }
 				}
 
-				whole_len = Str.count_utf8_bytes(parts.whole_part)
-				total_len = whole_len + Str.count_utf8_bytes(parts.frac_part)
-				leading_zeros_len = Json.json_dec_count_leading_zeros(parts)
-				significant_len = (total_len - leading_zeros_len).to_i64_wrap() # Str len fits I64
-
-				if significant_len == 0 {
-					Ok(0.0)
-				} else {
-					# where the point sits in the digit run as written
-					written_point_offset = whole_len.to_i64_wrap() - leading_zeros_len.to_i64_wrap() # Str len fits I64
-
-					# offset into the run of significant digits where the decimal point lives
-					# once the exponent is applied: 3 for 123.4, 0 for 0.1234, -2 for 0.001234
-					point_offset = written_point_offset + exponent
-
-					Json.json_dec_value_at_point(parts, { leading_zeros_len, significant_len, point_offset }, negative)
-				}
+				parts.to_dec()
 			}
 
-			## One digit of the run, indexed as though the two parts were joined.
-			json_dec_digit_at : { whole_part : Str, frac_part : Str }, U64 -> U8
-			json_dec_digit_at = |digits, index| {
-				whole_len = Str.count_utf8_bytes(digits.whole_part)
+			## A JSON number split into the pieces Dec needs: for `-1.5e3`, "1", "5",
+			## an exponent of 3, and a negative sign. The digit runs are indexed as
+			## though joined, so they are read without ever being joined.
+			DecParts :: { whole_part : Str, frac_part : Str, exponent : I64, negative : Bool }.{
 
-				if index < whole_len {
-					str_get_utf8_byte_unsafe(digits.whole_part, index)
-				} else {
-					str_get_utf8_byte_unsafe(digits.frac_part, index - whole_len)
+				## The value these parts spell out, or Err if it is outside Dec's range
+				## or needs more than 18 decimal places.
+				to_dec : DecParts -> Try(Dec, [BadNumStr])
+				to_dec = |parts| {
+					whole_len = Str.count_utf8_bytes(parts.whole_part)
+					total_len = whole_len + Str.count_utf8_bytes(parts.frac_part)
+					leading_zeros_len = parts.count_leading_zeros()
+					significant_len = (total_len - leading_zeros_len).to_i64_wrap() # Str len fits I64
+
+					if significant_len == 0 {
+						Ok(0.0)
+					} else {
+						# The exponent moves the decimal point; it never changes the digits,
+						# so every length above holds regardless of it.
+
+						# where the point sits in the digit run as written
+						written_point_offset = whole_len.to_i64_wrap() - leading_zeros_len.to_i64_wrap() # Str len fits I64
+
+						# offset into the run of significant digits where the decimal point lives
+						# once the exponent is applied: 3 for 123.4, 0 for 0.1234, -2 for 0.001234
+						point_offset = written_point_offset + parts.exponent
+
+						parts.value_at_point({ leading_zeros_len, significant_len, point_offset })
+					}
 				}
-			}
 
-			json_dec_count_leading_zeros : { whole_part : Str, frac_part : Str } -> U64
-			json_dec_count_leading_zeros = |digits| {
-				len = Str.count_utf8_bytes(digits.whole_part) + Str.count_utf8_bytes(digits.frac_part)
-				var $index = 0
+				## The digits read as a value with the decimal point at `point_offset`, which
+				## may sit outside them on either side: past the last digit for trailing
+				## zeros, or before the first for decimal places.
+				value_at_point : DecParts, { leading_zeros_len : U64, significant_len : I64, point_offset : I64 } -> Try(Dec, [BadNumStr])
+				value_at_point = |parts, placement| {
+					{ leading_zeros_len, significant_len, point_offset } = placement
 
-				while $index < len and Json.json_dec_digit_at(digits, $index) == 48 {
-					$index = $index + 1
-				}
+					# Dec holds at most 21 integer digits and 18 decimal places. This bounds
+					# the loop and the table index; whether the value itself fits is settled
+					# when the parts are converted.
+					decimal_places = significant_len - point_offset
 
-				$index
-			}
+					if point_offset > 21 or decimal_places > 18 {
+						Err(BadNumStr)
+					} else {
+						# The point can miss the digits in either direction: decimal places
+						# to divide by on one side, trailing zeros that were never written
+						# down to multiply by on the other. Only one is ever nonzero.
+						frac_count = decimal_places.max(0)
+						trailing_zeros = decimal_places.negate().max(0)
+						var $whole = 0
+						var $frac = 0
+						var $index = 0
 
-			## The digits read as a value with the decimal point at `point_offset`, which
-			## may sit outside them on either side: past the last digit for trailing
-			## zeros, or before the first for decimal places.
-			json_dec_value_at_point : { whole_part : Str, frac_part : Str }, { leading_zeros_len : U64, significant_len : I64, point_offset : I64 }, Bool -> Try(Dec, [BadNumStr])
-			json_dec_value_at_point = |digits, placement, negative| {
-				{ leading_zeros_len, significant_len, point_offset } = placement
+						while $index < significant_len {
+							digit_index = leading_zeros_len + $index.to_u64_wrap() # 0 <= index
+							digit = (parts.digit_at(digit_index) - 48).to_i128()
 
-				# Dec holds at most 21 integer digits and 18 decimal places. This bounds
-				# the loop and the table index; whether the value itself fits is settled
-				# when the parts are converted.
-				decimal_places = significant_len - point_offset
+							if $index < point_offset {
+								$whole = $whole * 10 + digit
+							} else {
+								$frac = $frac * 10 + digit
+							}
 
-				if point_offset > 21 or decimal_places > 18 {
-					Err(BadNumStr)
-				} else {
-					# The point can miss the digits in either direction: decimal places
-					# to divide by on one side, trailing zeros that were never written
-					# down to multiply by on the other. Only one is ever nonzero.
-					frac_count = decimal_places.max(0)
-					trailing_zeros = decimal_places.negate().max(0)
-					var $whole = 0
-					var $frac = 0
-					var $index = 0
-
-					while $index < significant_len {
-						digit_index = leading_zeros_len + $index.to_u64_wrap() # 0 <= index
-						digit = (Json.json_dec_digit_at(digits, digit_index) - 48).to_i128()
-
-						if $index < point_offset {
-							$whole = $whole * 10 + digit
-						} else {
-							$frac = $frac * 10 + digit
+							$index = $index + 1
 						}
 
+						whole_with_zeros = $whole * Json.json_dec_pow_ten(trailing_zeros.to_i128())
+
+						Json.json_dec_from_whole_and_frac(whole_with_zeros, $frac, frac_count.to_i128(), parts.negative)
+					}
+				}
+
+				## One digit of the run, indexed as though the two parts were joined.
+				digit_at : DecParts, U64 -> U8
+				digit_at = |parts, index| {
+					whole_len = Str.count_utf8_bytes(parts.whole_part)
+
+					if index < whole_len {
+						str_get_utf8_byte_unsafe(parts.whole_part, index)
+					} else {
+						str_get_utf8_byte_unsafe(parts.frac_part, index - whole_len)
+					}
+				}
+
+				## Leading zeros across both parts joined, so `0.00123` counts 3 of them.
+				count_leading_zeros : DecParts -> U64
+				count_leading_zeros = |parts| {
+					len = Str.count_utf8_bytes(parts.whole_part) + Str.count_utf8_bytes(parts.frac_part)
+					var $index = 0
+
+					while $index < len and parts.digit_at($index) == 48 {
 						$index = $index + 1
 					}
 
-					whole_with_zeros = $whole * Json.json_dec_pow_ten(trailing_zeros.to_i128())
-
-					Json.json_dec_from_whole_and_frac(whole_with_zeros, $frac, frac_count.to_i128(), negative)
+					$index
 				}
 			}
 
