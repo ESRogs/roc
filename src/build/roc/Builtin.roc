@@ -6543,7 +6543,7 @@ Builtin :: [].{
 			## expect U8.pow_try(U8.highest, 2) == Err(Overflow)
 			## ```
 			pow_try : U8, U8 -> Try(U8, [Overflow, ..])
-			pow_try = |base, exponent| unsigned_pow_try(U8.highest, 0, 1, 2, base, exponent)
+			pow_try = |base, exponent| unsigned_pow_try(U8.highest, 0, 1, base, exponent)
 
 			## Divide the first [U8] by the second, discarding any remainder. Crashes if the second [U8] is zero.
 			## ```roc
@@ -7983,7 +7983,7 @@ Builtin :: [].{
 			## expect U16.pow_try(U16.highest, 2) == Err(Overflow)
 			## ```
 			pow_try : U16, U16 -> Try(U16, [Overflow, ..])
-			pow_try = |base, exponent| unsigned_pow_try(U16.highest, 0, 1, 2, base, exponent)
+			pow_try = |base, exponent| unsigned_pow_try(U16.highest, 0, 1, base, exponent)
 
 			## Divide the first [U16] by the second, discarding any remainder. Crashes if the second [U16] is zero.
 			## ```roc
@@ -9523,7 +9523,7 @@ Builtin :: [].{
 			## expect U32.pow_try(U32.highest, 2) == Err(Overflow)
 			## ```
 			pow_try : U32, U32 -> Try(U32, [Overflow, ..])
-			pow_try = |base, exponent| unsigned_pow_try(U32.highest, 0, 1, 2, base, exponent)
+			pow_try = |base, exponent| unsigned_pow_try(U32.highest, 0, 1, base, exponent)
 
 			## Divide the first [U32] by the second, discarding any remainder. Crashes if the second [U32] is zero.
 			## ```roc
@@ -11115,7 +11115,7 @@ Builtin :: [].{
 			## expect U64.pow_try(U64.highest, 2) == Err(Overflow)
 			## ```
 			pow_try : U64, U64 -> Try(U64, [Overflow, ..])
-			pow_try = |base, exponent| unsigned_pow_try(U64.highest, 0, 1, 2, base, exponent)
+			pow_try = |base, exponent| unsigned_pow_try(U64.highest, 0, 1, base, exponent)
 
 			## Divide the first [U64] by the second, discarding any remainder. Crashes if the second [U64] is zero.
 			## ```roc
@@ -12777,7 +12777,7 @@ Builtin :: [].{
 			## expect U128.pow_try(U128.highest, 2) == Err(Overflow)
 			## ```
 			pow_try : U128, U128 -> Try(U128, [Overflow, ..])
-			pow_try = |base, exponent| unsigned_pow_try(U128.highest, 0, 1, 2, base, exponent)
+			pow_try = |base, exponent| unsigned_pow_try(U128.highest, 0, 1, base, exponent)
 
 			## Divide the first [U128] by the second, discarding any remainder. Crashes if the second [U128] is zero.
 			## ```roc
@@ -21878,30 +21878,36 @@ signed_div_try = |lowest, zero, neg_one, a, b|
 		Ok(a / b)
 	}
 
-unsigned_pow_try : item, item, item, item, item, item -> Try(item, [Overflow, ..])
+unsigned_pow_try : item, item, item, item, item -> Try(item, [Overflow, ..])
 	where [
 		item.is_eq : item, item -> Bool,
 		item.is_gt : item, item -> Bool,
 		item.div_by : item, item -> item,
-		item.rem_by : item, item -> item,
 		item.times : item, item -> item,
+		item.bitwise_and : item, item -> item,
+		item.shr_wrap : item, U8 -> item,
 	]
-unsigned_pow_try = |highest, zero, one, two, base, exponent|
-	unsigned_pow_try_step(highest, zero, one, two, one, base, exponent)
+unsigned_pow_try = |highest, zero, one, base, exponent|
+	unsigned_pow_try_step(highest, zero, one, one, base, exponent)
 
-unsigned_pow_try_step : item, item, item, item, item, item, item -> Try(item, [Overflow, ..])
+## Walks the exponent's bits: `bitwise_and(one)` tests the low bit and
+## `shr_wrap(1)` halves it. Both need a non-negative exponent -- the exponent is unsigned.
+## A right shift of a negative value rounds toward negative infinity, so the
+## loop would never reach zero.
+unsigned_pow_try_step : item, item, item, item, item, item -> Try(item, [Overflow, ..])
 	where [
 		item.is_eq : item, item -> Bool,
 		item.is_gt : item, item -> Bool,
 		item.div_by : item, item -> item,
-		item.rem_by : item, item -> item,
 		item.times : item, item -> item,
+		item.bitwise_and : item, item -> item,
+		item.shr_wrap : item, U8 -> item,
 	]
-unsigned_pow_try_step = |highest, zero, one, two, acc, base, exponent|
+unsigned_pow_try_step = |highest, zero, one, acc, base, exponent|
 	if exponent == zero {
 		Ok(acc)
 	} else {
-		next_acc = if exponent.rem_by(two) == zero {
+		next_acc = if exponent.bitwise_and(one) == zero {
 			Ok(acc)
 		} else {
 			unsigned_times_try(highest, zero, acc, base)
@@ -21910,13 +21916,13 @@ unsigned_pow_try_step = |highest, zero, one, two, acc, base, exponent|
 		match next_acc {
 			Err(Overflow) => Err(Overflow)
 			Ok(updated_acc) => {
-				next_exponent = exponent / two
+				next_exponent = exponent.shr_wrap(1)
 				if next_exponent == zero {
 					Ok(updated_acc)
 				} else {
 					match unsigned_times_try(highest, zero, base, base) {
 						Err(Overflow) => Err(Overflow)
-						Ok(updated_base) => unsigned_pow_try_step(highest, zero, one, two, updated_acc, updated_base, next_exponent)
+						Ok(updated_base) => unsigned_pow_try_step(highest, zero, one, updated_acc, updated_base, next_exponent)
 					}
 				}
 			}
@@ -21929,10 +21935,11 @@ signed_pow_try : item, item, item, item, item, item, item, item -> Try(item, [Ov
 		item.is_gt : item, item -> Bool,
 		item.is_lt : item, item -> Bool,
 		item.div_trunc_by : item, item -> item,
-		item.div_by : item, item -> item,
 		item.rem_by : item, item -> item,
 		item.minus : item, item -> item,
 		item.times : item, item -> item,
+		item.bitwise_and : item, item -> item,
+		item.shr_wrap : item, U8 -> item,
 	]
 signed_pow_try = |lowest, highest, zero, one, two, neg_one, base, exponent|
 	if exponent < zero {
@@ -21948,25 +21955,29 @@ signed_pow_try = |lowest, highest, zero, one, two, neg_one, base, exponent|
 			Err(Underflow)
 		}
 	} else {
-		signed_pow_try_step(lowest, highest, zero, one, two, neg_one, one, base, exponent)
+		signed_pow_try_step(lowest, highest, zero, one, neg_one, one, base, exponent)
 	}
 
-signed_pow_try_step : item, item, item, item, item, item, item, item, item -> Try(item, [Overflow, Underflow, ..])
+## Walks the exponent's bits: `bitwise_and(one)` tests the low bit and
+## `shr_wrap(1)` halves it. Both need a non-negative exponent -- `signed_pow_try` rejects negative exponents before calling this.
+## A right shift of a negative value rounds toward negative infinity, so the
+## loop would never reach zero.
+signed_pow_try_step : item, item, item, item, item, item, item, item -> Try(item, [Overflow, Underflow, ..])
 	where [
 		item.is_eq : item, item -> Bool,
 		item.is_gt : item, item -> Bool,
 		item.is_lt : item, item -> Bool,
 		item.div_trunc_by : item, item -> item,
-		item.div_by : item, item -> item,
-		item.rem_by : item, item -> item,
 		item.minus : item, item -> item,
 		item.times : item, item -> item,
+		item.bitwise_and : item, item -> item,
+		item.shr_wrap : item, U8 -> item,
 	]
-signed_pow_try_step = |lowest, highest, zero, one, two, neg_one, acc, base, exponent|
+signed_pow_try_step = |lowest, highest, zero, one, neg_one, acc, base, exponent|
 	if exponent == zero {
 		Ok(acc)
 	} else {
-		next_acc = if exponent.rem_by(two) == zero {
+		next_acc = if exponent.bitwise_and(one) == zero {
 			Ok(acc)
 		} else {
 			match signed_times_try(lowest, highest, zero, neg_one, acc, base) {
@@ -21979,13 +21990,13 @@ signed_pow_try_step = |lowest, highest, zero, one, two, neg_one, acc, base, expo
 			Err(Overflow) => Err(Overflow)
 			Err(Underflow) => Err(Underflow)
 			Ok(updated_acc) => {
-				next_exponent = exponent / two
+				next_exponent = exponent.shr_wrap(1)
 				if next_exponent == zero {
 					Ok(updated_acc)
 				} else {
 					match signed_times_try(lowest, highest, zero, neg_one, base, base) {
 						Err(Overflow) => Err(Overflow)
-						Ok(updated_base) => signed_pow_try_step(lowest, highest, zero, one, two, neg_one, updated_acc, updated_base, next_exponent)
+						Ok(updated_base) => signed_pow_try_step(lowest, highest, zero, one, neg_one, updated_acc, updated_base, next_exponent)
 					}
 				}
 			}
