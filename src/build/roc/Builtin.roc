@@ -541,80 +541,140 @@ Builtin :: [].{
 					Err(NotFound) => { int_part: unsigned_mantissa, frac_part: "" }
 				}
 
-				digits = Str.concat(parts.int_part, parts.frac_part)
+				# Joining the runs into one integer slides the point right past the
+				# fraction's digits, so the exponent has to move it back left as far.
+				digits = Json.json_dec_digits_value(parts.int_part, parts.frac_part, negative)?
+				frac_len = Str.count_utf8_bytes(parts.frac_part).to_i64_wrap() # Str len fits I64
 
-				if Json.json_dec_digits_are_zero(digits) {
-					dec_from_str("0")
+				Json.json_dec_at_power(digits, exponent - frac_len)
+			}
+
+			## Read both digit runs as the one integer they spell, negating as it is built
+			## so that Dec.lowest stays reachable — its magnitude has no positive I128.
+			## Err if the digits overflow, which takes more of them than a Dec can hold.
+			json_dec_digits_value : Str, Str, Bool -> Try(I128, [BadNumStr])
+			json_dec_digits_value = |int_part, frac_part, negative| {
+				int_len = Str.count_utf8_bytes(int_part)
+				total_len = int_len + Str.count_utf8_bytes(frac_part)
+				sign = if negative {
+					-1
 				} else {
-					int_len = Str.count_utf8_bytes(parts.int_part).to_i64_wrap()
-					raw_point = int_len + exponent
-					trimmed = Json.trim_json_dec_leading_zeros(digits, raw_point)
-
-					if trimmed.point > 21 or trimmed.point < -18 {
-						Err(BadNumStr)
-					} else {
-						normalized = Json.normalize_json_dec_digits(negative, trimmed.digits, trimmed.point)?
-						dec_from_str(normalized)
-					}
+					1
 				}
-			}
-
-			json_dec_digits_are_zero : Str -> Bool
-			json_dec_digits_are_zero = |digits| {
-				for byte in Str.iter_utf8(digits) {
-					if byte != 48 {
-						return False
-					}
-				}
-
-				True
-			}
-
-			trim_json_dec_leading_zeros : Str, I64 -> { digits : Str, point : I64 }
-			trim_json_dec_leading_zeros = |digits, point| {
-				len = Str.count_utf8_bytes(digits)
+				# No 38 digits can overflow an I128, so only the digits after those need
+				# checking. Every number short of that reads without a single check.
+				unchecked_len = total_len.min(38)
+				var $value = 0
 				var $index = 0
 
-				while $index < len and str_get_utf8_byte_unsafe(digits, $index) == 48 {
+				while $index < unchecked_len {
+					byte = if $index < int_len {
+						str_get_utf8_byte_unsafe(int_part, $index)
+					} else {
+						str_get_utf8_byte_unsafe(frac_part, $index - int_len)
+					}
+
+					$value = $value * 10 + (byte - 48).to_i128() * sign
 					$index = $index + 1
 				}
 
-				{
-					# the dropped prefix is ASCII zeros, so the cut is a UTF-8 boundary
-					digits: str_drop_first_bytes_unsafe(digits, $index),
-					point: point - $index.to_i64_wrap(),
+				# on through any remaining digits, now that they can carry past an I128
+				while $index < total_len {
+					byte = if $index < int_len {
+						str_get_utf8_byte_unsafe(int_part, $index)
+					} else {
+						str_get_utf8_byte_unsafe(frac_part, $index - int_len)
+					}
+					digit = (byte - 48).to_i128() * sign
+
+					shifted = match $value.times_try(10) {
+						Ok(next) => next
+						Err(_) => return Err(BadNumStr)
+					}
+
+					$value = match shifted.plus_try(digit) {
+						Ok(next) => next
+						Err(_) => return Err(BadNumStr)
+					}
+
+					$index = $index + 1
+				}
+
+				Ok($value)
+			}
+
+			## Place the digits with the last of them at 10^power, or Err if that lands
+			## outside Dec's range or below the 18 decimal places it keeps.
+			json_dec_at_power : I128, I64 -> Try(Dec, [BadNumStr])
+			json_dec_at_power = |digits, power| {
+				if digits == 0 {
+					return Ok(0.0)
+				}
+
+				atto_power = power + 18
+
+				if atto_power < 0 or atto_power > 38 {
+					# past Dec's last decimal place, or past the largest power an I128 holds
+					Err(BadNumStr)
+				} else {
+					atto_scale = Json.json_dec_pow_ten(atto_power.to_i128())
+
+					digits
+						.times_try(atto_scale)
+						.map_ok(Num.Dec.from_attos)
+						.map_err(|_| BadNumStr)
 				}
 			}
 
-			normalize_json_dec_digits : Bool, Str, I64 -> Try(Str, [BadNumStr])
-			normalize_json_dec_digits = |negative, digits, point| {
-				sign = if negative "-" else ""
-
-				if point <= 0 {
-					zero_count = point.negate().to_u64_wrap()
-
-					Ok(
-						Str.concat(
-							sign,
-							Str.concat("0.", Str.concat(Str.repeat("0", zero_count), digits)),
-						),
-					)
-				} else {
-					point_u64 = point.to_u64_wrap()
-					digits_len = Str.count_utf8_bytes(digits)
-
-					if point_u64 >= digits_len {
-						zero_count = point_u64 - digits_len
-						Ok(Str.concat(sign, Str.concat(digits, Str.repeat("0", zero_count))))
-					} else {
-						# digits holds only ASCII digits, so any cut is a UTF-8 boundary
-						before = str_substring_unsafe(digits, 0, point_u64)
-						after = str_drop_first_bytes_unsafe(digits, point_u64)
-
-						Ok(Str.concat(sign, Str.concat(before, Str.concat(".", after))))
+			## Look up 10^exponent across the range a Dec's atto count spans. These are
+			## literals because `pow` is a call with a loop inside, and this sits on
+			## every parse.
+			json_dec_pow_ten : I128 -> I128
+			json_dec_pow_ten = |exponent|
+				match exponent {
+					0 => 1
+					1 => 10
+					2 => 100
+					3 => 1000
+					4 => 10000
+					5 => 100000
+					6 => 1000000
+					7 => 10000000
+					8 => 100000000
+					9 => 1000000000
+					10 => 10000000000
+					11 => 100000000000
+					12 => 1000000000000
+					13 => 10000000000000
+					14 => 100000000000000
+					15 => 1000000000000000
+					16 => 10000000000000000
+					17 => 100000000000000000
+					18 => 1000000000000000000
+					19 => 10000000000000000000
+					20 => 100000000000000000000
+					21 => 1000000000000000000000
+					22 => 10000000000000000000000
+					23 => 100000000000000000000000
+					24 => 1000000000000000000000000
+					25 => 10000000000000000000000000
+					26 => 100000000000000000000000000
+					27 => 1000000000000000000000000000
+					28 => 10000000000000000000000000000
+					29 => 100000000000000000000000000000
+					30 => 1000000000000000000000000000000
+					31 => 10000000000000000000000000000000
+					32 => 100000000000000000000000000000000
+					33 => 1000000000000000000000000000000000
+					34 => 10000000000000000000000000000000000
+					35 => 100000000000000000000000000000000000
+					36 => 1000000000000000000000000000000000000
+					37 => 10000000000000000000000000000000000000
+					38 => 100000000000000000000000000000000000000
+					_ => {
+						crash "json_dec_pow_ten: exponent outside 0..38"
 					}
 				}
-			}
 
 			## Read one quoted object key at the cursor, leaving the cursor
 			## just past the closing quote.
