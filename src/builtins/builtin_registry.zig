@@ -120,6 +120,7 @@ pub const BuiltinFn = enum {
     str_from_literal,
     dec_to_str,
     dec_to_i64_trunc,
+    dec_to_i128_trunc,
     i64_to_dec,
     u64_to_dec,
     dec_to_f64,

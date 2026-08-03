@@ -2733,41 +2733,24 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 },
 
                 // ── Dec to i128 truncating ──
-                .dec_to_i128_trunc => {
+                // A Dec's integer part reaches ~1.7e20, past what an i64 holds, so
+                // these call the 128-bit conversion rather than widening the i64 one.
+                // The result's bits are the same either way; only the declared
+                // signedness of the destination differs.
+                .dec_to_i128_trunc, .dec_to_u128_trunc => {
                     if (args.len < 1) unreachable;
                     const src_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const parts = try self.getI128Parts(src_loc, .signed); // Dec is signed i128
-                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
-                    try builder.addRegArg(parts.low);
-                    try builder.addRegArg(parts.high);
-                    try self.callBuiltin(&builder, .dec_to_i64_trunc);
-                    self.codegen.freeGeneral(parts.low);
-                    self.codegen.freeGeneral(parts.high);
-
-                    // Sign-extend result from i64 to i128
-                    const stack_offset = self.codegen.allocStackSlot(16);
-                    try self.codegen.emitStoreStack(.w64, stack_offset, ret_reg_0);
-                    try self.emitAsrImm(.w64, ret_reg_0, ret_reg_0, 63);
-                    try self.codegen.emitStoreStack(.w64, stack_offset + 8, ret_reg_0);
-                    return .{ .stack_i128 = stack_offset };
-                },
-
-                // ── Dec to u128 truncating ──
-                .dec_to_u128_trunc => {
-                    if (args.len < 1) unreachable;
-                    const src_loc = try self.emitValueLocal(GuardedList.at(args, 0));
-                    const parts = try self.getI128Parts(src_loc, .signed); // Dec is signed i128
-                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
-                    try builder.addRegArg(parts.low);
-                    try builder.addRegArg(parts.high);
-                    try self.callBuiltin(&builder, .dec_to_i64_trunc);
-                    self.codegen.freeGeneral(parts.low);
-                    self.codegen.freeGeneral(parts.high);
 
                     const stack_offset = self.codegen.allocStackSlot(16);
-                    try self.codegen.emitStoreStack(.w64, stack_offset, ret_reg_0);
-                    try self.codegen.emitLoadImm(ret_reg_0, 0);
-                    try self.codegen.emitStoreStack(.w64, stack_offset + 8, ret_reg_0);
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    try builder.addLeaArg(frame_ptr, stack_offset); // out_low
+                    try builder.addLeaArg(frame_ptr, stack_offset + 8); // out_high
+                    try builder.addRegArg(parts.low);
+                    try builder.addRegArg(parts.high);
+                    try self.callBuiltin(&builder, .dec_to_i128_trunc);
+                    self.codegen.freeGeneral(parts.low);
+                    self.codegen.freeGeneral(parts.high);
                     return .{ .stack_i128 = stack_offset };
                 },
 

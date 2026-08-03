@@ -1463,6 +1463,16 @@ pub fn roc_builtins_dec_to_i64_trunc(low: u64, high: u64) callconv(.c) i64 {
     return @intCast(i128h.divTrunc_i128(val, dec.RocDec.one_point_zero_i128));
 }
 
+/// Dec (i128) → i128 by truncating division, via output pointers. The i64
+/// wrapper above cannot serve the 128-bit conversions: a Dec's integer part
+/// reaches ~1.7e20, well past what an i64 can hold.
+pub fn roc_builtins_dec_to_i128_trunc(out_low: *u64, out_high: *u64, low: u64, high: u64) callconv(.c) void {
+    const val: i128 = @bitCast(i128h.from_u64_pair(low, high));
+    const result: u128 = @bitCast(i128h.divTrunc_i128(val, dec.RocDec.one_point_zero_i128));
+    out_low.* = @truncate(result);
+    out_high.* = i128h.hi64(result);
+}
+
 /// i64 → Dec (i128) via output pointers
 pub fn roc_builtins_i64_to_dec(out_low: *u64, out_high: *u64, val: i64) callconv(.c) void {
     const result: i128 = if (dec.RocDec.fromWholeInt(@as(i128, val))) |d|
