@@ -4487,6 +4487,20 @@ pub const MonoLlvmCodeGen = struct {
                 try self.emitDecToFloatConversion(target, GuardedList.at(args, 0), op == .dec_to_f32_wrap);
                 return;
             },
+            .dec_to_i8_trunc,
+            .dec_to_i16_trunc,
+            .dec_to_i32_trunc,
+            .dec_to_i64_trunc,
+            .dec_to_i128_trunc,
+            .dec_to_u8_trunc,
+            .dec_to_u16_trunc,
+            .dec_to_u32_trunc,
+            .dec_to_u64_trunc,
+            .dec_to_u128_trunc,
+            => {
+                try self.emitDecToIntTrunc(target, op, GuardedList.at(args, 0));
+                return;
+            },
             .dec_to_i8_try_unsafe,
             .dec_to_i16_try_unsafe,
             .dec_to_i32_try_unsafe,
@@ -4539,6 +4553,53 @@ pub const MonoLlvmCodeGen = struct {
             &.{ .i64, .i64 },
             &.{ parts.low, parts.high },
         );
+        try self.storeScalar(self.slot(target).ptr, self.localLayout(target), result);
+    }
+
+    /// Dec to integer, truncating the fractional part toward zero.
+    ///
+    /// Widths up to 64 bits go through the i64 wrapper and narrow from there.
+    /// The 128-bit widths cannot: a Dec's integer part reaches ~1.7e20, past
+    /// what an i64 holds, so they call the 128-bit wrapper instead.
+    fn emitDecToIntTrunc(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, arg: LocalId) Error!void {
+        const wip = self.wip orelse return error.CompilationFailed;
+        const dec_value = try self.loadScalar(self.slot(arg).ptr, .dec);
+        const parts = try self.splitI128Value(dec_value);
+
+        const bytes: u8 = switch (op) {
+            .dec_to_i8_trunc, .dec_to_u8_trunc => 1,
+            .dec_to_i16_trunc, .dec_to_u16_trunc => 2,
+            .dec_to_i32_trunc, .dec_to_u32_trunc => 4,
+            .dec_to_i64_trunc, .dec_to_u64_trunc => 8,
+            .dec_to_i128_trunc, .dec_to_u128_trunc => 16,
+            else => unreachable,
+        };
+
+        if (bytes == 16) {
+            const out_low = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_trunc_low");
+            const out_high = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_trunc_high");
+            try self.callBuiltinVoid(
+                builtinSymbol(.dec_to_i128_trunc),
+                &.{ try self.ptrType(), try self.ptrType(), .i64, .i64 },
+                &.{ out_low, out_high, parts.low, parts.high },
+            );
+            const low = wip.load(.normal, .i64, out_low, LlvmBuilder.Alignment.fromByteUnits(8), "") catch return error.OutOfMemory;
+            const high = wip.load(.normal, .i64, out_high, LlvmBuilder.Alignment.fromByteUnits(8), "") catch return error.OutOfMemory;
+            const combined = try self.combineI128Parts(low, high);
+            try self.storeScalar(self.slot(target).ptr, self.localLayout(target), combined);
+            return;
+        }
+
+        const truncated = try self.callBuiltin(
+            builtinSymbol(.dec_to_i64_trunc),
+            .i64,
+            &.{ .i64, .i64 },
+            &.{ parts.low, parts.high },
+        );
+        const result = if (bytes == 8)
+            truncated
+        else
+            wip.cast(.trunc, truncated, intTypeForBytes(bytes), "") catch return error.OutOfMemory;
         try self.storeScalar(self.slot(target).ptr, self.localLayout(target), result);
     }
 

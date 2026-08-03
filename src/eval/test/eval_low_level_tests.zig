@@ -6869,4 +6869,53 @@ pub const tests = [_]TestCase{
         ,
         .expected = .{ .inspect_str = "8" },
     },
+    // These ran correctly only in the interpreter: the LLVM backend implemented
+    // none of the Dec-to-integer truncating conversions, and the dev backend
+    // routed even the 128-bit ones through an i64 wrapper, which panics once a
+    // Dec's integer part passes what an i64 holds.
+    .{
+        .name = "low_level - Dec truncates to every integer width",
+        .source =
+        \\{
+        \\Dec.to_i8_wrap(42.5) == 42
+        \\    and Dec.to_i16_wrap(42.5) == 42
+        \\    and Dec.to_i32_wrap(42.5) == 42
+        \\    and Dec.to_i64_wrap(42.5) == 42
+        \\    and Dec.to_u8_wrap(42.5) == 42
+        \\    and Dec.to_u16_wrap(42.5) == 42
+        \\    and Dec.to_u32_wrap(42.5) == 42
+        \\    and Dec.to_u64_wrap(42.5) == 42
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - Dec truncation wraps at narrow widths",
+        .source =
+        \\{
+        \\Dec.to_i8_wrap(200.0) == -56
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - Dec truncates to an I128 past the I64 range",
+        .source =
+        \\{
+        \\big : Dec
+        \\big = 170141183460469231731.0
+        \\Dec.to_i128_wrap(big) == 170141183460469231731
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - Dec truncation keeps the sign",
+        .source =
+        \\{
+        \\Dec.to_i32_wrap(-42.5) == -42 and Dec.to_i128_wrap(-42.5) == -42
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
 };
