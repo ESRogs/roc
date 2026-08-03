@@ -108,6 +108,16 @@ check_json_parse_allocs! = |input| {
 	skip_num_allocs = Host.alloc_count!() - skip_num_before
 	expect skip_num_allocs == 0
 	expect skipped_num == Ok({ a: 1 })
+
+	# a Dec whose exponent puts the point inside a long digit run; 31 bytes
+	# spelled out, past the inline limit
+	dec_doc = Str.concat("{\"d\":1.23456789012345678901234567890e14,\"s\":\"", Str.concat(two, "\"}"))
+	dec_before = Host.alloc_count!()
+	dec_parsed : Try({ d : Dec }, [InvalidJson(Str), MissingRequiredField(Str)])
+	dec_parsed = Json.parse(dec_doc)
+	dec_allocs = Host.alloc_count!() - dec_before
+	expect dec_allocs == 0
+	expect dec_parsed == Ok({ d: 123456789012345.67890123456789 })
 	{}
 }
 
