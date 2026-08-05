@@ -3437,7 +3437,7 @@ pub const MonoLlvmCodeGen = struct {
             .dec_to_f32_wrap,
             .dec_to_f32_try_unsafe,
             .dec_to_f64,
-            => try self.emitNumericConversionOrCrash(target, op, arg_locals),
+            => try self.emitNumericConversion(target, op, arg_locals),
         }
     }
 
@@ -4915,7 +4915,7 @@ pub const MonoLlvmCodeGen = struct {
         try self.storeScalar(self.slot(target).ptr, target_layout, coerced);
     }
 
-    fn emitNumericConversionOrCrash(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, args: anytype) Error!void {
+    fn emitNumericConversion(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, args: anytype) Error!void {
         const name = @tagName(op);
         const SpecialConversion = enum {
             f32_to_i8_try_unsafe,
@@ -5046,7 +5046,10 @@ pub const MonoLlvmCodeGen = struct {
                 return;
             }
         }
-        try self.emitCrashBytes(name);
+        // A conversion with no lowering is a gap in this backend, not something a
+        // program did wrong, so fail the compile rather than emit code that crashes
+        // if the branch is ever reached.
+        return error.UnsupportedLowLevel;
     }
 
     fn emitDecToFloatConversion(self: *MonoLlvmCodeGen, target: LocalId, arg: LocalId, is_f32: bool) Error!void {
