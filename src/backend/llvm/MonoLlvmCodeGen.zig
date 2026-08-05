@@ -5025,14 +5025,26 @@ pub const MonoLlvmCodeGen = struct {
                 return;
             }
         }
-        if (std.mem.find(u8, name, "_to_") != null and args.len >= 1 and
-            std.mem.find(u8, name, "_try") == null and
-            std.mem.find(u8, name, "_str") == null)
-        {
-            const value = try self.loadScalar(self.slot(GuardedList.at(args, 0)).ptr, self.localLayout(GuardedList.at(args, 0)));
-            const coerced = try self.coerceScalar(value, self.scalarType(self.localLayout(target)), self.localLayout(GuardedList.at(args, 0)).isSigned());
-            try self.storeScalar(self.slot(target).ptr, self.localLayout(target), coerced);
-            return;
+        // Coercion is the right lowering whenever both sides are plain machine
+        // numbers: integers sign- or zero-extend and truncate, an integer widens
+        // into a float with sitofp or uitofp, and a float changes width with fpext
+        // or fptrunc. Two cases have to stay out of it. A Dec is an i128 scaled by
+        // 10^18, so coercing one hands back that payload in place of the value.
+        // And a float narrowing to an integer wraps in Roc but is poison under
+        // fptosi, which is why those are lowered above. Matching on the layouts
+        // rather than the op's name is what tells these apart.
+        if (args.len >= 1) {
+            const src_layout = self.localLayout(GuardedList.at(args, 0));
+            const target_layout = self.localLayout(target);
+            const coercible = (isIntegerLayout(src_layout) and
+                (isIntegerLayout(target_layout) or isFloatLayout(target_layout))) or
+                (isFloatLayout(src_layout) and isFloatLayout(target_layout));
+            if (coercible) {
+                const value = try self.loadScalar(self.slot(GuardedList.at(args, 0)).ptr, src_layout);
+                const coerced = try self.coerceScalar(value, self.scalarType(target_layout), src_layout.isSigned());
+                try self.storeScalar(self.slot(target).ptr, target_layout, coerced);
+                return;
+            }
         }
         try self.emitCrashBytes(name);
     }
