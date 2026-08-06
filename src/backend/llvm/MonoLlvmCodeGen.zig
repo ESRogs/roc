@@ -8253,13 +8253,9 @@ pub const MonoLlvmCodeGen = struct {
 
     fn loadIntegerPtrAsUsize(self: *MonoLlvmCodeGen, ptr: LlvmBuilder.Value, value_layout: layout.Idx) Error!LlvmBuilder.Value {
         switch (value_layout) {
-            .dec => {
-                const value = try self.loadScalar(ptr, .dec);
-                const parts = try self.splitI128Value(value);
-                const truncated = try self.callBuiltin(builtinSymbol(.dec_to_i64_trunc), .i64, &.{ .i64, .i64 }, &.{ parts.low, parts.high });
-                return self.coerceScalar(truncated, self.ptrSizedIntType(), true);
-            },
-            .f32, .f64 => return error.CompilationFailed,
+            // Every op that reaches here takes a U64 at the Roc level, so a Dec
+            // cannot arrive any more than a float can.
+            .dec, .f32, .f64 => return error.CompilationFailed,
             .bool, .str, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .opaque_ptr, .zst, .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2, _ => {
                 const value = try self.loadScalar(ptr, value_layout);
                 return self.coerceScalar(value, self.ptrSizedIntType(), value_layout.isSigned());
