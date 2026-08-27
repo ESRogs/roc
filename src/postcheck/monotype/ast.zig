@@ -85,16 +85,8 @@ pub const PackedListLiteral = struct {
 };
 
 /// Slice descriptor over one of the program side arrays.
-pub fn Span(comptime _: type) type {
-    return extern struct {
-        start: u32,
-        len: u32,
-
-        pub fn empty() @This() {
-            return .{ .start = 0, .len = 0 };
-        }
-    };
-}
+/// Span into one of this IR's flat side tables.
+pub const Span = Common.Span;
 
 /// Checked function definition used by a Monotype function template.
 pub const FnDef = union(enum(u8)) {
@@ -250,8 +242,9 @@ pub fn fnTemplateIdentityEql(lhs: FnTemplate, rhs: FnTemplate) bool {
         lhs.mono_fn_ty == rhs.mono_fn_ty;
 }
 
-/// Compute a digest for a Monotype function template.
-pub fn fnTemplateDigest(template: FnTemplate, types: *const Type.Store, name_store: *const names.NameStore) names.TypeDigest {
+/// Compute a digest for a Monotype function template. Takes the type store
+/// mutable because type digests are computed through the store's cache.
+pub fn fnTemplateDigest(template: FnTemplate, types: *Type.Store, name_store: *const names.NameStore) names.TypeDigest {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     writeFnDef(&hasher, template.fn_def);
     writeBytes(&hasher, &template.source_fn_key.bytes);
@@ -261,26 +254,26 @@ pub fn fnTemplateDigest(template: FnTemplate, types: *const Type.Store, name_sto
     return .{ .bytes = hasher.finalResult() };
 }
 
-/// Compute the stable digest used in specialization identity from the exact
-/// durable evidence nodes and lexical frames carried by a function template.
+/// Compute the stable specialization digest from durable evidence topology,
+/// checked callable type keys, and lexical frames carried by a function template.
 pub fn fnEvidenceDigest(
     evidence: []const check.ConstStore.ConstFnEvidence,
     frames: []const check.ConstStore.ConstFnEvidenceFrame,
     head: ?u32,
 ) EvidenceDigest {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    writeBytes(&hasher, "roc.monotype.fn_evidence.v1");
+    writeBytes(&hasher, "roc.monotype.fn_evidence.v2");
     writeU32(&hasher, @intCast(evidence.len));
     for (evidence) |entry| {
         writeU8(&hasher, @intFromEnum(entry));
         switch (entry) {
             .target => |target| {
                 writeBytes(&hasher, &target.view.bytes);
-                writeMethodTarget(&hasher, target.method);
+                writeMethodTarget(&hasher, target.method, target.method_callable_key);
                 if (target.instantiation) |instantiation| {
                     writeU8(&hasher, 1);
                     writeBytes(&hasher, &instantiation.view.bytes);
-                    writeU32(&hasher, @intFromEnum(instantiation.callable_ty));
+                    writeBytes(&hasher, &instantiation.callable_key.bytes);
                 } else writeU8(&hasher, 0);
                 writeU8(&hasher, @intFromEnum(target.nested));
                 switch (target.nested) {
@@ -310,7 +303,67 @@ pub fn fnEvidenceDigest(
     return .{ .bytes = hasher.finalResult() };
 }
 
-fn writeMethodTarget(hasher: *std.crypto.hash.sha2.Sha256, target: static_dispatch.MethodTarget) void {
+/// Exact checked-identity equality for retained function evidence. Checked
+/// callable ids are replay payload; their type keys are the durable identity.
+pub fn fnEvidenceEql(
+    left_evidence: []const check.ConstStore.ConstFnEvidence,
+    left_frames: []const check.ConstStore.ConstFnEvidenceFrame,
+    left_head: ?u32,
+    right_evidence: []const check.ConstStore.ConstFnEvidence,
+    right_frames: []const check.ConstStore.ConstFnEvidenceFrame,
+    right_head: ?u32,
+) bool {
+    if (left_head != right_head or left_evidence.len != right_evidence.len or left_frames.len != right_frames.len) return false;
+    for (left_evidence, right_evidence) |left, right| {
+        switch (left) {
+            .target => |left_target| switch (right) {
+                .target => |right_target| {
+                    if (!fnEvidenceTargetEql(left_target, right_target)) return false;
+                },
+                .structural, .unreachable_value, .checked_error => return false,
+            },
+            .structural => |left_structural| switch (right) {
+                .structural => |right_structural| if (!std.meta.eql(left_structural, right_structural)) return false,
+                .target, .unreachable_value, .checked_error => return false,
+            },
+            .unreachable_value => if (right != .unreachable_value) return false,
+            .checked_error => if (right != .checked_error) return false,
+        }
+    }
+    for (left_frames, right_frames) |left, right| {
+        if (!std.meta.eql(left, right)) return false;
+    }
+    return true;
+}
+
+fn fnEvidenceTargetEql(left: anytype, right: @TypeOf(left)) bool {
+    if (!std.meta.eql(left.view, right.view)) return false;
+    if (!methodTargetIdentityEql(left.method, left.method_callable_key, right.method, right.method_callable_key)) return false;
+    if (left.instantiation) |left_instantiation| {
+        const right_instantiation = right.instantiation orelse return false;
+        if (!std.meta.eql(left_instantiation.view, right_instantiation.view)) return false;
+        if (!std.meta.eql(left_instantiation.callable_key, right_instantiation.callable_key)) return false;
+    } else if (right.instantiation != null) return false;
+    return std.meta.eql(left.nested, right.nested);
+}
+
+fn methodTargetIdentityEql(
+    left: static_dispatch.MethodTarget,
+    left_callable_key: names.CanonicalTypeKey,
+    right: static_dispatch.MethodTarget,
+    right_callable_key: names.CanonicalTypeKey,
+) bool {
+    return left.module_idx == right.module_idx and
+        left.def_idx == right.def_idx and
+        std.meta.eql(left.kind, right.kind) and
+        std.meta.eql(left_callable_key, right_callable_key);
+}
+
+fn writeMethodTarget(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    target: static_dispatch.MethodTarget,
+    callable_key: names.CanonicalTypeKey,
+) void {
     writeU32(hasher, target.module_idx);
     writeU32(hasher, @intFromEnum(target.def_idx));
     writeU8(hasher, @intFromEnum(target.kind));
@@ -330,7 +383,7 @@ fn writeMethodTarget(hasher: *std.crypto.hash.sha2.Sha256, target: static_dispat
         },
         .structural => |kind| writeU8(hasher, @intFromEnum(kind)),
     }
-    writeU32(hasher, @intFromEnum(target.callable_ty));
+    writeBytes(hasher, &callable_key.bytes);
 }
 
 fn writeStructuralDerivation(hasher: *std.crypto.hash.sha2.Sha256, derivation: static_dispatch.StructuralDerivation) void {
@@ -349,6 +402,47 @@ fn writeOptionalU32(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
         writeU8(hasher, 1);
         writeU32(hasher, actual);
     } else writeU8(hasher, 0);
+}
+
+test "function evidence identity uses checked callable type keys" {
+    var method_key: names.CanonicalTypeKey = .{};
+    method_key.bytes[0] = 1;
+    var instantiation_key: names.CanonicalTypeKey = .{};
+    instantiation_key.bytes[0] = 2;
+    const frames = [_]check.ConstStore.ConstFnEvidenceFrame{
+        check.ConstStore.ConstFnEvidenceFrame.init(.root, null, 0, 1),
+    };
+    const left = [_]check.ConstStore.ConstFnEvidence{.{ .target = .{
+        .view = .{},
+        .method = .{
+            .module_idx = 3,
+            .def_idx = @enumFromInt(4),
+            .kind = .{ .structural = .parser },
+            .callable_ty = @enumFromInt(5),
+        },
+        .method_callable_key = method_key,
+        .instantiation = .{
+            .view = .{},
+            .callable_key = instantiation_key,
+            .callable_ty = @enumFromInt(6),
+        },
+        .nested = .from_callable,
+    } }};
+    var right = left;
+    right[0].target.method.callable_ty = @enumFromInt(7);
+    right[0].target.instantiation.?.callable_ty = @enumFromInt(8);
+
+    try std.testing.expect(fnEvidenceEql(&left, &frames, 0, &right, &frames, 0));
+    try std.testing.expectEqual(fnEvidenceDigest(&left, &frames, 0), fnEvidenceDigest(&right, &frames, 0));
+
+    right[0].target.method_callable_key.bytes[0] = 9;
+    try std.testing.expect(!fnEvidenceEql(&left, &frames, 0, &right, &frames, 0));
+    try std.testing.expect(!std.meta.eql(fnEvidenceDigest(&left, &frames, 0), fnEvidenceDigest(&right, &frames, 0)));
+
+    right[0].target.method_callable_key = method_key;
+    right[0].target.instantiation.?.callable_key.bytes[0] = 9;
+    try std.testing.expect(!fnEvidenceEql(&left, &frames, 0, &right, &frames, 0));
+    try std.testing.expect(!std.meta.eql(fnEvidenceDigest(&left, &frames, 0), fnEvidenceDigest(&right, &frames, 0)));
 }
 
 fn writeFnDef(hasher: *std.crypto.hash.sha2.Sha256, fn_def: FnDef) void {
@@ -458,6 +552,10 @@ pub const FieldExpr = struct {
 pub const RecordUpdate = struct {
     base: ExprId,
     fields: Span(FieldExpr),
+};
+/// One source-ordered segment in a flattened record-field access path.
+pub const FieldAccessSegment = struct {
+    field: names.RecordFieldNameId,
 };
 
 /// Tag expression entry.
@@ -728,7 +826,7 @@ pub const ExprData = union(enum(u8)) {
     low_level: LowLevelCall,
     field_access: struct {
         receiver: ExprId,
-        field: names.RecordFieldNameId,
+        segments: Span(FieldAccessSegment),
     },
     tuple_access: struct {
         tuple: ExprId,
@@ -1043,6 +1141,7 @@ pub const ProgramView = struct {
     typed_locals: []const TypedLocal,
     stmt_ids: []const StmtId,
     field_exprs: []const FieldExpr,
+    field_access_segments: []const FieldAccessSegment,
     fn_def_captures: []const FnDefCapture,
     capture_operands: []const CaptureOperand,
     record_destructs: []const RecordDestruct,
@@ -1086,6 +1185,15 @@ pub const ProgramView = struct {
 
     pub fn procDebugName(self: ProgramView, symbol: Common.Symbol) ?names.ExportNameId {
         return procDebugNameInSlice(self.proc_debug_names, symbol);
+    }
+
+    pub fn fieldAccessSegmentSpan(self: ProgramView, span_: Span(FieldAccessSegment)) []const FieldAccessSegment {
+        return self.field_access_segments[span_.start..][0..span_.len];
+    }
+
+    pub fn fieldAccessSegmentAt(self: ProgramView, span_: Span(FieldAccessSegment), index: usize) FieldAccessSegment {
+        if (index >= span_.len) Common.invariant("field access segment index was outside span");
+        return self.field_access_segments[span_.start + index];
     }
 
     /// Verify that a completed program view refers only to durable type-store
@@ -1213,6 +1321,7 @@ pub const ProgramBuilder = struct {
     typed_locals: ProgramList(TypedLocal, "typed_locals"),
     stmt_ids: ProgramList(StmtId, "stmt_ids"),
     field_exprs: ProgramList(FieldExpr, "field_exprs"),
+    field_access_segments: ProgramList(FieldAccessSegment, "field_access_segments"),
     fn_def_captures: ProgramList(FnDefCapture, "fn_def_captures"),
     /// Backing pool for `Span(CaptureOperand)` direct-call operands. Pre-lift
     /// Monotype stores producer-authored local-proc operands here; closure
@@ -1272,6 +1381,7 @@ pub const ProgramBuilder = struct {
             .typed_locals = .empty,
             .stmt_ids = .empty,
             .field_exprs = .empty,
+            .field_access_segments = .empty,
             .fn_def_captures = .empty,
             .capture_operands = .empty,
             .record_destructs = .empty,
@@ -1324,6 +1434,7 @@ pub const ProgramBuilder = struct {
         self.record_destructs.deinit(self.allocator);
         self.fn_def_captures.deinit(self.allocator);
         self.capture_operands.deinit(self.allocator);
+        self.field_access_segments.deinit(self.allocator);
         self.field_exprs.deinit(self.allocator);
         self.stmt_ids.deinit(self.allocator);
         self.typed_locals.deinit(self.allocator);
@@ -1494,6 +1605,7 @@ pub const ProgramBuilder = struct {
             .typed_locals = self.typed_locals.unsafeRawItemsForView(),
             .stmt_ids = self.stmt_ids.unsafeRawItemsForView(),
             .field_exprs = self.field_exprs.unsafeRawItemsForView(),
+            .field_access_segments = self.field_access_segments.unsafeRawItemsForView(),
             .fn_def_captures = self.fn_def_captures.unsafeRawItemsForView(),
             .capture_operands = self.capture_operands.unsafeRawItemsForView(),
             .record_destructs = self.record_destructs.unsafeRawItemsForView(),
@@ -1810,6 +1922,10 @@ pub const ProgramBuilder = struct {
         return self.field_exprs.len();
     }
 
+    pub fn fieldAccessSegmentCount(self: *const ProgramBuilder) usize {
+        return self.field_access_segments.len();
+    }
+
     pub fn recordDestructCount(self: *const ProgramBuilder) usize {
         return self.record_destructs.len();
     }
@@ -1846,6 +1962,10 @@ pub const ProgramBuilder = struct {
         return self.field_exprs.get(index);
     }
 
+    pub fn getFieldAccessSegmentAt(self: *const ProgramBuilder, index: usize) FieldAccessSegment {
+        return self.field_access_segments.get(index);
+    }
+
     pub fn getRecordDestructAt(self: *const ProgramBuilder, index: usize) RecordDestruct {
         return self.record_destructs.get(index);
     }
@@ -1863,15 +1983,11 @@ pub const ProgramBuilder = struct {
     }
 
     pub fn addExprSpan(self: *ProgramBuilder, ids: []const ExprId) std.mem.Allocator.Error!Span(ExprId) {
-        const start: u32 = @intCast(self.expr_ids.len());
-        try self.expr_ids.appendSlice(self.allocator, ids);
-        return .{ .start = start, .len = @intCast(ids.len) };
+        return try Common.appendSpan(ExprId, &self.expr_ids, self.allocator, ids);
     }
 
     pub fn addPatSpan(self: *ProgramBuilder, ids: []const PatId) std.mem.Allocator.Error!Span(PatId) {
-        const start: u32 = @intCast(self.pat_ids.len());
-        try self.pat_ids.appendSlice(self.allocator, ids);
-        return .{ .start = start, .len = @intCast(ids.len) };
+        return try Common.appendSpan(PatId, &self.pat_ids, self.allocator, ids);
     }
 
     pub fn addTypedLocalSpan(self: *ProgramBuilder, values: []const TypedLocal) std.mem.Allocator.Error!Span(TypedLocal) {
@@ -1885,45 +2001,35 @@ pub const ProgramBuilder = struct {
     }
 
     pub fn addFieldExprSpan(self: *ProgramBuilder, values: []const FieldExpr) std.mem.Allocator.Error!Span(FieldExpr) {
-        const start: u32 = @intCast(self.field_exprs.len());
-        try self.field_exprs.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(FieldExpr, &self.field_exprs, self.allocator, values);
+    }
+
+    pub fn addFieldAccessSegmentSpan(self: *ProgramBuilder, values: []const FieldAccessSegment) std.mem.Allocator.Error!Span(FieldAccessSegment) {
+        return try Common.appendNonemptySpan(FieldAccessSegment, &self.field_access_segments, self.allocator, values, "field access segment span must be nonempty");
     }
 
     pub fn addFnDefCaptureSpan(self: *ProgramBuilder, values: []const FnDefCapture) std.mem.Allocator.Error!Span(FnDefCapture) {
-        const start: u32 = @intCast(self.fn_def_captures.len());
-        try self.fn_def_captures.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(FnDefCapture, &self.fn_def_captures, self.allocator, values);
     }
 
     pub fn addRecordDestructSpan(self: *ProgramBuilder, values: []const RecordDestruct) std.mem.Allocator.Error!Span(RecordDestruct) {
-        const start: u32 = @intCast(self.record_destructs.len());
-        try self.record_destructs.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(RecordDestruct, &self.record_destructs, self.allocator, values);
     }
 
     pub fn addStrPatternStepSpan(self: *ProgramBuilder, values: []const StrPatternStep) std.mem.Allocator.Error!Span(StrPatternStep) {
-        const start: u32 = @intCast(self.str_pattern_steps.len());
-        try self.str_pattern_steps.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(StrPatternStep, &self.str_pattern_steps, self.allocator, values);
     }
 
     pub fn addBranchSpan(self: *ProgramBuilder, values: []const Branch) std.mem.Allocator.Error!Span(Branch) {
-        const start: u32 = @intCast(self.branches.len());
-        try self.branches.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(Branch, &self.branches, self.allocator, values);
     }
 
     pub fn addIfBranchSpan(self: *ProgramBuilder, values: []const IfBranch) std.mem.Allocator.Error!Span(IfBranch) {
-        const start: u32 = @intCast(self.if_branches.len());
-        try self.if_branches.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(IfBranch, &self.if_branches, self.allocator, values);
     }
 
     pub fn addStmtSpan(self: *ProgramBuilder, ids: []const StmtId) std.mem.Allocator.Error!Span(StmtId) {
-        const start: u32 = @intCast(self.stmt_ids.len());
-        try self.stmt_ids.appendSlice(self.allocator, ids);
-        return .{ .start = start, .len = @intCast(ids.len) };
+        return try Common.appendSpan(StmtId, &self.stmt_ids, self.allocator, ids);
     }
 
     pub fn exprSpan(self: *const ProgramBuilder, span_: Span(ExprId)) ProgramSpanBorrow(ExprId, "expr_ids") {
@@ -1946,14 +2052,21 @@ pub const ProgramBuilder = struct {
         return self.field_exprs.borrowSpan(span_.start, span_.len);
     }
 
+    pub fn fieldAccessSegmentSpan(self: *const ProgramBuilder, span_: Span(FieldAccessSegment)) ProgramSpanBorrow(FieldAccessSegment, "field_access_segments") {
+        return self.field_access_segments.borrowSpan(span_.start, span_.len);
+    }
+
+    pub fn fieldAccessSegmentAt(self: *const ProgramBuilder, span_: Span(FieldAccessSegment), index: usize) FieldAccessSegment {
+        if (index >= span_.len) Common.invariant("field access segment index was outside span");
+        return self.field_access_segments.get(span_.start + index);
+    }
+
     pub fn fnDefCaptureSpan(self: *const ProgramBuilder, span_: Span(FnDefCapture)) ProgramSpanBorrow(FnDefCapture, "fn_def_captures") {
         return self.fn_def_captures.borrowSpan(span_.start, span_.len);
     }
 
     pub fn addCaptureOperandSpan(self: *ProgramBuilder, values: []const CaptureOperand) std.mem.Allocator.Error!Span(CaptureOperand) {
-        const start: u32 = @intCast(self.capture_operands.len());
-        try self.capture_operands.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(CaptureOperand, &self.capture_operands, self.allocator, values);
     }
 
     pub fn captureOperandSpan(self: *const ProgramBuilder, span_: Span(CaptureOperand)) ProgramSpanBorrow(CaptureOperand, "capture_operands") {

@@ -223,7 +223,7 @@ pub const BuildArgs = struct {
     watch: bool = false, // rebuild when source inputs change
     watch_inputs_file: ?[]const u8 = null, // internal: write watch input paths and byte states here
     max_threads: ?usize = null, // max worker threads (null = auto, 1 = single-threaded)
-    wasm_memory: ?usize = null, // initial memory size for WASM targets (default: 64MB)
+    wasm_memory: ?usize = null, // initial memory size for WASM targets (default: sized from data segments plus the stack)
     wasm_stack_size: ?usize = null, // stack size for WASM targets (default: 8MB)
     require_executable_output: bool = false, // reject static/shared library targets
     require_host_runnable_output: bool = false, // internal: reject targets that cannot run on this host
@@ -398,7 +398,7 @@ const main_help =
     \\  build            Build a binary from the given .roc file, but don't run it
     \\  bundle           Bundle .roc files into a compressed archive
     \\  unbundle         Extract files from compressed .tar.zst archives
-    \\  test             Run all top-level `expect`s in a main module and any modules it imports
+    \\  test             Run all top-level `expect`s in a module, and in the modules and path dependencies it imports
     \\  repl             Launch the interactive Read Eval Print Loop (REPL)
     \\  fmt              Format a .roc file or the .roc files contained in a directory using standard Roc formatting
     \\  glue             Generate native glue code from a Roc platform using a language-specific glue spec
@@ -592,7 +592,7 @@ fn parseBuild(args: []const []const u8) CliArgs {
             \\      --no-cache                     Disable compilation caching
             \\      --watch                        Rebuild when source inputs change
             \\  -j, --jobs=<N>                     Max worker threads for parallel compilation (default: auto-detect CPU count)
-            \\      --wasm-memory=<bytes>          Initial memory size for WASM targets in bytes (default: 67108864 = 64MB)
+            \\      --wasm-memory=<bytes>          Initial memory size for WASM targets in bytes (default: sized from data segments plus the stack)
             \\      --wasm-stack-size=<bytes>      Stack size for WASM targets in bytes (default: 8388608 = 8MB)
             \\      -h, --help                     Print help
             \\
@@ -875,6 +875,10 @@ fn parseTest(args: []const []const u8) CliArgs {
         if (isHelpFlag(arg)) {
             return CliArgs{ .help =
             \\Run all top-level `expect`s in a main module and any modules it imports
+            \\
+            \\Dependencies reached through a filesystem path are tested too, because
+            \\they are yours to edit. Dependencies downloaded from a URL are not: their
+            \\`expect`s belong to whoever published them.
             \\
             \\Usage: roc test [OPTIONS] [ROC_FILE]
             \\

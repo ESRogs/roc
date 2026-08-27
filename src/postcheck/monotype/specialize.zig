@@ -113,10 +113,7 @@ const OwnedEvidence = struct {
 };
 
 fn evidenceEql(left: EvidenceView, right: EvidenceView) bool {
-    if (left.head != right.head or left.nodes.len != right.nodes.len or left.frames.len != right.frames.len) return false;
-    for (left.nodes, right.nodes) |a, b| if (!std.meta.eql(a, b)) return false;
-    for (left.frames, right.frames) |a, b| if (!std.meta.eql(a, b)) return false;
-    return true;
+    return Ast.fnEvidenceEql(left.nodes, left.frames, left.head, right.nodes, right.frames, right.head);
 }
 
 fn evidenceDigestMatches(identity: Ast.SpecIdentity, evidence: EvidenceView) bool {
@@ -506,6 +503,14 @@ pub const SpecBuilder = struct {
             }
             try self.appendAliasEntry(record.identity.callable, record.identity.method_scope, record.identity.source_fn_ty_digest, record.identity.evidence_digest, request_fn_ty_digest, spec);
         }
+    }
+
+    /// Current lifecycle status of a record. The scheduler consults this at
+    /// dispatch to skip queued bodies an immediate caller already completed.
+    pub fn recordStatus(self: *const SpecBuilder, spec: Ast.SpecId) Ast.SpecStatus {
+        const index = @intFromEnum(spec);
+        if (index >= self.records.len()) invariant("Monotype spec builder referenced a missing record");
+        return self.records.get(index).status;
     }
 
     pub fn markLowering(self: *SpecBuilder, spec: Ast.SpecId) void {

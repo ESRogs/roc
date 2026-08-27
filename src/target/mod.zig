@@ -200,10 +200,8 @@ pub fn machoArchName(arch: std.Target.Cpu.Arch) MachoArchError![]const u8 {
 }
 
 /// Dynamic-linker (`ld.so`) soname filenames, one authority for the bare
-/// filenames used both by `RocTarget.getDynamicLinkerPath` (which prefixes them
-/// with a known absolute directory) and by `cli/libc_finder.zig` (which probes
-/// the real filesystem for them). Only the filenames live here; absolute search
-/// directories stay with the code that owns them.
+/// filenames that `glibcProgramInterpreter` and `RocTarget.getDynamicLinkerPath`
+/// prefix with the ABI-defined absolute directory.
 pub const ld_so = struct {
     /// glibc ld.so soname for x86_64.
     pub const glibc_x86_64 = "ld-linux-x86-64.so.2";
@@ -211,17 +209,26 @@ pub const ld_so = struct {
     pub const glibc_aarch64 = "ld-linux-aarch64.so.1";
     /// glibc ld.so soname for 32-bit hard-float ARM.
     pub const glibc_arm = "ld-linux-armhf.so.3";
-    /// glibc ld.so soname for 32-bit x86.
-    pub const glibc_x86 = "ld-linux.so.2";
-    /// musl ld.so soname for x86_64.
-    pub const musl_x86_64 = "ld-musl-x86_64.so.1";
-    /// musl ld.so soname for aarch64.
-    pub const musl_aarch64 = "ld-musl-aarch64.so.1";
-    /// musl ld.so soname for 32-bit ARM.
-    pub const musl_arm = "ld-musl-arm.so.1";
-    /// musl ld.so soname for 32-bit x86.
-    pub const musl_x86 = "ld-musl-i386.so.1";
 };
+
+/// The absolute path a Linux kernel uses as the program interpreter of a
+/// glibc-target executable.
+///
+/// The glibc ABI defines one canonical path per architecture. Every glibc
+/// distro provides it: most store the real file there, and Debian-family
+/// distros provide it as a `libc6` compatibility symlink to their multiarch
+/// copy. The path is a constant of the target ABI, not a property of the
+/// build machine, so writing any other path (such as the multiarch one)
+/// produces an executable that fails with `ENOENT` on other distros. Returns
+/// null for an architecture without a known canonical path.
+pub fn glibcProgramInterpreter(arch: std.Target.Cpu.Arch) ?[]const u8 {
+    return switch (classifyCpuArch(arch)) {
+        .x86_64 => "/lib64/" ++ ld_so.glibc_x86_64,
+        .aarch64 => "/lib/" ++ ld_so.glibc_aarch64,
+        .arm => "/lib/" ++ ld_so.glibc_arm,
+        .aarch64_be, .wasm32, .other => null,
+    };
+}
 
 /// The absolute path a BSD kernel uses as an executable's program interpreter.
 ///
@@ -320,7 +327,44 @@ const CpuContract = struct {
     }
 };
 
-const TargetFamily = enum { macos, windows, bsd, linux_dynamic, linux_static, elf, wasm };
+const TargetFamily = enum { macos, windows_msvc, windows_mingw, bsd, linux_dynamic, linux_static, elf, wasm };
+
+/// The C runtime ABI selected by a Windows Roc target.
+pub const WindowsAbi = enum { msvc, mingw };
+
+/// Translate Zig's ABI spelling into one of Roc's supported Windows ABIs.
+pub fn windowsAbiFromStd(abi: std.Target.Abi) ?WindowsAbi {
+    return switch (abi) {
+        .msvc => .msvc,
+        .gnu => .mingw,
+        .none,
+        .gnuabin32,
+        .gnuabi64,
+        .gnueabi,
+        .gnueabihf,
+        .gnuf32,
+        .gnusf,
+        .gnux32,
+        .eabi,
+        .eabihf,
+        .ilp32,
+        .android,
+        .androideabi,
+        .musl,
+        .muslabin32,
+        .muslabi64,
+        .musleabi,
+        .musleabihf,
+        .muslf32,
+        .muslsf,
+        .muslx32,
+        .itanium,
+        .simulator,
+        .ohos,
+        .ohoseabi,
+        => null,
+    };
+}
 
 /// Roc's simplified target representation.
 /// Maps to specific OS/arch/ABI combinations for cross-compilation.
@@ -334,6 +378,7 @@ pub const RocTarget = enum {
     // x64 (x86_64) targets
     x64mac,
     x64win,
+    x64mingw,
     x64freebsd,
     x64openbsd,
     x64netbsd,
@@ -345,6 +390,7 @@ pub const RocTarget = enum {
     // x64 (x86_64) targets, baseline CPU
     x64v1mac,
     x64v1win,
+    x64v1mingw,
     x64v1freebsd,
     x64v1openbsd,
     x64v1netbsd,
@@ -356,6 +402,7 @@ pub const RocTarget = enum {
     // arm64 (aarch64) targets
     arm64mac,
     arm64win,
+    arm64mingw,
     arm64linux,
     arm64musl,
     arm64glibc,
@@ -365,6 +412,7 @@ pub const RocTarget = enum {
     // There is no arm64v1mac: every Apple Silicon Mac is Armv8.4-A or newer,
     // so arm64mac already generates code its whole hardware range runs.
     arm64v1win,
+    arm64v1mingw,
     arm64v1linux,
     arm64v1musl,
     arm64v1glibc,
@@ -399,7 +447,10 @@ pub const RocTarget = enum {
             .x86_64 => {
                 switch (classifyOs(os)) {
                     .macos => return .x64mac,
-                    .windows => return .x64win,
+                    .windows => return switch (windowsAbiFromStd(abi).?) {
+                        .msvc => .x64win,
+                        .mingw => .x64mingw,
+                    },
                     .freebsd => return .x64freebsd,
                     .openbsd => return .x64openbsd,
                     .netbsd => return .x64netbsd,
@@ -416,7 +467,10 @@ pub const RocTarget = enum {
             .aarch64, .aarch64_be => {
                 switch (classifyOs(os)) {
                     .macos => return .arm64mac,
-                    .windows => return .arm64win,
+                    .windows => return switch (windowsAbiFromStd(abi).?) {
+                        .msvc => .arm64win,
+                        .mingw => .arm64mingw,
+                    },
                     .linux => {
                         return switch (classifyAbi(abi)) {
                             .musl => .arm64musl,
@@ -438,7 +492,10 @@ pub const RocTarget = enum {
                 // Default fallback based on OS
                 switch (classifyOs(os)) {
                     .macos => return .x64mac,
-                    .windows => return .x64win,
+                    .windows => return switch (windowsAbiFromStd(abi).?) {
+                        .msvc => .x64win,
+                        .mingw => .x64mingw,
+                    },
                     .linux => return .x64musl, // Default to musl
                     .freebsd, .openbsd, .netbsd, .other => return .x64elf,
                 }
@@ -473,6 +530,7 @@ pub const RocTarget = enum {
         return switch (self) {
             .x64v1mac => .x64mac,
             .x64v1win => .x64win,
+            .x64v1mingw => .x64mingw,
             .x64v1freebsd => .x64freebsd,
             .x64v1openbsd => .x64openbsd,
             .x64v1netbsd => .x64netbsd,
@@ -482,6 +540,7 @@ pub const RocTarget = enum {
             .x64v1elf => .x64elf,
 
             .arm64v1win => .arm64win,
+            .arm64v1mingw => .arm64mingw,
             .arm64v1linux => .arm64linux,
             .arm64v1musl => .arm64musl,
             .arm64v1glibc => .arm64glibc,
@@ -490,6 +549,7 @@ pub const RocTarget = enum {
 
             .x64mac,
             .x64win,
+            .x64mingw,
             .x64freebsd,
             .x64openbsd,
             .x64netbsd,
@@ -499,6 +559,7 @@ pub const RocTarget = enum {
             .x64elf,
             .arm64mac,
             .arm64win,
+            .arm64mingw,
             .arm64linux,
             .arm64musl,
             .arm64glibc,
@@ -521,6 +582,7 @@ pub const RocTarget = enum {
         return switch (self) {
             .x64mac => .x64v1mac,
             .x64win => .x64v1win,
+            .x64mingw => .x64v1mingw,
             .x64freebsd => .x64v1freebsd,
             .x64openbsd => .x64v1openbsd,
             .x64netbsd => .x64v1netbsd,
@@ -530,6 +592,7 @@ pub const RocTarget = enum {
             .x64elf => .x64v1elf,
 
             .arm64win => .arm64v1win,
+            .arm64mingw => .arm64v1mingw,
             .arm64linux => .arm64v1linux,
             .arm64musl => .arm64v1musl,
             .arm64glibc => .arm64v1glibc,
@@ -538,6 +601,7 @@ pub const RocTarget = enum {
 
             .x64v1mac,
             .x64v1win,
+            .x64v1mingw,
             .x64v1freebsd,
             .x64v1openbsd,
             .x64v1netbsd,
@@ -546,6 +610,7 @@ pub const RocTarget = enum {
             .x64v1linux,
             .x64v1elf,
             .arm64v1win,
+            .arm64v1mingw,
             .arm64v1linux,
             .arm64v1musl,
             .arm64v1glibc,
@@ -564,7 +629,8 @@ pub const RocTarget = enum {
     fn family(self: RocTarget) TargetFamily {
         return switch (self) {
             .x64mac, .x64v1mac, .arm64mac => .macos,
-            .x64win, .x64v1win, .arm64win, .arm64v1win => .windows,
+            .x64win, .x64v1win, .arm64win, .arm64v1win => .windows_msvc,
+            .x64mingw, .x64v1mingw, .arm64mingw, .arm64v1mingw => .windows_mingw,
             .x64freebsd,
             .x64openbsd,
             .x64netbsd,
@@ -597,7 +663,7 @@ pub const RocTarget = enum {
     pub fn toOsTag(self: RocTarget) std.Target.Os.Tag {
         return switch (self) {
             .x64mac, .x64v1mac, .arm64mac => .macos,
-            .x64win, .x64v1win, .arm64win, .arm64v1win => .windows,
+            .x64win, .x64v1win, .x64mingw, .x64v1mingw, .arm64win, .arm64v1win, .arm64mingw, .arm64v1mingw => .windows,
             .x64freebsd, .x64v1freebsd => .freebsd,
             .x64openbsd, .x64v1openbsd => .openbsd,
             .x64netbsd, .x64v1netbsd => .netbsd,
@@ -611,12 +677,12 @@ pub const RocTarget = enum {
     pub fn toCpuArch(self: RocTarget) std.Target.Cpu.Arch {
         return switch (self) {
             // x64 targets
-            .x64mac, .x64win, .x64freebsd, .x64openbsd, .x64netbsd, .x64musl, .x64glibc, .x64linux, .x64elf => .x86_64,
-            .x64v1mac, .x64v1win, .x64v1freebsd, .x64v1openbsd, .x64v1netbsd, .x64v1musl, .x64v1glibc, .x64v1linux, .x64v1elf => .x86_64,
+            .x64mac, .x64win, .x64mingw, .x64freebsd, .x64openbsd, .x64netbsd, .x64musl, .x64glibc, .x64linux, .x64elf => .x86_64,
+            .x64v1mac, .x64v1win, .x64v1mingw, .x64v1freebsd, .x64v1openbsd, .x64v1netbsd, .x64v1musl, .x64v1glibc, .x64v1linux, .x64v1elf => .x86_64,
 
             // arm64 targets
-            .arm64mac, .arm64win, .arm64linux, .arm64musl, .arm64glibc => .aarch64,
-            .arm64v1win, .arm64v1linux, .arm64v1musl, .arm64v1glibc => .aarch64,
+            .arm64mac, .arm64win, .arm64mingw, .arm64linux, .arm64musl, .arm64glibc => .aarch64,
+            .arm64v1win, .arm64v1mingw, .arm64v1linux, .arm64v1musl, .arm64v1glibc => .aarch64,
 
             // arm32 targets
             .arm32linux, .arm32musl => .arm,
@@ -745,7 +811,8 @@ pub const RocTarget = enum {
             .abi = switch (self.family()) {
                 .linux_static => .musl,
                 .linux_dynamic => .gnu,
-                .windows => .msvc,
+                .windows_msvc => .msvc,
+                .windows_mingw => .gnu,
                 .macos, .bsd, .elf, .wasm => .none,
             },
         };
@@ -766,6 +833,7 @@ pub const RocTarget = enum {
             // x64 targets
             .x64mac, .x64v1mac => "x86_64-apple-darwin",
             .x64win, .x64v1win => "x86_64-pc-windows-msvc",
+            .x64mingw, .x64v1mingw => "x86_64-w64-windows-gnu",
             .x64freebsd, .x64v1freebsd => "x86_64-unknown-freebsd",
             .x64openbsd, .x64v1openbsd => "x86_64-unknown-openbsd",
             .x64netbsd, .x64v1netbsd => "x86_64-unknown-netbsd",
@@ -777,6 +845,7 @@ pub const RocTarget = enum {
             // arm64 targets
             .arm64mac => "aarch64-apple-darwin",
             .arm64win, .arm64v1win => "aarch64-pc-windows-msvc",
+            .arm64mingw, .arm64v1mingw => "aarch64-w64-windows-gnu",
             .arm64linux, .arm64v1linux => "aarch64-unknown-linux-gnu",
             .arm64musl, .arm64v1musl => "aarch64-unknown-linux-musl",
             .arm64glibc, .arm64v1glibc => "aarch64-unknown-linux-gnu",
@@ -807,7 +876,19 @@ pub const RocTarget = enum {
 
     /// Check if target is Windows
     pub fn isWindows(self: RocTarget) bool {
-        return self.family() == .windows;
+        return switch (self.family()) {
+            .windows_msvc, .windows_mingw => true,
+            .macos, .bsd, .linux_dynamic, .linux_static, .elf, .wasm => false,
+        };
+    }
+
+    /// Return the selected Windows C runtime ABI, or null for non-Windows targets.
+    pub fn windowsAbi(self: RocTarget) ?WindowsAbi {
+        return switch (self.family()) {
+            .windows_msvc => .msvc,
+            .windows_mingw => .mingw,
+            .macos, .bsd, .linux_dynamic, .linux_static, .elf, .wasm => null,
+        };
     }
 
     /// Check if target is Linux-based
@@ -875,14 +956,17 @@ pub const RocTarget = enum {
     /// Get the dynamic linker path for this target
     pub fn getDynamicLinkerPath(self: RocTarget) error{ StaticLinkingTarget, WindowsTarget, NoKnownLinkerPath, WebAssemblyTarget }![]const u8 {
         return switch (self) {
-            // x64 glibc targets
-            .x64glibc, .x64linux, .x64v1glibc, .x64v1linux => "/lib64/" ++ ld_so.glibc_x86_64,
-
-            // arm64 glibc targets
-            .arm64glibc, .arm64linux, .arm64v1glibc, .arm64v1linux => "/lib/" ++ ld_so.glibc_aarch64,
-
-            // arm32 glibc targets
-            .arm32linux => "/lib/" ++ ld_so.glibc_arm,
+            // glibc targets
+            .x64glibc,
+            .x64linux,
+            .x64v1glibc,
+            .x64v1linux,
+            .arm64glibc,
+            .arm64linux,
+            .arm64v1glibc,
+            .arm64v1linux,
+            .arm32linux,
+            => glibcProgramInterpreter(self.toCpuArch()) orelse return error.NoKnownLinkerPath,
 
             // Static linking targets don't need dynamic linker
             .x64musl, .arm64musl, .arm32musl, .x64v1musl, .arm64v1musl => return error.StaticLinkingTarget,
@@ -891,7 +975,7 @@ pub const RocTarget = enum {
             .x64mac, .arm64mac, .x64v1mac => "/usr/lib/dyld",
 
             // Windows doesn't use ELF-style dynamic linker
-            .x64win, .arm64win, .x64v1win, .arm64v1win => return error.WindowsTarget,
+            .x64win, .arm64win, .x64v1win, .arm64v1win, .x64mingw, .arm64mingw, .x64v1mingw, .arm64v1mingw => return error.WindowsTarget,
 
             // BSD variants
             .x64freebsd,
@@ -967,6 +1051,7 @@ test "every v1 target shares its default target's platform" {
         try std.testing.expectEqual(default.isLinux(), target.isLinux());
         try std.testing.expectEqual(default.isMacOS(), target.isMacOS());
         try std.testing.expectEqual(default.isWindows(), target.isWindows());
+        try std.testing.expectEqual(default.windowsAbi(), target.windowsAbi());
         try std.testing.expectEqual(default.ptrBitWidth(), target.ptrBitWidth());
         try std.testing.expectEqual(default.isCompatibleWithHost(), target.isCompatibleWithHost());
         try std.testing.expectEqual(default.isExecutableOnHost(), target.isExecutableOnHost());
@@ -986,6 +1071,31 @@ test "every v1 target shares its default target's platform" {
             default.llvmTargetQuery().abi,
             target.llvmTargetQuery().abi,
         );
+    }
+}
+
+test "Windows targets preserve their C runtime ABI in their query and triple" {
+    const cases = [_]struct {
+        target: RocTarget,
+        abi: WindowsAbi,
+        zig_abi: std.Target.Abi,
+        triple: []const u8,
+    }{
+        .{ .target = .x64win, .abi = .msvc, .zig_abi = .msvc, .triple = "x86_64-pc-windows-msvc" },
+        .{ .target = .x64v1win, .abi = .msvc, .zig_abi = .msvc, .triple = "x86_64-pc-windows-msvc" },
+        .{ .target = .arm64win, .abi = .msvc, .zig_abi = .msvc, .triple = "aarch64-pc-windows-msvc" },
+        .{ .target = .arm64v1win, .abi = .msvc, .zig_abi = .msvc, .triple = "aarch64-pc-windows-msvc" },
+        .{ .target = .x64mingw, .abi = .mingw, .zig_abi = .gnu, .triple = "x86_64-w64-windows-gnu" },
+        .{ .target = .x64v1mingw, .abi = .mingw, .zig_abi = .gnu, .triple = "x86_64-w64-windows-gnu" },
+        .{ .target = .arm64mingw, .abi = .mingw, .zig_abi = .gnu, .triple = "aarch64-w64-windows-gnu" },
+        .{ .target = .arm64v1mingw, .abi = .mingw, .zig_abi = .gnu, .triple = "aarch64-w64-windows-gnu" },
+    };
+
+    for (cases) |case| {
+        try std.testing.expect(case.target.isWindows());
+        try std.testing.expectEqual(case.abi, case.target.windowsAbi().?);
+        try std.testing.expectEqual(case.zig_abi, case.target.llvmTargetQuery().abi.?);
+        try std.testing.expectEqualStrings(case.triple, case.target.toTriple());
     }
 }
 

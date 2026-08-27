@@ -60,9 +60,9 @@ fn typeDispatchOwnerVar(module: anytype, stmt_idx: CIR.Statement.Idx) Var {
     };
 }
 
-fn checkedFieldBackingAccess(module: TypedCIR.Module, receiver: CIR.Expr.Idx) CheckedFieldBackingAccess {
+fn checkedFieldBackingAccess(module: TypedCIR.Module, receiver_var: Var) CheckedFieldBackingAccess {
     const store = module.typeStoreConst();
-    var current = ModuleEnv.varFrom(receiver);
+    var current = receiver_var;
     var remaining = store.len();
     while (remaining > 0) : (remaining -= 1) {
         const resolved = store.resolveVar(current);
@@ -86,7 +86,7 @@ fn checkedFieldBackingAccess(module: TypedCIR.Module, receiver: CIR.Expr.Idx) Ch
                 .empty_tag_union,
                 => .inspectable,
             },
-            .flex, .rigid, .err => return .inspectable,
+            .flex, .rigid, .field_presence, .err => return .inspectable,
         }
     }
     checkedArtifactInvariant("field access receiver alias chain contained a cycle", .{});
@@ -350,6 +350,7 @@ fn hashCheckingContextIdentity(identity: CheckingContextIdentity) [32]u8 {
     for (identity.explicit_roots) |root| {
         hashExplicitRootRequestInput(&hasher, root);
     }
+    hashByteSlice(&hasher, @tagName(identity.validation));
     return hasher.finalResult();
 }
 
@@ -442,12 +443,19 @@ pub const CheckingContextIdentity = struct {
     platform_requirement_context: ?PlatformRequirementContextKey = null,
     platform_app_relation: ?PlatformAppRelationKey = null,
     explicit_roots: []const ExplicitRootRequestInput = &.{},
+    /// How the module's compile-time roots were established. An app root
+    /// checked without its entrypoint contract reports no problem for a
+    /// platform requirement it does not supply, so two compilations of the
+    /// same source that disagree here produce different checked output and
+    /// must not share a cache entry.
+    validation: can.Can.Validation = .checking,
 
     pub const Serialized = extern struct {
         imports: SerializedSlice(ImportIdentity) = .{},
         explicit_roots: SerializedSlice(ExplicitRootRequestInput) = .{},
         platform_requirement_context: artifact_serialize.SerializedOptional(PlatformRequirementContextKey) = .{},
         platform_app_relation: artifact_serialize.SerializedOptional(PlatformAppRelationKey) = .{},
+        validation: artifact_serialize.SerializedScalar(can.Can.Validation, .checking) = .{},
         const Serde = artifact_serialize.SliceStoreSerde(CheckingContextIdentity, @This());
         pub const serialize = Serde.serialize;
         pub const deserialize = Serde.deserialize;
@@ -460,6 +468,7 @@ pub const CheckingContextIdentity = struct {
         platform_requirement_context: ?PlatformRequirementContextKey,
         platform_app_relation: ?PlatformAppRelationKey,
         explicit_roots: []const ExplicitRootRequestInput,
+        validation: can.Can.Validation,
     ) Allocator.Error!CheckingContextIdentity {
         const module_env = module.moduleEnvConst();
         const imported_names = module_env.imports.imports.items.items;
@@ -485,6 +494,7 @@ pub const CheckingContextIdentity = struct {
             .platform_requirement_context = platform_requirement_context,
             .platform_app_relation = platform_app_relation,
             .explicit_roots = roots,
+            .validation = validation,
         };
     }
 
@@ -672,6 +682,7 @@ pub const PublishInputs = struct {
     hoisted_roots: []const hoist_roots.SelectedHoistedRoot = &.{},
     compile_time_finalizer: CompileTimeFinalizer,
     problem_store: ?*problem.Store = null,
+    validation: can.Can.Validation = .checking,
 };
 
 /// Public `CompileTimeFinalizer` declaration.
@@ -951,6 +962,10 @@ pub const RootRequest = struct {
     module_idx: u32,
     kind: RootRequestKind,
     source: RootSource,
+    /// Exact checked root selected for this request. Compile-time roots can
+    /// share a source expression, so source and broad request kind are not an
+    /// identity.
+    compile_time_root: ?ComptimeRootId = null,
     checked_type: CheckedTypeId,
     abi: RootAbi,
     exposure: RootExposure,
@@ -1004,6 +1019,7 @@ pub const RootRequestTable = struct {
         top_level_procedure_bindings: *const TopLevelProcedureBindingTable,
         callable_eval_templates: *const CallableEvalTemplateTable,
         hoisted_constants: *const HoistedConstTable,
+        const_templates: *const ConstTemplateTable,
         template_root_evidence: []const artifact_serialize.Span,
         explicit_roots: []const ExplicitRootRequestInput,
     ) Allocator.Error!RootRequestTable {
@@ -1023,12 +1039,14 @@ pub const RootRequestTable = struct {
                 compile_time_roots,
                 entry_wrappers,
                 root.source,
+                root.kind,
                 source_checked_type,
             );
             try appendRoot(&requests, allocator, .{
                 .module_idx = module.moduleIndex(),
                 .kind = root.kind,
                 .source = root.source,
+                .compile_time_root = backing.compile_time_root,
                 .checked_type = backing.checked_type,
                 .abi = root.abi,
                 .exposure = root.exposure,
@@ -1086,15 +1104,16 @@ pub const RootRequestTable = struct {
             try appendRoot(&requests, allocator, .{
                 .module_idx = root.module_idx,
                 .kind = switch (root.kind) {
-                    .constant, .hoisted_constant, .numeral_conversion, .quote_conversion => .compile_time_constant,
+                    .constant, .hoisted_constant, .hoisted_validation, .numeral_conversion, .quote_conversion, .field_default => .compile_time_constant,
                     .callable_binding => .compile_time_callable,
                     .expect => .test_expect,
                 },
                 .source = root.source,
+                .compile_time_root = root.id,
                 .checked_type = entryWrapperForRoot(entry_wrappers, root.id).checked_fn_root,
                 .abi = switch (root.kind) {
                     .expect => .test_expect,
-                    .constant, .hoisted_constant, .callable_binding, .numeral_conversion, .quote_conversion => .compile_time,
+                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .field_default => .compile_time,
                 },
                 .exposure = .private,
                 .procedure_template = templateForEntryWrapperRoot(entry_wrappers, root.id),
@@ -1138,6 +1157,7 @@ pub const RootRequestTable = struct {
             platform_required_bindings,
             callable_eval_templates,
             hoisted_constants,
+            const_templates,
         );
         verifyCompileTimeRequestsScheduled(compile_time_requests, compile_time_roots);
 
@@ -1165,19 +1185,29 @@ fn explicitRootMatchesCheckedRootKind(
         return root.kind != .compile_time_constant and root.kind != .compile_time_callable;
     }
 
-    const root_id = compile_time_roots.lookupIdBySource(root.source) orelse return false;
-    const compile_time_root = compile_time_roots.root(root_id);
-    return compileTimeRootKindMatchesRequest(compile_time_root.kind, root.kind);
+    return compileTimeRootIdForSourceAndRequestKind(compile_time_roots, root.source, root.kind) != null;
 }
 
 fn explicitCompileTimeRootRequestIsEligible(
     compile_time_roots: *const CompileTimeRootTable,
     root: ExplicitRootRequestInput,
 ) bool {
-    const root_id = compile_time_roots.lookupIdBySource(root.source) orelse return true;
+    const root_id = compileTimeRootIdForSourceAndRequestKind(compile_time_roots, root.source, root.kind) orelse return true;
     const compile_time_root = compile_time_roots.root(root_id);
-    if (!compileTimeRootKindMatchesRequest(compile_time_root.kind, root.kind)) return true;
     return compileTimeRootRequestIsEligible(compile_time_root);
+}
+
+fn compileTimeRootIdForSourceAndRequestKind(
+    compile_time_roots: *const CompileTimeRootTable,
+    source: RootSource,
+    request_kind: RootRequestKind,
+) ?ComptimeRootId {
+    for (compile_time_roots.roots) |root| {
+        if (!rootSourceMatches(root.source, source)) continue;
+        if (!compileTimeRootKindMatchesRequest(root.kind, request_kind)) continue;
+        return root.id;
+    }
+    return null;
 }
 
 fn collectRuntimeRootRequests(
@@ -1201,6 +1231,21 @@ const CompileTimeRequestScheduleEntry = struct {
     original_order: u32,
 };
 
+fn collectScheduledFieldDefaultRoots(
+    allocator: Allocator,
+    compile_time_roots: *const CompileTimeRootTable,
+    entries: []const CompileTimeRequestScheduleEntry,
+) Allocator.Error![]ComptimeRootId {
+    var roots = std.ArrayList(ComptimeRootId).empty;
+    errdefer roots.deinit(allocator);
+    for (entries) |entry| {
+        if (compile_time_roots.root(entry.root_id).kind == .field_default) {
+            try roots.append(allocator, entry.root_id);
+        }
+    }
+    return try roots.toOwnedSlice(allocator);
+}
+
 fn collectCompileTimeRootRequests(
     allocator: Allocator,
     requests: []const RootRequest,
@@ -1214,6 +1259,7 @@ fn collectCompileTimeRootRequests(
     platform_required_bindings: *const PlatformRequiredBindingTable,
     callable_eval_templates: *const CallableEvalTemplateTable,
     hoisted_constants: *const HoistedConstTable,
+    const_templates: *const ConstTemplateTable,
 ) Allocator.Error![]RootRequest {
     var entries = std.ArrayList(CompileTimeRequestScheduleEntry).empty;
     defer entries.deinit(allocator);
@@ -1240,6 +1286,7 @@ fn collectCompileTimeRootRequests(
         platform_required_bindings,
         callable_eval_templates,
         hoisted_constants,
+        const_templates,
         entries.items,
     );
     defer scheduler.deinit();
@@ -1259,7 +1306,9 @@ const CompileTimeRequestScheduler = struct {
     platform_required_bindings: *const PlatformRequiredBindingTable,
     callable_eval_templates: *const CallableEvalTemplateTable,
     hoisted_constants: *const HoistedConstTable,
+    const_templates: *const ConstTemplateTable,
     entries: []const CompileTimeRequestScheduleEntry,
+    field_default_roots: []const ComptimeRootId,
     root_to_request_index: []?usize,
     dependents: []std.ArrayList(usize),
     indegrees: []u32,
@@ -1282,8 +1331,12 @@ const CompileTimeRequestScheduler = struct {
         platform_required_bindings: *const PlatformRequiredBindingTable,
         callable_eval_templates: *const CallableEvalTemplateTable,
         hoisted_constants: *const HoistedConstTable,
+        const_templates: *const ConstTemplateTable,
         entries: []const CompileTimeRequestScheduleEntry,
     ) Allocator.Error!CompileTimeRequestScheduler {
+        const field_default_roots = try collectScheduledFieldDefaultRoots(allocator, compile_time_roots, entries);
+        errdefer allocator.free(field_default_roots);
+
         const root_to_request_index = try allocator.alloc(?usize, compile_time_roots.roots.len);
         errdefer allocator.free(root_to_request_index);
         @memset(root_to_request_index, null);
@@ -1327,7 +1380,9 @@ const CompileTimeRequestScheduler = struct {
             .platform_required_bindings = platform_required_bindings,
             .callable_eval_templates = callable_eval_templates,
             .hoisted_constants = hoisted_constants,
+            .const_templates = const_templates,
             .entries = entries,
+            .field_default_roots = field_default_roots,
             .root_to_request_index = root_to_request_index,
             .dependents = dependents,
             .indegrees = indegrees,
@@ -1345,6 +1400,7 @@ const CompileTimeRequestScheduler = struct {
         for (self.dependents) |*list| list.deinit(self.allocator);
         self.allocator.free(self.dependents);
         self.allocator.free(self.root_to_request_index);
+        self.allocator.free(self.field_default_roots);
         self.* = undefined;
     }
 
@@ -1385,6 +1441,13 @@ const CompileTimeRequestScheduler = struct {
         for (self.entries, 0..) |entry, i| {
             self.current_request_index = i;
             self.current_root_id = entry.root_id;
+
+            if (self.field_default_roots.len != 0 and self.compile_time_roots.root(entry.root_id).kind != .field_default) {
+                for (self.field_default_roots) |field_default_root| {
+                    try self.addUnconditionalRootDependency(field_default_root);
+                }
+            }
+
             self.beginDependencyVisit();
             const template_ref = entry.request.procedure_template orelse {
                 checkedArtifactInvariant("compile-time root request had no entry wrapper template", .{});
@@ -1519,6 +1582,9 @@ const CompileTimeRequestScheduler = struct {
         self: *CompileTimeRequestScheduler,
         const_use: ConstUseTemplate,
     ) Allocator.Error!void {
+        // A declaration with no implementation evaluates nothing, so it
+        // publishes no compile-time root and contributes no dependency edge.
+        if (self.constUseIsUnimplemented(const_use.const_ref)) return;
         const root_id = self.rootForConstRef(const_use.const_ref) orelse return;
         const own_hoisted_root = switch (const_use.const_ref.owner) {
             .hoisted_expr => true,
@@ -1526,6 +1592,11 @@ const CompileTimeRequestScheduler = struct {
         };
         if (root_id == self.current_root_id and own_hoisted_root) return;
         try self.addRootDependency(root_id);
+    }
+
+    fn constUseIsUnimplemented(self: *CompileTimeRequestScheduler, const_ref: ConstRef) bool {
+        if (!checkedArtifactKeyEql(const_ref.artifact, self.artifact_key)) return false;
+        return self.const_templates.get(const_ref).state == .unimplemented;
     }
 
     fn rootForConstRef(
@@ -1558,6 +1629,14 @@ const CompileTimeRequestScheduler = struct {
     ) Allocator.Error!void {
         if (dependency_root == self.current_root_id) return;
         if (!self.rootDependencyIsStrict(dependency_root)) return;
+        try self.addUnconditionalRootDependency(dependency_root);
+    }
+
+    fn addUnconditionalRootDependency(
+        self: *CompileTimeRequestScheduler,
+        dependency_root: ComptimeRootId,
+    ) Allocator.Error!void {
+        if (dependency_root == self.current_root_id) return;
         const raw = @intFromEnum(dependency_root);
         if (raw >= self.root_to_request_index.len) {
             checkedArtifactInvariant("compile-time root dependency was outside the root table", .{});
@@ -1605,12 +1684,21 @@ fn compileTimeRootIdForRequest(
     compile_time_roots: *const CompileTimeRootTable,
     request: RootRequest,
 ) ComptimeRootId {
-    for (compile_time_roots.roots) |root| {
-        if (!compileTimeRootKindMatchesRequest(root.kind, request.kind)) continue;
-        if (!rootSourceMatches(root.source, request.source)) continue;
-        return root.id;
+    const root_id = request.compile_time_root orelse {
+        checkedArtifactInvariant("compile-time request had no exact compile-time root identity", .{});
+    };
+    const raw = @intFromEnum(root_id);
+    if (raw >= compile_time_roots.roots.len) {
+        checkedArtifactInvariant("compile-time request root identity was outside the checked root table", .{});
     }
-    checkedArtifactInvariant("compile-time request had no matching compile-time root", .{});
+    const root = compile_time_roots.roots[raw];
+    if (root.id != root_id or
+        !compileTimeRootKindMatchesRequest(root.kind, request.kind) or
+        !rootSourceMatches(root.source, request.source))
+    {
+        checkedArtifactInvariant("compile-time request identity did not match its checked root", .{});
+    }
+    return root_id;
 }
 
 fn verifyCompileTimeRequestsScheduled(
@@ -1738,9 +1826,30 @@ fn checkedFieldTypesAreConcreteCompileTimeRoots(
     active: *collections.DenseMap(CheckedTypeId, void),
 ) Allocator.Error!bool {
     for (fields) |field| {
+        if (field.kind.tag == .undetermined) return false;
         if (!try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, field.ty, active)) return false;
     }
     return true;
+}
+
+test "compile-time roots reject undetermined record field kinds" {
+    const allocator = std.testing.allocator;
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+
+    const leaf: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.payloads.items.len)));
+    try store.payloads.append(allocator, try store.commitPayload(allocator, .empty_record));
+
+    const root: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.payloads.items.len)));
+    const fields = try allocator.alloc(CheckedRecordField, 1);
+    fields[0] = .{
+        .name = testIndexId(canonical.RecordFieldLabelId, 7),
+        .ty = leaf,
+        .kind = .undetermined(leaf),
+    };
+    try store.payloads.append(allocator, try store.commitPayload(allocator, .{ .record_unbound = fields }));
+
+    try std.testing.expect(!try checkedTypeIsConcreteCompileTimeRoot(allocator, &store, root));
 }
 
 fn checkedTagsAreConcreteCompileTimeRoots(
@@ -1830,6 +1939,9 @@ fn checkedFieldsContainError(
     fields: []const CheckedRecordField,
 ) Allocator.Error!bool {
     for (fields) |field| {
+        if (field.kind.undeterminedVariable()) |variable| {
+            if (try traversal.visit(variable)) return true;
+        }
         if (try traversal.visit(field.ty)) return true;
     }
     return false;
@@ -1859,9 +1971,7 @@ fn compileTimeRootHasRootRequest(
 ) bool {
     for (requests) |request| {
         if (request.abi != .compile_time) continue;
-        if (!compileTimeRootKindMatchesRequest(root.kind, request.kind)) continue;
-        if (!rootSourceMatches(root.source, request.source)) continue;
-        return true;
+        if (request.compile_time_root == root.id) return true;
     }
     return false;
 }
@@ -1910,10 +2020,10 @@ fn compileTimeRootKindMatchesRequest(
     request_kind: RootRequestKind,
 ) bool {
     return switch (root_kind) {
-        .constant, .hoisted_constant => request_kind == .compile_time_constant,
+        .constant, .hoisted_constant, .hoisted_validation => request_kind == .compile_time_constant,
         .callable_binding => request_kind == .compile_time_callable,
         .expect => request_kind == .test_expect,
-        .numeral_conversion, .quote_conversion => request_kind == .compile_time_constant,
+        .numeral_conversion, .quote_conversion, .field_default => request_kind == .compile_time_constant,
     };
 }
 
@@ -1980,9 +2090,11 @@ fn compileTimeRootDependsOnUnboundPlatformRequirement(
     return switch (root.kind) {
         .constant,
         .hoisted_constant,
+        .hoisted_validation,
         .callable_binding,
         .numeral_conversion,
         .quote_conversion,
+        .field_default,
         => exprDependsOnUnboundPlatformRequirement(
             checked_bodies,
             resolved_value_refs,
@@ -2277,21 +2389,16 @@ fn appendExposedAppProcedureRoots(
     top_level_procedure_bindings: *const TopLevelProcedureBindingTable,
 ) Allocator.Error!void {
     const module_env = module.moduleEnvConst();
-    var exposed_iter = module_env.common.exposed_items.iterator();
-    while (exposed_iter.next()) |entry| {
-        const raw_node_idx = entry.target.valueDefNode() orelse continue;
-        if (raw_node_idx >= module.nodeCount()) {
-            checkedArtifactInvariant(
-                "checked artifact invariant violated: app exposed item {s} points at out-of-range node {d}",
-                .{ module_env.getIdent(@bitCast(entry.ident_idx)), raw_node_idx },
-            );
-        }
-        const node_idx: CIR.Node.Idx = @enumFromInt(raw_node_idx);
-        if (module.nodeTag(node_idx) != .def) continue;
-
-        const def_idx: CIR.Def.Idx = @enumFromInt(raw_node_idx);
+    // `exports` is canonicalization's exact app-header `provides` inventory.
+    // `common.exposed_items` is broader: it also publishes associated methods
+    // for module imports, including compiler-owned generated-method markers.
+    // Those methods are public API, but they are not app entrypoints.
+    for (module_env.store.sliceDefs(module_env.exports)) |def_idx| {
         const top_level = top_level_values.lookupByDef(def_idx) orelse {
-            checkedArtifactInvariant("app exposed value definition had no top-level value entry", .{});
+            checkedArtifactInvariant(
+                "app-provided definition {d} had no top-level value entry",
+                .{@intFromEnum(def_idx)},
+            );
         };
         const procedure_binding = switch (top_level.value) {
             .procedure_binding => |binding| binding,
@@ -2354,6 +2461,7 @@ fn requiredProcedureTemplateForRootSource(
 const RootBackingProcedure = struct {
     checked_type: CheckedTypeId,
     template: canonical.ProcedureTemplateRef,
+    compile_time_root: ?ComptimeRootId,
 };
 
 fn explicitRootBackingProcedure(
@@ -2361,17 +2469,18 @@ fn explicitRootBackingProcedure(
     compile_time_roots: *const CompileTimeRootTable,
     entry_wrappers: *const EntryWrapperTable,
     source: RootSource,
+    request_kind: RootRequestKind,
     source_checked_type: CheckedTypeId,
 ) RootBackingProcedure {
     if (procedureTemplateForRootSource(procedure_templates, source)) |template| {
-        return .{ .checked_type = source_checked_type, .template = template };
+        return .{ .checked_type = source_checked_type, .template = template, .compile_time_root = null };
     }
 
-    const root_id = compile_time_roots.lookupIdBySource(source) orelse {
+    const root_id = compileTimeRootIdForSourceAndRequestKind(compile_time_roots, source, request_kind) orelse {
         checkedArtifactInvariant("explicit root has no checked procedure template or entry wrapper", .{});
     };
     const wrapper = entryWrapperForRoot(entry_wrappers, root_id);
-    return .{ .checked_type = wrapper.checked_fn_root, .template = wrapper.template };
+    return .{ .checked_type = wrapper.checked_fn_root, .template = wrapper.template, .compile_time_root = root_id };
 }
 
 fn checkedTypeIdForRootSource(
@@ -2431,6 +2540,7 @@ const RootRequestWithoutOrder = struct {
     module_idx: u32,
     kind: RootRequestKind,
     source: RootSource,
+    compile_time_root: ?ComptimeRootId = null,
     checked_type: CheckedTypeId,
     abi: RootAbi,
     exposure: RootExposure,
@@ -2450,6 +2560,7 @@ fn appendRoot(
         .module_idx = request.module_idx,
         .kind = request.kind,
         .source = request.source,
+        .compile_time_root = request.compile_time_root,
         .checked_type = request.checked_type,
         .abi = request.abi,
         .exposure = request.exposure,
@@ -2480,8 +2591,16 @@ fn entryWrapperForRoot(
     return wrapper;
 }
 
-fn topLevelExprIsAlreadyProcedure(expr: CIR.Expr) bool {
-    return expr == .e_lambda or expr == .e_closure or expr == .e_anno_only or expr == .e_hosted_lambda;
+fn topLevelExprIsAlreadyProcedure(module: TypedCIR.Module, def_idx: CIR.Def.Idx, expr: CIR.Expr) bool {
+    if (expr == .e_lambda or expr == .e_closure or expr == .e_hosted_lambda) return true;
+    if (expr != .e_anno_only) return false;
+    // A compiler-owned intrinsic is a procedure whatever it declares, because
+    // its body comes from the intrinsic wrapper rather than the declaration.
+    if (intrinsicForProcedureDef(module, def_idx) != null) return true;
+    // Every other annotation-only declaration is a procedure only when the
+    // type it declares is a function. Annotation-only values are published
+    // through the const path, which records the missing value the same way.
+    return sourceTypeIsFunction(module, module.defType(def_idx));
 }
 
 fn sourceTypeIsFunction(module: TypedCIR.Module, var_: Var) bool {
@@ -2532,6 +2651,17 @@ pub const IteratorForPlanId = static_dispatch.IteratorForPlanId;
 pub const PatternBinderId = checked_ids.PatternBinderId;
 /// Public `CaptureId` declaration.
 pub const CaptureId = checked_ids.CaptureId;
+/// Public `OptionalId` declaration: the one inline optional-id encoding used
+/// by checked-artifact data (see `checked_ids.OptionalId`).
+pub const OptionalId = checked_ids.OptionalId;
+/// Public `CheckedVarNameId` declaration.
+pub const CheckedVarNameId = checked_ids.CheckedVarNameId;
+/// Inline optional `canonical.ModuleIdentityId`.
+pub const OptionalModuleIdentityId = OptionalId(canonical.ModuleIdentityId);
+/// Inline optional `CheckedTypeId` used by undetermined record-field kinds.
+pub const OptionalCheckedTypeId = OptionalId(CheckedTypeId);
+/// Inline optional `CheckedVarNameId`.
+pub const OptionalVarNameId = OptionalId(CheckedVarNameId);
 
 /// Public `CheckedTypeRoot` declaration.
 pub const CheckedTypeRoot = struct {
@@ -2603,10 +2733,83 @@ pub const CheckedTypeVariable = struct {
     row_default: ?RowDefault = null,
 };
 
-/// Public `CheckedRecordField` declaration.
+/// Artifact-stable identity of a `??` default in its declaring module; see
+/// design.md "Defaulted Fields".
+pub const CheckedFieldDefault = extern struct {
+    origin_module: OptionalModuleIdentityId = .none,
+    expr_node: u32 = 0,
+
+    // Inline element of the serialized `record_field_pool`: the optional
+    // wrapper must not disturb the 8-byte row layout.
+    comptime {
+        std.debug.assert(@sizeOf(CheckedFieldDefault) == 8);
+        std.debug.assert(@alignOf(CheckedFieldDefault) == 4);
+    }
+
+    pub const none: CheckedFieldDefault = .{};
+
+    pub fn fromParts(origin_module: canonical.ModuleIdentityId, expr_node: u32) CheckedFieldDefault {
+        return .{ .origin_module = .some(origin_module), .expr_node = expr_node };
+    }
+
+    pub fn origin(self: CheckedFieldDefault) ?canonical.ModuleIdentityId {
+        return self.origin_module.get();
+    }
+};
+
+/// Exact checker-selected default for a field omitted at one record
+/// construction site. This remains separate from the record's final checked
+/// type because ordinary value unification may normalize that shared field to
+/// `required` after the construction decision has already been made.
+pub const CheckedRecordOmittedDefault = extern struct {
+    expr: CheckedExprId,
+    field_name: canonical.RecordFieldLabelId,
+    default: CheckedFieldDefault,
+};
+
+/// Published field-kind axis. `required` and `defaulted` use inline slots;
+/// `optional` uses the tagged slot defined in design.md "Field Kinds".
+pub const CheckedFieldKind = extern struct {
+    tag: Tag = .required,
+    default: CheckedFieldDefault = .none,
+    variable: OptionalCheckedTypeId = .none,
+
+    pub const Tag = enum(u32) { required, optional, defaulted, undetermined, err };
+
+    // Inline element of the serialized `record_field_pool`: tag word plus the
+    // 8-byte default identity.
+    comptime {
+        std.debug.assert(@sizeOf(CheckedFieldKind) == 16);
+        std.debug.assert(@alignOf(CheckedFieldKind) == 4);
+    }
+
+    pub const required: CheckedFieldKind = .{};
+    pub const optional: CheckedFieldKind = .{ .tag = .optional };
+    pub const err: CheckedFieldKind = .{ .tag = .err };
+
+    pub fn undetermined(variable: CheckedTypeId) CheckedFieldKind {
+        return .{ .tag = .undetermined, .variable = .some(variable) };
+    }
+
+    pub fn defaultedFromParts(origin_module: canonical.ModuleIdentityId, expr_node: u32) CheckedFieldKind {
+        return .{ .tag = .defaulted, .default = CheckedFieldDefault.fromParts(origin_module, expr_node) };
+    }
+
+    /// The default identity carried by a `.defaulted` kind, else null.
+    pub fn defaultIdentity(self: CheckedFieldKind) ?CheckedFieldDefault {
+        return if (self.tag == .defaulted) self.default else null;
+    }
+
+    pub fn undeterminedVariable(self: CheckedFieldKind) ?CheckedTypeId {
+        return if (self.tag == .undetermined) self.variable.get() else null;
+    }
+};
+
+/// Record field with its checker-selected kind published explicitly.
 pub const CheckedRecordField = struct {
     name: canonical.RecordFieldLabelId,
     ty: CheckedTypeId,
+    kind: CheckedFieldKind = .required,
 };
 
 /// One entry in a nominal record's source-declared layout order.
@@ -2763,6 +2966,37 @@ pub const CheckedPrimitive = enum(u8) {
     u64x2,
     i64x2,
 };
+
+/// The builtin owner a primitive dispatches through. This is the single source
+/// of truth shared by every post-check consumer; call it rather than writing a
+/// second switch over `CheckedPrimitive`.
+pub fn builtinOwnerForPrimitive(primitive: CheckedPrimitive) static_dispatch.BuiltinOwner {
+    return switch (primitive) {
+        .bool => .bool,
+        .str => .str,
+        .u8 => .u8,
+        .i8 => .i8,
+        .u16 => .u16,
+        .i16 => .i16,
+        .u32 => .u32,
+        .i32 => .i32,
+        .u64 => .u64,
+        .i64 => .i64,
+        .u128 => .u128,
+        .i128 => .i128,
+        .f32 => .f32,
+        .f64 => .f64,
+        .dec => .dec,
+        .u8x16 => .u8x16,
+        .i8x16 => .i8x16,
+        .u16x8 => .u16x8,
+        .i16x8 => .i16x8,
+        .u32x4 => .u32x4,
+        .i32x4 => .i32x4,
+        .u64x2 => .u64x2,
+        .i64x2 => .i64x2,
+    };
+}
 
 /// Public `CheckedBuiltinRuntimeEncoding` declaration.
 pub const CheckedBuiltinRuntimeEncoding = union(enum) {
@@ -2981,19 +3215,15 @@ pub const CheckedTypePayloadBuild = union(enum) {
     empty_tag_union,
 };
 
-/// POD form of `CheckedTypeVariable`: `name` is a `var_names` interner id (with a
-/// sentinel of `no_var_name` for absent), constraints are a range into
-/// `constraint_pool`.
+/// POD form of `CheckedTypeVariable`: `name` is an optional `var_names`
+/// interner id, constraints are a range into `constraint_pool`.
 pub const StoredTypeVariable = struct {
-    /// Interner serial id, or `no_var_name` if absent.
-    name: u32 = no_var_name,
+    /// Interner serial id, or `.none` if the variable is unnamed.
+    name: OptionalVarNameId = .none,
     constraints: CheckedTypeRange = .{},
     numeric_default_phase: ?NumericDefaultPhase = null,
     row_default: ?RowDefault = null,
 };
-
-/// Sentinel `StoredTypeVariable.name` value for "no name".
-pub const no_var_name: u32 = std.math.maxInt(u32);
 
 /// POD form of `CheckedAliasType`: `args` is a range into `type_id_pool`.
 pub const StoredAlias = struct {
@@ -3061,7 +3291,7 @@ pub const StoredCheckedTypePayload = union(enum) {
 
 /// Materialize the public read-form `CheckedTypePayload` from its stored POD
 /// form. `pool_owner` must expose `typeIdPool()`, `recordFieldPool()`,
-/// `constraintPool()`, `tagPool()`, and `varName(u32)` accessors (both
+/// `constraintPool()`, `tagPool()`, and `varName(OptionalVarNameId)` accessors (both
 /// `CheckedTypeStore` and `CheckedTypeStoreView` do). Slice fields alias the
 /// pools; no allocation.
 ///
@@ -3189,10 +3419,10 @@ pub const CheckedTypeStoreView = struct {
         return self.tag_pool;
     }
 
-    /// Text of a stored variable name id, or null for the absent sentinel.
-    pub fn varName(self: CheckedTypeStoreView, id: u32) ?[]const u8 {
-        if (id == no_var_name) return null;
-        return self.var_names.getText(id);
+    /// Text of a stored variable name id, or null when absent.
+    pub fn varName(self: CheckedTypeStoreView, id: OptionalVarNameId) ?[]const u8 {
+        const name_id = id.get() orelse return null;
+        return self.var_names.getText(@intFromEnum(name_id));
     }
 
     /// Number of stored payloads (checked type roots).
@@ -3504,6 +3734,9 @@ fn checkedTypeViewRecordFieldsAreConcreteConstProducerScheme(
     active: *collections.DenseMap(CheckedTypeId, void),
 ) Allocator.Error!bool {
     for (fields) |field| {
+        if (field.kind.undeterminedVariable()) |variable| {
+            if (!try checkedTypeViewIsConcreteConstProducerSchemeInner(checked_types, variable, active)) return false;
+        }
         if (!try checkedTypeViewIsConcreteConstProducerSchemeInner(checked_types, field.ty, active)) return false;
     }
     return true;
@@ -3711,10 +3944,10 @@ pub const CheckedTypeStore = struct {
         return self.tag_pool.items;
     }
 
-    /// Text of a stored variable name id, or null for the absent sentinel.
-    pub fn varName(self: *const CheckedTypeStore, id: u32) ?[]const u8 {
-        if (id == no_var_name) return null;
-        return self.var_names.getText(id);
+    /// Text of a stored variable name id, or null when absent.
+    pub fn varName(self: *const CheckedTypeStore, id: OptionalVarNameId) ?[]const u8 {
+        const name_id = id.get() orelse return null;
+        return self.var_names.getText(@intFromEnum(name_id));
     }
 
     /// Number of stored payloads (checked type roots).
@@ -3766,10 +3999,11 @@ pub const CheckedTypeStore = struct {
         return artifact_serialize.appendSpan(CheckedTypeRange, CheckedStaticDispatchConstraint, &self.constraint_pool, allocator, constraints);
     }
 
-    /// Intern a variable name, returning its interner id or `no_var_name`.
-    fn internVarName(self: *CheckedTypeStore, allocator: Allocator, name: ?[]const u8) Allocator.Error!u32 {
-        const text = name orelse return no_var_name;
-        return try self.var_names.insert(allocator, text);
+    /// Intern a variable name, returning its optional interner id (`.none`
+    /// for an unnamed variable).
+    fn internVarName(self: *CheckedTypeStore, allocator: Allocator, name: ?[]const u8) Allocator.Error!OptionalVarNameId {
+        const text = name orelse return .none;
+        return .some(@enumFromInt(try self.var_names.insert(allocator, text)));
     }
 
     /// Convert a build-form variable into stored form, copying its constraints
@@ -3895,6 +4129,7 @@ pub const CheckedTypeStore = struct {
         imports: []const PublishImportArtifact,
         available: []const ImportedModuleView,
         source_nodes: *const CheckedSourceNodes,
+        selected_hoisted_roots: []const hoist_roots.SelectedHoistedRoot,
     ) Allocator.Error!CheckedTypePublication {
         const import_views = CheckedImportViews{
             .current_owner = current_owner,
@@ -3909,6 +4144,7 @@ pub const CheckedTypeStore = struct {
         defer local_type_declarations.deinit();
         var top_level_defs = try TopLevelDefPatternIndex.init(allocator, module);
         defer top_level_defs.deinit(allocator);
+        const module_env = module.moduleEnvConst();
 
         var node_idx: u32 = 0;
         while (node_idx < module.nodeCount()) : (node_idx += 1) {
@@ -3926,6 +4162,21 @@ pub const CheckedTypeStore = struct {
                     if (expr.e_call.constraint_fn_var) |constraint_fn_var| {
                         _ = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, constraint_fn_var);
                     }
+                } else if (expr == .e_field_access) {
+                    const field_access = expr.e_field_access;
+                    var position: u32 = 0;
+                    while (position < field_access.segments.len) : (position += 1) {
+                        const segment_idx = module_env.store.fieldAccessSegmentAt(field_access.segments, position);
+                        _ = try appendCheckedTypeRoot(
+                            allocator,
+                            module,
+                            names,
+                            import_views,
+                            &store,
+                            &active,
+                            ModuleEnv.varFrom(segment_idx),
+                        );
+                    }
                 }
             } else if (source_nodes.hasPattern(@enumFromInt(node_idx))) {
                 const pattern_source_var = checkedPatternSourceTypeVar(module, &top_level_defs, @enumFromInt(node_idx));
@@ -3941,7 +4192,6 @@ pub const CheckedTypeStore = struct {
             }
         }
 
-        const module_env = module.moduleEnvConst();
         // Static-dispatch evidence resolves constrained scheme instantiations
         // after type publication. Publish each recorded fresh variable now so
         // evidence nodes can name the exact concrete dispatcher type by a
@@ -4100,6 +4350,32 @@ pub const CheckedTypeStore = struct {
                 module.typeStoreConst(),
                 module.moduleEnvConst(),
                 module.defType(def_idx),
+            );
+            if (findCheckedTypeScheme(store.schemes.items, scheme_key) == null) {
+                const scheme_id: CheckedTypeSchemeId = @enumFromInt(@as(u32, @intCast(store.schemes.items.len)));
+                try store.schemes.append(allocator, .{
+                    .id = scheme_id,
+                    .key = scheme_key,
+                    .root = root,
+                });
+            }
+        }
+
+        // Selected roots own source schemes just like ordinary top-level
+        // values. Publish them explicitly so const and callable templates can
+        // name the exact scheme without relying on an unrelated definition
+        // having the same canonical key.
+        for (selected_hoisted_roots) |selected| {
+            const source_var = if (selected.pattern) |pattern|
+                ModuleEnv.varFrom(pattern)
+            else
+                module.exprType(selected.expr);
+            const root = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, source_var);
+            const scheme_key = try canonical_type_keys.schemeFromVar(
+                allocator,
+                module.typeStoreConst(),
+                module.moduleEnvConst(),
+                source_var,
             );
             if (findCheckedTypeScheme(store.schemes.items, scheme_key) == null) {
                 const scheme_id: CheckedTypeSchemeId = @enumFromInt(@as(u32, @intCast(store.schemes.items.len)));
@@ -4336,7 +4612,7 @@ pub const CheckedTypeStore = struct {
         names: *const canonical.CanonicalNameStore,
     ) Allocator.Error!CheckedTypeId {
         const key = try checkedTypePayloadKeyBuild(allocator, names, self, .empty_record);
-        if (self.rootForKey(key)) |existing| {
+        if (self.rootForKey(key.key)) |existing| {
             if (self.payload(existing) != .empty_record) try self.replaceTypeRootPayload(allocator, existing, .empty_record);
             return existing;
         }
@@ -4878,6 +5154,10 @@ pub const CheckedTypeStore = struct {
             out[i] = .{
                 .name = field.name,
                 .ty = try self.cloneCheckedTypeRootSubstituting(allocator, names, field.ty, formals, actuals, active),
+                .kind = if (field.kind.undeterminedVariable()) |variable|
+                    .undetermined(try self.cloneCheckedTypeRootSubstituting(allocator, names, variable, formals, actuals, active))
+                else
+                    field.kind,
             };
         }
         return out;
@@ -5853,7 +6133,9 @@ fn checkedRecordFieldsFromDeclarationAnnoSpan(
     // from the backing row here so they are never name-resolved or unified.
     var named_count: usize = 0;
     for (fields) |field_idx| {
-        if (!module.moduleEnvConst().store.getAnnoRecordField(field_idx).is_unnamed) named_count += 1;
+        const field = module.moduleEnvConst().store.getAnnoRecordField(field_idx);
+        if (field.is_unnamed) continue;
+        named_count += 1;
     }
     if (named_count == 0) return &.{};
     const out = try allocator.alloc(CheckedRecordField, named_count);
@@ -5865,6 +6147,20 @@ fn checkedRecordFieldsFromDeclarationAnnoSpan(
         out[out_index] = .{
             .name = try names.internRecordFieldIdent(module.identStoreConst(), field.name),
             .ty = try appendCheckedTypeRootFromDeclarationAnno(allocator, module, names, imports, store, active, local_type_declarations, declaration_formals, field.ty),
+            // The annotation pins the kind concretely (design.md "Field
+            // Kinds"): `?:` publishes `optional`, `??` publishes `defaulted`
+            // with this module's canonical identity (design.md "Defaulted
+            // Fields"), plain `:` publishes `required`. `?:` and `??` never
+            // combine—canonicalization rejects `a ?: T ?? d` outright.
+            .kind = if (field.is_optional)
+                .optional
+            else if (field.default_value) |default_expr_idx|
+                .defaultedFromParts(
+                    try names.internModuleIdentity(module.moduleEnvConst().moduleIdentityHash(module.moduleEnvConst().selfModuleIdentity())),
+                    @intFromEnum(default_expr_idx),
+                )
+            else
+                .required,
         };
         out_index += 1;
     }
@@ -6336,12 +6632,18 @@ fn checkedTypePayloadBuildContainsIdentityVariables(
         },
         .record => |record| blk: {
             for (record.fields) |field| {
+                if (field.kind.undeterminedVariable()) |variable| {
+                    if (store.rootContainsIdentityVariables(variable)) break :blk true;
+                }
                 if (store.rootContainsIdentityVariables(field.ty)) break :blk true;
             }
             break :blk store.rootContainsIdentityVariables(record.ext);
         },
         .record_unbound => |fields| blk: {
             for (fields) |field| {
+                if (field.kind.undeterminedVariable()) |variable| {
+                    if (store.rootContainsIdentityVariables(variable)) break :blk true;
+                }
                 if (store.rootContainsIdentityVariables(field.ty)) break :blk true;
             }
             break :blk false;
@@ -6381,7 +6683,7 @@ fn checkedTypePayloadBuildContainsIdentityVariables(
 fn checkedRecordFieldSliceEql(a: []const CheckedRecordField, b: []const CheckedRecordField) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
-        if (left.name != right.name or left.ty != right.ty) return false;
+        if (left.name != right.name or left.ty != right.ty or !std.meta.eql(left.kind, right.kind)) return false;
     }
     return true;
 }
@@ -6681,6 +6983,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
     const RecordFieldForKey = struct {
         name: canonical.RecordFieldLabelId,
         ty: CheckedTypeId,
+        kind: CheckedFieldKind,
     };
 
     const TagForKey = struct {
@@ -6869,6 +7172,10 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
             try fields.append(self.allocator, .{
                 .name = field.name,
                 .ty = self.substitutedRoot(field.ty),
+                .kind = if (field.kind.undeterminedVariable()) |variable|
+                    .undetermined(self.substitutedRoot(variable))
+                else
+                    field.kind,
             });
         }
     }
@@ -6927,6 +7234,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
                 checkedArtifactInvariant("checked type substitution key row normalization found duplicate record fields", .{});
             }
             self.writeBytes(self.names.recordFieldLabelText(field.name));
+            try self.writeCheckedFieldKind(field.kind);
             try self.writeType(field.ty);
         }
         if (tail) |tail_id| {
@@ -6996,6 +7304,7 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
                 checkedArtifactInvariant("checked type substitution key row normalization found duplicate record fields", .{});
             }
             self.writeBytes(self.names.recordFieldLabelText(field.name));
+            try self.writeCheckedFieldKind(field.kind);
             try self.writeType(field.ty);
         }
         if (tail) |tail_id| {
@@ -7181,6 +7490,32 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
     fn writeBool(self: *SubstitutedCheckedTypeKeyBuilder, value: bool) void {
         const byte: u8 = if (value) 1 else 0;
         self.hasher.update(std.mem.asBytes(&byte));
+    }
+
+    fn writeCheckedFieldKind(
+        self: *SubstitutedCheckedTypeKeyBuilder,
+        kind: CheckedFieldKind,
+    ) Allocator.Error!void {
+        // Keep this byte-for-byte aligned with canonical_type_keys.zig's
+        // `writeFieldPresenceForKey`.
+        switch (kind.tag) {
+            .required => self.writeBool(false),
+            .optional => self.writeTag("presence_optional_field"),
+            .defaulted => {
+                const origin_module = kind.default.origin() orelse
+                    checkedArtifactInvariant("checked defaulted field kind carried no default identity", .{});
+                self.writeTag("field_default");
+                self.writeBytes(self.names.moduleIdentityBytes(origin_module));
+                self.writeU32(kind.default.expr_node);
+            },
+            .undetermined => {
+                const variable = kind.undeterminedVariable() orelse
+                    checkedArtifactInvariant("checked undetermined field kind carried no variable identity", .{});
+                self.writeTag("presence_variable");
+                try self.writeType(variable);
+            },
+            .err => self.writeTag("err"),
+        }
     }
 
     fn writeOptionalU32(self: *SubstitutedCheckedTypeKeyBuilder, value: ?u32) void {
@@ -7386,6 +7721,8 @@ fn appendStaticDispatchTypeRoots(
 
     for (module.moduleEnvConst().for_loop_dispatch_plans.items.items) |plan| {
         if (!source_nodes.hasRawLoop(plan.node_idx)) continue;
+        _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.iterator_var));
+        _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.step_var));
         _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.iter_fn_var));
         _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.next_fn_var));
         _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.step_topology.one_payload_var));
@@ -7475,7 +7812,7 @@ const SourceTypeGraphFactsContext = struct {
 
         var facts: SourceTypeGraphFacts = .{};
         switch (resolved.desc.content) {
-            .err => {},
+            .err, .field_presence => {},
             .flex, .rigid => facts.contains_identity_variables = true,
             .alias => |alias| {
                 try self.mergeVar(traversal, &facts, types_store.getAliasBackingVar(alias));
@@ -7490,11 +7827,27 @@ const SourceTypeGraphFactsContext = struct {
                     try self.mergeVar(traversal, &facts, function.ret);
                 },
                 .record => |record| {
-                    try self.mergeVars(traversal, &facts, types_store.getRecordFieldsSlice(record.fields).items(.var_));
+                    for (types_store.getRecordFieldsSlice(record.fields).items(.presence)) |presence| {
+                        switch (presence.decode()) {
+                            .required => |type_var| try self.mergeVar(traversal, &facts, type_var),
+                            .unknown => |unknown| {
+                                try self.mergeVar(traversal, &facts, unknown.presence);
+                                try self.mergeVar(traversal, &facts, unknown.var_);
+                            },
+                        }
+                    }
                     try self.mergeVar(traversal, &facts, record.ext);
                 },
                 .record_unbound => |fields| {
-                    try self.mergeVars(traversal, &facts, types_store.getRecordFieldsSlice(fields).items(.var_));
+                    for (types_store.getRecordFieldsSlice(fields).items(.presence)) |presence| {
+                        switch (presence.decode()) {
+                            .required => |type_var| try self.mergeVar(traversal, &facts, type_var),
+                            .unknown => |unknown| {
+                                try self.mergeVar(traversal, &facts, unknown.presence);
+                                try self.mergeVar(traversal, &facts, unknown.var_);
+                            },
+                        }
+                    }
                 },
                 .tag_union => |tag_union| {
                     const tags = types_store.getTagsSlice(tag_union.tags);
@@ -7844,6 +8197,10 @@ fn copyCheckedTypePayload(
             .backing = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, module.typeStoreConst().getAliasBackingVar(alias)),
             .args = try copyCheckedTypeRange(allocator, module, names, imports, store, active, module.typeStoreConst().sliceAliasArgs(alias)),
         } },
+        // The checked artifact models required fields only, so a presence
+        // variable never becomes a standalone checked type. Poison to err if one
+        // is ever reached rather than inventing an unrepresentable payload.
+        .field_presence => .err,
         .structure => |flat| try copyCheckedFlatType(allocator, module, names, imports, store, active, flat),
     };
 }
@@ -7938,14 +8295,14 @@ fn copyCheckedFlatType(
 fn checkedRecordExtIsEmpty(module: TypedCIR.Module, ext: Var) bool {
     return switch (module.typeStoreConst().resolveVar(ext).desc.content) {
         .structure => |flat| flat == .empty_record,
-        .flex, .rigid, .alias, .err => false,
+        .flex, .rigid, .alias, .field_presence, .err => false,
     };
 }
 
 fn checkedTagUnionExtIsEmpty(module: TypedCIR.Module, ext: Var) bool {
     return switch (module.typeStoreConst().resolveVar(ext).desc.content) {
         .structure => |flat| flat == .empty_tag_union,
-        .flex, .rigid, .alias, .err => false,
+        .flex, .rigid, .alias, .field_presence, .err => false,
     };
 }
 
@@ -8039,15 +8396,64 @@ fn copyCheckedRecordFields(
 ) Allocator.Error![]const CheckedRecordField {
     const fields = module.typeStoreConst().getRecordFieldsSlice(range);
     const field_names = fields.items(.name);
-    const field_vars = fields.items(.var_);
+    const field_presences = fields.items(.presence);
     if (field_names.len == 0) return &.{};
 
     const out = try allocator.alloc(CheckedRecordField, field_names.len);
     errdefer allocator.free(out);
-    for (field_names, field_vars, 0..) |field_name, field_var, i| {
+    for (field_names, field_presences, 0..) |field_name, field_presence, i| {
+        // Publish the independent value and kind axes; see design.md "Field Kinds".
+        var kind: CheckedFieldKind = .required;
+        const ty: CheckedTypeId = switch (field_presence.decode()) {
+            .required => |type_var| try appendCheckedTypeRoot(allocator, module, names, imports, store, active, type_var),
+            .unknown => |unknown| switch (module.typeStoreConst().resolveVar(unknown.presence).desc.content) {
+                .field_presence => |fp| blk: {
+                    switch (fp) {
+                        .required => {},
+                        .defaulted => |id| kind = .defaultedFromParts(
+                            try names.internModuleIdentity(module.moduleEnvConst().moduleIdentityHash(id.origin_module)),
+                            id.expr_node,
+                        ),
+                        .optional => kind = .optional,
+                    }
+                    break :blk try appendCheckedTypeRoot(allocator, module, names, imports, store, active, unknown.var_);
+                },
+                // A still-flex kind here is a SCHEME INTERIOR. Preserve its
+                // checked identity separately from the payload type so each
+                // Monotype instantiation can solve the kind from its concrete
+                // call interface before choosing the slot representation.
+                .flex => blk: {
+                    kind = .undetermined(try appendCheckedTypeRoot(
+                        allocator,
+                        module,
+                        names,
+                        imports,
+                        store,
+                        active,
+                        unknown.presence,
+                    ));
+                    break :blk try appendCheckedTypeRoot(allocator, module, names, imports, store, active, unknown.var_);
+                },
+                // A poisoned presence var (a presence mismatch merges to err,
+                // unify.zig `unifyFieldPresence`) poisons the KIND axis while
+                // preserving the field's independent VALUE axis. Keeping both
+                // explicit also preserves the solver key's `"err"` + value
+                // encoding at the checked boundary.
+                .err => blk: {
+                    kind = .err;
+                    break :blk try appendCheckedTypeRoot(allocator, module, names, imports, store, active, unknown.var_);
+                },
+                // A presence variable may only hold a committed
+                // `.field_presence` kind, a still-undetermined `.flex`, or a
+                // poisoned `.err` (same inventory as the canonical key
+                // writer's `writeFieldPresenceForKey`).
+                .rigid, .alias, .structure => checkedArtifactInvariant("checked publication reached a field presence variable holding non-presence content", .{}),
+            },
+        };
         out[i] = .{
             .name = try names.internRecordFieldIdent(module.identStoreConst(), field_name),
-            .ty = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, field_var),
+            .ty = ty,
+            .kind = kind,
         };
     }
     return out;
@@ -8284,7 +8690,7 @@ fn expectSingleNominalBackingPayload(allocator: Allocator, module_name: []const 
     };
     _ = try names.internModuleIdentity(&module_identity.stable_hash);
 
-    var checking_context_identity = try CheckingContextIdentity.fromModule(allocator, module, &.{}, null, null, &.{});
+    var checking_context_identity = try CheckingContextIdentity.fromModule(allocator, module, &.{}, null, null, &.{}, .checking);
     defer checking_context_identity.deinit(allocator);
     const artifact_key = CheckedModuleArtifactKey.computeFromSourceHash(
         hashModuleSourceInputs(module_env),
@@ -8296,7 +8702,7 @@ fn expectSingleNominalBackingPayload(allocator: Allocator, module_name: []const 
     var source_nodes = try CheckedSourceNodes.init(allocator, module);
     defer source_nodes.deinit(allocator);
 
-    var publication = try CheckedTypeStore.fromModule(allocator, module, &names, artifact_key, &.{}, &.{}, &source_nodes);
+    var publication = try CheckedTypeStore.fromModule(allocator, module, &names, artifact_key, &.{}, &.{}, &source_nodes, &.{});
     defer publication.deinit(allocator);
 
     const nominal_stmt = for (module_env.store.sliceStatements(module_env.all_statements)) |statement_idx| {
@@ -8340,6 +8746,367 @@ test "checked type publication normalizes closed empty tag union backing" {
 
 test "checked type publication normalizes closed empty record backing" {
     try expectSingleNominalBackingPayload(std.testing.allocator, "Foo", "Foo := {}", .empty_record);
+}
+
+test "required record canonical keys agree across solver and checked representations" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+    const head_name = try env.insertIdent(Ident.for_text("head"));
+    const tail_name = try env.insertIdent(Ident.for_text("tail"));
+
+    var source_store = try types.Store.initCapacity(allocator, 32, 16);
+    defer source_store.deinit();
+    const field_var = try source_store.freshFromContent(.{ .structure = .empty_record });
+    const ext_var = try source_store.freshFromContent(.{ .structure = .empty_record });
+    const source_tail_fields = try source_store.appendRecordFields(&.{.{
+        .name = tail_name,
+        .presence = .required(field_var),
+    }});
+    const source_tail = try source_store.freshFromContent(.{ .structure = .{ .record = .{
+        .fields = source_tail_fields,
+        .ext = ext_var,
+    } } });
+    const source_head_fields = try source_store.appendRecordFields(&.{.{
+        .name = head_name,
+        .presence = .required(field_var),
+    }});
+    const source_record = try source_store.freshFromContent(.{ .structure = .{ .record = .{
+        .fields = source_head_fields,
+        .ext = source_tail,
+    } } });
+    const source_unbound_fields = try source_store.appendRecordFields(&.{
+        .{ .name = head_name, .presence = .required(field_var) },
+        .{ .name = tail_name, .presence = .required(field_var) },
+    });
+    const source_unbound = try source_store.freshFromContent(.{ .structure = .{ .record_unbound = source_unbound_fields } });
+    const source_record_key = try canonical_type_keys.fromVar(allocator, &source_store, &env, source_record);
+    const source_unbound_key = try canonical_type_keys.fromVar(allocator, &source_store, &env, source_unbound);
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    const checked_head_name = try names.internRecordFieldLabel("head");
+    const checked_tail_name = try names.internRecordFieldLabel("tail");
+
+    var checked_store = CheckedTypeStore{};
+    defer checked_store.deinit(allocator);
+    const checked_empty = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .empty_record);
+    const checked_tail_fields = try allocator.alloc(CheckedRecordField, 1);
+    checked_tail_fields[0] = .{ .name = checked_tail_name, .ty = checked_empty };
+    const checked_tail = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record = .{
+        .fields = checked_tail_fields,
+        .ext = checked_empty,
+    } });
+    const checked_head_fields = try allocator.alloc(CheckedRecordField, 1);
+    checked_head_fields[0] = .{ .name = checked_head_name, .ty = checked_empty };
+    const checked_record = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record = .{
+        .fields = checked_head_fields,
+        .ext = checked_tail,
+    } });
+    const checked_unbound_fields = try allocator.alloc(CheckedRecordField, 2);
+    checked_unbound_fields[0] = .{ .name = checked_head_name, .ty = checked_empty };
+    checked_unbound_fields[1] = .{ .name = checked_tail_name, .ty = checked_empty };
+    const checked_unbound = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record_unbound = checked_unbound_fields });
+    const checked_record_key = checked_store.roots.items[@intFromEnum(checked_record)].key;
+    const checked_unbound_key = checked_store.roots.items[@intFromEnum(checked_unbound)].key;
+
+    try std.testing.expectEqualSlices(u8, &source_record_key.bytes, &checked_record_key.bytes);
+    try std.testing.expectEqualSlices(u8, &source_unbound_key.bytes, &checked_unbound_key.bytes);
+}
+
+test "defaulted record canonical keys agree across solver and checked representations" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+    try env.setContentIdentity([_]u8{0xAB} ** 32);
+    const count_name = try env.insertIdent(Ident.for_text("count"));
+
+    var source_store = try types.Store.initCapacity(allocator, 32, 16);
+    defer source_store.deinit();
+    const field_var = try source_store.freshFromContent(.{ .structure = .empty_record });
+    const ext_var = try source_store.freshFromContent(.{ .structure = .empty_record });
+    const default_id = types.DefaultId{ .origin_module = env.selfModuleIdentity(), .expr_node = 7 };
+    const presence_var = try source_store.freshFromContent(.{ .field_presence = .{ .defaulted = default_id } });
+    const source_fields = try source_store.appendRecordFields(&.{.{
+        .name = count_name,
+        .presence = .unknown(presence_var, field_var),
+    }});
+    const source_record = try source_store.freshFromContent(.{ .structure = .{ .record = .{
+        .fields = source_fields,
+        .ext = ext_var,
+    } } });
+    const source_key = try canonical_type_keys.fromVar(allocator, &source_store, &env, source_record);
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    const checked_count_name = try names.internRecordFieldLabel("count");
+    const canonical_origin = try names.internModuleIdentity(env.moduleIdentityHash(env.selfModuleIdentity()));
+
+    var checked_store = CheckedTypeStore{};
+    defer checked_store.deinit(allocator);
+    const checked_empty = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .empty_record);
+    const checked_fields = try allocator.alloc(CheckedRecordField, 1);
+    checked_fields[0] = .{
+        .name = checked_count_name,
+        .ty = checked_empty,
+        .kind = .defaultedFromParts(canonical_origin, 7),
+    };
+    const checked_record = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record = .{
+        .fields = checked_fields,
+        .ext = checked_empty,
+    } });
+    const checked_key = checked_store.roots.items[@intFromEnum(checked_record)].key;
+
+    // The same default identity keys identically across representations.
+    try std.testing.expectEqualSlices(u8, &source_key.bytes, &checked_key.bytes);
+
+    // A DIFFERENT default (another expr node) is a different type.
+    const other_fields = try allocator.alloc(CheckedRecordField, 1);
+    other_fields[0] = .{
+        .name = checked_count_name,
+        .ty = checked_empty,
+        .kind = .defaultedFromParts(canonical_origin, 8),
+    };
+    const other_record = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record = .{
+        .fields = other_fields,
+        .ext = checked_empty,
+    } });
+    const other_key = checked_store.roots.items[@intFromEnum(other_record)].key;
+    try std.testing.expect(!std.meta.eql(checked_key.bytes, other_key.bytes));
+
+    // And a plain required field is a different type from a defaulted one.
+    const required_fields = try allocator.alloc(CheckedRecordField, 1);
+    required_fields[0] = .{ .name = checked_count_name, .ty = checked_empty };
+    const required_record = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record = .{
+        .fields = required_fields,
+        .ext = checked_empty,
+    } });
+    const required_key = checked_store.roots.items[@intFromEnum(required_record)].key;
+    try std.testing.expect(!std.meta.eql(checked_key.bytes, required_key.bytes));
+}
+
+test "optional record canonical keys agree across solver and checked representations" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+    const world_name = try env.insertIdent(Ident.for_text("world"));
+
+    var source_store = try types.Store.initCapacity(allocator, 32, 16);
+    defer source_store.deinit();
+    const field_var = try source_store.freshFromContent(.{ .structure = .empty_record });
+    const ext_var = try source_store.freshFromContent(.{ .structure = .empty_record });
+    const presence_var = try source_store.freshFromContent(.{ .field_presence = .optional });
+    const source_fields = try source_store.appendRecordFields(&.{.{
+        .name = world_name,
+        .presence = .unknown(presence_var, field_var),
+    }});
+    const source_record = try source_store.freshFromContent(.{ .structure = .{ .record = .{
+        .fields = source_fields,
+        .ext = ext_var,
+    } } });
+    const source_key = try canonical_type_keys.fromVar(allocator, &source_store, &env, source_record);
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    const checked_world_name = try names.internRecordFieldLabel("world");
+
+    var checked_store = CheckedTypeStore{};
+    defer checked_store.deinit(allocator);
+    const checked_empty = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .empty_record);
+    const checked_fields = try allocator.alloc(CheckedRecordField, 1);
+    checked_fields[0] = .{ .name = checked_world_name, .ty = checked_empty, .kind = .optional };
+    const checked_record = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record = .{
+        .fields = checked_fields,
+        .ext = checked_empty,
+    } });
+    const checked_key = checked_store.roots.items[@intFromEnum(checked_record)].key;
+
+    // The optional kind keys identically across representations (the
+    // load-bearing agreement invariant: solver keys and checked keys for one
+    // type must produce one digest).
+    try std.testing.expectEqualSlices(u8, &source_key.bytes, &checked_key.bytes);
+
+    // And an optional field is a different type from a required one.
+    const required_fields = try allocator.alloc(CheckedRecordField, 1);
+    required_fields[0] = .{ .name = checked_world_name, .ty = checked_empty };
+    const required_record = try appendExplicitCheckedTypePayload(allocator, &names, &checked_store, .{ .record = .{
+        .fields = required_fields,
+        .ext = checked_empty,
+    } });
+    const required_key = checked_store.roots.items[@intFromEnum(required_record)].key;
+    try std.testing.expect(!std.meta.eql(checked_key.bytes, required_key.bytes));
+}
+
+test "optional record fields publish through solver-side record copy" {
+    const testing = std.testing;
+    const TestEnv = @import("test/TestEnv.zig");
+    const allocator = testing.allocator;
+
+    var test_env = try TestEnv.init("Main",
+        \\orig! : { world ?: {} }
+        \\orig! = { world: {} }
+    );
+    defer test_env.deinit();
+    try test_env.assertNoErrors();
+
+    const source_modules = [_]TypedCIR.Modules.SourceModule{
+        .{ .precompiled = test_env.module_env },
+    };
+    var modules = try TypedCIR.Modules.init(allocator, &source_modules);
+    defer modules.deinit();
+    const module = modules.module(0);
+
+    const defs = test_env.module_env.store.sliceDefs(test_env.module_env.all_defs);
+    try testing.expect(defs.len >= 1);
+    const record_var = module.def(defs[defs.len - 1]).expr.ty();
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+    var active = CheckedSourceTypeRoots.init(allocator);
+    defer active.deinit();
+    const imports = CheckedImportViews{ .current_owner = testCheckedModuleKey(1), .direct = &.{} };
+
+    const checked_record = try appendCheckedTypeRoot(allocator, module, &names, imports, &store, &active, record_var);
+    const fields = switch (store.payload(checked_record)) {
+        .record => |record| record.fields,
+        .record_unbound => |fields| fields,
+        .pending, .err, .flex, .rigid, .alias, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(usize, 1), fields.len);
+    try testing.expectEqualStrings("world", names.recordFieldLabelText(fields[0].name));
+    try testing.expectEqual(CheckedFieldKind.Tag.optional, fields[0].kind.tag);
+
+    // Cross-representation agreement on a genuinely-checked type: the
+    // published checked root keys byte-for-byte as the solver keys the var.
+    const source_key = try canonical_type_keys.fromVar(allocator, module.typeStoreConst(), module.moduleEnvConst(), record_var);
+    const checked_key = store.roots.items[@intFromEnum(checked_record)].key;
+    try std.testing.expectEqualSlices(u8, &source_key.bytes, &checked_key.bytes);
+}
+
+test "poisoned record field presence preserves its value type and canonical key" {
+    const testing = std.testing;
+    const TestEnv = @import("test/TestEnv.zig");
+    const allocator = testing.allocator;
+
+    var test_env = try TestEnv.init("Main", "value = {}");
+    defer test_env.deinit();
+    try test_env.assertNoErrors();
+
+    // This is the solver state produced after a required-field destructure is
+    // unified with an optional annotation: the field-presence axis is poisoned,
+    // while the independent value-type axis remains valid.
+    const field_name = try test_env.module_env.insertIdent(Ident.for_text("a"));
+    const value_var = try test_env.module_env.types.freshFromContent(.{ .structure = .empty_tag_union });
+    const presence_var = try test_env.module_env.types.freshFromContent(.err);
+    const ext_var = try test_env.module_env.types.freshFromContent(.{ .structure = .empty_record });
+    const source_fields = try test_env.module_env.types.appendRecordFields(&.{.{
+        .name = field_name,
+        .presence = .unknown(presence_var, value_var),
+    }});
+    const record_var = try test_env.module_env.types.freshFromContent(.{ .structure = .{ .record = .{
+        .fields = source_fields,
+        .ext = ext_var,
+    } } });
+
+    const source_modules = [_]TypedCIR.Modules.SourceModule{
+        .{ .precompiled = test_env.module_env },
+    };
+    var modules = try TypedCIR.Modules.init(allocator, &source_modules);
+    defer modules.deinit();
+    const module = modules.module(0);
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+    var active = CheckedSourceTypeRoots.init(allocator);
+    defer active.deinit();
+    const imports = CheckedImportViews{ .current_owner = testCheckedModuleKey(1), .direct = &.{} };
+
+    const checked_record = try appendCheckedTypeRoot(allocator, module, &names, imports, &store, &active, record_var);
+    const checked_value = try appendCheckedTypeRoot(allocator, module, &names, imports, &store, &active, value_var);
+    const fields = switch (store.payload(checked_record)) {
+        .record => |record| record.fields,
+        .record_unbound => |record_fields| record_fields,
+        .pending, .err, .flex, .rigid, .alias, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(usize, 1), fields.len);
+    try testing.expectEqual(checked_value, fields[0].ty);
+
+    const source_key = try canonical_type_keys.fromVar(allocator, module.typeStoreConst(), module.moduleEnvConst(), record_var);
+    const checked_key_info = try substitutedCheckedTypeKeyInfo(allocator, &names, &store, checked_record, &.{}, &.{});
+    try testing.expectEqualSlices(u8, &source_key.bytes, &checked_key_info.key.bytes);
+}
+
+test "optional record fields publish through the declaration annotation path" {
+    const testing = std.testing;
+    const TestEnv = @import("test/TestEnv.zig");
+    const allocator = testing.allocator;
+
+    var test_env = try TestEnv.init("Main",
+        \\Thing : { world ?: {}, req : {} }
+        \\
+        \\mk! : Thing
+        \\mk! = { req: {} }
+    );
+    defer test_env.deinit();
+    try test_env.assertNoErrors();
+
+    const source_modules = [_]TypedCIR.Modules.SourceModule{
+        .{ .precompiled = test_env.module_env },
+    };
+    var modules = try TypedCIR.Modules.init(allocator, &source_modules);
+    defer modules.deinit();
+    const module = modules.module(0);
+    const module_env = module.moduleEnvConst();
+
+    // Find `Thing`'s alias declaration and its record annotation span.
+    const record_span = blk: {
+        for (module_env.store.sliceStatements(module_env.all_statements)) |statement_idx| {
+            const statement = module_env.store.getStatement(statement_idx);
+            if (statement != .s_alias_decl) continue;
+            const anno = module_env.store.getTypeAnno(statement.s_alias_decl.anno);
+            if (anno != .record) continue;
+            break :blk anno.record.fields;
+        }
+        return error.TestUnexpectedResult;
+    };
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+    var active = CheckedSourceTypeRoots.init(allocator);
+    defer active.deinit();
+    const imports = CheckedImportViews{ .current_owner = testCheckedModuleKey(1), .direct = &.{} };
+    var source_nodes = try CheckedSourceNodes.init(allocator, module);
+    defer source_nodes.deinit(allocator);
+    var local_type_declarations = try LocalTypeDeclarationIndex.init(allocator, module, &source_nodes);
+    defer local_type_declarations.deinit();
+
+    const fields = try checkedRecordFieldsFromDeclarationAnnoSpan(
+        allocator,
+        module,
+        &names,
+        imports,
+        &store,
+        &active,
+        &local_type_declarations,
+        &.{},
+        record_span,
+    );
+    defer allocator.free(fields);
+
+    try testing.expectEqual(@as(usize, 2), fields.len);
+    try testing.expectEqualStrings("world", names.recordFieldLabelText(fields[0].name));
+    try testing.expectEqual(CheckedFieldKind.Tag.optional, fields[0].kind.tag);
+    try testing.expectEqualStrings("req", names.recordFieldLabelText(fields[1].name));
+    try testing.expectEqual(CheckedFieldKind.Tag.required, fields[1].kind.tag);
 }
 
 const EmptyTagCheckedOutputTestError = @import("test/TestEnv.zig").TestEnvError || error{
@@ -8788,6 +9555,36 @@ pub const CheckedRecordExprField = struct {
     value: CheckedExprId,
 };
 
+/// The published access operation of one record-field path segment
+/// (design.md "Field Kinds (All-Dynamic Optional Fields)"): `required` is a
+/// plain inline-slot projection; `optional` is a `.?` access whose lowering
+/// tests the field's tagged slot at runtime.
+pub const CheckedFieldAccessMode = enum(u8) {
+    required,
+    optional,
+};
+
+/// One source-ordered segment of a checked record-field access path.
+///
+/// `success_ty` is the checked type of this path prefix's successful payload—
+/// for `.?` segments too, the field's VALUE type, never the slot or Try
+/// wrapper. The enclosing checked expression owns the observable type of the
+/// complete path (one flat `Try(τ, [MissingField])` when any segment's `mode`
+/// is `optional`).
+pub const CheckedFieldAccessSegment = struct {
+    field_name: canonical.RecordFieldLabelId,
+    success_ty: CheckedTypeId,
+    source_region: base.Region,
+    mode: CheckedFieldAccessMode,
+    /// How Monotype may reach this segment's slot in its receiver: through an
+    /// ordinary record field, or through the private backing record of an
+    /// opaque nominal defined in the current module. Computed per segment:
+    /// the first segment's receiver is the access expression's receiver, and
+    /// each later segment's receiver is the previous segment's successful
+    /// value.
+    backing_access: CheckedFieldBackingAccess,
+};
+
 /// Public `CheckedIfBranch` declaration.
 pub const CheckedIfBranch = struct {
     cond: CheckedExprId,
@@ -9125,8 +9922,7 @@ pub const CheckedExprData = union(enum) {
     unary_not: CheckedExprId,
     field_access: struct {
         receiver: CheckedExprId,
-        field_name: canonical.RecordFieldLabelId,
-        backing_access: CheckedFieldBackingAccess,
+        segments: []const CheckedFieldAccessSegment,
     },
     dispatch_call: ?StaticDispatchPlanId,
     interpolation: CheckedInterpolation,
@@ -9287,8 +10083,7 @@ pub const StoredCheckedExprData = union(enum) {
     unary_not: CheckedExprId,
     field_access: struct {
         receiver: CheckedExprId,
-        field_name: canonical.RecordFieldLabelId,
-        backing_access: CheckedFieldBackingAccess,
+        segments: CheckedBodyRange,
     },
     dispatch_call: ?StaticDispatchPlanId,
     interpolation: StoredCheckedInterpolation,
@@ -9524,7 +10319,10 @@ fn reconstructCheckedExprData(pool_owner: anytype, stored: StoredCheckedExprData
         .binop => |b| .{ .binop = .{ .op = b.op, .lhs = b.lhs, .rhs = b.rhs } },
         .unary_minus => |e| .{ .unary_minus = e },
         .unary_not => |e| .{ .unary_not = e },
-        .field_access => |f| .{ .field_access = .{ .receiver = f.receiver, .field_name = f.field_name, .backing_access = f.backing_access } },
+        .field_access => |f| .{ .field_access = .{
+            .receiver = f.receiver,
+            .segments = pool_owner.fieldAccessSegmentPool()[f.segments.start .. f.segments.start + f.segments.len],
+        } },
         .dispatch_call => |p| .{ .dispatch_call = p },
         .interpolation => |i| .{ .interpolation = .{
             .plan = i.plan,
@@ -9673,6 +10471,13 @@ pub const SyntheticExprOrigin = union(enum) {
         selected_root_index: u32,
         scrutinee_pattern: CheckedPatternId,
     },
+    pattern_validation_result: struct {
+        selected_root_index: u32,
+    },
+    pattern_validation_wrapper: struct {
+        selected_root_index: u32,
+        scrutinee_pattern: CheckedPatternId,
+    },
 };
 
 const SyntheticExprOriginRecord = struct {
@@ -9708,6 +10513,7 @@ pub const CheckedBodyStoreView = struct {
     statement_id_pool: []const CheckedStatementId = &.{},
     pattern_binder_id_pool: []const PatternBinderId = &.{},
     record_expr_field_pool: []const CheckedRecordExprField = &.{},
+    field_access_segment_pool: []const CheckedFieldAccessSegment = &.{},
     if_branch_pool: []const CheckedIfBranch = &.{},
     match_branch_pool: []const CheckedMatchBranch = &.{},
     match_branch_pattern_pool: []const CheckedMatchBranchPattern = &.{},
@@ -9718,6 +10524,19 @@ pub const CheckedBodyStoreView = struct {
     interpolation_part_pool: []const CheckedInterpolationPart = &.{},
     string_bytes: []const u8 = &.{},
     string_ranges: []const canonical.NameInterner.Range = &.{},
+    default_exprs: []const CheckedBodyStore.CheckedDefaultExpr = &.{},
+    record_omitted_defaults: []const CheckedRecordOmittedDefault = &.{},
+
+    /// Resolve a locally-declared field default's `DefaultId.expr_node` to
+    /// its published checked expression (design.md "Defaulted Fields").
+    /// Null for a node this module never declared a default on—a foreign
+    /// default resolves in its declaring module's view instead.
+    pub fn defaultExpr(self: CheckedBodyStoreView, expr_node: u32) ?CheckedExprId {
+        for (self.default_exprs) |entry| {
+            if (entry.expr_node == expr_node) return entry.checked_expr;
+        }
+        return null;
+    }
 
     pub fn exprIdPool(self: CheckedBodyStoreView) []const CheckedExprId {
         return self.expr_id_pool;
@@ -9733,6 +10552,9 @@ pub const CheckedBodyStoreView = struct {
     }
     pub fn recordExprFieldPool(self: CheckedBodyStoreView) []const CheckedRecordExprField {
         return self.record_expr_field_pool;
+    }
+    pub fn fieldAccessSegmentPool(self: CheckedBodyStoreView) []const CheckedFieldAccessSegment {
+        return self.field_access_segment_pool;
     }
     pub fn ifBranchPool(self: CheckedBodyStoreView) []const CheckedIfBranch {
         return self.if_branch_pool;
@@ -9840,6 +10662,9 @@ const CheckedSourceNodeKind = enum(u2) {
     statement,
 };
 
+// Not an `OptionalId`: a slot here is a packed `(kind:2, id:30)` pair, not a
+// plain id, and the map is build-only (`serde_transient_fields`), never
+// serialized—the sentinel marks an empty slot in the dense per-node table.
 const checked_source_node_empty = std.math.maxInt(u32);
 const checked_source_node_id_bits = 30;
 const checked_source_node_id_limit = @as(u32, 1) << checked_source_node_id_bits;
@@ -9997,6 +10822,18 @@ const CheckedSourceNodes = struct {
                 .s_break,
                 => {},
             }
+        }
+
+        // Defaulted-field annotations (`a : T ?? expr`, design.md "Defaulted
+        // Fields") hold value expressions no def body reaches; publication
+        // archives them by CIR node for construction-site materialization,
+        // so seed every default expression explicitly.
+        var default_node_idx: u32 = 0;
+        while (default_node_idx < node_count) : (default_node_idx += 1) {
+            const node: CIR.Node.Idx = @enumFromInt(default_node_idx);
+            if (module_env.store.nodes.get(node).tag != .ty_record_field_defaulted) continue;
+            const payload = module_env.store.nodes.get(node).getPayload().ty_record_field_defaulted;
+            try self.markExpr(@enumFromInt(payload.default_value), &work);
         }
 
         var next: usize = 0;
@@ -10373,6 +11210,8 @@ pub const CheckedBodyStore = struct {
     pattern_binder_id_pool: std.ArrayList(PatternBinderId) = .empty,
     /// Flat pool of record expression fields backing record payloads.
     record_expr_field_pool: std.ArrayList(CheckedRecordExprField) = .empty,
+    /// Flat pool of checked field-access segments backing field-access paths.
+    field_access_segment_pool: std.ArrayList(CheckedFieldAccessSegment) = .empty,
     /// Flat pool of if-branches backing if_ payloads.
     if_branch_pool: std.ArrayList(CheckedIfBranch) = .empty,
     /// Flat pool of (range-form) match branches backing match_ payloads.
@@ -10393,6 +11232,11 @@ pub const CheckedBodyStore = struct {
     string_bytes: std.ArrayList(u8) = .empty,
     /// `CheckedStringLiteralId`-indexed ranges into `string_bytes`.
     string_ranges: std.ArrayList(canonical.NameInterner.Range) = .empty,
+    /// Serialized local default expressions, sorted by source node for
+    /// cross-module construction lookup.
+    default_exprs: std.ArrayList(CheckedDefaultExpr) = .empty,
+    /// Checker-selected defaults attached to their exact omission sites.
+    record_omitted_defaults: std.ArrayList(CheckedRecordOmittedDefault) = .empty,
     source_node_map: CheckedSourceNodeMap = .{},
     /// Synthesized `from_numeral` conversion expressions for literal patterns,
     /// keyed by the pattern's source node. Pattern nodes already occupy their
@@ -10411,6 +11255,12 @@ pub const CheckedBodyStore = struct {
     pub const NumeralConversionExpr = struct {
         raw_node: u32,
         expr: CheckedExprId,
+    };
+
+    /// See `default_exprs`.
+    pub const CheckedDefaultExpr = extern struct {
+        expr_node: u32,
+        checked_expr: CheckedExprId,
     };
 
     pub fn fromModule(
@@ -10506,6 +11356,10 @@ pub const CheckedBodyStore = struct {
         errdefer match_branch_pattern_pool.deinit(allocator);
         var binder_remap_pool = std.ArrayList(CheckedAlternativeBinderRemap).empty;
         errdefer binder_remap_pool.deinit(allocator);
+        // Dedup set for locally-declared field defaults; consumed by the
+        // defaults-collection block after the build arrays are committed.
+        var seen_defaults = std.AutoHashMap(u32, void).init(allocator);
+        errdefer seen_defaults.deinit();
 
         var copier = CheckedBodyPayloadCopier{
             .allocator = allocator,
@@ -10671,6 +11525,59 @@ pub const CheckedBodyStore = struct {
         match_branch_pattern_pool.deinit(allocator);
         binder_remap_pool.deinit(allocator);
 
+        // Collect locally-declared field defaults: every published defaulted
+        // field whose identity originates in THIS module resolves its CIR
+        // expr node to the checked expression published by the source-node
+        // walk above (design.md "Defaulted Fields").
+        const self_origin = try names.internModuleIdentity(
+            module.moduleEnvConst().moduleIdentityHash(module.moduleEnvConst().selfModuleIdentity()),
+        );
+        {
+            for (checked_types.store.recordFieldPool()) |field| {
+                const default = field.kind.defaultIdentity() orelse continue;
+                const default_origin = default.origin() orelse
+                    checkedArtifactInvariant("checked defaulted field kind carried no default identity", .{});
+                if (default_origin != self_origin) continue;
+                if (seen_defaults.contains(default.expr_node)) continue;
+                try seen_defaults.put(default.expr_node, {});
+                const checked_expr = source_node_map.exprAtRawNode(default.expr_node) orelse
+                    checkedArtifactInvariant("field default expression was not published as a source node", .{});
+                try store.default_exprs.append(allocator, .{
+                    .expr_node = default.expr_node,
+                    .checked_expr = checked_expr,
+                });
+            }
+        }
+
+        for (module.moduleEnvConst().record_omitted_defaults.items.items) |omitted| {
+            const checked_expr = source_node_map.exprAtRawNode(@intFromEnum(omitted.expr)) orelse
+                checkedArtifactInvariant("omitted-default record expression was not published as a source node", .{});
+            const field_name = try names.internRecordFieldIdent(module.identStoreConst(), omitted.field_name);
+            const origin_module = try names.internModuleIdentity(
+                module.moduleEnvConst().moduleIdentityHash(omitted.origin_module),
+            );
+            try store.record_omitted_defaults.append(allocator, .{
+                .expr = checked_expr,
+                .field_name = field_name,
+                .default = CheckedFieldDefault.fromParts(origin_module, omitted.default_expr_node),
+            });
+            if (origin_module == self_origin and !seen_defaults.contains(omitted.default_expr_node)) {
+                try seen_defaults.put(omitted.default_expr_node, {});
+                const default_expr = source_node_map.exprAtRawNode(omitted.default_expr_node) orelse
+                    checkedArtifactInvariant("omitted field default expression was not published as a source node", .{});
+                try store.default_exprs.append(allocator, .{
+                    .expr_node = omitted.default_expr_node,
+                    .checked_expr = default_expr,
+                });
+            }
+        }
+        std.mem.sort(CheckedDefaultExpr, store.default_exprs.items, {}, struct {
+            fn lessThan(_: void, a: CheckedDefaultExpr, b: CheckedDefaultExpr) bool {
+                return a.expr_node < b.expr_node;
+            }
+        }.lessThan);
+        seen_defaults.deinit();
+
         store.source_node_map = source_node_map;
         return store;
     }
@@ -10688,6 +11595,7 @@ pub const CheckedBodyStore = struct {
             .statement_id_pool = self.statement_id_pool.items,
             .pattern_binder_id_pool = self.pattern_binder_id_pool.items,
             .record_expr_field_pool = self.record_expr_field_pool.items,
+            .field_access_segment_pool = self.field_access_segment_pool.items,
             .if_branch_pool = self.if_branch_pool.items,
             .match_branch_pool = self.match_branch_pool.items,
             .match_branch_pattern_pool = self.match_branch_pattern_pool.items,
@@ -10698,6 +11606,8 @@ pub const CheckedBodyStore = struct {
             .interpolation_part_pool = self.interpolation_part_pool.items,
             .string_bytes = self.string_bytes.items,
             .string_ranges = self.string_ranges.items,
+            .default_exprs = self.default_exprs.items,
+            .record_omitted_defaults = self.record_omitted_defaults.items,
         };
     }
 
@@ -10740,6 +11650,9 @@ pub const CheckedBodyStore = struct {
     }
     pub fn recordExprFieldPool(self: *const CheckedBodyStore) []const CheckedRecordExprField {
         return self.record_expr_field_pool.items;
+    }
+    pub fn fieldAccessSegmentPool(self: *const CheckedBodyStore) []const CheckedFieldAccessSegment {
+        return self.field_access_segment_pool.items;
     }
     pub fn ifBranchPool(self: *const CheckedBodyStore) []const CheckedIfBranch {
         return self.if_branch_pool.items;
@@ -10784,6 +11697,10 @@ pub const CheckedBodyStore = struct {
 
     fn appendRecordExprFields(self: *CheckedBodyStore, allocator: Allocator, fields: []const CheckedRecordExprField) Allocator.Error!CheckedBodyRange {
         return artifact_serialize.appendSpan(CheckedBodyRange, CheckedRecordExprField, &self.record_expr_field_pool, allocator, fields);
+    }
+
+    fn appendFieldAccessSegments(self: *CheckedBodyStore, allocator: Allocator, segments: []const CheckedFieldAccessSegment) Allocator.Error!CheckedBodyRange {
+        return artifact_serialize.appendSpan(CheckedBodyRange, CheckedFieldAccessSegment, &self.field_access_segment_pool, allocator, segments);
     }
 
     fn appendIfBranches(self: *CheckedBodyStore, allocator: Allocator, branches: []const CheckedIfBranch) Allocator.Error!CheckedBodyRange {
@@ -10875,7 +11792,10 @@ pub const CheckedBodyStore = struct {
             .binop => |b| .{ .binop = .{ .op = b.op, .lhs = b.lhs, .rhs = b.rhs } },
             .unary_minus => |e| .{ .unary_minus = e },
             .unary_not => |e| .{ .unary_not = e },
-            .field_access => |f| .{ .field_access = .{ .receiver = f.receiver, .field_name = f.field_name, .backing_access = f.backing_access } },
+            .field_access => |f| .{ .field_access = .{
+                .receiver = f.receiver,
+                .segments = try self.appendFieldAccessSegments(allocator, f.segments),
+            } },
             .dispatch_call => |p| .{ .dispatch_call = p },
             .interpolation => |i| .{ .interpolation = .{
                 .plan = i.plan,
@@ -11380,6 +12300,9 @@ pub const CheckedBodyStore = struct {
             self.statement_id_pool.deinit(allocator);
             self.pattern_binder_id_pool.deinit(allocator);
             self.record_expr_field_pool.deinit(allocator);
+            self.field_access_segment_pool.deinit(allocator);
+            self.default_exprs.deinit(allocator);
+            self.record_omitted_defaults.deinit(allocator);
             self.if_branch_pool.deinit(allocator);
             self.match_branch_pool.deinit(allocator);
             self.match_branch_pattern_pool.deinit(allocator);
@@ -11412,6 +12335,7 @@ pub const CheckedBodyStore = struct {
         statement_id_pool: SerializedSlice(CheckedStatementId) = .{},
         pattern_binder_id_pool: SerializedSlice(PatternBinderId) = .{},
         record_expr_field_pool: SerializedSlice(CheckedRecordExprField) = .{},
+        field_access_segment_pool: SerializedSlice(CheckedFieldAccessSegment) = .{},
         if_branch_pool: SerializedSlice(CheckedIfBranch) = .{},
         match_branch_pool: SerializedSlice(CheckedMatchBranch) = .{},
         match_branch_pattern_pool: SerializedSlice(CheckedMatchBranchPattern) = .{},
@@ -11422,11 +12346,13 @@ pub const CheckedBodyStore = struct {
         interpolation_part_pool: SerializedSlice(CheckedInterpolationPart) = .{},
         string_bytes: SerializedSlice(u8) = .{},
         string_ranges: SerializedSlice(canonical.NameInterner.Range) = .{},
+        default_exprs: SerializedSlice(CheckedDefaultExpr) = .{},
+        record_omitted_defaults: SerializedSlice(CheckedRecordOmittedDefault) = .{},
 
         comptime {
-            // 21 SerializedSlice fields → 21 base-pointer fixups, independent of
+            // 24 SerializedSlice fields → 24 base-pointer fixups, independent of
             // stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 21);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 24);
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(CheckedBodyStore, @This());
@@ -11555,7 +12481,13 @@ fn checkedExprEvaluationMayBeElidedForInspect(
             const record = receiver_data.record;
             if (record.ext != null or record.fields.len != 1) break :blk false;
             const field = record.fields[0];
-            if (field.label != access.field_name) break :blk false;
+            // Only a single-segment required access reads the literal's one
+            // field directly; `.?` segments and longer chains evaluate more
+            // than the field value, so they are never elided here.
+            if (access.segments.len != 1) break :blk false;
+            const segment = access.segments[0];
+            if (segment.mode != .required) break :blk false;
+            if (field.label != segment.field_name) break :blk false;
             break :blk checkedExprEvaluationMayBeElidedForInspect(exprs, may_be_elided, field.value, states);
         }
         break :blk false;
@@ -12616,10 +13548,9 @@ const CheckedBodyPayloadCopier = struct {
             } },
             .e_unary_minus => |unary| .{ .unary_minus = self.checkedExpr(unary.expr) },
             .e_unary_not => |unary| .{ .unary_not = self.checkedExpr(unary.expr) },
-            .e_field_access => |field| .{ .field_access = .{
-                .receiver = self.checkedExpr(field.receiver),
-                .field_name = try self.names.internRecordFieldIdent(self.module.identStoreConst(), field.field_name),
-                .backing_access = checkedFieldBackingAccess(self.module, field.receiver),
+            .e_field_access => |field_access| .{ .field_access = .{
+                .receiver = self.checkedExpr(field_access.receiver),
+                .segments = try self.copyFieldAccessSegments(field_access.receiver, field_access.segments),
             } },
             .e_method_call => checkedArtifactInvariant(
                 "ordinary method call reached artifact publication after checking; expected explicit static-dispatch plan",
@@ -13036,6 +13967,45 @@ const CheckedBodyPayloadCopier = struct {
                 .label = try self.names.internRecordFieldIdent(self.module.identStoreConst(), field.name),
                 .value = self.checkedExpr(field.value),
             };
+        }
+        return out;
+    }
+
+    /// Copy a path into its retained read-form slice. These slices coexist until
+    /// `commitExprs`, so they cannot share one scratch buffer.
+    fn copyFieldAccessSegments(
+        self: *@This(),
+        receiver: CIR.Expr.Idx,
+        span: CIR.Expr.FieldAccessSegment.Span,
+    ) Allocator.Error![]const CheckedFieldAccessSegment {
+        if (span.len == 0) {
+            checkedArtifactInvariant("checked field-access path had no segments", .{});
+        }
+
+        const out = try self.allocator.alloc(CheckedFieldAccessSegment, span.len);
+        errdefer self.allocator.free(out);
+
+        const module_env = self.module.moduleEnvConst();
+        var receiver_var = ModuleEnv.varFrom(receiver);
+        var position: u32 = 0;
+        while (position < span.len) : (position += 1) {
+            const segment_idx = module_env.store.fieldAccessSegmentAt(span, position);
+            const segment = module_env.store.getFieldAccessSegment(segment_idx);
+            out[position] = .{
+                .field_name = try self.names.internRecordFieldIdent(self.module.identStoreConst(), segment.name),
+                .success_ty = try self.checkedTypeForRequiredVar(
+                    ModuleEnv.varFrom(segment_idx),
+                    "checked field-access segment type root was not output",
+                ),
+                .source_region = module_env.store.getFieldAccessSegmentRegion(segment_idx),
+                .mode = switch (segment.mode) {
+                    .required => .required,
+                    .optional => .optional,
+                },
+                .backing_access = checkedFieldBackingAccess(self.module, receiver_var),
+            };
+            // The next segment reads from this segment's successful value.
+            receiver_var = ModuleEnv.varFrom(segment_idx);
         }
         return out;
     }
@@ -13527,7 +14497,7 @@ fn deinitCheckedExprData(allocator: Allocator, data: *CheckedExprData) void {
         .unary_minus,
         .unary_not,
         => {},
-        .field_access => {},
+        .field_access => |field_access| allocator.free(field_access.segments),
         .interpolation => |interpolation| allocator.free(interpolation.parts),
         .hosted_lambda => |hosted| allocator.free(hosted.args),
         .run_low_level => |run| allocator.free(run.args),
@@ -13584,16 +14554,43 @@ fn deinitCheckedStatementData(allocator: Allocator, data: *CheckedStatementData)
     data.* = .pending;
 }
 
-fn verifyCheckedExprDataComplete(data: StoredCheckedExprData) void {
-    if (data == .pending) std.debug.panic("checked artifact invariant violated: checked expression payload was not filled", .{});
-    if (data == .lookup_local) std.debug.assert(data.lookup_local.resolved != null);
-    if (data == .lookup_external) std.debug.assert(data.lookup_external != null);
-    if (data == .lookup_required) std.debug.assert(data.lookup_required != null);
-    if (data == .dispatch_call) std.debug.assert(data.dispatch_call != null);
-    if (data == .interpolation) std.debug.assert(data.interpolation.plan != null);
-    if (data == .method_eq) std.debug.assert(data.method_eq != null);
-    if (data == .type_dispatch_call) std.debug.assert(data.type_dispatch_call != null);
-    if (data == .for_) std.debug.assert(data.for_.plan != null);
+fn verifyCheckedExprDataComplete(
+    data: StoredCheckedExprData,
+    checked_bodies: *const CheckedBodyStore,
+    checked_type_count: usize,
+) void {
+    switch (data) {
+        .pending => std.debug.panic("checked artifact invariant violated: checked expression payload was not filled", .{}),
+        .lookup_local => |lookup| std.debug.assert(lookup.resolved != null),
+        .lookup_external => |ref| std.debug.assert(ref != null),
+        .lookup_required => |ref| std.debug.assert(ref != null),
+        .dispatch_call => |plan| std.debug.assert(plan != null),
+        .interpolation => |interpolation| std.debug.assert(interpolation.plan != null),
+        .method_eq => |plan| std.debug.assert(plan != null),
+        .type_dispatch_call => |plan| std.debug.assert(plan != null),
+        .for_ => |for_| std.debug.assert(for_.plan != null),
+        .field_access => |field_access| {
+            if (field_access.segments.len == 0) {
+                checkedArtifactInvariant("checked field-access path had no stored segments", .{});
+            }
+            if (@intFromEnum(field_access.receiver) >= checked_bodies.exprCount()) {
+                checkedArtifactInvariant("checked field-access receiver expression was out of range", .{});
+            }
+            const start: usize = field_access.segments.start;
+            const len: usize = field_access.segments.len;
+            const end = std.math.add(usize, start, len) catch
+                checkedArtifactInvariant("checked field-access segment range overflowed", .{});
+            if (end > checked_bodies.field_access_segment_pool.items.len) {
+                checkedArtifactInvariant("checked field-access segment range was out of bounds", .{});
+            }
+            for (checked_bodies.field_access_segment_pool.items[start..end]) |segment| {
+                if (@intFromEnum(segment.success_ty) >= checked_type_count) {
+                    checkedArtifactInvariant("checked field-access segment type was out of range", .{});
+                }
+            }
+        },
+        .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .hosted_lambda, .run_low_level => {},
+    }
 }
 
 fn verifyCheckedPatternDataComplete(data: StoredCheckedPatternData) void {
@@ -13636,11 +14633,24 @@ fn isStatementNodeTag(tag: CIR.Node.Tag) bool {
     return Ident.textStartsWith(@tagName(tag), "statement_");
 }
 
+/// A declaration that carries a type annotation and no implementation. The
+/// checker keeps the declared type intact so uses of the declaration still
+/// check against it, which is why this is published as an executable fact
+/// rather than an erroneous type: reaching the declaration crashes.
+pub const UnimplementedDeclaration = struct {
+    /// Source region of the declaration, used as the crash's location.
+    region: base.Region,
+};
+
 /// Public `CheckedProcedureBody` declaration.
 pub const CheckedProcedureBody = union(enum) {
     checked_body: CheckedBodyId,
     intrinsic_wrapper: canonical.IntrinsicWrapperId,
     entry_wrapper: canonical.EntryWrapperId,
+    /// This procedure was declared with a type annotation and never given an
+    /// implementation. It lowers to a crash body carrying the declared arity,
+    /// so every call site still links and arguments still evaluate.
+    unimplemented: UnimplementedDeclaration,
 };
 
 /// Public compiler-intrinsic identity published by canonicalization.
@@ -14006,6 +15016,81 @@ pub const CallableEvalTemplateTable = struct {
     }
 };
 
+/// Publication-only index for callable values produced by selected pattern
+/// extraction roots. The durable identity lives in the compile-time root,
+/// callable-eval template, and top-level procedure binding tables; this index
+/// only connects source lookups to those identities while resolved refs are
+/// being published.
+const SelectedHoistedCallableTable = struct {
+    by_pattern: []?TopLevelProcedureBindingRef = &.{},
+
+    fn fromRoots(
+        allocator: Allocator,
+        module: TypedCIR.Module,
+        checked_bodies: *const CheckedBodyStore,
+        roots: *const CompileTimeRootTable,
+        callable_eval_templates: *CallableEvalTemplateTable,
+        procedure_bindings: *TopLevelProcedureBindingTable,
+    ) Allocator.Error!SelectedHoistedCallableTable {
+        const by_pattern = try allocator.alloc(?TopLevelProcedureBindingRef, checked_bodies.patternCount());
+        errdefer allocator.free(by_pattern);
+        @memset(by_pattern, null);
+
+        for (roots.roots) |root| {
+            if (root.kind != .callable_binding) continue;
+            switch (root.source) {
+                .hoisted => {},
+                .def, .expr, .statement, .required_binding => continue,
+            }
+
+            const source_pattern = root.source_pattern orelse
+                checkedArtifactInvariant("selected callable root had no source pattern", .{});
+            if (!sourceTypeIsFunction(module, ModuleEnv.varFrom(source_pattern))) {
+                checkedArtifactInvariant("selected callable root source pattern was not function-typed", .{});
+            }
+            const checked_pattern = root.pattern orelse
+                checkedArtifactInvariant("selected callable root had no checked pattern", .{});
+            const source_scheme = try canonical_type_keys.schemeFromVar(
+                allocator,
+                module.typeStoreConst(),
+                module.moduleEnvConst(),
+                ModuleEnv.varFrom(source_pattern),
+            );
+            const callable_template = try callable_eval_templates.append(
+                allocator,
+                module.moduleIndex(),
+                checked_pattern,
+                root.id,
+                source_scheme,
+                root.checked_type,
+            );
+            const binding = try procedure_bindings.appendCallableEval(
+                allocator,
+                source_scheme,
+                callable_template,
+            );
+            const slot = &by_pattern[@intFromEnum(checked_pattern)];
+            if (slot.* != null) {
+                checkedArtifactInvariant("selected callable pattern was published more than once", .{});
+            }
+            slot.* = binding;
+        }
+
+        return .{ .by_pattern = by_pattern };
+    }
+
+    fn lookupByPattern(self: *const SelectedHoistedCallableTable, pattern: CheckedPatternId) ?TopLevelProcedureBindingRef {
+        const raw = @intFromEnum(pattern);
+        if (raw >= self.by_pattern.len) return null;
+        return self.by_pattern[raw];
+    }
+
+    fn deinit(self: *SelectedHoistedCallableTable, allocator: Allocator) void {
+        allocator.free(self.by_pattern);
+        self.* = .{};
+    }
+};
+
 /// Public `ImportedProcedureBindingRef` declaration.
 pub const ImportedProcedureBindingRef = struct {
     artifact: CheckedModuleArtifactKey,
@@ -14142,6 +15227,7 @@ pub const ResolvedValueRefTable = struct {
         platform_required_declarations: *const PlatformRequiredDeclarationTable,
         platform_required_bindings: *const PlatformRequiredBindingTable,
         top_level_values: *const TopLevelValueTable,
+        selected_hoisted_callables: *const SelectedHoistedCallableTable,
         hoisted_constants: *const HoistedConstTable,
         checked_types: *const CheckedTypePublication,
         checked_bodies: *const CheckedBodyStore,
@@ -14183,6 +15269,7 @@ pub const ResolvedValueRefTable = struct {
                 platform_required_declarations,
                 platform_required_bindings,
                 top_level_values,
+                selected_hoisted_callables,
                 hoisted_constants,
                 &local_pattern_roles,
                 checked_bodies,
@@ -14216,6 +15303,7 @@ pub const ResolvedValueRefTable = struct {
             &records,
             by_checked_expr,
             checked_bodies,
+            selected_hoisted_callables,
             hoisted_constants,
             synthetic_expr_origins,
         );
@@ -14308,6 +15396,7 @@ fn appendSyntheticLocalLookupRefs(
     records: *std.ArrayList(ResolvedValueRefRecord),
     by_checked_expr: []?ResolvedValueRefId,
     checked_bodies: *const CheckedBodyStore,
+    selected_hoisted_callables: *const SelectedHoistedCallableTable,
     hoisted_constants: *const HoistedConstTable,
     synthetic_expr_origins: []const SyntheticExprOriginRecord,
 ) Allocator.Error!void {
@@ -14336,20 +15425,24 @@ fn appendSyntheticLocalLookupRefs(
                 const binder = checked_bodies.patternBinderForCheckedPattern(origin.result_pattern) orelse {
                     checkedArtifactInvariant("synthetic lookup local referenced a pattern without a checked binder", .{});
                 };
-                const hoisted = hoisted_constants.lookupByPattern(origin.result_pattern) orelse {
-                    checkedArtifactInvariant("synthetic pattern-extraction lookup had no selected hoisted const entry", .{});
-                };
+                const resolved_ref: ResolvedValueRef = if (selected_hoisted_callables.lookupByPattern(origin.result_pattern) != null)
+                    .{ .pattern_binder = .{ .binder = binder } }
+                else if (hoisted_constants.lookupByPattern(origin.result_pattern)) |hoisted|
+                    selectedHoistedConstUse(hoisted, .{ .binder = binder })
+                else
+                    checkedArtifactInvariant("synthetic pattern-extraction lookup had no selected root entry", .{});
 
                 const id: ResolvedValueRefId = @enumFromInt(@as(u32, @intCast(records.items.len)));
                 try records.append(allocator, .{
                     .expr = expr.id,
-                    .ref = selectedHoistedConstUse(hoisted, .{ .binder = binder }),
+                    .ref = resolved_ref,
                     .checked_ty = expr.ty,
                     .scope_depth = 0,
                 });
                 by_checked_expr[raw_expr] = id;
             },
-            .pattern_extraction_wrapper => {
+            .pattern_validation_result => {},
+            .pattern_extraction_wrapper, .pattern_validation_wrapper => {
                 const raw_expr = @intFromEnum(origin_record.expr);
                 if (raw_expr >= checked_bodies.exprCount()) {
                     checkedArtifactInvariant("synthetic wrapper origin referenced an expression out of range", .{});
@@ -14392,6 +15485,7 @@ fn categorizeValueRef(
     platform_required_declarations: *const PlatformRequiredDeclarationTable,
     platform_required_bindings: *const PlatformRequiredBindingTable,
     top_level_values: *const TopLevelValueTable,
+    selected_hoisted_callables: *const SelectedHoistedCallableTable,
     hoisted_constants: *const HoistedConstTable,
     local_pattern_roles: *const LocalPatternRoleIndex,
     checked_bodies: *const CheckedBodyStore,
@@ -14404,6 +15498,7 @@ fn categorizeValueRef(
             local.pattern_idx,
             hosted_procs,
             top_level_values,
+            selected_hoisted_callables,
             hoisted_constants,
             local_pattern_roles,
             checked_bodies,
@@ -14556,6 +15651,7 @@ fn categorizeLocalValueRef(
     pattern: CIR.Pattern.Idx,
     hosted_procs: *const HostedProcTable,
     top_level_values: *const TopLevelValueTable,
+    selected_hoisted_callables: *const SelectedHoistedCallableTable,
     hoisted_constants: *const HoistedConstTable,
     local_pattern_roles: *const LocalPatternRoleIndex,
     checked_bodies: *const CheckedBodyStore,
@@ -14593,6 +15689,17 @@ fn categorizeLocalValueRef(
         }
         unreachable;
     };
+
+    if (selected_hoisted_callables.lookupByPattern(checked_pattern)) |binding| {
+        return .{ .top_level_proc = .{
+            .binding = .{ .top_level = .{
+                .artifact = artifact_key,
+                .binding = binding,
+            } },
+            .source_fn_ty_template = .{},
+            .runtime_result_provenance = null,
+        } };
+    }
 
     if (hoisted_constants.lookupByPattern(checked_pattern)) |hoisted| {
         return selectedHoistedConstUse(hoisted, .{ .binder = binder });
@@ -15245,16 +16352,36 @@ fn sealCheckedProcedureTemplateRefs(
     resolved_value_refs: *ResolvedValueRefTable,
     template_iterator_refs: *TemplateIteratorRefs,
 ) Allocator.Error!void {
-    // Generalized local functions with dispatch obligations: entering one
-    // while collecting pushes an evidence scope. Declarations map to their
-    // pattern scheme; expression-position functions stored in a containing
-    // value map to the pristine scheme instantiated at that construction edge.
+    // Local functions with dispatch obligations: entering one while collecting
+    // pushes an evidence scope. Declarations map to their pattern scheme;
+    // expression-position functions stored in a containing value map to the
+    // pristine scheme instantiated at that construction edge.
     var local_schemes = std.AutoHashMap(u32, Var).init(allocator);
     defer local_schemes.deinit();
     var nested_function_uses = std.AutoHashMap(u32, u32).init(allocator);
     defer nested_function_uses.deinit();
     {
         const types_store = module.typeStoreConst();
+
+        // Every reference that instantiated a scheme is a record checking
+        // wrote, naming the exact scheme root it instantiated. A local
+        // definition named that way owns an evidence scope: its uses carry the
+        // evidence vector that scope schedules. Reading the records is what
+        // decides this, because the pattern var's rank answers a different
+        // question—whether let-generalization ran—and a definition whose body
+        // defers a dispatch to its caller is instantiated at its uses while
+        // that rank settles at `.outermost`.
+        var instantiated_scheme_roots = std.AutoHashMap(Var, void).init(allocator);
+        defer instantiated_scheme_roots.deinit();
+        for (module.moduleEnvConst().scheme_uses.items.items) |record| {
+            switch (@as(ModuleEnv.SchemeUseRecord.Slot, @enumFromInt(record.slot_kind))) {
+                .value_use, .shared_value_use => try instantiated_scheme_roots.put(
+                    @enumFromInt(record.scheme_root),
+                    {},
+                ),
+                .nested_function_use, .dispatch_target => {},
+            }
+        }
 
         var raw_node: u32 = 0;
         while (raw_node < module.nodeCount()) : (raw_node += 1) {
@@ -15266,7 +16393,8 @@ fn sealCheckedProcedureTemplateRefs(
             const expr_data = module.expr(decl.expr).data;
             if (expr_data != .e_lambda and expr_data != .e_closure) continue;
             const pattern_var = ModuleEnv.varFrom(decl.pattern);
-            if (types_store.resolveVar(pattern_var).desc.rank != .generalized) continue;
+            const generalized = types_store.resolveVar(pattern_var).desc.rank == .generalized;
+            if (!generalized and !instantiated_scheme_roots.contains(pattern_var)) continue;
             const checked_expr = checked_bodies.exprIdForSource(decl.expr) orelse continue;
             try local_schemes.put(@intFromEnum(checked_expr), pattern_var);
         }
@@ -15344,7 +16472,9 @@ fn sealCheckedProcedureTemplateRefs(
                     true,
                 );
             },
-            .intrinsic_wrapper => {},
+            // Neither an intrinsic wrapper nor an unimplemented declaration
+            // has a checked body to collect plans from.
+            .intrinsic_wrapper, .unimplemented => {},
         }
 
         var seen_local_uses = collections.DenseMap(ResolvedValueRefId, void).init(allocator);
@@ -15488,8 +16618,9 @@ fn publishLocalMethodDispatchScopes(
     scope_by_checked_expr: *const collections.DenseMap(CheckedExprId, DispatchScopeId),
 ) void {
     for (method_registry.entries) |*entry| {
-        if (entry.target.kind != .local_proc) continue;
-        const local = &entry.target.kind.local_proc;
+        const target = if (entry.target) |*target| target else continue;
+        if (target.kind != .local_proc) continue;
+        const local = &target.kind.local_proc;
 
         local.dispatch_scope = scope_by_checked_expr.get(local.expr);
     }
@@ -15798,7 +16929,12 @@ const EvidencePass = struct {
         // finished evidence vector across the checked-artifact boundary.
         for (self.platform_requirement_solutions, self.platform_requirement_root_evidence) |solution, *out| {
             out.* = .{};
-            if (!solution.is_function or try solutionVarsReachErr(self.allocator, self.module, solution)) continue;
+            switch (solution.outcome) {
+                .checked_error => continue,
+                .success => {},
+                .pending => checkedArtifactInvariant("platform requirement solution was not finalized before evidence publication", .{}),
+            }
+            if (!solution.is_function) continue;
 
             params.clearRetainingCapacity();
             try self.enumerateParams(solution.solved_var, &params);
@@ -15879,7 +17015,7 @@ const EvidencePass = struct {
                 // Expression roots (REPL lines, eval snippets) have no pattern
                 // and no callers, so their obligations are chain-free.
             },
-            .checked_body, .intrinsic_wrapper => {},
+            .checked_body, .intrinsic_wrapper, .unimplemented => {},
         }
     }
 
@@ -15963,7 +17099,12 @@ const EvidencePass = struct {
             }
             for (artifact_calls, source_calls) |*call, source_call| {
                 const owner = (try self.methodOwnerForSourceContent(@enumFromInt(source_call.dispatcher_var))) orelse continue;
-                const target = self.lookupMethodTargetAcrossViews(owner, call.method) orelse continue;
+                const target = switch (self.lookupMethodTargetAcrossViews(owner, call.method) orelse continue) {
+                    // The declaration this codec contract names was rejected;
+                    // its diagnostic is reported and nothing lowers it.
+                    .rejected => continue,
+                    .target => |target| target,
+                };
                 const evidence_var: Var = @enumFromInt(source_call.evidence_var);
                 switch (target.kind) {
                     .procedure, .local_proc => {
@@ -16072,7 +17213,7 @@ const EvidencePass = struct {
         const constraints = switch (resolved.desc.content) {
             .flex => |flex| flex.constraints,
             .rigid => |rigid| rigid.constraints,
-            .alias, .structure, .err => return null,
+            .alias, .field_presence, .structure, .err => return null,
         };
         return numericDefaultPhaseForConstraints(self.module, constraints);
     }
@@ -16093,7 +17234,7 @@ const EvidencePass = struct {
     /// views. (Snapshot-style compiles pass the builtin module only as a
     /// direct import, so searching `available` alone misses every
     /// builtin-owned method.)
-    fn lookupMethodTargetAcrossViews(self: *EvidencePass, owner: static_dispatch.MethodOwner, method: canonical.MethodNameId) ?static_dispatch.MethodTarget {
+    fn lookupMethodTargetAcrossViews(self: *EvidencePass, owner: static_dispatch.MethodOwner, method: canonical.MethodNameId) ?static_dispatch.CheckedMethodLookup {
         if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, &.{}, owner, method)) |target| {
             return target;
         }
@@ -16201,29 +17342,16 @@ const EvidencePass = struct {
             chain,
             commit_unpinned,
         )) orelse return;
-        // The iterator type is the `iter` callable's return: dispatch `next`
-        // on it.
-        const next_dispatcher = self.iteratorNextDispatcherVar(src.iter_fn_var);
-        plan.next.resolution = if (next_dispatcher) |dispatcher_var|
-            (try self.resolveObligation(
-                dispatcher_var,
-                plan.next.dispatcher_ty,
-                plan.next.method,
-                null,
-                src.next_fn_var,
-                chain,
-                commit_unpinned,
-            )) orelse return
-        else
-            // A non-function `iter` callable only occurs on checked errors.
-            .checked_error;
+        plan.next.resolution = (try self.resolveObligation(
+            src.next_dispatcher_var,
+            plan.next.dispatcher_ty,
+            plan.next.method,
+            null,
+            src.next_fn_var,
+            chain,
+            commit_unpinned,
+        )) orelse return;
         self.iterator_plan_resolved[raw] = true;
-    }
-
-    fn iteratorNextDispatcherVar(self: *EvidencePass, iter_fn_var: Var) ?Var {
-        const resolved = self.types.resolveVar(iter_fn_var);
-        const func = resolved.desc.content.unwrapFunc() orelse return null;
-        return func.ret;
     }
 
     /// Resolve one dispatch obligation: `method` dispatched on
@@ -16297,13 +17425,22 @@ const EvidencePass = struct {
             // The explicit rejection map above remains the sole authority for
             // dispatch-specific failures; `.err` is the separate value-error
             // fence and must never be inferred from the callable or its return.
-            .err => return .checked_error,
+            // A presence variable is not a dispatch target and carries no
+            // obligations—treat it as inert like `.err`.
+            .err, .field_presence => return .checked_error,
             .flex => |flex| return self.resolveVarObligation(resolved.var_, dispatcher_ty, flex.constraints, method, structural_kind, constraint_fn_var, chain, commit_unpinned),
             .rigid => |rigid| return self.resolveVarObligation(resolved.var_, dispatcher_ty, rigid.constraints, method, structural_kind, constraint_fn_var, chain, commit_unpinned),
             .alias, .structure => {
                 if (try self.methodOwnerForSourceContent(resolved.var_)) |owner| {
-                    if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
-                        return try self.resolutionForMethodTarget(target, structural_kind, dispatcher_ty, constraint_fn_var);
+                    if (self.lookupMethodTargetAcrossViews(owner, method)) |found| {
+                        return switch (found) {
+                            // The method is declared, but canonicalization or
+                            // checking rejected its declaration and already
+                            // reported why. The dispatch itself needs no second
+                            // diagnostic; it just must never lower.
+                            .rejected => .checked_error,
+                            .target => |target| try self.resolutionForMethodTarget(target, structural_kind, dispatcher_ty, constraint_fn_var),
+                        };
                     }
                     // The dispatcher has an owner, checking passed, and no
                     // registry-visible view declares the method: the checker
@@ -16407,8 +17544,11 @@ const EvidencePass = struct {
                 // resolved; an unresolved one cannot carry it.
                 .checking_finalized => return .checked_error,
             };
-            if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
-                return try self.resolutionForMethodTarget(target, structural_kind, dispatcher_ty, constraint_fn_var);
+            if (self.lookupMethodTargetAcrossViews(owner, method)) |found| {
+                return switch (found) {
+                    .rejected => .checked_error,
+                    .target => |target| try self.resolutionForMethodTarget(target, structural_kind, dispatcher_ty, constraint_fn_var),
+                };
             }
         }
 
@@ -16507,7 +17647,7 @@ const EvidencePass = struct {
                     .empty_tag_union,
                     => return null,
                 },
-                .flex, .rigid, .err => return null,
+                .flex, .rigid, .field_presence, .err => return null,
             }
         }
     }
@@ -17232,8 +18372,11 @@ fn sealConstEvalTemplatesForRoots(
         if (!compileTimeRootHasConstBody(root.kind)) continue;
         const const_ref = switch (root.kind) {
             .constant => blk: {
-                const pattern = root.pattern orelse checkedArtifactInvariant("constant root has no top-level pattern", .{});
-                const top_level = top_level_values.lookupByPattern(pattern) orelse {
+                const def_idx = switch (root.source) {
+                    .def => |def| def,
+                    .expr, .statement, .required_binding, .hoisted => checkedArtifactInvariant("constant root source is not a top-level definition", .{}),
+                };
+                const top_level = top_level_values.lookupByDef(def_idx) orelse {
                     checkedArtifactInvariant("constant root has no top-level value entry", .{});
                 };
                 break :blk switch (top_level.value) {
@@ -17247,10 +18390,12 @@ fn sealConstEvalTemplatesForRoots(
                 };
                 break :blk hoisted.const_ref;
             },
+            .hoisted_validation,
             .callable_binding,
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .field_default,
             => checkedArtifactInvariant("non-constant root reached const eval template sealing", .{}),
         };
         const body = checked_const_bodies.bodyForRoot(root.id) orelse {
@@ -17907,7 +19052,7 @@ pub const NestedProcSiteTable = struct {
             switch (template.body) {
                 .checked_body => |body_id| try builder.scanCheckedBody(body_id, template),
                 .entry_wrapper => |wrapper_id| try builder.scanEntryWrapper(entry_wrappers.get(wrapper_id), template),
-                .intrinsic_wrapper => {},
+                .intrinsic_wrapper, .unimplemented => {},
             }
             template.nested_proc_sites = .{
                 .start = start,
@@ -18176,7 +19321,7 @@ pub const CheckedProcedureTemplateTable = struct {
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
-        global_value_defs: []const CIR.Def.Idx,
+        value_binding_defs: []const CIR.Def.Idx,
         names: *canonical.CanonicalNameStore,
         owner_artifact: canonical.ArtifactRef,
         checked_type_publication: *CheckedTypePublication,
@@ -18191,9 +19336,12 @@ pub const CheckedProcedureTemplateTable = struct {
 
         const module_name = try names.internModuleIdent(module.identStoreConst(), module.qualifiedModuleIdent());
 
-        for (global_value_defs) |def_idx| {
+        for (value_binding_defs) |def_idx| {
             const def = module.def(def_idx);
-            if (!topLevelExprIsAlreadyProcedure(def.expr.data)) continue;
+            if (def.expr.data == .e_derived_method) {
+                checkedArtifactInvariant("generated method marker reached procedure-template publication", .{});
+            }
+            if (!topLevelExprIsAlreadyProcedure(module, def_idx, def.expr.data)) continue;
 
             const export_name = if (def.patternName()) |name|
                 try names.internExportIdent(module.identStoreConst(), name)
@@ -18254,7 +19402,9 @@ pub const CheckedProcedureTemplateTable = struct {
             const body: CheckedProcedureBody = if (intrinsic) |intrinsic_id| blk: {
                 const wrapper_id = try intrinsic_wrappers.append(allocator, template_ref, checked_fn_root, intrinsic_id);
                 break :blk .{ .intrinsic_wrapper = wrapper_id };
-            } else blk: {
+            } else if (def.expr.data == .e_anno_only) .{ .unimplemented = .{
+                .region = module.regionAt(ModuleEnv.nodeIdxFrom(def.expr.idx)),
+            } } else blk: {
                 const root_expr = checked_bodies.exprIdForSource(def.expr.idx) orelse {
                     if (builtin.mode == .Debug) {
                         std.debug.panic("checked artifact invariant violated: checked procedure body root expression was not published", .{});
@@ -18364,7 +19514,7 @@ pub const CheckedProcedureTemplateTable = struct {
                 .nested_proc_sites = .{},
                 .target = switch (root.kind) {
                     .expect => .entry,
-                    .constant, .hoisted_constant, .callable_binding, .numeral_conversion, .quote_conversion => .comptime_only,
+                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .field_default => .comptime_only,
                 },
             });
         }
@@ -18879,14 +20029,17 @@ const NestedProcSiteBuilder = struct {
         statement_id: CheckedStatementId,
         owner: canonical.ProcedureTemplateRef,
     ) Allocator.Error!void {
-        for (self.method_registry.entries) |entry| switch (entry.target.kind) {
-            .local_proc => |local| {
-                if (local.context_anchor == statement_id) {
-                    try self.scanExpr(local.expr, owner, false);
-                }
-            },
-            .procedure, .structural => {},
-        };
+        for (self.method_registry.entries) |entry| {
+            const target = entry.target orelse continue;
+            switch (target.kind) {
+                .local_proc => |local| {
+                    if (local.context_anchor == statement_id) {
+                        try self.scanExpr(local.expr, owner, false);
+                    }
+                },
+                .procedure, .structural => {},
+            }
+        }
     }
 };
 
@@ -19057,11 +20210,16 @@ pub const HostedBindingTable = struct {
         pub const deserialize = Serde.deserialize;
     };
 
+    /// `own_key` and `own_procs` describe the platform module being published,
+    /// so an entry written without a module name binds the declaration this
+    /// module makes rather than one an import makes.
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
         names: *canonical.CanonicalNameStore,
         imports: []const PublishImportArtifact,
+        own_key: CheckedModuleArtifactKey,
+        own_procs: *const HostedProcTable,
     ) Allocator.Error!HostedBindingTable {
         if (module.moduleEnvConst().module_kind != .platform) return .{};
 
@@ -19088,17 +20246,25 @@ pub const HostedBindingTable = struct {
 
         for (module.moduleEnvConst().hosted_entries.items.items) |entry| {
             if (entry.target_status != .resolved) continue;
-            const import_idx = entry.target_import orelse continue;
             const target_def = entry.target_def orelse continue;
-            const resolved_module_idx = module.resolvedImportModule(import_idx) orelse continue;
-            const import_index = hosted_targets.get(.{
-                .module_idx = resolved_module_idx,
-                .def = target_def,
-            }) orelse continue;
-            const imported = imports[import_index];
+
+            const target_module_key = if (entry.target_import) |import_idx| blk: {
+                const resolved_module_idx = module.resolvedImportModule(import_idx) orelse continue;
+                const import_index = hosted_targets.get(.{
+                    .module_idx = resolved_module_idx,
+                    .def = target_def,
+                }) orelse continue;
+                break :blk imports[import_index].key;
+            } else blk: {
+                // No import means the entry named this module's own
+                // declaration, which is a hosted procedure only if the hosted
+                // transform rewrote it.
+                if (hostedProcForDef(own_procs, target_def) == null) continue;
+                break :blk own_key;
+            };
 
             try bindings.append(allocator, .{
-                .target_checked_module = imported.key,
+                .target_checked_module = target_module_key,
                 .target_def = target_def,
                 .external_symbol_name = try names.internExternalSymbolName(module.moduleEnvConst().getString(entry.symbol)),
             });
@@ -19808,7 +20974,11 @@ fn platformRequirementSolutionTableFromInputs(
     errdefer identity_solutions.deinit(allocator);
 
     for (inputs, root_evidence) |input, evidence| {
-        if (try solutionVarsReachErr(allocator, module, input)) continue;
+        switch (input.outcome) {
+            .checked_error => continue,
+            .success => {},
+            .pending => checkedArtifactInvariant("platform requirement solution was not finalized by checking", .{}),
+        }
 
         const top_level = top_level_values.lookupByDef(input.def) orelse {
             checkedArtifactInvariant("platform requirement solution references a def with no published top-level value", .{});
@@ -19863,28 +21033,6 @@ fn platformRequirementSolutionTableFromInputs(
         .solutions = try solutions.toOwnedSlice(allocator),
         .identity_solutions = try identity_solutions.toOwnedSlice(allocator),
     };
-}
-
-fn solutionVarsReachErr(
-    allocator: Allocator,
-    module: TypedCIR.Module,
-    input: requirement_solution.SolutionInput,
-) Allocator.Error!bool {
-    if (try canonical_type_keys.containsError(
-        allocator,
-        module.typeStoreConst(),
-        module.moduleEnvConst(),
-        input.solved_var,
-    )) return true;
-    for (input.identity_vars) |identity_var| {
-        if (try canonical_type_keys.containsError(
-            allocator,
-            module.typeStoreConst(),
-            module.moduleEnvConst(),
-            identity_var,
-        )) return true;
-    }
-    return false;
 }
 
 /// Public `PlatformRequiredBinding` declaration.
@@ -22469,6 +23617,9 @@ pub const CompileTimeRootKind = enum {
     constant,
     /// A selected top-level-equivalent expression inside a runtime body.
     hoisted_constant,
+    /// A compile-time-known refutable destructure whose successful unit result
+    /// has no runtime value to archive.
+    hoisted_validation,
     callable_binding,
     expect,
     /// A `from_numeral` conversion of a numeric literal whose target is a
@@ -22480,6 +23631,19 @@ pub const CompileTimeRootKind = enum {
     /// non-builtin nominal type; works exactly like `numeral_conversion` with
     /// `Err(BadQuotedBytes(..))` reported as the checking problem.
     quote_conversion,
+    /// A record field default (`a : U8 ?? expr`, design.md "Defaulted
+    /// Fields"): the declaring module evaluates the pure default once, and
+    /// construction sites—local and cross-module—restore the archived
+    /// constant instead of re-lowering the expression.
+    field_default,
+};
+
+/// A field-default root can also own the checked literal conversion for its
+/// body. In that case its wrapper returns the conversion's `Try` and
+/// finalization archives the `Ok` payload as the field default constant.
+pub const CompileTimeLiteralConversionKind = enum(u8) {
+    numeral,
+    quote,
 };
 
 /// Public `CompileTimeRootPayload` declaration.
@@ -22487,6 +23651,7 @@ pub const CompileTimeRootPayload = union(enum) {
     pending,
     const_node: ConstNodeId,
     fn_value: ConstFnId,
+    discarded,
     expect,
 };
 
@@ -22508,24 +23673,19 @@ pub const CompileTimeRoot = struct {
     pattern: ?CheckedPatternId,
     expr: CheckedExprId,
     checked_type: CheckedTypeId,
+    literal_conversion: ?CompileTimeLiteralConversionKind = null,
     request_eligibility: CompileTimeRootRequestEligibility,
     payload: CompileTimeRootPayload,
-};
 
-fn topLevelDefHasValueImplementation(
-    module: TypedCIR.Module,
-    names: *canonical.CanonicalNameStore,
-    global_value_defs: []const CIR.Def.Idx,
-    source_name: canonical.ExportNameId,
-) Allocator.Error!bool {
-    for (global_value_defs) |other_def_idx| {
-        const other_def = module.def(other_def_idx);
-        if (other_def.expr.data == .e_anno_only) continue;
-        const other_name = (try topLevelDefSourceName(module, names, other_def)) orelse continue;
-        if (other_name == source_name) return true;
+    pub fn literalConversionKind(self: CompileTimeRoot) ?CompileTimeLiteralConversionKind {
+        return switch (self.kind) {
+            .numeral_conversion => .numeral,
+            .quote_conversion => .quote,
+            .field_default => self.literal_conversion,
+            .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .expect => null,
+        };
     }
-    return false;
-}
+};
 
 /// Public `CompileTimeRootTable` declaration.
 ///
@@ -22549,10 +23709,10 @@ pub const CompileTimeRootTable = struct {
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
-        names: *canonical.CanonicalNameStore,
-        global_value_defs: []const CIR.Def.Idx,
+        names: *const canonical.CanonicalNameStore,
+        value_binding_defs: []const CIR.Def.Idx,
         selected_hoisted_roots: []const hoist_roots.SelectedHoistedRoot,
-        checked_types: *const CheckedTypePublication,
+        checked_types: *CheckedTypePublication,
         checked_body_builder: *CheckedBodyStoreBuilder,
         procedure_templates: *const CheckedProcedureTemplateTable,
     ) Allocator.Error!CompileTimeRootTable {
@@ -22563,20 +23723,45 @@ pub const CompileTimeRootTable = struct {
             roots.deinit(allocator);
         }
 
-        var seen_source_names = std.AutoHashMapUnmanaged(canonical.ExportNameId, void){};
-        defer seen_source_names.deinit(allocator);
+        var field_default_root_by_expr = std.AutoHashMapUnmanaged(CheckedExprId, usize){};
+        defer field_default_root_by_expr.deinit(allocator);
+
+        // Every archived field default is a compile-time constant root
+        // (design.md "Defaulted Fields"): the declaring module evaluates the
+        // pure default once, and construction sites—local and
+        // cross-module—restore the archived constant. Registered FIRST:
+        // defaults are closed literals with no dependencies (literals-only
+        // rule), and derived parsers restore them from within OTHER roots'
+        // compile-time evaluation, so every default must finalize before
+        // any ordinary root evaluates.
+        for (checked_bodies.default_exprs.items) |entry| {
+            try appendCompileTimeRoot(&roots, allocator, .{
+                .module_idx = module.moduleIndex(),
+                .kind = .field_default,
+                .source = .{ .expr = @enumFromInt(entry.expr_node) },
+                .pattern = null,
+                .expr = entry.checked_expr,
+                .checked_type = checked_bodies.expr(entry.checked_expr).ty,
+                .payload = .pending,
+            });
+            const inserted = try field_default_root_by_expr.getOrPut(allocator, entry.checked_expr);
+            if (inserted.found_existing) {
+                checkedArtifactInvariant("field default expression was registered as more than one root", .{});
+            }
+            inserted.value_ptr.* = roots.items.len - 1;
+        }
 
         const module_env = module.moduleEnvConst();
-        for (global_value_defs) |def_idx| {
+        for (value_binding_defs) |def_idx| {
             const def = module.def(def_idx);
+            if (def.expr.data == .e_derived_method) {
+                checkedArtifactInvariant("generated method marker reached compile-time-root publication", .{});
+            }
             if (topLevelDefSourceIdent(def) == null) continue;
             if (procedure_templates.lookupByDef(def_idx) != null) continue;
-
-            const source_name = try topLevelDefSourceName(module, names, def) orelse continue;
-            if (def.expr.data == .e_anno_only and try topLevelDefHasValueImplementation(module, names, global_value_defs, source_name)) continue;
-            const seen_source_name = try seen_source_names.getOrPut(allocator, source_name);
-            if (seen_source_name.found_existing) continue;
-            seen_source_name.value_ptr.* = {};
+            // An annotation-only declaration has no value to evaluate; its
+            // const template already records that the value is missing.
+            if (def.expr.data == .e_anno_only) continue;
 
             const source_ty = module.defType(def_idx);
             if (sourceTypeIsFunction(module, source_ty)) {
@@ -22607,12 +23792,22 @@ pub const CompileTimeRootTable = struct {
                 ModuleEnv.varFrom(pattern)
             else
                 module.exprType(selected.expr);
-            if (sourceTypeIsFunction(module, source_ty)) {
-                checkedArtifactInvariant("function-typed selected hoisted root reached data-constant publication", .{});
-            }
-            const checked_expr = try checkedExprIdForSelectedHoistedRoot(
+            const source_is_function = sourceTypeIsFunction(module, source_ty);
+            const kind: CompileTimeRootKind = switch (selected.value_kind) {
+                .data_constant => if (source_is_function)
+                    checkedArtifactInvariant("function-typed selected root was classified as a data constant", .{})
+                else
+                    .hoisted_constant,
+                .callable_binding => if (!source_is_function)
+                    checkedArtifactInvariant("non-function selected root was classified as a callable binding", .{})
+                else
+                    .callable_binding,
+                .discarded => .hoisted_validation,
+            };
+            const checked_root = try checkedBodyForSelectedHoistedRoot(
                 allocator,
                 module,
+                names,
                 checked_types,
                 checked_body_builder,
                 @intCast(selected_index),
@@ -22621,16 +23816,16 @@ pub const CompileTimeRootTable = struct {
             const hoisted_body = try hoist_roots.cloneBody(allocator, selected.body);
             try appendCompileTimeRoot(&roots, allocator, .{
                 .module_idx = module.moduleIndex(),
-                .kind = .hoisted_constant,
+                .kind = kind,
                 .source = .{ .hoisted = .{
                     .index = @intCast(selected_index),
                     .expr = selected.expr,
                 } },
                 .source_pattern = selected.pattern,
                 .hoisted_body = hoisted_body,
-                .pattern = if (selected.pattern) |pattern| checkedPatternIdForSource(checked_bodies, pattern) else null,
-                .expr = checked_expr,
-                .checked_type = try checkedTypeIdForVar(allocator, module, checked_types, source_ty),
+                .pattern = checked_root.pattern,
+                .expr = checked_root.expr,
+                .checked_type = checked_root.checked_type,
                 .payload = .pending,
             });
         }
@@ -22656,6 +23851,11 @@ pub const CompileTimeRootTable = struct {
             }
             const try_ty = fn_payload.function.ret;
             const expr_idx: CIR.Expr.Idx = @enumFromInt(numeral_plan.node_idx);
+            if (field_default_root_by_expr.get(checked_expr)) |root_index| {
+                roots.items[root_index].checked_type = try_ty;
+                roots.items[root_index].literal_conversion = .numeral;
+                continue;
+            }
             try appendCompileTimeRoot(&roots, allocator, .{
                 .module_idx = module.moduleIndex(),
                 .kind = .numeral_conversion,
@@ -22688,6 +23888,11 @@ pub const CompileTimeRootTable = struct {
             }
             const try_ty = fn_payload.function.ret;
             const expr_idx: CIR.Expr.Idx = @enumFromInt(quote_plan.node_idx);
+            if (field_default_root_by_expr.get(checked_expr)) |root_index| {
+                roots.items[root_index].checked_type = try_ty;
+                roots.items[root_index].literal_conversion = .quote;
+                continue;
+            }
             try appendCompileTimeRoot(&roots, allocator, .{
                 .module_idx = module.moduleIndex(),
                 .kind = .quote_conversion,
@@ -22720,14 +23925,29 @@ pub const CompileTimeRootTable = struct {
 
     pub fn lookupIdByPattern(self: *const CompileTimeRootTable, pattern: CheckedPatternId) ?ComptimeRootId {
         for (self.roots) |entry| {
+            if (entry.kind == .hoisted_validation) continue;
             if (entry.pattern != null and entry.pattern.? == pattern) return entry.id;
         }
         return null;
     }
 
-    pub fn lookupIdBySource(self: *const CompileTimeRootTable, source: RootSource) ?ComptimeRootId {
+    pub fn validationResolvedByPattern(self: *const CompileTimeRootTable, pattern: CheckedPatternId) bool {
         for (self.roots) |entry| {
-            if (rootSourceMatches(entry.source, source)) return entry.id;
+            if (entry.kind != .hoisted_validation or entry.pattern != pattern) continue;
+            const body = entry.hoisted_body orelse checkedArtifactInvariant("hoisted validation root had no selected body", .{});
+            if (body != .pattern_validation) checkedArtifactInvariant("hoisted validation root had a non-validation body", .{});
+            if (!body.pattern_validation.erase_runtime) return false;
+            return entry.payload == .discarded;
+        }
+        return false;
+    }
+
+    /// Look up the field-default root (design.md "Defaulted Fields") whose
+    /// body is the given checked expression.
+    pub fn lookupFieldDefaultRootByExpr(self: *const CompileTimeRootTable, expr: CheckedExprId) ?CompileTimeRoot {
+        for (self.roots) |entry| {
+            if (entry.expr != expr) continue;
+            if (entry.kind == .field_default) return entry;
         }
         return null;
     }
@@ -22737,7 +23957,7 @@ pub const CompileTimeRootTable = struct {
     pub fn lookupNumeralRootByExpr(self: *const CompileTimeRootTable, expr: CheckedExprId) ?CompileTimeRoot {
         for (self.roots) |entry| {
             if (entry.expr != expr) continue;
-            if (entry.kind == .numeral_conversion or entry.kind == .quote_conversion) {
+            if (entry.literalConversionKind() != null) {
                 return entry;
             }
         }
@@ -22864,15 +24084,9 @@ fn publishCompileTimeRootRequestEligibility(
 ) Allocator.Error!void {
     for (roots) |*root| {
         const concrete = try checkedTypeIsConcreteCompileTimeRoot(allocator, &checked_types.store, root.checked_type);
-        const eligible = concrete and switch (root.kind) {
-            .expect => !checked_bodies.exprContainsDiagnosticError(root.expr),
-            .constant,
-            .hoisted_constant,
-            .callable_binding,
-            .numeral_conversion,
-            .quote_conversion,
-            => true,
-        };
+        // The checker already owns this diagnostic; evaluating the root would
+        // only add a secondary compile-time crash for its replacement node.
+        const eligible = concrete and !checked_bodies.exprContainsDiagnosticError(root.expr);
         root.request_eligibility = if (eligible) .eligible else .ineligible;
     }
 }
@@ -22890,7 +24104,11 @@ fn verifyCompileTimeRootPayloadMatchesKind(kind: CompileTimeRootKind, payload: C
     const matches = switch (kind) {
         .constant, .hoisted_constant => switch (payload) {
             .const_node => true,
-            .pending, .fn_value, .expect => false,
+            .pending, .fn_value, .discarded, .expect => false,
+        },
+        .hoisted_validation => switch (payload) {
+            .discarded => true,
+            .pending, .const_node, .fn_value, .expect => false,
         },
         .callable_binding => switch (payload) {
             // A callable initializer that reaches an explicit checked error is
@@ -22898,25 +24116,41 @@ fn verifyCompileTimeRootPayloadMatchesKind(kind: CompileTimeRootKind, payload: C
             // node at the callable's expected type, so execution crashes at
             // the exact invalid binding while independent roots remain usable.
             .fn_value, .const_node => true,
-            .pending, .expect => false,
+            .pending, .discarded, .expect => false,
         },
         .expect => switch (payload) {
             .expect => true,
-            .pending, .const_node, .fn_value => false,
+            .pending, .const_node, .fn_value, .discarded => false,
         },
-        .numeral_conversion, .quote_conversion => switch (payload) {
+        .numeral_conversion, .quote_conversion, .field_default => switch (payload) {
             .const_node => true,
-            .pending, .fn_value, .expect => false,
+            .pending, .fn_value, .discarded, .expect => false,
         },
     };
     if (matches) return;
     checkedArtifactInvariant("compile-time root payload does not match root kind", .{});
 }
 
+fn verifyCompileTimeRootLiteralConversion(root: CompileTimeRoot) void {
+    switch (root.kind) {
+        .field_default => {},
+        .constant,
+        .hoisted_constant,
+        .hoisted_validation,
+        .callable_binding,
+        .expect,
+        .numeral_conversion,
+        .quote_conversion,
+        => std.debug.assert(root.literal_conversion == null),
+    }
+}
+
 fn compileTimeRootHasConstBody(kind: CompileTimeRootKind) bool {
     return switch (kind) {
         .constant, .hoisted_constant => true,
-        .callable_binding, .expect, .numeral_conversion, .quote_conversion => false,
+        // A field default's constant is restored by expression lookup at
+        // construction sites, never exported as a named data constant.
+        .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .field_default => false,
     };
 }
 
@@ -23321,6 +24555,35 @@ fn exhaustivenessReplacingRootForSource(
 ) ?CompileTimeRoot {
     for (compile_time_roots.roots) |root| {
         if (!compileTimeRootReplacesSourceOccurrence(root.kind)) continue;
+        if (root.hoisted_body) |body| switch (body) {
+            .pattern_extraction, .pattern_validation => {
+                const base_expr, const exact_pattern = switch (body) {
+                    .pattern_extraction => |extraction| .{ extraction.base_expr, extraction.scrutinee_pattern },
+                    .pattern_validation => |validation| .{ validation.base_expr, validation.scrutinee_pattern },
+                    .expr => unreachable,
+                };
+                if (source == .destructure_pattern and source.destructure_pattern == exact_pattern) return root;
+
+                // Pattern roots evaluate both their synthetic outer match and
+                // the original right-hand side. The exact-pattern check above
+                // owns the former; sites contained by the base expression
+                // belong to the latter.
+                const checked_base_expr = checkedExprIdForSource(checked_bodies, base_expr);
+                const base_contains = switch (source) {
+                    .match_expr => |source_expr| blk: {
+                        const checked_expr = checked_bodies.exprIdForSource(source_expr) orelse break :blk false;
+                        break :blk checkedExprContainsExpr(checked_bodies, checked_base_expr, checked_expr);
+                    },
+                    .destructure_pattern => |source_pattern| blk: {
+                        const checked_pattern = checked_bodies.patternIdForSource(source_pattern) orelse break :blk false;
+                        break :blk checkedExprContainsPattern(checked_bodies, checked_base_expr, checked_pattern);
+                    },
+                };
+                if (base_contains) return root;
+                continue;
+            },
+            .expr => {},
+        };
         const contains = switch (source) {
             .match_expr => |source_expr| blk: {
                 const checked_expr = checked_bodies.exprIdForSource(source_expr) orelse break :blk false;
@@ -23340,8 +24603,13 @@ fn compileTimeRootReplacesSourceOccurrence(kind: CompileTimeRootKind) bool {
     return switch (kind) {
         .constant,
         .hoisted_constant,
+        .hoisted_validation,
         .numeral_conversion,
         .quote_conversion,
+        // A default expression never occurs in a runtime body: any
+        // exhaustiveness site inside it belongs to its compile-time
+        // evaluation (design.md "Defaulted Fields").
+        .field_default,
         => true,
         .callable_binding,
         .expect,
@@ -23710,6 +24978,7 @@ fn syntheticExprCapacityForHoistedRoots(selected_hoisted_roots: []const hoist_ro
         count += switch (root.body) {
             .expr => 0,
             .pattern_extraction => 2,
+            .pattern_validation => 2,
         };
     }
     return count;
@@ -23724,25 +24993,108 @@ fn checkedExprIdForSource(checked_bodies: *const CheckedBodyStore, expr: CIR.Exp
     };
 }
 
-fn checkedExprIdForSelectedHoistedRoot(
+const SelectedHoistedCheckedBody = struct {
+    expr: CheckedExprId,
+    pattern: ?CheckedPatternId,
+    checked_type: CheckedTypeId,
+};
+
+fn checkedBodyForSelectedHoistedRoot(
     allocator: Allocator,
     module: TypedCIR.Module,
-    checked_types: *const CheckedTypePublication,
+    names: *const canonical.CanonicalNameStore,
+    checked_types: *CheckedTypePublication,
     checked_body_builder: *CheckedBodyStoreBuilder,
     selected_index: u32,
     selected: hoist_roots.SelectedHoistedRoot,
-) Allocator.Error!CheckedExprId {
+) Allocator.Error!SelectedHoistedCheckedBody {
     const checked_bodies = checked_body_builder.storePtr();
     return switch (selected.body) {
-        .expr => checkedExprIdForSource(checked_bodies, selected.expr),
-        .pattern_extraction => |extraction| try appendCheckedPatternExtractionRootExpr(
+        .expr => .{
+            .expr = checkedExprIdForSource(checked_bodies, selected.expr),
+            .pattern = if (selected.pattern) |pattern| checkedPatternIdForSource(checked_bodies, pattern) else null,
+            .checked_type = try checkedTypeIdForVar(allocator, module, checked_types, if (selected.pattern) |pattern| ModuleEnv.varFrom(pattern) else module.exprType(selected.expr)),
+        },
+        .pattern_extraction => |extraction| blk: {
+            const checked_type = try checkedTypeIdForVar(allocator, module, checked_types, ModuleEnv.varFrom(extraction.result_pattern));
+            break :blk .{
+                .expr = try appendCheckedPatternExtractionRootExpr(
+                    allocator,
+                    module,
+                    checked_body_builder,
+                    selected_index,
+                    extraction,
+                    checked_type,
+                ),
+                .pattern = checkedPatternIdForSource(checked_bodies, extraction.result_pattern),
+                .checked_type = checked_type,
+            };
+        },
+        .pattern_validation => |validation| try appendCheckedPatternValidationRootBody(
             allocator,
             module,
+            try checked_types.store.ensureEmptyRecordRoot(allocator, names),
             checked_body_builder,
             selected_index,
-            extraction,
-            try checkedTypeIdForVar(allocator, module, checked_types, ModuleEnv.varFrom(extraction.result_pattern)),
+            validation,
         ),
+    };
+}
+
+fn appendCheckedPatternValidationRootBody(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    checked_type: CheckedTypeId,
+    checked_body_builder: *CheckedBodyStoreBuilder,
+    selected_index: u32,
+    validation: hoist_roots.PatternValidation,
+) Allocator.Error!SelectedHoistedCheckedBody {
+    const checked_bodies = checked_body_builder.storePtr();
+    const scrutinee = checkedExprIdForSource(checked_bodies, validation.base_expr);
+    const checked_source_pattern = checkedPatternIdForSource(checked_bodies, validation.scrutinee_pattern);
+    const pattern_region = module.regionAt(ModuleEnv.nodeIdxFrom(validation.scrutinee_pattern));
+    const result = try checked_body_builder.appendSyntheticExpr(allocator, .{ .pattern_validation_result = .{
+        .selected_root_index = selected_index,
+    } }, checked_type, pattern_region, .empty_record);
+
+    try checked_bodies.match_branch_pattern_pool.ensureUnusedCapacity(allocator, 1);
+    const pattern_start: u32 = @intCast(checked_bodies.match_branch_pattern_pool.items.len);
+    checked_bodies.match_branch_pattern_pool.appendAssumeCapacity(.{
+        .pattern = checked_source_pattern,
+        .degenerate = false,
+        .bn_start = 0,
+        .bn_len = 0,
+    });
+    errdefer _ = checked_bodies.match_branch_pattern_pool.pop();
+
+    const branches = try allocator.alloc(CheckedMatchBranch, 1);
+    var branches_owned = true;
+    errdefer if (branches_owned) allocator.free(branches);
+    branches[0] = .{
+        .pt_start = pattern_start,
+        .pt_len = 1,
+        .value = result,
+        .guard = null,
+    };
+
+    var data: CheckedExprData = .{ .match_ = .{
+        .cond = scrutinee,
+        .branches = branches,
+        .is_try_suffix = false,
+        .skip_exhaustiveness = false,
+        .comptime_site_kind = .destructure,
+    } };
+    branches_owned = false;
+    defer deinitCheckedExprData(allocator, &data);
+
+    const wrapper = try checked_body_builder.appendSyntheticExpr(allocator, .{ .pattern_validation_wrapper = .{
+        .selected_root_index = selected_index,
+        .scrutinee_pattern = checked_source_pattern,
+    } }, checked_type, pattern_region, data);
+    return .{
+        .expr = wrapper,
+        .pattern = checked_source_pattern,
+        .checked_type = checked_type,
     };
 }
 
@@ -23890,7 +25242,7 @@ pub const TopLevelValueTable = struct {
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
-        global_value_defs: []const CIR.Def.Idx,
+        value_binding_defs: []const CIR.Def.Idx,
         names: *canonical.CanonicalNameStore,
         checked_bodies: *const CheckedBodyStore,
         templates: *const CheckedProcedureTemplateTable,
@@ -23910,17 +25262,13 @@ pub const TopLevelValueTable = struct {
         var by_def = std.ArrayList(TopLevelValueByDefEntry).empty;
         errdefer by_def.deinit(allocator);
 
-        var seen_source_names = std.AutoHashMapUnmanaged(canonical.ExportNameId, void){};
-        defer seen_source_names.deinit(allocator);
-
-        for (global_value_defs) |def_idx| {
+        for (value_binding_defs) |def_idx| {
             const def = module.def(def_idx);
+            if (def.expr.data == .e_derived_method) {
+                checkedArtifactInvariant("generated method marker reached top-level-value publication", .{});
+            }
             const checked_pattern = checkedPatternIdForSource(checked_bodies, def.pattern.idx);
             const source_name = try topLevelDefSourceName(module, names, def) orelse continue;
-            if (def.expr.data == .e_anno_only and try topLevelDefHasValueImplementation(module, names, global_value_defs, source_name)) continue;
-            const seen_source_name = try seen_source_names.getOrPut(allocator, source_name);
-            if (seen_source_name.found_existing) continue;
-            seen_source_name.value_ptr.* = {};
             const source_ty = module.defType(def_idx);
             const source_scheme = try canonical_type_keys.schemeFromVar(
                 allocator,
@@ -23971,7 +25319,14 @@ pub const TopLevelValueTable = struct {
                     callable_template,
                 );
                 break :blk .{ .procedure_binding = binding };
-            } else .{ .const_ref = try const_templates.reserveTopLevel(
+            } else if (def.expr.data == .e_anno_only) .{ .const_ref = try const_templates.reserveUnimplementedTopLevel(
+                allocator,
+                artifact_key,
+                module.moduleIndex(),
+                checked_pattern,
+                source_scheme,
+                .{ .region = module.regionAt(ModuleEnv.nodeIdxFrom(def.expr.idx)) },
+            ) } else .{ .const_ref = try const_templates.reserveTopLevel(
                 allocator,
                 artifact_key,
                 module.moduleIndex(),
@@ -24098,6 +25453,7 @@ pub const HoistedConstTable = struct {
         allocator: Allocator,
         module: TypedCIR.Module,
         artifact_key: CheckedModuleArtifactKey,
+        checked_types: *CheckedTypeStore,
         roots: *const CompileTimeRootTable,
         const_templates: *ConstTemplateTable,
     ) Allocator.Error!HoistedConstTable {
@@ -24128,7 +25484,15 @@ pub const HoistedConstTable = struct {
                 ModuleEnv.varFrom(pattern)
             else
                 ModuleEnv.varFrom(source_expr);
-            const source_scheme = try canonical_type_keys.schemeFromVar(
+            const source_scheme = if (root.hoisted_body) |body| switch (body) {
+                .pattern_validation => try checked_types.ensureSchemeForRoot(allocator, root.checked_type),
+                .expr, .pattern_extraction => try canonical_type_keys.schemeFromVar(
+                    allocator,
+                    module.typeStoreConst(),
+                    module.moduleEnvConst(),
+                    source_var,
+                ),
+            } else try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
                 module.moduleEnvConst(),
@@ -25435,7 +26799,10 @@ const PublicApiClosureDependencyCollector = struct {
                 try self.appendResolvedValueRefs(eval.resolved_value_refs);
                 try self.appendProcedureTemplateRef(eval.entry_template);
             },
-            .stored_const => {},
+            // A stored constant carries its value directly, and an
+            // unimplemented declaration has no value at all; neither pulls in
+            // further dependencies.
+            .stored_const, .unimplemented => {},
             .reserved => checkedArtifactInvariant("public API closure dependency reached unsealed const template", .{}),
         }
     }
@@ -25674,11 +27041,17 @@ const LoweringVisibilityBuilder = struct {
                 try self.appendTypeRoots(artifact, nominal.padding_field_types);
             },
             .record => |record| {
-                for (record.fields) |field| try self.appendTypeRoot(artifact, field.ty);
+                for (record.fields) |field| {
+                    if (field.kind.undeterminedVariable()) |variable| try self.appendTypeRoot(artifact, variable);
+                    try self.appendTypeRoot(artifact, field.ty);
+                }
                 try self.appendTypeRoot(artifact, record.ext);
             },
             .record_unbound => |fields| {
-                for (fields) |field| try self.appendTypeRoot(artifact, field.ty);
+                for (fields) |field| {
+                    if (field.kind.undeterminedVariable()) |variable| try self.appendTypeRoot(artifact, variable);
+                    try self.appendTypeRoot(artifact, field.ty);
+                }
             },
             .tuple => |items| try self.appendTypeRoots(artifact, items),
             .function => |function| {
@@ -26148,6 +27521,7 @@ const ImportedTemplateClosureBuilder = struct {
             .checked_body => |body| try self.appendCheckedBody(body),
             .intrinsic_wrapper,
             .entry_wrapper,
+            .unimplemented,
             => {},
         }
         try self.appendCheckedTypeRoot(template.checked_fn_root);
@@ -26426,7 +27800,7 @@ const ImportedTemplateClosureBuilder = struct {
                 const entry_template = self.checked_templates.get(eval.entry_template.template);
                 try self.appendTemplate(eval.entry_template, entry_template);
             },
-            .stored_const => {},
+            .stored_const, .unimplemented => {},
             .reserved => checkedArtifactInvariant("imported template closure reached unsealed const template", .{}),
         }
     }
@@ -26958,6 +28332,9 @@ pub const ConstTemplateState = union(enum) {
     reserved,
     eval_template: ConstEvalTemplate,
     stored_const: StoredConstTemplate,
+    /// This constant was declared with a type annotation and never given a
+    /// value. It lowers to a crash wherever the constant is used.
+    unimplemented: UnimplementedDeclaration,
 };
 
 /// Public `ConstTemplate` declaration.
@@ -26987,6 +28364,38 @@ pub const ConstTemplateTable = struct {
         pattern: CheckedPatternId,
         source_scheme: canonical.CanonicalTypeSchemeKey,
     ) Allocator.Error!ConstRef {
+        return self.appendTopLevel(allocator, artifact_key, module_idx, pattern, source_scheme, .reserved);
+    }
+
+    /// Record a top-level constant whose declaration never received a value.
+    pub fn reserveUnimplementedTopLevel(
+        self: *ConstTemplateTable,
+        allocator: Allocator,
+        artifact_key: CheckedModuleArtifactKey,
+        module_idx: u32,
+        pattern: CheckedPatternId,
+        source_scheme: canonical.CanonicalTypeSchemeKey,
+        declaration: UnimplementedDeclaration,
+    ) Allocator.Error!ConstRef {
+        return self.appendTopLevel(
+            allocator,
+            artifact_key,
+            module_idx,
+            pattern,
+            source_scheme,
+            .{ .unimplemented = declaration },
+        );
+    }
+
+    fn appendTopLevel(
+        self: *ConstTemplateTable,
+        allocator: Allocator,
+        artifact_key: CheckedModuleArtifactKey,
+        module_idx: u32,
+        pattern: CheckedPatternId,
+        source_scheme: canonical.CanonicalTypeSchemeKey,
+        state: ConstTemplateState,
+    ) Allocator.Error!ConstRef {
         const id: ConstTemplateId = @enumFromInt(@as(u32, @intCast(self.templates.items.len)));
         const owner: ConstOwner = .{ .top_level_binding = .{
             .module_idx = module_idx,
@@ -26996,7 +28405,7 @@ pub const ConstTemplateTable = struct {
             .id = id,
             .owner = owner,
             .source_scheme = source_scheme,
-            .state = .reserved,
+            .state = state,
         });
         return .{
             .artifact = artifact_key,
@@ -27045,6 +28454,7 @@ pub const ConstTemplateTable = struct {
         switch (record.state) {
             .reserved => record.state = .{ .eval_template = template },
             .eval_template, .stored_const => checkedArtifactInvariant("constant template was filled twice", .{}),
+            .unimplemented => checkedArtifactInvariant("constant template without a declared value was given an eval body", .{}),
         }
     }
 
@@ -27057,6 +28467,7 @@ pub const ConstTemplateTable = struct {
         switch (record.state) {
             .reserved, .eval_template => record.state = .{ .stored_const = template },
             .stored_const => checkedArtifactInvariant("constant template was filled twice", .{}),
+            .unimplemented => checkedArtifactInvariant("constant template without a declared value was given a stored value", .{}),
         }
     }
 
@@ -27080,7 +28491,9 @@ pub const ConstTemplateTable = struct {
         for (self.templates.items, 0..) |template, i| {
             std.debug.assert(@intFromEnum(template.id) == i);
             switch (template.state) {
-                .eval_template, .stored_const => {},
+                // A declaration with no implementation is sealed on
+                // publication; there is never a value to fill in later.
+                .eval_template, .stored_const, .unimplemented => {},
                 .reserved => std.debug.panic(
                     "checked artifact invariant violated: constant template {d} was not sealed before publication",
                     .{i},
@@ -27350,6 +28763,9 @@ pub const DispatchEvidenceFailure = struct {
         dispatch_expr_plan_out_of_bounds,
         iterator_for_missing_plan,
         iterator_for_plan_out_of_bounds,
+        iterator_plan_structural_resolution,
+        iterator_plan_callable_type_out_of_bounds,
+        iterator_plan_callable_not_function,
         plan_unfinalized_direct,
         plan_evidence_node_out_of_bounds,
         evidence_node_nested_refs_out_of_bounds,
@@ -27627,8 +29043,9 @@ pub const CheckedModuleArtifact = struct {
             // interner base pointers (`canonical_names` = 22 via its 7 interners +
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
-            // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 209);
+            // independent of stored data size. The optional-field body tables
+            // add three pointers beyond the current-main count.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 212);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -27778,7 +29195,45 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 57;
+    // Version 57 (over upstream 56) publishes the optional/defaulted record
+    // field machinery: checked record-field access paths as ordered segment
+    // ranges with explicit successful-prefix types, source regions, access
+    // modes (`CheckedFieldAccessSegment.mode`—`.?` segments reach checked
+    // bodies), and per-segment backing access; the field-kind axis on
+    // checked record fields (`CheckedRecordField.kind`:
+    // required/optional/defaulted plus the defaulted identity, design.md
+    // "Field Kinds (All-Dynamic Optional Fields)"); the body store's
+    // default-expression table (`default_exprs`); and `checked_ids.OptionalId`
+    // encodings for inline optional ids. Version 58: const-store record type
+    // evidence carries the `??` default identity
+    // (`ConstStore.TypeField.default`), mirroring the Monotype
+    // `Type.FieldDefault` axis (design.md "Defaulted Fields").
+    // Version 59 combines the optional/defaulted field layouts above with
+    // upstream's version-57 artifact change.
+    // Version 60 preserves generalized field-kind variable identities and
+    // optional source-value types in stored const evidence.
+    // Version 61 gives every compile-time request its exact checked-root ID.
+    // Version 62 publishes exact record-construction omission defaults.
+    // Version 63 lets a field-default root own its literal conversion instead
+    // of publishing a second root for the same checked expression.
+    // Version 64 publishes iterator producer identities for `List.iter_rev`,
+    // the numeric `to`/`until` ranges, and the F32/F64 range helpers.
+    // Version 65 publishes unit-valued destructure-validation hoisted roots.
+    // Version 66 gives validation-only roots a discarded payload state so no
+    // unit constant is archived for them.
+    // Version 67 records a method whose declaration was rejected under its own
+    // registry key with no target.
+    // Version 68 publishes declarations that carry a type annotation and no
+    // implementation as their own artifact state
+    // (`CheckedProcedureBody.unimplemented` and
+    // `ConstTemplateState.unimplemented`) instead of pointing at a body the
+    // declaration never had.
+    // Version 69 records in the checking-context identity how a module's
+    // compile-time roots were established, so an app root checked without its
+    // entrypoint contract cannot share a cache entry with one checked under it.
+    // Version 70 retains canonical callable type keys in stored function
+    // evidence so specialization identity does not depend on fresh checked ids.
+    const serialized_layout_version: u32 = 70;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -27940,7 +29395,7 @@ pub const CheckedModuleArtifact = struct {
         for (self.checked_bodies.stored_exprs.items, 0..) |expr, i| {
             std.debug.assert(@intFromEnum(expr.id) == i);
             std.debug.assert(@intFromEnum(expr.ty) < self.checked_types.roots.items.len);
-            verifyCheckedExprDataComplete(expr.data);
+            verifyCheckedExprDataComplete(expr.data, &self.checked_bodies, self.checked_types.roots.items.len);
         }
 
         for (self.checked_const_bodies.bodies, 0..) |body, i| {
@@ -27975,12 +29430,14 @@ pub const CheckedModuleArtifact = struct {
             std.debug.assert(@intFromEnum(root.id) == i);
             std.debug.assert(root.module_idx == self.module_identity.module_idx);
             std.debug.assert(@intFromEnum(root.expr) < self.checked_bodies.exprCount());
+            verifyCompileTimeRootLiteralConversion(root);
             if (root.pattern) |pattern| std.debug.assert(@intFromEnum(pattern) < self.checked_bodies.patternCount());
             switch (root.kind) {
-                .constant, .hoisted_constant, .callable_binding, .numeral_conversion, .quote_conversion => switch (root.payload) {
+                .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .field_default => switch (root.payload) {
                     .pending => {},
                     .const_node,
                     .fn_value,
+                    .discarded,
                     .expect,
                     => verifyCompileTimeRootPayloadMatchesKind(root.kind, root.payload),
                 },
@@ -27989,6 +29446,7 @@ pub const CheckedModuleArtifact = struct {
                     .pending,
                     .const_node,
                     .fn_value,
+                    .discarded,
                     => std.debug.panic("checked artifact invariant violated: expect root has non-expect payload before compile-time lowering", .{}),
                 },
             }
@@ -28292,7 +29750,29 @@ pub const CheckedModuleArtifact = struct {
                             .method = call.method,
                         };
                     },
-                    .evidence_dependent, .structural, .checked_error, .@"unreachable" => {},
+                    .structural => return .{
+                        .kind = .iterator_plan_structural_resolution,
+                        .index = @intCast(i),
+                        .method = call.method,
+                    },
+                    .checked_error, .@"unreachable" => continue,
+                    .evidence_dependent => {},
+                }
+
+                if (@intFromEnum(call.callable_ty) >= self.checked_types.payloads.items.len) {
+                    return .{
+                        .kind = .iterator_plan_callable_type_out_of_bounds,
+                        .index = @intCast(i),
+                        .method = call.method,
+                    };
+                }
+                const callable = self.checked_types.payload(call.callable_ty);
+                if (callable != .function) {
+                    return .{
+                        .kind = .iterator_plan_callable_not_function,
+                        .index = @intCast(i),
+                        .method = call.method,
+                    };
                 }
             }
         }
@@ -28565,7 +30045,8 @@ pub const CheckedModuleArtifact = struct {
     /// category without repeating the classification work.
     fn verifyMethodIntrinsicRuntimeTargets(self: *const CheckedModuleArtifact) void {
         for (self.method_registry.entries, 0..) |entry, entry_index| {
-            const procedure = switch (entry.target.kind) {
+            const entry_target = entry.target orelse continue;
+            const procedure = switch (entry_target.kind) {
                 .procedure => |procedure| procedure,
                 .local_proc, .structural => continue,
             };
@@ -28601,7 +30082,7 @@ pub const CheckedModuleArtifact = struct {
                     }
                     break :blk wrapper.intrinsic;
                 },
-                .checked_body, .entry_wrapper => null,
+                .checked_body, .entry_wrapper, .unimplemented => null,
             };
 
             switch (procedure.runtime_target) {
@@ -28702,11 +30183,12 @@ pub const CheckedModuleArtifact = struct {
             std.debug.assert(@intFromEnum(root.id) == i);
             std.debug.assert(root.module_idx == self.module_identity.module_idx);
             std.debug.assert(@intFromEnum(root.expr) < self.checked_bodies.exprCount());
+            verifyCompileTimeRootLiteralConversion(root);
             if (root.pattern) |pattern| std.debug.assert(@intFromEnum(pattern) < self.checked_bodies.patternCount());
             if (root.kind == .expect) {
                 switch (root.payload) {
                     .expect => {},
-                    .pending, .const_node, .fn_value => std.debug.panic("checked artifact invariant violated: expect root has non-expect payload", .{}),
+                    .pending, .const_node, .fn_value, .discarded => std.debug.panic("checked artifact invariant violated: expect root has non-expect payload", .{}),
                 }
                 continue;
             }
@@ -28717,7 +30199,7 @@ pub const CheckedModuleArtifact = struct {
                         std.debug.panic("checked artifact invariant violated: requested compile-time root has pending payload", .{});
                     }
                 },
-                .const_node, .fn_value, .expect => {
+                .const_node, .fn_value, .discarded, .expect => {
                     if (!has_request) {
                         std.debug.panic("checked artifact invariant violated: non-requested compile-time root has concrete payload", .{});
                     }
@@ -28757,7 +30239,7 @@ pub const CheckedModuleArtifact = struct {
         for (self.checked_bodies.stored_exprs.items, 0..) |expr, i| {
             std.debug.assert(@intFromEnum(expr.id) == i);
             std.debug.assert(@intFromEnum(expr.ty) < self.checked_types.roots.items.len);
-            verifyCheckedExprDataComplete(expr.data);
+            verifyCheckedExprDataComplete(expr.data, &self.checked_bodies, self.checked_types.roots.items.len);
         }
 
         for (self.checked_bodies.stored_patterns.items, 0..) |pattern, i| {
@@ -28820,6 +30302,8 @@ pub const CheckedModuleArtifact = struct {
                     std.debug.assert(wrapper.template.proc_base == template.proc_base);
                     std.debug.assert(std.meta.eql(wrapper.template.artifact.bytes, self.key.bytes));
                 },
+                // An unimplemented declaration publishes no body to verify.
+                .unimplemented => {},
             }
 
             const nested_end = template.nested_proc_sites.start + template.nested_proc_sites.len;
@@ -28920,6 +30404,9 @@ pub const CheckedModuleArtifact = struct {
                     "checked artifact invariant violated: exported const template was not sealed",
                     .{},
                 ),
+                // An unimplemented declaration publishes no body or stored
+                // value, so there is nothing further to verify.
+                .unimplemented => {},
             }
             for (closure.const_templates) |const_ref| {
                 if (closureArtifactRefIsLocal(self, const_ref.artifact)) {
@@ -29118,7 +30605,7 @@ pub const CheckedModuleArtifact = struct {
                     std.debug.assert(@intFromEnum(stored.node) < self.const_store.values.items.len);
                     std.debug.assert(@intFromEnum(stored.root_type) < self.const_store.type_store.types.items.len);
                 },
-                .eval_template, .reserved => {},
+                .eval_template, .reserved, .unimplemented => {},
             }
         }
         self.const_templates.verifySealed();
@@ -29591,6 +31078,16 @@ pub const CheckedTypeProjector = struct {
             out[i] = .{
                 .name = try self.remapViewRecordField(source_names, field.name),
                 .ty = try self.projectCheckedTypeViewRootInner(source, source_names, field.ty, active),
+                // Default identities remap across name stores; an
+                // undetermined kind's checked variable is projected through
+                // the same active map as the field payload.
+                .kind = if (field.kind.defaultIdentity()) |default|
+                    .defaultedFromParts(try self.remapViewModuleIdentity(source_names, default.origin() orelse
+                        checkedArtifactInvariant("checked defaulted field kind carried no default identity", .{})), default.expr_node)
+                else if (field.kind.undeterminedVariable()) |variable|
+                    .undetermined(try self.projectCheckedTypeViewRootInner(source, source_names, variable, active))
+                else
+                    field.kind,
             };
         }
         return out;
@@ -29970,6 +31467,16 @@ pub const CheckedTypeProjector = struct {
             out[i] = .{
                 .name = try self.remapRecordField(imported, field.name),
                 .ty = try self.projectImportedCheckedType(imported, field.ty),
+                // Default identities remap across name stores; an
+                // undetermined kind's checked variable is projected with the
+                // field payload.
+                .kind = if (field.kind.defaultIdentity()) |default|
+                    .defaultedFromParts(try self.remapModuleIdentity(imported, default.origin() orelse
+                        checkedArtifactInvariant("checked defaulted field kind carried no default identity", .{})), default.expr_node)
+                else if (field.kind.undeterminedVariable()) |variable|
+                    .undetermined(try self.projectImportedCheckedType(imported, variable))
+                else
+                    field.kind,
             };
         }
         return out;
@@ -30304,6 +31811,16 @@ const CheckedTypeStoreImportProjector = struct {
             out[i] = .{
                 .name = try self.remapRecordField(field.name),
                 .ty = try self.project(field.ty),
+                // Default identities remap across name stores; an
+                // undetermined kind's checked variable is projected with the
+                // field payload.
+                .kind = if (field.kind.defaultIdentity()) |default|
+                    .defaultedFromParts(try self.remapModuleIdentity(default.origin() orelse
+                        checkedArtifactInvariant("checked defaulted field kind carried no default identity", .{})), default.expr_node)
+                else if (field.kind.undeterminedVariable()) |variable|
+                    .undetermined(try self.project(variable))
+                else
+                    field.kind,
             };
         }
         return out;
@@ -30548,6 +32065,10 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
         const node_idx: CIR.Node.Idx = @enumFromInt(raw_node_idx);
         const tag = store.nodes.get(node_idx).tag;
         switch (tag) {
+            .field_access_segment => {
+                const segment = store.getFieldAccessSegment(@enumFromInt(raw_node_idx));
+                try visitor.recordField(segment.name);
+            },
             .record_field => {
                 const field = store.getRecordField(@enumFromInt(raw_node_idx));
                 try visitor.recordField(field.name);
@@ -30584,7 +32105,7 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
                         try visitor.tag(tag_expr.closure_name);
                     },
                     .e_closure => |closure| try visitor.tag(closure.tag_name),
-                    .e_field_access => |field_access| try visitor.recordField(field_access.field_name),
+                    .e_field_access => {}, // no action needed, segments are added above directly
                     .e_method_call => |method_call| try visitor.method(method_call.method_name),
                     .e_dispatch_call => |dispatch_call| try visitor.method(dispatch_call.method_name),
                     .e_method_eq => try visitor.method(module_env.idents.is_eq),
@@ -30690,7 +32211,7 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
                     => {},
                 }
             },
-            .ty_record_field => {
+            .ty_record_field, .ty_record_field_defaulted => {
                 const field = store.getAnnoRecordField(@enumFromInt(raw_node_idx));
                 try visitor.recordField(field.name);
             },
@@ -30834,6 +32355,7 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
             .diag_erroneous_value_expr,
             .diag_qualified_ident_does_not_exist,
             .diag_invalid_top_level_statement,
+            .diag_invalid_associated_statement,
             .diag_expr_not_canonicalized,
             .diag_invalid_string_interpolation,
             .diag_unreachable_string_pattern_capture,
@@ -30850,6 +32372,8 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
             .diag_where_alias_constraint_not_on_receiver,
             .diag_open_ext_not_allowed_in_type_decl,
             .diag_unnamed_field_not_allowed_in_structural_record,
+            .diag_optional_field_cannot_have_default,
+            .diag_record_default_not_literal,
             .diag_type_module_missing_matching_type,
             .diag_type_module_has_alias_not_nominal,
             .diag_default_app_missing_main,
@@ -30881,6 +32405,7 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
             .diag_type_from_missing_module,
             .diag_module_not_imported,
             .diag_nested_type_not_found,
+            .diag_internal_builtin_type,
             .diag_nested_value_not_found,
             .diag_record_builder_map2_not_found,
             .diag_too_many_exports,
@@ -30908,9 +32433,45 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
             .diag_mutually_recursive_type_aliases,
             .diag_deprecated_number_suffix,
             .diag_range_op_chained,
+            .diag_unnamed_field_cannot_have_default,
             => {},
         }
     }
+}
+
+test "mixed field-access segment labels are lowering-visible" {
+    const allocator = std.testing.allocator;
+    var module_env = try ModuleEnv.init(allocator, "");
+    defer module_env.deinit();
+    try module_env.initCIRFields("Test");
+
+    const required_name = try module_env.insertIdent(Ident.for_text("required_field"));
+    const optional_name = try module_env.insertIdent(Ident.for_text("optional_field"));
+    const receiver = try module_env.addExpr(.{ .e_empty_record = .{} }, base.Region.zero());
+
+    const path = try module_env.startFieldAccessPath(2);
+    _ = module_env.appendFieldAccessPathSegmentAssumeCapacity(path, .{
+        .name = optional_name,
+        .mode = .optional,
+    }, base.Region.zero());
+    _ = module_env.appendFieldAccessPathSegmentAssumeCapacity(path, .{
+        .name = required_name,
+        .mode = .required,
+    }, base.Region.zero());
+    const segments = module_env.finishFieldAccessPath(path);
+    _ = try module_env.addExpr(.{ .e_field_access = .{
+        .receiver = receiver,
+        .segments = segments,
+    } }, base.Region.zero());
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    try internLoweringVisibleNames(&module_env, &names);
+
+    const idents = module_env.getIdentStoreConst();
+    try std.testing.expect(names.lookupRecordFieldIdent(idents, required_name) != null);
+    try std.testing.expect(names.lookupRecordFieldIdent(idents, optional_name) != null);
+    verifyLoweringVisibleNamesInterned(&module_env, &names);
 }
 
 /// Public `loweringView` function.
@@ -30941,6 +32502,7 @@ pub const CheckedModuleKeyInputs = struct {
     platform_requirement_context: ?PlatformRequirementContextKey = null,
     platform_app_relation: ?PlatformAppRelationKey = null,
     explicit_roots: []const ExplicitRootRequestInput = &.{},
+    validation: can.Can.Validation = .checking,
 };
 
 /// Compute the checked module cache identity for a checked typed module and the
@@ -30976,6 +32538,7 @@ pub fn checkedModuleKeyFromTypedModule(
         inputs.platform_requirement_context,
         inputs.platform_app_relation,
         inputs.explicit_roots,
+        inputs.validation,
     );
     defer checking_context_identity.deinit(allocator);
 
@@ -31019,6 +32582,8 @@ pub fn publishFromTypedModule(
     _ = try canonical_names.internModuleIdentity(&module_identity.stable_hash);
 
     try internLoweringVisibleNames(module_env, &canonical_names);
+    _ = try canonical_names.internTagLabel("#Missing");
+    _ = try canonical_names.internTagLabel("#Present");
 
     var platform_required_declarations = try PlatformRequiredDeclarationTable.fromModule(allocator, module, &canonical_names);
     errdefer platform_required_declarations.deinit(allocator);
@@ -31030,6 +32595,7 @@ pub fn publishFromTypedModule(
         inputs.platform_requirement_context,
         if (inputs.platform_app_relation) |relation| relation.key else null,
         inputs.explicit_roots,
+        inputs.validation,
     );
     errdefer checking_context_identity.deinit(allocator);
 
@@ -31056,7 +32622,7 @@ pub fn publishFromTypedModule(
     var source_nodes = try CheckedSourceNodes.init(allocator, module);
     defer source_nodes.deinit(allocator);
 
-    var checked_type_publication = try CheckedTypeStore.fromModule(allocator, module, &canonical_names, artifact_key, inputs.imports, inputs.available_artifacts, &source_nodes);
+    var checked_type_publication = try CheckedTypeStore.fromModule(allocator, module, &canonical_names, artifact_key, inputs.imports, inputs.available_artifacts, &source_nodes, inputs.hoisted_roots);
     defer checked_type_publication.deinitIndex(allocator);
     errdefer checked_type_publication.store.deinit(allocator);
     const checked_types = &checked_type_publication.store;
@@ -31066,7 +32632,7 @@ pub fn publishFromTypedModule(
     try checked_body_builder.reserveSyntheticExprs(allocator, syntheticExprCapacityForHoistedRoots(inputs.hoisted_roots));
     const checked_bodies = checked_body_builder.storePtr();
 
-    const global_value_defs = module_env.store.sliceDefs(module_env.global_value_defs);
+    const value_binding_defs = module_env.store.sliceDefs(module_env.value_binding_defs);
 
     var relation_type_substitutions = try PlatformRelationTypeSubstitutions.fromRelation(
         allocator,
@@ -31098,7 +32664,7 @@ pub fn publishFromTypedModule(
     var checked_procedure_templates = try CheckedProcedureTemplateTable.fromModule(
         allocator,
         module,
-        global_value_defs,
+        value_binding_defs,
         &canonical_names,
         owner_artifact,
         &checked_type_publication,
@@ -31145,7 +32711,7 @@ pub fn publishFromTypedModule(
     );
     errdefer hosted_procs.deinit(allocator);
 
-    var hosted_bindings = try HostedBindingTable.fromModule(allocator, module, &canonical_names, inputs.imports);
+    var hosted_bindings = try HostedBindingTable.fromModule(allocator, module, &canonical_names, inputs.imports, artifact_key, &hosted_procs);
     errdefer hosted_bindings.deinit(allocator);
 
     var platform_required_bindings = try PlatformRequiredBindingTable.fromRelation(
@@ -31163,7 +32729,7 @@ pub fn publishFromTypedModule(
         allocator,
         module,
         &canonical_names,
-        global_value_defs,
+        value_binding_defs,
         inputs.hoisted_roots,
         &checked_type_publication,
         &checked_body_builder,
@@ -31201,7 +32767,7 @@ pub fn publishFromTypedModule(
     var top_level_values = try TopLevelValueTable.fromModule(
         allocator,
         module,
-        global_value_defs,
+        value_binding_defs,
         &canonical_names,
         checked_bodies,
         &checked_procedure_templates,
@@ -31217,10 +32783,21 @@ pub fn publishFromTypedModule(
         allocator,
         module,
         artifact_key,
+        checked_types,
         &compile_time_roots,
         &const_templates,
     );
     errdefer hoisted_constants.deinit(allocator);
+
+    var selected_hoisted_callables = try SelectedHoistedCallableTable.fromRoots(
+        allocator,
+        module,
+        checked_bodies,
+        &compile_time_roots,
+        &callable_eval_templates,
+        &top_level_procedure_bindings,
+    );
+    defer selected_hoisted_callables.deinit(allocator);
 
     var resolved_value_refs = try ResolvedValueRefTable.fromModule(
         allocator,
@@ -31234,6 +32811,7 @@ pub fn publishFromTypedModule(
         &platform_required_declarations,
         &platform_required_bindings,
         &top_level_values,
+        &selected_hoisted_callables,
         &hoisted_constants,
         &checked_type_publication,
         checked_bodies,
@@ -31350,6 +32928,7 @@ pub fn publishFromTypedModule(
         &top_level_procedure_bindings,
         &callable_eval_templates,
         &hoisted_constants,
+        &const_templates,
         template_root_evidence,
         inputs.explicit_roots,
     );
@@ -31649,7 +33228,7 @@ fn expectProvidedExportKind(
     );
     var builtin_source_nodes = try CheckedSourceNodes.init(allocator, builtin_module);
     defer builtin_source_nodes.deinit(allocator);
-    var builtin_checked_type_publication = try CheckedTypeStore.fromModule(allocator, builtin_module, &builtin_names, builtin_key, &.{}, &.{}, &builtin_source_nodes);
+    var builtin_checked_type_publication = try CheckedTypeStore.fromModule(allocator, builtin_module, &builtin_names, builtin_key, &.{}, &.{}, &builtin_source_nodes, &.{});
     defer builtin_checked_type_publication.deinit(allocator);
     const empty_checked_bodies = CheckedBodyStore{};
     const empty_checked_const_bodies = CheckedConstBodyTable{};
@@ -31692,7 +33271,7 @@ fn expectProvidedExportKind(
     var builtin_templates = try CheckedProcedureTemplateTable.fromModule(
         allocator,
         builtin_module,
-        builtin_env.store.sliceDefs(builtin_env.global_value_defs),
+        builtin_env.store.sliceDefs(builtin_env.value_binding_defs),
         &builtin_names,
         artifactRef(builtin_key),
         &builtin_checked_type_publication,
@@ -31756,6 +33335,8 @@ fn expectProvidedExportKind(
     var canonical_names = canonical.CanonicalNameStore.init(allocator);
     defer canonical_names.deinit();
     try internLoweringVisibleNames(module_env, &canonical_names);
+    _ = try canonical_names.internTagLabel("#Missing");
+    _ = try canonical_names.internTagLabel("#Present");
 
     const module_name = try canonical_names.internModuleName(module_env.module_name);
     const display_module_name = try canonical_names.internModuleIdent(module.identStoreConst(), module_env.display_module_name_idx);
@@ -31778,7 +33359,7 @@ fn expectProvidedExportKind(
     var source_nodes = try CheckedSourceNodes.init(allocator, module);
     defer source_nodes.deinit(allocator);
 
-    var checked_type_publication = try CheckedTypeStore.fromModule(allocator, module, &canonical_names, artifact_key, &builtin_imports, &.{}, &source_nodes);
+    var checked_type_publication = try CheckedTypeStore.fromModule(allocator, module, &canonical_names, artifact_key, &builtin_imports, &.{}, &source_nodes, &.{});
     defer checked_type_publication.deinit(allocator);
     const checked_types = &checked_type_publication.store;
 
@@ -31786,7 +33367,7 @@ fn expectProvidedExportKind(
     defer checked_body_builder.deinit(allocator);
     const checked_bodies = checked_body_builder.storePtr();
 
-    const global_value_defs = module_env.store.sliceDefs(module_env.global_value_defs);
+    const value_binding_defs = module_env.store.sliceDefs(module_env.value_binding_defs);
 
     var relation_type_substitutions = PlatformRelationTypeSubstitutions{};
     defer relation_type_substitutions.deinit(allocator);
@@ -31797,7 +33378,7 @@ fn expectProvidedExportKind(
     var checked_procedure_templates = try CheckedProcedureTemplateTable.fromModule(
         allocator,
         module,
-        global_value_defs,
+        value_binding_defs,
         &canonical_names,
         owner_artifact,
         &checked_type_publication,
@@ -31871,7 +33452,7 @@ fn expectProvidedExportKind(
         allocator,
         module,
         &canonical_names,
-        global_value_defs,
+        value_binding_defs,
         &.{},
         &checked_type_publication,
         &checked_body_builder,
@@ -31903,7 +33484,7 @@ fn expectProvidedExportKind(
     var top_level_values = try TopLevelValueTable.fromModule(
         allocator,
         module,
-        global_value_defs,
+        value_binding_defs,
         &canonical_names,
         checked_bodies,
         &checked_procedure_templates,
@@ -31919,10 +33500,21 @@ fn expectProvidedExportKind(
         allocator,
         module,
         artifact_key,
+        checked_types,
         &compile_time_roots,
         &const_templates,
     );
     defer hoisted_constants.deinit(allocator);
+
+    var selected_hoisted_callables = try SelectedHoistedCallableTable.fromRoots(
+        allocator,
+        module,
+        checked_bodies,
+        &compile_time_roots,
+        &callable_eval_templates,
+        &top_level_procedure_bindings,
+    );
+    defer selected_hoisted_callables.deinit(allocator);
 
     const provides = try publishProvidesMetadata(allocator, module, &canonical_names);
     defer allocator.free(provides);
@@ -31939,6 +33531,7 @@ fn expectProvidedExportKind(
         &platform_required_declarations,
         &platform_required_bindings,
         &top_level_values,
+        &selected_hoisted_callables,
         &hoisted_constants,
         &checked_type_publication,
         checked_bodies,
@@ -32027,6 +33620,7 @@ fn expectProvidedExportKind(
         &top_level_procedure_bindings,
         &callable_eval_templates,
         &hoisted_constants,
+        &const_templates,
         template_root_evidence,
         &.{},
     );
@@ -32071,6 +33665,7 @@ test "compile-time finalization route is explicit and non-optional" {
 
 test "compile-time roots and top-level values store final checked output only" {
     try std.testing.expect(std.meta.stringToEnum(CompileTimeRootKind, "constant") != null);
+    try std.testing.expect(std.meta.stringToEnum(CompileTimeRootKind, "hoisted_validation") != null);
     try std.testing.expect(std.meta.stringToEnum(CompileTimeRootKind, "callable_binding") != null);
     try std.testing.expect(std.meta.stringToEnum(CompileTimeRootKind, "expect") != null);
     try std.testing.expect(@hasField(CompileTimeRoot, "request_eligibility"));
@@ -32081,6 +33676,7 @@ test "compile-time roots and top-level values store final checked output only" {
     try std.testing.expect(@hasField(CompileTimeRootPayload, "pending"));
     try std.testing.expect(@hasField(CompileTimeRootPayload, "const_node"));
     try std.testing.expect(@hasField(CompileTimeRootPayload, "fn_value"));
+    try std.testing.expect(@hasField(CompileTimeRootPayload, "discarded"));
     try std.testing.expect(@hasField(CompileTimeRootPayload, "expect"));
 
     try std.testing.expectEqual(@as(usize, 2), unionFieldCount(TopLevelValueKind));
@@ -32092,10 +33688,11 @@ test "compile-time roots and top-level values store final checked output only" {
 }
 
 test "constant template states contain sealed value data but no runtime initializer concepts" {
-    try std.testing.expectEqual(@as(usize, 3), unionFieldCount(ConstTemplateState));
+    try std.testing.expectEqual(@as(usize, 4), unionFieldCount(ConstTemplateState));
     try std.testing.expect(@hasField(ConstTemplateState, "reserved"));
     try std.testing.expect(@hasField(ConstTemplateState, "eval_template"));
     try std.testing.expect(@hasField(ConstTemplateState, "stored_const"));
+    try std.testing.expect(@hasField(ConstTemplateState, "unimplemented"));
 
     try std.testing.expect(!@hasField(ConstTemplateState, "runtime_thunk"));
     try std.testing.expect(!@hasField(ConstTemplateState, "global_initializer"));
@@ -33116,12 +34713,13 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     var store = CheckedTypeStore{};
     defer store.deinit(gpa);
 
-    // Four payload ids derived from the current pool position rather than
+    // Five payload ids derived from the current pool position rather than
     // hardcoded placeholder indices.
     const a: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.payloads.items.len)));
     const b: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.payloads.items.len)) + 1);
     const c: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.payloads.items.len)) + 2);
     const d: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.payloads.items.len)) + 3);
+    const e: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.payloads.items.len)) + 4);
 
     // Build via the commit path so the pools are populated correctly.
     // 0: a flex with a name + a constraint.
@@ -33179,6 +34777,16 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     } });
     try store.roots.append(gpa, .{ .id = d, .key = .{ .bytes = [_]u8{5} ** 32 } });
     try store.payloads.append(gpa, nominal_stored);
+
+    // 4: a record with one field of each published kind (design.md "Field
+    // Kinds (All-Dynamic Optional Fields)"): required, optional, defaulted.
+    const record_fields = try gpa.alloc(CheckedRecordField, 3);
+    record_fields[0] = .{ .name = @enumFromInt(21), .ty = a };
+    record_fields[1] = .{ .name = @enumFromInt(22), .ty = a, .kind = .optional };
+    record_fields[2] = .{ .name = @enumFromInt(23), .ty = a, .kind = .defaultedFromParts(@enumFromInt(12), 77) };
+    const record_stored = try store.commitPayload(gpa, .{ .record = .{ .fields = record_fields, .ext = a } });
+    try store.roots.append(gpa, .{ .id = e, .key = .{ .bytes = [_]u8{6} ** 32 } });
+    try store.payloads.append(gpa, record_stored);
 
     // A scheme with generalized vars [a, b].
     const gv = try store.appendTypeIds(gpa, &.{ a, b });
@@ -33258,6 +34866,18 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     try std.testing.expectEqualSlices(CheckedTypeId, &.{c}, nominal.args);
     try std.testing.expectEqualSlices(CheckedTypeId, &.{a}, nominal.padding_field_types);
 
+    // Record fields keep their published kind axis through the round-trip:
+    // required, optional, and defaulted (with its default identity).
+    const record = loaded.payload(e).record;
+    try std.testing.expectEqual(@as(usize, 3), record.fields.len);
+    try std.testing.expectEqual(a, record.ext);
+    try std.testing.expectEqual(CheckedFieldKind.Tag.required, record.fields[0].kind.tag);
+    try std.testing.expectEqual(CheckedFieldKind.Tag.optional, record.fields[1].kind.tag);
+    try std.testing.expectEqual(a, record.fields[1].ty);
+    try std.testing.expectEqual(CheckedFieldKind.Tag.defaulted, record.fields[2].kind.tag);
+    try std.testing.expectEqual(@as(canonical.ModuleIdentityId, @enumFromInt(12)), record.fields[2].kind.default.origin().?);
+    try std.testing.expectEqual(@as(u32, 77), record.fields[2].kind.default.expr_node);
+
     // Scheme generalized vars + decl formal args.
     try std.testing.expectEqualSlices(CheckedTypeId, &.{ a, b }, loaded.schemes.items[0].generalizedVars(&loaded));
     try std.testing.expectEqualSlices(CheckedTypeId, &.{c}, loaded.nominal_declarations.items[0].formalArgs(&loaded));
@@ -33277,7 +34897,7 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     try std.testing.expectEqual(@as(usize, 2), v.nominalDeclarationById(loaded.nominal_declarations.items[0].id).declaredRecordFields(v).len);
 }
 
-test "CheckedBodyStore: POD round-trip preserves exprs, slices, match branches, string literals" {
+test "CheckedBodyStore: POD round-trip preserves exprs, paths, match branches, string literals" {
     const gpa = std.testing.allocator;
     const CW = collections.CompactWriter;
 
@@ -33288,12 +34908,14 @@ test "CheckedBodyStore: POD round-trip preserves exprs, slices, match branches, 
     // so the "first element" ids carry no placeholder literals.
     const e0: CheckedExprId = @enumFromInt(@as(u32, @intCast(store.stored_exprs.items.len)));
     const e1: CheckedExprId = @enumFromInt(@as(u32, @intCast(store.stored_exprs.items.len)) + 1);
+    const e2: CheckedExprId = @enumFromInt(@as(u32, @intCast(store.stored_exprs.items.len)) + 2);
     const boom_id: CheckedStringLiteralId = @enumFromInt(@as(u32, @intCast(store.string_ranges.items.len)));
     const second_id: CheckedStringLiteralId = @enumFromInt(@as(u32, @intCast(store.string_ranges.items.len)) + 1);
     // p0/ty0 are referenced but never dereferenced as indices here; distinct
     // non-zero ids prove they survive the round-trip.
     const p0: CheckedPatternId = @enumFromInt(7);
     const ty0: CheckedTypeId = @enumFromInt(9);
+    const ty1: CheckedTypeId = @enumFromInt(10);
     const region = base.Region.zero();
 
     // A match branch with one pattern carrying one binder remap, transferred 1:1
@@ -33301,9 +34923,25 @@ test "CheckedBodyStore: POD round-trip preserves exprs, slices, match branches, 
     try store.binder_remap_pool.append(gpa, .{ .candidate_binder = @enumFromInt(5), .representative_binder = @enumFromInt(1) });
     try store.match_branch_pattern_pool.append(gpa, .{ .pattern = p0, .degenerate = false, .bn_start = 0, .bn_len = 1 });
 
-    // A `match_` expr referencing the pre-seeded branch pool entry, plus a `str`
-    // expr (segments [e1]) and a `crash` literal, committed via the commit path.
+    // A `match_` expr referencing the pre-seeded branch pool entry, a crash
+    // literal, and a two-segment field-access path committed via the same path.
     const branches = [_]CheckedMatchBranch{.{ .pt_start = 0, .pt_len = 1, .value = e1, .guard = null }};
+    const field_access_segments = [_]CheckedFieldAccessSegment{
+        .{
+            .field_name = @enumFromInt(3),
+            .success_ty = ty0,
+            .source_region = base.Region.from_raw_offsets(11, 17),
+            .mode = .required,
+            .backing_access = .inspectable,
+        },
+        .{
+            .field_name = @enumFromInt(4),
+            .success_ty = ty1,
+            .source_region = base.Region.from_raw_offsets(18, 25),
+            .mode = .optional,
+            .backing_access = .inspectable,
+        },
+    };
     const exprs = [_]CheckedExpr{
         .{ .id = e0, .ty = ty0, .source_region = region, .data = .{ .match_ = .{
             .cond = e1,
@@ -33313,6 +34951,10 @@ test "CheckedBodyStore: POD round-trip preserves exprs, slices, match branches, 
             .comptime_site_kind = .match,
         } } },
         .{ .id = e1, .ty = ty0, .source_region = region, .data = .{ .crash = boom_id } },
+        .{ .id = e2, .ty = ty1, .source_region = region, .data = .{ .field_access = .{
+            .receiver = e1,
+            .segments = &field_access_segments,
+        } } },
     };
     try store.commitExprs(gpa, &exprs);
     try store.commitStringLiterals(gpa, &.{ "boom", "second" });
@@ -33340,6 +34982,12 @@ test "CheckedBodyStore: POD round-trip preserves exprs, slices, match branches, 
     try std.testing.expectEqual(e1, match_data.branches[0].value);
     try std.testing.expectEqual(boom_id, loaded.expr(e1).data.crash);
 
+    // Field-access segment order, checked prefix types, and source regions
+    // survive in their dedicated flat pool.
+    const field_access = loaded.expr(e2).data.field_access;
+    try std.testing.expectEqual(e1, field_access.receiver);
+    try std.testing.expectEqualSlices(CheckedFieldAccessSegment, &field_access_segments, field_access.segments);
+
     // String literals resolve by id.
     try std.testing.expectEqualStrings("boom", loaded.stringLiteral(boom_id));
     try std.testing.expectEqualStrings("second", loaded.stringLiteral(second_id));
@@ -33355,6 +35003,7 @@ test "CheckedBodyStore: POD round-trip preserves exprs, slices, match branches, 
     // The view exposes the same data.
     const v = loaded.view();
     try std.testing.expectEqual(e1, v.expr(e0).data.match_.branches[0].value);
+    try std.testing.expectEqualSlices(CheckedFieldAccessSegment, &field_access_segments, v.expr(e2).data.field_access.segments);
     try std.testing.expectEqualStrings("boom", v.stringLiteral(boom_id));
     try std.testing.expect(v.exprContainsDiagnosticError(e0));
 }
@@ -33516,7 +35165,7 @@ test "module source input hash uses explicit file dependency state" {
     var missing_env = try ModuleEnv.init(gpa, "");
     defer missing_env.deinit();
     try missing_env.initCIRFields("Test");
-    const missing_idx = try missing_env.recordFileDependency("data.txt");
+    const missing_idx = try missing_env.recordFileDependency("data.txt", 0, 0);
     missing_env.setFileDependencyMissing(missing_idx);
     const missing_hash = hashModuleSourceInputs(&missing_env);
 
@@ -33527,14 +35176,14 @@ test "module source input hash uses explicit file dependency state" {
     var unreadable_env = try ModuleEnv.init(gpa, "");
     defer unreadable_env.deinit();
     try unreadable_env.initCIRFields("Test");
-    const unreadable_idx = try unreadable_env.recordFileDependency("data.txt");
+    const unreadable_idx = try unreadable_env.recordFileDependency("data.txt", 0, 0);
     unreadable_env.setFileDependencyUnreadable(unreadable_idx);
     const unreadable_hash = hashModuleSourceInputs(&unreadable_env);
 
     var present_env = try ModuleEnv.init(gpa, "");
     defer present_env.deinit();
     try present_env.initCIRFields("Test");
-    const present_idx = try present_env.recordFileDependency("data.txt");
+    const present_idx = try present_env.recordFileDependency("data.txt", 0, 0);
     present_env.setFileDependencyContentHash(present_idx, [_]u8{0} ** 32);
     const present_hash = hashModuleSourceInputs(&present_env);
 
@@ -33545,6 +35194,32 @@ test "module source input hash uses explicit file dependency state" {
     try std.testing.expect(missing_bits != unreadable_bits);
     try std.testing.expect(missing_bits != present_bits);
     try std.testing.expect(unreadable_bits != present_bits);
+}
+
+test "compile-time scheduler precollects only requested field-default roots" {
+    const root_0 = testIndexId(ComptimeRootId, 0);
+    const root_1: ComptimeRootId = @enumFromInt(1);
+    const root_2: ComptimeRootId = @enumFromInt(2);
+    const checked_expr = testIndexId(CheckedExprId, 0);
+    const checked_type = testIndexId(CheckedTypeId, 0);
+    const source_0 = testIndexId(CIR.Expr.Idx, 10);
+    const source_1 = testIndexId(CIR.Expr.Idx, 11);
+    const source_2 = testIndexId(CIR.Expr.Idx, 12);
+
+    var roots = [_]CompileTimeRoot{
+        .{ .id = root_0, .module_idx = 0, .kind = .constant, .source = .{ .expr = source_0 }, .pattern = null, .expr = checked_expr, .checked_type = checked_type, .request_eligibility = .eligible, .payload = .pending },
+        .{ .id = root_1, .module_idx = 0, .kind = .field_default, .source = .{ .expr = source_1 }, .pattern = null, .expr = checked_expr, .checked_type = checked_type, .request_eligibility = .eligible, .payload = .pending },
+        .{ .id = root_2, .module_idx = 0, .kind = .field_default, .source = .{ .expr = source_2 }, .pattern = null, .expr = checked_expr, .checked_type = checked_type, .request_eligibility = .eligible, .payload = .pending },
+    };
+    const root_table = CompileTimeRootTable{ .roots = &roots };
+    const entries = [_]CompileTimeRequestScheduleEntry{
+        .{ .request = .{ .order = 0, .module_idx = 0, .kind = .compile_time_constant, .source = .{ .expr = source_2 }, .compile_time_root = root_2, .checked_type = checked_type, .abi = .compile_time, .exposure = .private }, .root_id = root_2, .original_order = 0 },
+        .{ .request = .{ .order = 1, .module_idx = 0, .kind = .compile_time_constant, .source = .{ .expr = source_0 }, .compile_time_root = root_0, .checked_type = checked_type, .abi = .compile_time, .exposure = .private }, .root_id = root_0, .original_order = 1 },
+    };
+
+    const field_defaults = try collectScheduledFieldDefaultRoots(std.testing.allocator, &root_table, &entries);
+    defer std.testing.allocator.free(field_defaults);
+    try std.testing.expectEqualSlices(ComptimeRootId, &.{root_2}, field_defaults);
 }
 
 test "checked divergence publishes both inline-expect runtime modes" {
@@ -33658,12 +35333,19 @@ test "checked diagnostic-error fact propagates through body dependencies and typ
 test "checked inspect evaluation elision is producer-recorded for exact callable value forms" {
     const field_name: canonical.RecordFieldLabelId = @enumFromInt(1);
     const record_fields = [_]CheckedRecordExprField{.{ .label = field_name, .value = testIndexId(CheckedExprId, 0) }};
+    const access_segments = [_]CheckedFieldAccessSegment{.{
+        .field_name = field_name,
+        .success_ty = testIndexId(CheckedTypeId, 0),
+        .source_region = base.Region.zero(),
+        .mode = .required,
+        .backing_access = .inspectable,
+    }};
     const block_statements = [_]CheckedStatementId{};
     const call_args = [_]CheckedExprId{};
     const exprs = [_]CheckedExpr{
         .{ .id = testIndexId(CheckedExprId, 0), .ty = testIndexId(CheckedTypeId, 0), .source_region = base.Region.zero(), .data = .{ .lambda = .{ .args = &.{}, .body = testIndexId(CheckedExprId, 0) } } },
         .{ .id = @enumFromInt(1), .ty = testIndexId(CheckedTypeId, 0), .source_region = base.Region.zero(), .data = .{ .record = .{ .fields = &record_fields, .ext = null } } },
-        .{ .id = @enumFromInt(2), .ty = testIndexId(CheckedTypeId, 0), .source_region = base.Region.zero(), .data = .{ .field_access = .{ .receiver = @enumFromInt(1), .field_name = field_name, .backing_access = .inspectable } } },
+        .{ .id = @enumFromInt(2), .ty = testIndexId(CheckedTypeId, 0), .source_region = base.Region.zero(), .data = .{ .field_access = .{ .receiver = @enumFromInt(1), .segments = &access_segments } } },
         .{ .id = @enumFromInt(3), .ty = testIndexId(CheckedTypeId, 0), .source_region = base.Region.zero(), .data = .{ .block = .{ .statements = &block_statements, .final_expr = testIndexId(CheckedExprId, 0) } } },
         .{ .id = @enumFromInt(4), .ty = testIndexId(CheckedTypeId, 0), .source_region = base.Region.zero(), .data = .{ .call = .{ .func = testIndexId(CheckedExprId, 0), .args = &call_args, .called_via = .apply, .source_fn_ty_payload = testIndexId(CheckedTypeId, 0) } } },
     };
@@ -33704,8 +35386,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x57, 0xB2, 0x53, 0x2B, 0x91, 0x98, 0xC4, 0xD7, 0x8B, 0x1B, 0xFA, 0x0C, 0xDB, 0x84, 0x19, 0x2A,
-        0x30, 0x45, 0x56, 0x5A, 0x69, 0xC9, 0xAC, 0x85, 0x61, 0x8B, 0xF5, 0x8D, 0x3C, 0x8F, 0xAF, 0x5B,
+        0xF4, 0x44, 0xBF, 0x73, 0x28, 0x33, 0x3B, 0x3E, 0x4E, 0xD1, 0xF6, 0x56, 0x8D, 0x7E, 0x27, 0x88,
+        0x5A, 0x77, 0x16, 0xA5, 0xA3, 0x94, 0xB2, 0x00, 0xA8, 0xD6, 0xCA, 0xB1, 0x7B, 0x8C, 0x8E, 0x54,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
@@ -33793,7 +35475,7 @@ test "template dispatch classification separates direct calls from graph relatio
                 .kind = .{ .procedure = .{
                     .proc = undefined,
                     .template = undefined,
-                    .runtime_target = .{ .low_level = .num_plus_wrap },
+                    .runtime_target = .{ .low_level = .num_int_add_wrap },
                 } },
                 .callable_ty = callable_ty,
             },

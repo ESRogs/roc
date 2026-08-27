@@ -43,6 +43,7 @@ pub const BuildWithMainError = BuildError || CompileDiscoveredError;
 
 const ModuleEnv = can.ModuleEnv;
 const CIR = can.CIR;
+const Can = can.Can;
 const SemanticModuleData = compile_package.SemanticModuleData;
 const ModuleTimingInfo = compile_package.TimingInfo;
 const CacheManager = @import("cache_manager.zig").CacheManager;
@@ -228,6 +229,13 @@ pub const BuildEnv = struct {
 
     /// Compiler role to assign to the root module of this build.
     root_module_role: ModuleEnv.ModuleRole = .user,
+
+    /// Post-canonicalization validation to apply to the root module of this
+    /// build. `roc test` sets `.explicit_roots` because it runs the root file's
+    /// top-level `expect`s, which are compile-time roots in their own right: a
+    /// headerless root that is neither a type module nor a default app is a
+    /// plain module there rather than a file missing its `main!`.
+    root_validation: Can.Validation = .checking,
 
     /// Optional source directory used to resolve imports from the root module.
     root_source_dir_override: ?[]const u8 = null,
@@ -482,6 +490,10 @@ pub const BuildEnv = struct {
         self.root_module_role = role;
     }
 
+    pub fn setRootValidation(self: *BuildEnv, validation: Can.Validation) void {
+        self.root_validation = validation;
+    }
+
     pub fn setRootSourceDirOverride(self: *BuildEnv, source_dir: []const u8) void {
         self.root_source_dir_override = source_dir;
     }
@@ -695,7 +707,7 @@ pub const BuildEnv = struct {
         const file = ast.store.getFile();
         const header = ast.store.getHeader(file.header);
         return switch (header) {
-            .app => .app,
+            .app => |a| if (a.platform_idx == null) .default_app else .app,
             .package => .package,
             .platform => .platform,
             .module => .module,
@@ -764,12 +776,10 @@ pub const BuildEnv = struct {
         var header_info = try self.parseHeaderDeps(root_abs);
         defer header_info.deinit(self.gpa);
 
-        const is_executable = header_info.kind == .app or header_info.kind == .default_app;
-        // Allow all module types: app, module, type_module, package, platform
-        // Package and platform modules can also be tested
-        if (!is_executable and header_info.kind != .module and header_info.kind != .type_module and header_info.kind != .package and header_info.kind != .platform) {
-            return error.UnsupportedHeader;
-        }
+        // Every header kind names a module this build can root at: apps and
+        // default apps produce programs, and the rest are compiled for their own
+        // definitions and `expect`s. A file whose header parsed into none of them
+        // already failed in `parseHeaderDeps`.
 
         // Create package entry keyed by stable package identity. Real roots use
         // their canonical path; URL-launched roots use their bundle URL because
@@ -880,7 +890,7 @@ pub const BuildEnv = struct {
                     public_module.nested_type,
                 );
             }
-            coord_pkg.finishPublicModules();
+            try coord_pkg.finishPublicModules(self.gpa);
 
             // The coordinator gates the hosted transform (and app-root artifact
             // lookups) on knowing which package is the app; app modules must
@@ -925,6 +935,7 @@ pub const BuildEnv = struct {
         const module_name = base.module_path.getModuleName(pkg_root_file);
         const root_id = try coord_pkg.ensureModule(self.gpa, module_name, pkg_root_file);
         coord_pkg.modules.items[root_id].module_role = self.root_module_role;
+        coord_pkg.modules.items[root_id].validation = self.root_validation;
         if (self.root_source_dir_override) |source_dir| {
             coord_pkg.modules.items[root_id].source_dir_override = try self.gpa.dupe(u8, source_dir);
         }
@@ -949,7 +960,7 @@ pub const BuildEnv = struct {
                 const entry_module_name = base.module_path.getModuleName(entry_file);
                 const entry_id = try coord_pkg.ensureModule(self.gpa, entry_module_name, entry_file);
                 const entry_module = &coord_pkg.modules.items[entry_id];
-                entry_module.validate_as_explicit_roots = true;
+                entry_module.validation = .explicit_roots;
                 if (entry_module.phase == .Parse) {
                     entry_module.depth = 0;
                     coord_pkg.remaining_modules += 1;
@@ -1255,8 +1266,10 @@ pub const BuildEnv = struct {
         errdefer info.deinit(self.gpa);
 
         switch (header) {
-            .app => {
-                info.kind = .app;
+            .app => |a| {
+                // An app that names no platform gets the built-in Echo
+                // platform, which is what a default app is.
+                info.kind = if (a.platform_idx == null) .default_app else .app;
             },
             .package => |p| {
                 info.kind = .package;
@@ -1936,18 +1949,20 @@ pub const BuildEnv = struct {
         if (self.syntheticRootDisplayPath(filename) == null) return;
 
         const header_lines = self.synthetic_root_header_lines;
-        if (header_lines == 0) {
+        if (region.start_line <= header_lines or region.end_line <= header_lines) return;
+
+        const original_start_line = region.start_line - header_lines;
+        const original_end_line = region.end_line - header_lines;
+        // A region past the last line of the user's source points at wiring
+        // the staging appended, which is not the user's code; that region
+        // keeps its own text and only its file name maps back.
+        if (original_line_starts.len == 0 or original_end_line > original_line_starts.len) {
             const owned_filename = try allocator.dupe(u8, original_path);
             if (region.filename) |old_filename| allocator.free(old_filename);
             region.filename = owned_filename;
             return;
         }
 
-        if (region.start_line <= header_lines or region.end_line <= header_lines) return;
-        if (original_line_starts.len == 0) return;
-
-        const original_start_line = region.start_line - header_lines;
-        const original_end_line = region.end_line - header_lines;
         const region_info = base.RegionInfo{
             .start_line_idx = original_start_line - 1,
             .start_col_idx = region.start_column - 1,
@@ -1991,6 +2006,19 @@ pub const BuildEnv = struct {
                     }
                 }
             },
+            .source_location => |*location| {
+                const original_path = self.synthetic_root_original_path orelse return;
+                const filename = location.filename orelse return;
+                if (self.syntheticRootDisplayPath(filename) == null) return;
+
+                const header_lines = self.synthetic_root_header_lines;
+                if (header_lines > 0 and location.line <= header_lines) return;
+
+                const owned_filename = try allocator.dupe(u8, original_path);
+                if (location.filename) |old_filename| allocator.free(old_filename);
+                location.filename = owned_filename;
+                if (location.line > header_lines) location.line -= header_lines;
+            },
             .text,
             .annotated,
             .line_break,
@@ -2011,17 +2039,6 @@ pub const BuildEnv = struct {
 
     fn remapSyntheticRootReport(self: *BuildEnv, report: *Report) Allocator.Error!void {
         if (self.synthetic_root_original_path == null or self.synthetic_root_original_source == null) return;
-
-        if (self.synthetic_root_header_lines == 0) {
-            for (report.document.elements.items) |*element| {
-                try self.remapSyntheticRootDocumentElement(
-                    report.document.allocator,
-                    element,
-                    &.{},
-                );
-            }
-            return;
-        }
 
         var original_line_starts = try base.RegionInfo.findLineStarts(self.gpa, self.synthetic_root_original_source.?);
         defer original_line_starts.deinit(self.gpa);
@@ -2350,15 +2367,105 @@ pub const BuildEnv = struct {
         return false;
     }
 
-    pub fn findModuleByName(self: *BuildEnv, module_name: []const u8) ?*coordinator_mod.ModuleState {
+    fn isPathInDir(path: []const u8, dir: []const u8) bool {
+        if (dir.len == 0) return false;
+        if (!std.mem.startsWith(u8, path, dir)) return false;
+        if (path.len == dir.len) return true;
+        if (std.fs.path.isSep(path[dir.len])) return true;
+        return std.fs.path.isSep(dir[dir.len - 1]);
+    }
+
+    pub fn findPackageForModulePath(self: *BuildEnv, path: []const u8) ?*coordinator_mod.PackageState {
         const coord = self.coordinator orelse return null;
+
+        // 1. Pass 1: exact module or root_file membership across all packages
         var pkg_it = coord.packages.iterator();
         while (pkg_it.next()) |entry| {
             const pkg = entry.value_ptr.*;
-            const id = pkg.getModuleId(module_name) orelse continue;
-            return pkg.getModule(id);
+            for (pkg.modules.items) |*mod| {
+                if (std.mem.eql(u8, mod.path, path)) return pkg;
+            }
+            if (pkg.root_file) |rf| {
+                if (std.mem.eql(u8, rf, path)) return pkg;
+            }
+        }
+
+        // 2. Pass 2: find the package with the longest matching root_dir that contains `path`
+        // on a directory boundary. This deterministically selects the most specific package when
+        // package root directories nest or overlap (e.g. app workspace root vs child package root).
+        var best_pkg: ?*coordinator_mod.PackageState = null;
+        var longest_dir_len: usize = 0;
+
+        pkg_it = coord.packages.iterator();
+        while (pkg_it.next()) |entry| {
+            const pkg = entry.value_ptr.*;
+            if (pkg.root_dir.len > longest_dir_len and isPathInDir(path, pkg.root_dir)) {
+                best_pkg = pkg;
+                longest_dir_len = pkg.root_dir.len;
+            }
+        }
+
+        return best_pkg;
+    }
+
+    pub fn findModuleByQualifiedNameInPackage(
+        self: *BuildEnv,
+        importing_pkg_opt: ?*coordinator_mod.PackageState,
+        qualified_name: []const u8,
+    ) ?*coordinator_mod.ModuleState {
+        const coord = self.coordinator orelse return null;
+        const importing_pkg = importing_pkg_opt orelse return null;
+
+        if (std.mem.find(u8, qualified_name, ".")) |dot_pos| {
+            const pkg_alias = qualified_name[0..dot_pos];
+            const mod_name = qualified_name[dot_pos + 1 ..];
+
+            // 1. If pkg_alias is defined in the importing package's shorthands,
+            // resolve it strictly in the target package. If the target package or module
+            // cannot be found, return null immediately without falling through to other namespaces.
+            if (importing_pkg.shorthands.get(pkg_alias)) |target_pkg_name| {
+                const target_pkg = coord.packages.get(target_pkg_name) orelse return null;
+                if (target_pkg.getPublicModuleTarget(mod_name)) |public_target| {
+                    if (target_pkg.getModuleId(public_target.logicalModule())) |id| {
+                        return target_pkg.getModule(id);
+                    }
+                }
+                if (target_pkg.getPublicModuleId(mod_name) orelse target_pkg.getModuleId(mod_name)) |id| {
+                    return target_pkg.getModule(id);
+                }
+                return null;
+            }
+
+            // 2. If pkg_alias is not a package shorthand, the qualifier must be part of a
+            // hierarchical module defined within the importing package itself (e.g. `Foo.Bar`).
+            if (importing_pkg.getModuleId(qualified_name) orelse importing_pkg.getPublicModuleId(qualified_name)) |id| {
+                return importing_pkg.getModule(id);
+            }
+
+            return null;
+        }
+
+        return self.findModuleByNameInPackage(importing_pkg_opt, qualified_name);
+    }
+
+    pub fn findModuleByQualifiedName(self: *BuildEnv, qualified_name: []const u8) ?*coordinator_mod.ModuleState {
+        return self.findModuleByQualifiedNameInPackage(null, qualified_name);
+    }
+
+    pub fn findModuleByNameInPackage(
+        _: *BuildEnv,
+        importing_pkg_opt: ?*coordinator_mod.PackageState,
+        module_name: []const u8,
+    ) ?*coordinator_mod.ModuleState {
+        const importing_pkg = importing_pkg_opt orelse return null;
+        if (importing_pkg.getModuleId(module_name) orelse importing_pkg.getPublicModuleId(module_name)) |id| {
+            return importing_pkg.getModule(id);
         }
         return null;
+    }
+
+    pub fn findModuleByName(self: *BuildEnv, module_name: []const u8) ?*coordinator_mod.ModuleState {
+        return self.findModuleByNameInPackage(null, module_name);
     }
 
     pub fn findModuleByPath(self: *BuildEnv, path: []const u8) ?*coordinator_mod.ModuleState {
@@ -2380,6 +2487,21 @@ pub const BuildEnv = struct {
         return pkg.getModule(root_id);
     }
 
+    /// How the build reached the package a module belongs to. `roc test` runs
+    /// the `expect`s the developer wrote and skips the ones that arrived with
+    /// a dependency, so the origin has to travel alongside each module.
+    pub const PackageOrigin = enum {
+        /// The package the `roc test` source argument explicitly selected,
+        /// including a bundle URL or installed shorthand.
+        root,
+        /// A dependency the root reaches through filesystem paths alone.
+        local_path_dependency,
+        /// Downloaded from a URL, or reached only by way of a fetched package.
+        fetched,
+        /// Embedded in the compiler, such as the default platform.
+        compiler_owned,
+    };
+
     /// Information about a compiled module, ready for serialization.
     /// All pointers reference data owned by the BuildEnv/Coordinator.
     pub const CompiledModuleInfo = struct {
@@ -2393,6 +2515,8 @@ pub const BuildEnv = struct {
         source: []const u8,
         /// Package name this module belongs to
         package_name: []const u8,
+        /// How the build reached this module's package.
+        package_origin: PackageOrigin,
         /// True if this is the platform's main.roc
         is_platform_main: bool,
         /// True if this is the app module
@@ -2403,8 +2527,22 @@ pub const BuildEnv = struct {
         depth: u32,
         /// Platform provides entries (only populated for platform main modules)
         provides_entries: []const ProvidesEntry = &.{},
+    };
+
+    /// Compact borrowed view used only by public docs and API extraction.
+    /// General compiled-module consumers do not pay for this routing metadata.
+    pub const PublicModuleInfo = struct {
+        name: []const u8,
+        path: []const u8,
+        semantic: SemanticModuleData,
+        package_name: []const u8,
         /// Root-owned names to retain when extracting documentation.
         docs_exposed_names: ?[]const []const u8 = null,
+        /// Exact type declaration represented by this public module view.
+        /// This is transient post-build routing data, not retained per CIR node.
+        public_type_decl: ?CIR.Statement.Idx = null,
+        /// Declaration order within the owning package's public surface.
+        public_order: u32 = 0,
     };
 
     /// Get all compiled modules from the Coordinator (after build completes).
@@ -2469,6 +2607,56 @@ pub const BuildEnv = struct {
         return true;
     }
 
+    /// The explicitly requested root package and the dependencies it reaches
+    /// through filesystem paths alone, keyed by package identity. Keys borrow
+    /// the names stored in `self.packages`.
+    ///
+    /// The requested root is included even when its identity is a bundle URL.
+    /// After that root, the walk stops at every downloaded package and every
+    /// compiler-owned platform, because a path dependency declared inside a
+    /// fetched dependency arrived by download too and must not inherit the
+    /// root's ownership.
+    fn collectTestOwnedPackages(
+        self: *BuildEnv,
+        allocator: Allocator,
+    ) Allocator.Error!std.StringHashMapUnmanaged(void) {
+        var reached: std.StringHashMapUnmanaged(void) = .{};
+        errdefer reached.deinit(allocator);
+
+        const root_name = self.discovered_pkg_name orelse return reached;
+        if (compiler_platforms.fromIdentity(root_name) != null) return reached;
+
+        var frontier: std.ArrayList([]const u8) = .empty;
+        defer frontier.deinit(allocator);
+
+        try reached.put(allocator, root_name, {});
+        try frontier.append(allocator, root_name);
+
+        var next: usize = 0;
+        while (next < frontier.items.len) : (next += 1) {
+            const pkg = self.packages.getPtr(frontier.items[next]) orelse continue;
+            var shorthand_it = pkg.shorthands.iterator();
+            while (shorthand_it.next()) |shorthand| {
+                const target = shorthand.value_ptr.name;
+                if (reached.contains(target)) continue;
+                if (!self.isLocalPathPackage(target)) continue;
+                const key = (self.packages.getKeyPtr(target) orelse continue).*;
+                try reached.put(allocator, key, {});
+                try frontier.append(allocator, key);
+            }
+        }
+
+        return reached;
+    }
+
+    /// Whether this package's own source is a filesystem path the developer
+    /// could edit, ignoring how the build arrived at it.
+    fn isLocalPathPackage(self: *BuildEnv, name: []const u8) bool {
+        if (compiler_platforms.fromIdentity(name) != null) return false;
+        const pkg = self.packages.getPtr(name) orelse return false;
+        return pkg.url == null;
+    }
+
     pub fn getCompiledModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
         const coord = self.coordinator orelse {
             std.debug.panic("build env invariant violated: compiled modules requested before coordinator initialization", .{});
@@ -2476,6 +2664,10 @@ pub const BuildEnv = struct {
 
         var modules = std.ArrayList(CompiledModuleInfo).empty;
         errdefer modules.deinit(allocator);
+
+        var test_owned_packages = try self.collectTestOwnedPackages(allocator);
+        defer test_owned_packages.deinit(allocator);
+        const root_name = self.discovered_pkg_name;
 
         var pkg_it = coord.packages.iterator();
         while (pkg_it.next()) |entry| {
@@ -2486,6 +2678,14 @@ pub const BuildEnv = struct {
             const pkg_ptr = self.packages.getPtr(pkg_name);
             const is_platform_pkg = pkg_ptr != null and pkg_ptr.?.kind == .platform;
             const is_app_pkg = pkg_ptr != null and (pkg_ptr.?.kind == .app or pkg_ptr.?.kind == .default_app);
+            const package_origin: PackageOrigin = if (compiler_platforms.fromIdentity(pkg_name) != null)
+                .compiler_owned
+            else if (root_name != null and std.mem.eql(u8, pkg_name, root_name.?))
+                .root
+            else if (test_owned_packages.contains(pkg_name))
+                .local_path_dependency
+            else
+                .fetched;
 
             for (coord_pkg.modules.items, 0..) |*mod, mod_idx| {
                 const semantic = mod.semanticData() orelse continue;
@@ -2500,6 +2700,7 @@ pub const BuildEnv = struct {
                     .semantic = semantic,
                     .source = semantic.env.common.source,
                     .package_name = pkg_name,
+                    .package_origin = package_origin,
                     .is_platform_main = is_platform_main,
                     .is_app = is_app,
                     .is_platform_sibling = is_platform_sibling,
@@ -2517,7 +2718,7 @@ pub const BuildEnv = struct {
 
     /// Resolve the root package or platform's explicit public module list to
     /// completed compiler outputs. Dependency modules are deliberately absent.
-    pub fn getPublicRootModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
+    pub fn getPublicRootModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]PublicModuleInfo {
         const root_name = self.discovered_pkg_name orelse {
             std.debug.panic("build env invariant violated: public modules requested before dependency discovery", .{});
         };
@@ -2534,11 +2735,17 @@ pub const BuildEnv = struct {
             std.debug.panic("build env invariant violated: public-module root coordinator package is unavailable", .{});
         };
 
-        var public_modules = std.ArrayList(CompiledModuleInfo).empty;
+        var public_modules = std.ArrayList(PublicModuleInfo).empty;
         errdefer public_modules.deinit(allocator);
 
-        for (root_pkg.public_surface.modules.items) |public_module| {
+        for (root_pkg.public_surface.modules.items, 0..) |public_module, public_index| {
             const module_name = public_module.name;
+            const public_target = root_coord_pkg.getPublicModuleTarget(module_name) orelse {
+                std.debug.panic(
+                    "build env invariant violated: public module '{s}' has no source target",
+                    .{module_name},
+                );
+            };
             const module_id = root_coord_pkg.getPublicModuleId(module_name) orelse {
                 std.debug.panic(
                     "build env invariant violated: public module '{s}' was not compiled",
@@ -2553,16 +2760,64 @@ pub const BuildEnv = struct {
                 );
             };
             try public_modules.append(allocator, .{
-                .name = module_state.name,
+                .name = module_name,
                 .path = module_state.path,
                 .semantic = module_data,
-                .source = module_data.env.common.source,
                 .package_name = root_name,
-                .is_platform_main = false,
-                .is_app = false,
-                .is_platform_sibling = root_pkg.kind == .platform,
-                .depth = module_state.depth,
+                .public_order = @intCast(public_index),
+                .public_type_decl = switch (public_target.selection) {
+                    .type_decl => |statement| statement,
+                    .whole_module => null,
+                    .unresolved_nested_type => std.debug.panic(
+                        "build env invariant violated: public module '{s}' has an unresolved nested type",
+                        .{module_name},
+                    ),
+                },
             });
+        }
+
+        return public_modules.toOwnedSlice(allocator);
+    }
+
+    /// Return every compiled public module view in the resolved package graph.
+    /// Consumers use the public spelling here instead of exposing private
+    /// source-module names; type views additionally carry their exact root.
+    pub fn getCompiledPublicModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]PublicModuleInfo {
+        const coord = self.coordinator orelse {
+            std.debug.panic("build env invariant violated: public modules requested before coordinator initialization", .{});
+        };
+
+        var public_modules = std.ArrayList(PublicModuleInfo).empty;
+        errdefer public_modules.deinit(allocator);
+
+        var packages = self.packages.iterator();
+        while (packages.next()) |package_entry| {
+            const package_name = package_entry.key_ptr.*;
+            const package = package_entry.value_ptr;
+            const coord_package = coord.packages.get(package_name) orelse continue;
+
+            for (package.public_surface.modules.items, 0..) |public_module, public_index| {
+                const module_id = coord_package.getPublicModuleId(public_module.name) orelse continue;
+                const module_state = coord_package.getModule(module_id) orelse continue;
+                const semantic = module_state.semanticData() orelse continue;
+                const public_target = coord_package.getPublicModuleTarget(public_module.name) orelse unreachable;
+                const source_decl: ?CIR.Statement.Idx = switch (public_target.selection) {
+                    .type_decl => |statement| statement,
+                    .whole_module => null,
+                    .unresolved_nested_type => std.debug.panic(
+                        "build env invariant violated: compiled public module '{s}' has an unresolved nested type",
+                        .{public_module.name},
+                    ),
+                };
+                try public_modules.append(allocator, .{
+                    .name = public_module.name,
+                    .path = module_state.path,
+                    .semantic = semantic,
+                    .package_name = package_name,
+                    .public_type_decl = source_decl,
+                    .public_order = @intCast(public_index),
+                });
+            }
         }
 
         return public_modules.toOwnedSlice(allocator);
@@ -2571,7 +2826,7 @@ pub const BuildEnv = struct {
     /// Return the compiled modules that belong in generated documentation.
     /// Package roots use their public modules. Platform roots additionally use
     /// their root module when the header exposes root-owned names.
-    pub fn getDocumentationModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]CompiledModuleInfo {
+    pub fn getDocumentationModules(self: *BuildEnv, allocator: Allocator) Allocator.Error![]PublicModuleInfo {
         const root_name = self.discovered_pkg_name orelse {
             std.debug.panic("build env invariant violated: documentation requested before dependency discovery", .{});
         };
@@ -2587,7 +2842,7 @@ pub const BuildEnv = struct {
             const public_modules = try self.getPublicRootModules(allocator);
             defer allocator.free(public_modules);
 
-            var docs_modules = try std.ArrayList(CompiledModuleInfo).initCapacity(
+            var docs_modules = try std.ArrayList(PublicModuleInfo).initCapacity(
                 allocator,
                 public_modules.len + @intFromBool(root_pkg.public_surface.root_names.items.len > 0),
             );
@@ -2605,13 +2860,7 @@ pub const BuildEnv = struct {
                     .name = root_module.name,
                     .path = root_module.path,
                     .semantic = root_data,
-                    .source = root_data.env.common.source,
                     .package_name = root_name,
-                    .is_platform_main = true,
-                    .is_app = false,
-                    .is_platform_sibling = false,
-                    .depth = root_module.depth,
-                    .provides_entries = root_pkg.provides_entries.items,
                     .docs_exposed_names = root_pkg.public_surface.root_names.items,
                 });
             }
@@ -2620,20 +2869,35 @@ pub const BuildEnv = struct {
         }
 
         const all_modules = try self.getCompiledModules(allocator);
-        errdefer allocator.free(all_modules);
+        defer allocator.free(all_modules);
+        const public_modules = try self.getCompiledPublicModules(allocator);
+        defer allocator.free(public_modules);
 
-        var docs_modules = std.ArrayList(CompiledModuleInfo).empty;
+        var docs_modules = std.ArrayList(PublicModuleInfo).empty;
         errdefer docs_modules.deinit(allocator);
 
+        // The root's own compiled modules are its documentation surface.
         for (all_modules) |mod| {
+            if (!std.mem.eql(u8, mod.package_name, root_name)) continue;
             switch (mod.semantic.env.module_kind) {
                 .package, .platform => continue,
                 .type_module, .default_app, .app, .hosted, .module, .malformed => {},
             }
+            try docs_modules.append(allocator, .{
+                .name = mod.name,
+                .path = mod.path,
+                .semantic = mod.semantic,
+                .package_name = mod.package_name,
+            });
+        }
+
+        // Dependencies contribute only explicit public views. Their private
+        // source module names and transitive implementation helpers stay out.
+        for (public_modules) |mod| {
+            if (std.mem.eql(u8, mod.package_name, root_name)) continue;
             try docs_modules.append(allocator, mod);
         }
 
-        allocator.free(all_modules);
         return docs_modules.toOwnedSlice(allocator);
     }
 
@@ -2887,7 +3151,6 @@ pub const BuildEnv = struct {
         for (drained) |mod| {
             for (mod.reports) |*report| {
                 switch (report.severity) {
-                    .info => {},
                     .runtime_error, .fatal => total_error_count += 1,
                     .warning => total_warning_count += 1,
                 }
@@ -3371,7 +3634,7 @@ test "BuildEnv collectWatchInputStates resolves file dependencies from module so
     const module_env = try allocator.create(ModuleEnv);
     module_env.* = try ModuleEnv.init(allocator, source);
     try module_env.initCIRFields("App");
-    const dep_idx = try module_env.recordFileDependency("data.txt");
+    const dep_idx = try module_env.recordFileDependency("data.txt", 0, 0);
     const dep_hash = [_]u8{3} ** 32;
     module_env.setFileDependencyContentHash(dep_idx, dep_hash);
     coord_mod.semantic = .{ .module_env = module_env, .checked_artifact = null };
@@ -3768,4 +4031,105 @@ test "issue 9737: logicalModuleToPath frees its scratch path exactly once on the
     // it must free its `with_ext` scratch allocation exactly once; freeing it a
     // second time is a double free that the testing allocator detects.
     try std.testing.expectError(error.PathOutsideWorkspace, env.logicalModuleToPath("/tmp/roc-issue-9737", "Mod"));
+}
+
+test "findPackageForModulePath deterministically selects nested package over outer package root_dir" {
+    const gpa = std.testing.allocator;
+
+    var coord: coordinator_mod.Coordinator = undefined;
+    coord.packages = std.StringHashMap(*coordinator_mod.PackageState).init(gpa);
+    defer coord.packages.deinit();
+    coord.app_package_name = null;
+
+    var pkg_app = coordinator_mod.PackageState.init(gpa, try gpa.dupe(u8, "app"), try gpa.dupe(u8, "/workspace"), null);
+    defer pkg_app.deinit(gpa);
+    var pkg_b = coordinator_mod.PackageState.init(gpa, try gpa.dupe(u8, "pkg_b"), try gpa.dupe(u8, "/workspace/pkg_b"), null);
+    defer pkg_b.deinit(gpa);
+
+    try coord.packages.put("app", &pkg_app);
+    try coord.packages.put("pkg_b", &pkg_b);
+
+    var env: BuildEnv = undefined;
+    env.gpa = gpa;
+    env.coordinator = &coord;
+    env.discovered_pkg_name = null;
+
+    // Exact nested file matches the more specific package, not the outer workspace package
+    const nested_pkg = env.findPackageForModulePath("/workspace/pkg_b/ModB.roc");
+    try std.testing.expect(nested_pkg != null);
+    try std.testing.expectEqualStrings("pkg_b", nested_pkg.?.name);
+
+    // Top-level workspace file matches the outer package
+    const app_pkg = env.findPackageForModulePath("/workspace/Main.roc");
+    try std.testing.expect(app_pkg != null);
+    try std.testing.expectEqualStrings("app", app_pkg.?.name);
+
+    // Partial directory name match on same prefix (e.g. /workspace/pkg_bad vs /workspace/pkg_b) matches /workspace, not pkg_b
+    const sibling_pkg = env.findPackageForModulePath("/workspace/pkg_bad/Mod.roc");
+    try std.testing.expect(sibling_pkg != null);
+    try std.testing.expectEqualStrings("app", sibling_pkg.?.name);
+
+    // Unowned document path returns null (never guesses or falls back to root/app package)
+    env.discovered_pkg_name = "app";
+    coord.app_package_name = "app";
+    const unowned_pkg = env.findPackageForModulePath("/unrelated/path/Doc.roc");
+    try std.testing.expect(unowned_pkg == null);
+}
+
+test "findModuleByQualifiedNameInPackage strictly preserves shorthand identity and does not cross namespaces" {
+    const gpa = std.testing.allocator;
+
+    var coord: coordinator_mod.Coordinator = undefined;
+    coord.packages = std.StringHashMap(*coordinator_mod.PackageState).init(gpa);
+    defer coord.packages.deinit();
+    coord.app_package_name = null;
+
+    var pkg_app = coordinator_mod.PackageState.init(gpa, try gpa.dupe(u8, "app"), try gpa.dupe(u8, "/workspace"), null);
+    defer pkg_app.deinit(gpa);
+    var pkg_dep = coordinator_mod.PackageState.init(gpa, try gpa.dupe(u8, "dep_pkg"), try gpa.dupe(u8, "/workspace/dep"), null);
+    defer pkg_dep.deinit(gpa);
+
+    // App has shorthand "dep" -> "dep_pkg"
+    try pkg_app.shorthands.put(try gpa.dupe(u8, "dep"), try gpa.dupe(u8, "dep_pkg"));
+
+    // App also has a hierarchical module named "dep.Missing"
+    try pkg_app.modules.append(gpa, coordinator_mod.ModuleState.init(try gpa.dupe(u8, "dep.Missing"), try gpa.dupe(u8, "/workspace/dep_Missing.roc")));
+    try pkg_app.module_names.put(pkg_app.modules.items[0].name, 0);
+
+    // dep_pkg has module "RealModule" (but not "Missing")
+    try pkg_dep.modules.append(gpa, coordinator_mod.ModuleState.init(try gpa.dupe(u8, "RealModule"), try gpa.dupe(u8, "/workspace/dep/RealModule.roc")));
+    try pkg_dep.module_names.put(pkg_dep.modules.items[0].name, 0);
+
+    try coord.packages.put("app", &pkg_app);
+    try coord.packages.put("dep_pkg", &pkg_dep);
+
+    var env: BuildEnv = undefined;
+    env.gpa = gpa;
+    env.coordinator = &coord;
+    env.discovered_pkg_name = null;
+
+    // 1. Dotted name with declared shorthand resolves in target package
+    const mod_res = env.findModuleByQualifiedNameInPackage(&pkg_app, "dep.RealModule");
+    try std.testing.expect(mod_res != null);
+    try std.testing.expectEqualStrings("RealModule", mod_res.?.name);
+
+    // 2. Dotted name with declared shorthand where target package misses module does NOT fall through to hierarchical module "dep.Missing"
+    const missing_res = env.findModuleByQualifiedNameInPackage(&pkg_app, "dep.Missing");
+    try std.testing.expect(missing_res == null);
+
+    // 3. Dotted name with undeclared qualifier does NOT resolve against foreign canonical packages
+    var pkg_other = coordinator_mod.PackageState.init(gpa, try gpa.dupe(u8, "foreign"), try gpa.dupe(u8, "/workspace/foreign"), null);
+    defer pkg_other.deinit(gpa);
+    try pkg_other.modules.append(gpa, coordinator_mod.ModuleState.init(try gpa.dupe(u8, "Mod"), try gpa.dupe(u8, "/workspace/foreign/Mod.roc")));
+    try pkg_other.module_names.put(pkg_other.modules.items[0].name, 0);
+    try coord.packages.put("foreign", &pkg_other);
+
+    const foreign_res = env.findModuleByQualifiedNameInPackage(&pkg_app, "foreign.Mod");
+    try std.testing.expect(foreign_res == null);
+
+    // 4. Null importing package context returns null (never guesses or falls back to root/app package)
+    env.discovered_pkg_name = "app";
+    coord.app_package_name = "app";
+    const null_pkg_res = env.findModuleByQualifiedNameInPackage(null, "dep.RealModule");
+    try std.testing.expect(null_pkg_res == null);
 }

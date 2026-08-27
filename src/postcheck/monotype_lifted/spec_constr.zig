@@ -261,11 +261,59 @@ fn walkSpanCloned(
     for (source) |item| try visit(context, item);
 }
 
+/// Exact post-SpecConstr use information for one lifted procedure.
+pub const ProcedureUse = struct {
+    external_calls: usize = 0,
+    external_call_expr: ?Ast.ExprId = null,
+    external_call_owner: ?Ast.FnId = null,
+    value_refs: usize = 0,
+    contains_return: bool = false,
+};
+
+/// Read-only exact procedure-use inventory produced after all SpecConstr graph
+/// rewrites. Function ids index `items` directly.
+pub const ProcedureUsage = struct {
+    items: []const ProcedureUse = &.{},
+
+    pub fn get(self: ProcedureUsage, fn_id: Ast.FnId) ProcedureUse {
+        const index = @intFromEnum(fn_id);
+        if (index >= self.items.len) {
+            Common.invariant("procedure-use inventory did not contain a lifted function");
+        }
+        return self.items[index];
+    }
+};
+
+/// Allocator-owned storage for an exact post-SpecConstr procedure-use inventory.
+pub const OwnedProcedureUsage = struct {
+    allocator: Allocator,
+    items: []ProcedureUse,
+
+    pub fn empty(allocator: Allocator) OwnedProcedureUsage {
+        return .{ .allocator = allocator, .items = &.{} };
+    }
+
+    pub fn deinit(self: *OwnedProcedureUsage) void {
+        if (self.items.len != 0) self.allocator.free(self.items);
+        self.* = empty(self.allocator);
+    }
+
+    pub fn view(self: *const OwnedProcedureUsage) ProcedureUsage {
+        return .{ .items = self.items };
+    }
+};
+
 /// Specialize recursive direct calls whose arguments are known constructor shapes.
 pub fn run(allocator: Allocator, program: *Ast.Program) Common.LowerError!void {
+    var procedure_usage = try runAndCollectProcedureUsage(allocator, program);
+    defer procedure_usage.deinit();
+}
+
+/// Run SpecConstr and retain the exact use inventory from its final graph.
+pub fn runAndCollectProcedureUsage(allocator: Allocator, program: *Ast.Program) Common.LowerError!OwnedProcedureUsage {
     var pass = try Pass.init(allocator, program);
     defer pass.deinit();
-    try pass.run();
+    return try pass.run();
 }
 
 const Shape = union(enum) {
@@ -452,9 +500,18 @@ const BodySize = union(enum) {
     }
 };
 
+const FnSource = struct {
+    /// The authoritative input body for every clone of this function. The
+    /// program's function table becomes an output table once rewriting starts,
+    /// so reading a body back from it would make later clones consume output
+    /// emitted by earlier clones.
+    body: Ast.FnBody,
+    size: BodySize,
+};
+
 const FnPlan = struct {
     used_args: []bool,
-    body_size: BodySize,
+    source: FnSource,
     specs: std.ArrayList(Spec),
 
     fn deinit(self: *FnPlan, allocator: Allocator) void {
@@ -466,8 +523,10 @@ const FnPlan = struct {
 /// A pattern binder paired with the monomorphic type it was bound at. A single
 /// source binder is reused across every monomorphization of its binding, so the
 /// binder alone does not identify a value; the type digest completes the
-/// identity, matching the `(binder, type)` identity Monotype lowering uses for
-/// locals. See `Builder.sameLocalIdentity` in monotype/lower.zig.
+/// identity. This must use the digest of `typeEql`, not stored type identity:
+/// one monomorphization may carry distinct checked-node provenance or a
+/// transparent alias at equivalent local sites. See `Builder.sameLocalIdentity`
+/// in monotype/lower.zig.
 const BinderIdentity = struct {
     binder: check.CheckedModule.PatternBinderId,
     digest: names.TypeDigest,
@@ -680,6 +739,16 @@ const SpecAdmission = enum {
     denied_spec_count,
 };
 
+/// The phase that owns a clone. Loop-exit selection is deliberately separate
+/// from specialization and ordinary rewrites: their full lexical clones can
+/// expose another projectable loop through an inlined callee, so only the final
+/// call-opaque exit-selection phase may initiate another selected exit ABI.
+const ClonePurpose = enum {
+    specialization,
+    rewrite,
+    loop_exit_selection,
+};
+
 const InlineCallMode = enum {
     all,
     iterator_fusion,
@@ -810,7 +879,10 @@ const Pass = struct {
             @memset(used_args, false);
             plan.* = .{
                 .used_args = used_args,
-                .body_size = fnBodySizeWithin(program, fn_.body, spec_constr_body_expr_threshold),
+                .source = .{
+                    .body = fn_.body,
+                    .size = fnBodySizeWithin(program, fn_.body, spec_constr_body_expr_threshold),
+                },
                 .specs = .empty,
             };
         }
@@ -878,7 +950,7 @@ const Pass = struct {
         self.arena.deinit();
     }
 
-    fn run(self: *Pass) Common.LowerError!void {
+    fn run(self: *Pass) Common.LowerError!OwnedProcedureUsage {
         const original_fn_count = self.plans.len;
 
         const capture_snapshot = try self.snapshotOriginalCaptures(original_fn_count);
@@ -897,12 +969,14 @@ const Pass = struct {
         try self.rewriteAllOriginalBodies(original_fn_count);
         try self.createSpecializations(original_fn_count);
         try self.projectUnusedLoopResults();
-        try self.localizeSingleUseTailRecursiveWorkers(original_fn_count);
+        var procedure_usage = try self.localizeSingleUseTailRecursiveWorkers(original_fn_count);
+        errdefer procedure_usage.deinit();
         try Lift.recomputeCaptures(self.allocator, self.program);
         self.verifyRewrittenCaptureGain(capture_snapshot);
         try self.verifyRewrittenBodyLocals(original_fn_count);
 
         self.program.next_symbol = self.symbols.next;
+        return procedure_usage;
     }
 
     /// Turn a specialized tail-recursive worker with exactly one external use
@@ -910,7 +984,7 @@ const Pass = struct {
     /// exposed the worker's constructor leaves as scalar arguments here, so
     /// moving that exact ABI into the caller preserves the specialized loop
     /// without paying an out-of-line call or duplicating any code.
-    fn localizeSingleUseTailRecursiveWorkers(self: *Pass, original_fn_count: usize) Common.LowerError!void {
+    fn localizeSingleUseTailRecursiveWorkers(self: *Pass, original_fn_count: usize) Common.LowerError!OwnedProcedureUsage {
         const fn_count = self.program.fnCount();
         var program_usage = try ProgramProcedureUsage.collect(self.allocator, self.program);
         defer program_usage.deinit(self.allocator);
@@ -923,7 +997,7 @@ const Pass = struct {
             // A source-level return is relative to the worker procedure. It
             // cannot be moved across a procedure boundary until the IR gives
             // it an explicit continuation target.
-            if (program_usage.contains_return[worker_index]) continue;
+            if (program_usage.fn_uses[worker_index].contains_return) continue;
 
             const tail = program_usage.tail_self_calls[worker_index];
             if (!tail.valid or tail.count == 0) continue;
@@ -943,6 +1017,11 @@ const Pass = struct {
             program_usage = refreshed_usage;
             refreshed_usage = undefined;
         }
+
+        return .{
+            .allocator = self.allocator,
+            .items = program_usage.takeFnUses(),
+        };
     }
 
     fn localizeTailRecursiveWorker(
@@ -1271,17 +1350,20 @@ const Pass = struct {
                 .body = .{ .roc = specialized },
                 .ret = fn_.ret,
             });
-            self.refreshPreCloneBodySize(index);
+            self.refreshPreCloneSource(index);
         }
     }
 
-    fn refreshPreCloneBodySize(self: *Pass, index: usize) void {
-        if (index >= self.plans.len) Common.invariant("SpecConstr body-size refresh received a generated function");
-        self.plans[index].body_size = fnBodySizeWithin(
-            self.program,
-            self.program.getFnAt(index).body,
-            spec_constr_body_expr_threshold,
-        );
+    /// Replace the paired source body and size during the one authoritative
+    /// pre-clone rewrite. After this phase both fields remain immutable, so a
+    /// clone can never charge one body while reading another.
+    fn refreshPreCloneSource(self: *Pass, index: usize) void {
+        if (index >= self.plans.len) Common.invariant("SpecConstr source refresh received a generated function");
+        const body = self.program.getFnAt(index).body;
+        self.plans[index].source = .{
+            .body = body,
+            .size = fnBodySizeWithin(self.program, body, spec_constr_body_expr_threshold),
+        };
     }
 
     fn copyProcDebugName(self: *Pass, source_symbol: Common.Symbol, target_symbol: Common.Symbol) Allocator.Error!void {
@@ -1295,8 +1377,7 @@ const Pass = struct {
         while (changed) {
             changed = false;
             for (0..original_fn_count) |index| {
-                const fn_ = self.program.getFnAt(index);
-                const body = switch (fn_.body) {
+                const body = switch (self.plans[index].source.body) {
                     .roc => |body| body,
                     .hosted => continue,
                 };
@@ -1309,8 +1390,7 @@ const Pass = struct {
     fn collectCallPatterns(self: *Pass, original_fn_count: usize) Allocator.Error!void {
         var index: usize = 0;
         while (index < original_fn_count) : (index += 1) {
-            const fn_ = self.program.getFnAt(index);
-            const body = switch (fn_.body) {
+            const body = switch (self.plans[index].source.body) {
                 .roc => |body| body,
                 .hosted => continue,
             };
@@ -1328,8 +1408,7 @@ const Pass = struct {
 
         var index: usize = 0;
         while (index < original_fn_count) : (index += 1) {
-            const fn_ = self.program.getFnAt(index);
-            const body = switch (fn_.body) {
+            const body = switch (self.plans[index].source.body) {
                 .roc => |body| body,
                 .hosted => continue,
             };
@@ -1754,21 +1833,35 @@ const Pass = struct {
     }
 
     fn newSpecAdmission(self: *const Pass, raw: usize) SpecAdmission {
-        if (!self.plans[raw].body_size.admits()) return .denied_body_size;
+        if (!self.plans[raw].source.size.admits()) return .denied_body_size;
         if (self.plans[raw].specs.items.len >= spec_constr_specialization_count) return .denied_spec_count;
         return .admitted;
     }
 
-    fn inlineBodySize(self: *const Pass, fn_id: Ast.FnId, body: Ast.ExprId) BodySize {
+    const InlineSourceBody = struct {
+        expr: Ast.ExprId,
+        size: BodySize,
+    };
+
+    fn sourceBody(self: *const Pass, fn_id: Ast.FnId) Ast.FnBody {
         const raw = @intFromEnum(fn_id);
-        return if (raw < self.plans.len)
-            self.plans[raw].body_size
-        else
-            exprBodySizeWithin(self.program, body, spec_constr_body_expr_threshold);
+        return if (raw < self.plans.len) self.plans[raw].source.body else self.program.getFn(fn_id).body;
     }
 
-    fn inlineBodyAdmission(self: *const Pass, fn_id: Ast.FnId, body: Ast.ExprId) SpecAdmission {
-        return if (self.inlineBodySize(fn_id, body).admits()) .admitted else .denied_body_size;
+    /// Return the body and the work charged for cloning it as one value. Keeping
+    /// these inseparable prevents a mutable output body from being admitted
+    /// against an original source body's smaller size.
+    fn inlineSourceBody(self: *const Pass, fn_id: Ast.FnId) ?InlineSourceBody {
+        const raw = @intFromEnum(fn_id);
+        const body = switch (self.sourceBody(fn_id)) {
+            .roc => |body| body,
+            .hosted => return null,
+        };
+        const size = if (raw < self.plans.len)
+            self.plans[raw].source.size
+        else
+            exprBodySizeWithin(self.program, body, spec_constr_body_expr_threshold);
+        return .{ .expr = body, .size = size };
     }
 
     fn recordCallPattern(self: *Pass, fn_id: Ast.FnId, args_span: Ast.Span(Ast.ExprId)) Allocator.Error!void {
@@ -1823,7 +1916,7 @@ const Pass = struct {
     fn ensureCallPatternForValues(self: *Pass, fn_id: Ast.FnId, values: []const Value) Common.LowerError!void {
         const raw = @intFromEnum(fn_id);
         if (raw >= self.plans.len) return;
-        if (!self.plans[raw].body_size.admits()) return;
+        if (!self.plans[raw].source.size.admits()) return;
 
         const pattern = (try self.callPatternForValues(fn_id, values)) orelse return;
         for (self.plans[raw].specs.items) |spec| {
@@ -1892,7 +1985,7 @@ const Pass = struct {
         }
 
         const args = try cloner.buildArgs();
-        const body: Ast.FnBody = switch (source_fn.body) {
+        const body: Ast.FnBody = switch (self.sourceBody(source_fn_id)) {
             .roc => |body_expr| .{ .roc = try cloner.cloneExpr(body_expr) },
             .hosted => Common.invariant("hosted function had a call-pattern specialization"),
         };
@@ -1914,8 +2007,11 @@ const Pass = struct {
         defer self.allocator.free(done);
         @memset(done, false);
 
+        // Original bodies are immutable clone sources. Their output calls are
+        // rewritten when rewriteAllOriginalBodies clones them below; only the
+        // already-emitted specialization bodies need this in-place update.
         const fn_count = self.program.fnCount();
-        for (0..fn_count) |index| {
+        for (self.plans.len..fn_count) |index| {
             const fn_ = self.program.getFnAt(index);
             const body = switch (fn_.body) {
                 .roc => |body| body,
@@ -1931,11 +2027,7 @@ const Pass = struct {
     fn rewriteAllOriginalBodies(self: *Pass, original_fn_count: usize) Common.LowerError!void {
         for (0..original_fn_count) |index| {
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
-            const body = switch (self.program.getFnAt(index).body) {
-                .roc => |body| body,
-                .hosted => continue,
-            };
-            try self.cloneFnBodyInPlace(fn_id, body);
+            try self.cloneFnBodyInPlace(fn_id);
         }
     }
 
@@ -2589,7 +2681,8 @@ const Pass = struct {
         if (iterator_type != .named) return false;
         const named = iterator_type.named;
         const topology = named.def.iterator_topology orelse return false;
-        if (access.field != topology.step_field) return false;
+        if (access.segments.len != 1) return false;
+        if (self.program.fieldAccessSegmentAt(access.segments, 0).field != topology.step_field) return false;
         const backing = named.backing orelse return false;
         if (backing.authority != .generated_private) return false;
         const backing_type = self.program.types.get(backing.ty);
@@ -2924,7 +3017,7 @@ const Pass = struct {
         const base_param_ref = try self.program.addExpr(.{ .ty = base_ty, .data = .{ .local = base_param } });
         const step = try self.program.addExpr(.{ .ty = step_fn_ty, .data = .{ .field_access = .{
             .receiver = base_param_ref,
-            .field = topology.step_field,
+            .segments = try self.program.addFieldAccessSegmentSpan(&.{.{ .field = topology.step_field }}),
         } } });
         const next = try self.program.addExpr(.{ .ty = step_ty, .data = .{ .call_value = .{
             .callee = step,
@@ -3384,7 +3477,7 @@ const Pass = struct {
             } },
             .field_access => |field| .{ .field_access = .{
                 .receiver = (try self.cloneExprFresh(field.receiver, renames)) orelse return null,
-                .field = field.field,
+                .segments = field.segments,
             } },
             .tuple_access => |access| .{ .tuple_access = .{
                 .tuple = (try self.cloneExprFresh(access.tuple, renames)) orelse return null,
@@ -3620,11 +3713,15 @@ const Pass = struct {
     /// Structural consumers expose exact producer calls locally, call-pattern
     /// rewrites consume the resulting values, and loop fixed points scalarize
     /// known carried structure without a body-category routing decision.
-    fn cloneFnBodyInPlace(self: *Pass, fn_id: Ast.FnId, body: Ast.ExprId) Common.LowerError!void {
+    fn cloneFnBodyInPlace(self: *Pass, fn_id: Ast.FnId) Common.LowerError!void {
         const fn_index = @intFromEnum(fn_id);
         if (fn_index < self.whole_body_cloned.len and self.whole_body_cloned[fn_index]) return;
 
         const fn_ = self.program.getFn(fn_id);
+        const body = switch (self.sourceBody(fn_id)) {
+            .roc => |body| body,
+            .hosted => return,
+        };
         var cloner = Cloner.initForRewrite(self);
         defer cloner.deinit();
         cloner.inline_direct_requires_known_arg = true;
@@ -3668,11 +3765,8 @@ const Pass = struct {
             const aggregate_projectable = try self.bodyHasAggregateProjectableLoopResult(body);
             if (!tuple_projectable and !aggregate_projectable) continue;
 
-            var cloner = Cloner.initForRewrite(self);
+            var cloner = Cloner.initForLoopExitSelection(self);
             defer cloner.deinit();
-            cloner.inline_calls = .none;
-            cloner.rewrite_call_patterns = false;
-            cloner.emit_callable_workers = false;
             const cloned = try cloner.cloneExpr(body);
             self.program.setFn(fn_id, .{
                 .symbol = fn_.symbol,
@@ -4279,19 +4373,22 @@ const Subst = struct {
     /// Identity a local's binder-scoped substitution is keyed by: the pattern
     /// binder together with the digest of the local's monomorphic type. Two
     /// locals that share a binder but were monomorphized at different types are
-    /// distinct bindings and must not read one another's substitution.
-    fn binderIdentityOf(program: *const Ast.Program, local: Ast.LocalId) ?BinderIdentity {
+    /// distinct bindings and must not read one another's substitution. Every
+    /// local reference resolves through here, so the digest must come from the
+    /// store's memoized construction, which is why these helpers need the
+    /// program mutable.
+    fn binderIdentityOf(program: *Ast.Program, local: Ast.LocalId) ?BinderIdentity {
         const local_data = program.getLocal(local);
         const binder = local_data.binder orelse return null;
         return .{
             .binder = binder,
-            .digest = program.types.typeDigest(&program.names, local_data.ty),
+            .digest = program.types.equalityDigest(&program.names, local_data.ty),
         };
     }
 
     /// Resolve a local to its known value through the exact-local map, then the
     /// binder-wide map.
-    fn get(self: *const Subst, program: *const Ast.Program, local: Ast.LocalId) ?Value {
+    fn get(self: *const Subst, program: *Ast.Program, local: Ast.LocalId) ?Value {
         if (self.exact.get(local)) |value| return value;
         if (binderIdentityOf(program, local)) |identity| {
             if (self.binder_subst.get(identity)) |value| return value;
@@ -4301,7 +4398,7 @@ const Subst = struct {
 
     /// Resolve a local for emitted code, including the active value of a
     /// binder-equivalent Monotype local id.
-    fn getForClone(self: *const Subst, program: *const Ast.Program, local: Ast.LocalId) ?Value {
+    fn getForClone(self: *const Subst, program: *Ast.Program, local: Ast.LocalId) ?Value {
         if (self.exact.get(local)) |value| return value;
         if (binderIdentityOf(program, local)) |identity| {
             if (self.binder_aliases.get(identity)) |value| return value;
@@ -4322,13 +4419,8 @@ const Subst = struct {
         return self.changes.items.len;
     }
 
-    fn put(self: *Subst, program: *const Ast.Program, local: Ast.LocalId, value: Value) Allocator.Error!void {
-        const previous = self.exact.get(local);
-        try self.changes.append(self.allocator, .{
-            .key = .{ .local = local },
-            .previous = previous,
-        });
-        try self.exact.put(local, value);
+    fn put(self: *Subst, program: *Ast.Program, local: Ast.LocalId, value: Value) Allocator.Error!void {
+        try self.putExact(local, value);
 
         const identity = binderIdentityOf(program, local) orelse return;
         try self.putAlias(identity, value);
@@ -4352,6 +4444,22 @@ const Subst = struct {
         try self.binder_subst.put(identity, value);
     }
 
+    /// Install a substitution for one exact local id without touching its
+    /// binder's maps. A binder-wide entry claims that every version of the
+    /// variable resolves to this value, which holds only where the value is in
+    /// scope. Pinning a binding whose scope is narrower than the position being
+    /// cloned—a loop param, read from the loop's own initial values—must stay
+    /// exact, or a sibling version of the same variable resolves to a binding
+    /// that does not exist at its use site.
+    fn putExact(self: *Subst, local: Ast.LocalId, value: Value) Allocator.Error!void {
+        const previous = self.exact.get(local);
+        try self.changes.append(self.allocator, .{
+            .key = .{ .local = local },
+            .previous = previous,
+        });
+        try self.exact.put(local, value);
+    }
+
     fn putAlias(self: *Subst, identity: BinderIdentity, value: Value) Allocator.Error!void {
         const previous = self.binder_aliases.get(identity);
         try self.changes.append(self.allocator, .{
@@ -4361,7 +4469,7 @@ const Subst = struct {
         try self.binder_aliases.put(identity, value);
     }
 
-    fn putLocalAlias(self: *Subst, program: *const Ast.Program, local: Ast.LocalId, value: Value) Allocator.Error!void {
+    fn putLocalAlias(self: *Subst, program: *Ast.Program, local: Ast.LocalId, value: Value) Allocator.Error!void {
         const identity = binderIdentityOf(program, local) orelse return;
         try self.putAlias(identity, value);
     }
@@ -4391,7 +4499,7 @@ const Subst = struct {
     /// binder-carrying local; the identity is returned whether or not a
     /// pre-loop entry existed, because the slot's reassigned copies resolve
     /// through it either way.
-    fn dropCarriedBinder(self: *Subst, program: *const Ast.Program, initial: Ast.ExprId) Allocator.Error!?BinderIdentity {
+    fn dropCarriedBinder(self: *Subst, program: *Ast.Program, initial: Ast.ExprId) Allocator.Error!?BinderIdentity {
         const local = localExpr(program, initial) orelse return null;
         const identity = binderIdentityOf(program, local) orelse return null;
         if (self.binder_subst.get(identity)) |previous| {
@@ -4503,6 +4611,7 @@ const Subst = struct {
 
 const Cloner = struct {
     pass: *Pass,
+    purpose: ClonePurpose,
     /// Symbolic values, shapes, and strict-binding chains owned by this clone.
     /// Accepted call patterns are copied into the pass-wide arena before this
     /// short-lived scratch arena is released.
@@ -4596,6 +4705,7 @@ const Cloner = struct {
     fn init(pass: *Pass, source_fn: Ast.FnId, pattern: CallPattern) Cloner {
         return .{
             .pass = pass,
+            .purpose = .specialization,
             .arena = std.heap.ArenaAllocator.init(pass.allocator),
             .source_fn = source_fn,
             .pattern = pattern,
@@ -4628,6 +4738,7 @@ const Cloner = struct {
     fn initForRewrite(pass: *Pass) Cloner {
         return .{
             .pass = pass,
+            .purpose = .rewrite,
             .arena = std.heap.ArenaAllocator.init(pass.allocator),
             .source_fn = undefined, // initForRewrite never calls buildArgs, which is the only reader.
             .pattern = .{ .args = &.{} },
@@ -4655,6 +4766,15 @@ const Cloner = struct {
             .current_region = Region.zero(),
             .current_inline_scope = Ast.InlineScopeId.none,
         };
+    }
+
+    fn initForLoopExitSelection(pass: *Pass) Cloner {
+        var cloner = initForRewrite(pass);
+        cloner.purpose = .loop_exit_selection;
+        cloner.inline_calls = .none;
+        cloner.rewrite_call_patterns = false;
+        cloner.emit_callable_workers = false;
+        return cloner;
     }
 
     fn deinit(self: *Cloner) void {
@@ -4937,6 +5057,7 @@ const Cloner = struct {
 
     fn buildArgs(self: *Cloner) Allocator.Error!Ast.Span(Ast.TypedLocal) {
         const source_fn = self.pass.program.getFn(self.source_fn);
+        const source_body = self.pass.sourceBody(self.source_fn);
         const source_args = try GuardedList.dupe(self.pass.allocator, Ast.TypedLocal, self.pass.program.typedLocalSpan(source_fn.args));
         defer self.pass.allocator.free(source_args);
         if (source_args.len != self.pattern.args.len) Common.invariant("call-pattern argument count differed from source function arity");
@@ -4944,11 +5065,11 @@ const Cloner = struct {
         defer self.current_loc = saved_loc;
         const saved_region = self.current_region;
         defer self.current_region = saved_region;
-        self.current_loc = switch (source_fn.body) {
+        self.current_loc = switch (source_body) {
             .roc => |body| self.pass.program.exprLoc(body),
             .hosted => SourceLoc.none,
         };
-        self.current_region = switch (source_fn.body) {
+        self.current_region = switch (source_body) {
             .roc => |body| self.pass.program.exprRegion(body),
             .hosted => Region.zero(),
         };
@@ -5141,7 +5262,7 @@ const Cloner = struct {
 
                 const base = try self.cloneExpr(update.base);
                 const base_ty = self.pass.program.getExpr(base).ty;
-                if (!sameType(self.pass.program, base_ty, expr.ty)) {
+                if (!try self.pass.program.types.typeEql(&self.pass.program.names, base_ty, expr.ty)) {
                     Common.invariant("record update base type differed from its result type in SpecConstr");
                 }
                 const base_local = try self.pass.program.addLocal(self.pass.symbols.fresh(), base_ty);
@@ -5161,7 +5282,7 @@ const Cloner = struct {
 
                     const read = try self.addExpr(.{ .ty = type_field.ty, .data = .{ .field_access = .{
                         .receiver = base_ref,
-                        .field = type_field.name,
+                        .segments = try self.pass.program.addFieldAccessSegmentSpan(&.{.{ .field = type_field.name }}),
                     } } });
                     const read_local = try self.pass.program.addLocal(self.pass.symbols.fresh(), type_field.ty);
                     try bindings.appendBinding(self.arena.allocator(), .{
@@ -5224,14 +5345,7 @@ const Cloner = struct {
                 if (try self.cloneBlockValue(block, bindings)) |value| return value;
                 return .{ .expr = try self.cloneExprPlain(expr_id) };
             },
-            .field_access => |field| {
-                const receiver = try self.cloneExprValueDemandingShapeInto(field.receiver, bindings);
-                if (fieldFromValue(self.pass.program, receiver, field.field)) |value| return value;
-                return .{ .expr = try self.addExpr(.{ .ty = expr.ty, .data = .{ .field_access = .{
-                    .receiver = try self.materialize(receiver),
-                    .field = field.field,
-                } } }) };
-            },
+            .field_access => |field| return try self.cloneFieldAccessValue(expr.ty, field, bindings),
             .tuple_access => |access| {
                 const receiver = try self.cloneExprValueDemandingShapeInto(access.tuple, bindings);
                 if (itemFromValue(receiver, access.elem_index)) |value| return value;
@@ -5473,7 +5587,11 @@ const Cloner = struct {
             .field_access => |field| blk: {
                 const receiver_local = localExpr(self.pass.program, field.receiver) orelse break :blk false;
                 const receiver = self.subst.getExact(receiver_local) orelse break :blk false;
-                const value = fieldFromValue(self.pass.program, receiver, field.field) orelse break :blk false;
+                const value = fieldPathFromValue(
+                    self.pass.program,
+                    receiver,
+                    self.pass.program.fieldAccessSegmentSpan(field.segments),
+                ) orelse break :blk false;
                 break :blk shapeProofIsProven(try self.pass.shapeFromValue(value));
             },
             .tuple_access => |access| blk: {
@@ -5665,14 +5783,13 @@ const Cloner = struct {
         fn_ref: @import("../monotype/ast.zig").LiftedFunctionValue,
         bindings: *BindingChain,
     ) Common.LowerError!Value {
-        const source_fn = self.pass.program.getFn(fn_ref.fn_id);
-        if (source_fn.body == .roc and
-            self.pass.inlineBodyAdmission(fn_ref.fn_id, source_fn.body.roc) != .admitted)
-        {
-            return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .fn_ref = .{
-                .fn_id = fn_ref.fn_id,
-                .captures = try self.cloneCaptureOperandSpan(fn_ref.captures),
-            } } }) };
+        if (self.pass.inlineSourceBody(fn_ref.fn_id)) |source| {
+            if (!source.size.admits()) {
+                return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .fn_ref = .{
+                    .fn_id = fn_ref.fn_id,
+                    .captures = try self.cloneCaptureOperandSpan(fn_ref.captures),
+                } } }) };
+            }
         }
 
         const capture_count: usize = @intCast(fn_ref.captures.len);
@@ -5932,7 +6049,9 @@ const Cloner = struct {
     }
 
     fn cloneLetValue(self: *Cloner, let_: anytype, bindings: *BindingChain) Common.LowerError!Value {
-        if (try self.loopWithSelectedExitValues(let_)) |selected| return try self.cloneExprValueInto(selected, bindings);
+        if (self.purpose == .loop_exit_selection) {
+            if (try self.loopWithSelectedExitValues(let_)) |selected| return try self.cloneExprValueInto(selected, bindings);
+        }
 
         var value_bindings: BindingChain = .{};
         const value = try self.cloneExprValueInto(let_.value, &value_bindings);
@@ -7274,8 +7393,16 @@ const Cloner = struct {
         // its initialized-ness at the loop head. The emitted params do not
         // exist yet, so pin those references to the source param ids while
         // cloning; each emission below retargets them to its fresh params.
+        //
+        // The pin is exact, never binder-wide. A loop-carried `var` shares one
+        // binder across its pre-loop version, its param, and its post-loop
+        // version, and the slot's own initial value is that pre-loop version.
+        // Claiming the param binder-wide here would resolve that initial value
+        // to the param, so the loop would seed its slot from the binding it is
+        // about to introduce. The param becomes the binder's value only inside
+        // the loop, which is what `putLoopCarried` installs below.
         const forward_start = self.subst.watermark();
-        for (params) |param| try self.shadowLocal(param.local);
+        for (params) |param| try self.pinSourceLocal(param.local);
         for (initial_values, 0..) |initial, index| {
             values[index] = try self.cloneExprValueDemandingShapeInto(initial, bindings);
             switch (try self.pass.shapeFromValue(values[index])) {
@@ -7835,10 +7962,11 @@ const Cloner = struct {
                             const fields = try self.arena.allocator().alloc(FieldShape, record.fields.len);
                             var demoted = false;
                             for (record.fields, 0..) |field_shape, index| {
-                                const field_expr = try self.addExpr(.{ .ty = shapeType(field_shape.shape), .data = .{ .field_access = .{
-                                    .receiver = receiver,
-                                    .field = field_shape.name,
-                                } } });
+                                const field_expr = try self.addFieldAccessExpr(
+                                    shapeType(field_shape.shape),
+                                    receiver,
+                                    field_shape.name,
+                                );
                                 const supplied = try self.supplyLoopSlotLeaves(field_shape.shape, .{ .expr = field_expr }, out);
                                 fields[index] = .{ .name = field_shape.name, .shape = supplied.shape };
                                 demoted = demoted or supplied.demoted;
@@ -7931,16 +8059,32 @@ const Cloner = struct {
         return .{ .shape = .{ .any = ty }, .demoted = true };
     }
 
-    fn cloneFieldAccess(self: *Cloner, ty: Type.TypeId, field: anytype) Common.LowerError!Ast.ExprId {
-        const receiver = try self.cloneExprValueDemandingShape(field.receiver);
-        if (fieldFromValue(self.pass.program, receiver.value, field.field)) |value| {
-            return try self.wrapBindings(receiver.bindings, try self.materialize(value));
+    fn cloneFieldAccessValue(self: *Cloner, ty: Type.TypeId, field: anytype, bindings: *BindingChain) Common.LowerError!Value {
+        const receiver = try self.cloneExprValueDemandingShapeInto(field.receiver, bindings);
+        if (field.segments.len == 0) Common.invariant("field access path had no segments");
+
+        var prefix = receiver;
+        var consumed: u32 = 0;
+        while (consumed < field.segments.len) : (consumed += 1) {
+            const segment = self.pass.program.fieldAccessSegmentAt(field.segments, consumed);
+            prefix = fieldFromValue(self.pass.program, prefix, segment.field) orelse break;
         }
-        const access = try self.addExpr(.{ .ty = ty, .data = .{ .field_access = .{
-            .receiver = try self.materialize(receiver.value),
-            .field = field.field,
-        } } });
-        return try self.wrapBindings(receiver.bindings, access);
+        if (consumed == field.segments.len) return prefix;
+
+        const residual_segments: Ast.Span(Ast.FieldAccessSegment) = .{
+            .start = field.segments.start + consumed,
+            .len = field.segments.len - consumed,
+        };
+        return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .field_access = .{
+            .receiver = try self.materialize(prefix),
+            .segments = residual_segments,
+        } } }) };
+    }
+
+    fn cloneFieldAccess(self: *Cloner, ty: Type.TypeId, field: anytype) Common.LowerError!Ast.ExprId {
+        var bindings: BindingChain = .{};
+        const value = try self.cloneFieldAccessValue(ty, field, &bindings);
+        return try self.wrapBindings(bindings, try self.materialize(value));
     }
 
     fn cloneTupleAccess(self: *Cloner, ty: Type.TypeId, access: anytype) Common.LowerError!Ast.ExprId {
@@ -8006,11 +8150,13 @@ const Cloner = struct {
 
     /// Collapse a match whose scrutinee is a known constructor to the selected
     /// branch's body. `decline_on_no_match` distinguishes the two callers: the
-    /// direct known-match collapse proves exhaustiveness (a known constructor
-    /// always selects a branch), so a miss is an invariant; case-of-case
-    /// distribution instead *offers* a value that a branch may not structurally
-    /// cover (an opaque tag payload the selection cannot verify), so it declines
-    /// and leaves the match materialized.
+    /// direct known-match collapse proves exhaustiveness for a non-empty branch
+    /// set, so a miss there is an invariant; case-of-case distribution instead
+    /// *offers* a value that a branch may not structurally cover (an opaque tag
+    /// payload the selection cannot verify), so it declines and leaves the
+    /// match materialized. An empty branch set is absurd elimination. A symbolic
+    /// structural value does not prove reachability because an eager child may
+    /// itself be an impossible expression, so that match must also remain.
     fn selectKnownMatchValue(
         self: *Cloner,
         scrutinee: Value,
@@ -8019,6 +8165,7 @@ const Cloner = struct {
         bindings: *BindingChain,
     ) Common.LowerError!?Value {
         if (scrutinee == .expr) return null;
+        if (branches_span.len == 0) return null;
         // Read each branch by stable index rather than holding a `branchSpan`
         // borrow: `cloneExprValue(branch.body)` below can append to `branches`
         // through a nested match, which would invalidate a live borrow.
@@ -8109,10 +8256,7 @@ const Cloner = struct {
                         for (0..fields.len) |index| {
                             const field = GuardedList.at(fields, index);
                             const field_ty = self.pass.program.getPat(field.pattern).ty;
-                            const field_expr = try self.addExpr(.{ .ty = field_ty, .data = .{ .field_access = .{
-                                .receiver = receiver,
-                                .field = field.name,
-                            } } });
+                            const field_expr = try self.addFieldAccessExpr(field_ty, receiver, field.name);
                             _ = (try self.bindPatToMatchValue(field.pattern, .{ .expr = field_expr }, body, bindings)) orelse return null;
                         }
                         return value;
@@ -8385,7 +8529,11 @@ const Cloner = struct {
             },
             .field_access => |field| blk: {
                 const receiver = self.peekKnownValue(field.receiver) orelse break :blk null;
-                break :blk fieldFromValue(self.pass.program, receiver, field.field);
+                break :blk fieldPathFromValue(
+                    self.pass.program,
+                    receiver,
+                    self.pass.program.fieldAccessSegmentSpan(field.segments),
+                );
             },
             .tuple_access => |access| blk: {
                 const receiver = self.peekKnownValue(access.tuple) orelse break :blk null;
@@ -8975,21 +9123,18 @@ const Cloner = struct {
                 .args = try self.cloneExprSpan(args_span),
             } } }) };
         }
-        const body = switch (source_fn.body) {
-            .roc => |body| body,
-            .hosted => return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
+        const source = self.pass.inlineSourceBody(callable.fn_id) orelse
+            return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
                 .callee = try self.materialize(.{ .callable = callable }),
                 .args = try self.cloneExprSpan(args_span),
-            } } }) },
-        };
-        const body_size = self.pass.inlineBodySize(callable.fn_id, body);
-        if (!body_size.admits()) {
+            } } }) };
+        if (!source.size.admits()) {
             return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
                 .callee = try self.materialize(.{ .callable = callable }),
                 .args = try self.cloneExprSpan(args_span),
             } } }) };
         }
-        if (exprContainsReturn(self.pass.program, body)) {
+        if (exprContainsReturn(self.pass.program, source.expr)) {
             return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
                 .callee = try self.materialize(.{ .callable = callable }),
                 .args = try self.cloneExprSpan(args_span),
@@ -9013,7 +9158,7 @@ const Cloner = struct {
                 } } }) };
             }
         }
-        if (!self.admitInlineBodyGrowth(body_size)) {
+        if (!self.admitInlineBodyGrowth(source.size)) {
             return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .call_value = .{
                 .callee = try self.materialize(.{ .callable = callable }),
                 .args = try self.cloneExprSpan(args_span),
@@ -9074,7 +9219,7 @@ const Cloner = struct {
         const saved_inline_scope = self.current_inline_scope;
         defer self.current_inline_scope = saved_inline_scope;
         try self.enterInlineScope(callable.fn_id, self.pass.program.exprLoc(original_expr));
-        return try self.cloneExprValueInto(body, bindings);
+        return try self.cloneExprValueInto(source.expr, bindings);
     }
 
     fn inlineDirectCallValue(
@@ -9094,15 +9239,12 @@ const Cloner = struct {
         if (!sameType(self.pass.program, result_ty, source_fn.ret)) {
             return .{ .expr = try self.cloneExprPlain(original_expr) };
         }
-        const body = switch (source_fn.body) {
-            .roc => |body| body,
-            .hosted => return .{ .expr = try self.cloneExprPlain(original_expr) },
-        };
-        const body_size = self.pass.inlineBodySize(callee, body);
-        if (!body_size.admits()) {
+        const source = self.pass.inlineSourceBody(callee) orelse
+            return .{ .expr = try self.cloneExprPlain(original_expr) };
+        if (!source.size.admits()) {
             return .{ .expr = try self.cloneExprPlain(original_expr) };
         }
-        if (exprContainsReturn(self.pass.program, body)) {
+        if (exprContainsReturn(self.pass.program, source.expr)) {
             return .{ .expr = try self.cloneExprPlain(original_expr) };
         }
         const direct_call_size = self.argsKnownConstructorSize(args_span).plus(self.captureOperandsKnownConstructorSize(captures_span));
@@ -9113,7 +9255,7 @@ const Cloner = struct {
                 return .{ .expr = try self.cloneExprPlain(original_expr) };
             }
         }
-        if (!self.admitInlineBodyGrowth(body_size)) {
+        if (!self.admitInlineBodyGrowth(source.size)) {
             return .{ .expr = try self.cloneExprPlain(original_expr) };
         }
         const source_args = try GuardedList.dupe(self.pass.allocator, Ast.TypedLocal, self.pass.program.typedLocalSpan(source_fn.args));
@@ -9185,7 +9327,7 @@ const Cloner = struct {
         const saved_inline_scope = self.current_inline_scope;
         defer self.current_inline_scope = saved_inline_scope;
         try self.enterInlineScope(callee, self.pass.program.exprLoc(original_expr));
-        return try self.cloneExprValueInto(body, bindings);
+        return try self.cloneExprValueInto(source.expr, bindings);
     }
 
     fn bindPatToValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!MatchVerdict {
@@ -9211,10 +9353,7 @@ const Cloner = struct {
                         for (0..fields.len) |index| {
                             const field = GuardedList.at(fields, index);
                             const field_ty = self.pass.program.getPat(field.pattern).ty;
-                            const field_expr = try self.addExpr(.{ .ty = field_ty, .data = .{ .field_access = .{
-                                .receiver = receiver,
-                                .field = field.name,
-                            } } });
+                            const field_expr = try self.addFieldAccessExpr(field_ty, receiver, field.name);
                             const child_verdict = try self.bindPatToValue(field.pattern, .{ .expr = field_expr });
                             switch (child_verdict) {
                                 .match => {},
@@ -9376,10 +9515,7 @@ const Cloner = struct {
                         for (0..fields.len) |index| {
                             const field = GuardedList.at(fields, index);
                             const field_ty = self.pass.program.getPat(field.pattern).ty;
-                            const field_expr = try self.addExpr(.{ .ty = field_ty, .data = .{ .field_access = .{
-                                .receiver = receiver,
-                                .field = field.name,
-                            } } });
+                            const field_expr = try self.addFieldAccessExpr(field_ty, receiver, field.name);
                             if (!try self.bindPatToFlowValue(field.pattern, .{ .expr = field_expr })) return false;
                         }
                     },
@@ -9455,6 +9591,15 @@ const Cloner = struct {
     fn shadowLocal(self: *Cloner, local: Ast.LocalId) Common.LowerError!void {
         const ty = self.pass.program.getLocal(local).ty;
         try self.subst.put(self.pass.program, local, .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .local = local } }) });
+    }
+
+    /// Record an identity substitution for one exact local id, leaving its
+    /// binder's other versions to resolve however they already do. This is the
+    /// pin for a binding whose scope does not cover the position being cloned,
+    /// where `shadowLocal`'s binder-wide claim would be false.
+    fn pinSourceLocal(self: *Cloner, local: Ast.LocalId) Common.LowerError!void {
+        const ty = self.pass.program.getLocal(local).ty;
+        try self.subst.putExact(local, .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .local = local } }) });
     }
 
     fn putLocalAlias(self: *Cloner, source: Ast.LocalId, target: Ast.LocalId) Common.LowerError!void {
@@ -10015,10 +10160,17 @@ const Cloner = struct {
         const expr = self.pass.program.getExpr(source);
         if (expr.data == .field_access) {
             const field = expr.data.field_access;
-            return try self.addExpr(.{ .ty = expr.ty, .data = .{ .field_access = .{
-                .receiver = try self.cloneFieldTupleReadReplacingRoot(field.receiver, root, replacement),
-                .field = field.field,
-            } } });
+            return try self.addExpr(.{
+                .ty = expr.ty,
+                .data = .{
+                    .field_access = .{
+                        .receiver = try self.cloneFieldTupleReadReplacingRoot(field.receiver, root, replacement),
+                        // The clone stays within `pass.program`, so the source span
+                        // remains valid for the replacement expression.
+                        .segments = field.segments,
+                    },
+                },
+            });
         }
         if (expr.data == .tuple_access) {
             const access = expr.data.tuple_access;
@@ -10045,7 +10197,7 @@ const Cloner = struct {
                 &self.pass.program.types,
                 &self.pass.program.names,
             ),
-            .callable_abi = self.pass.program.types.typeDigest(&self.pass.program.names, callable.ty),
+            .callable_abi = self.pass.program.types.typeDigestCached(&self.pass.program.names, callable.ty, null),
             .capture_abi = self.callableCaptureAbiDigest(source_captures, callable.captures),
         };
         if (self.pass.callable_workers.get(worker_key)) |worker_fn_id| {
@@ -10053,7 +10205,7 @@ const Cloner = struct {
             return try self.materializeCallableWithCaptures(callable.ty, worker_fn_id, worker.captures, callable.captures);
         }
 
-        const source_body = switch (source_fn.body) {
+        const source_body = switch (self.pass.sourceBody(source_fn_id)) {
             .roc => |body| body,
             .hosted => Common.invariant("hosted callable value needed a rewritten body"),
         };
@@ -10187,7 +10339,7 @@ const Cloner = struct {
                 Common.invariant("rewritten callable had no value for a source capture slot");
             std.mem.writeInt(u32, &word, @intFromEnum(id), .little);
             hasher.update(&word);
-            const digest = self.pass.program.types.typeDigest(&self.pass.program.names, valueType(self.pass.program, value));
+            const digest = self.pass.program.types.typeDigestCached(&self.pass.program.names, valueType(self.pass.program, value), null);
             hasher.update(&digest.bytes);
         }
         return .{ .bytes = hasher.finalResult() };
@@ -10332,13 +10484,26 @@ const Cloner = struct {
         const source_fn = self.pass.program.getFn(callee);
         self.current_inline_scope = try self.pass.program.addInlineScope(.{
             .source_symbol = source_fn.symbol,
-            .source_loc = switch (source_fn.body) {
+            .source_loc = switch (self.pass.sourceBody(callee)) {
                 .roc => |body| self.pass.program.exprLoc(body),
                 .hosted => SourceLoc.none,
             },
             .call_site = call_site,
             .parent = self.current_inline_scope,
         });
+    }
+
+    fn addFieldAccessExpr(
+        self: *Cloner,
+        ty: Type.TypeId,
+        receiver: Ast.ExprId,
+        field: names.RecordFieldNameId,
+    ) Allocator.Error!Ast.ExprId {
+        const segments = try self.pass.program.addFieldAccessSegmentSpan(&.{.{ .field = field }});
+        return try self.addExpr(.{ .ty = ty, .data = .{ .field_access = .{
+            .receiver = receiver,
+            .segments = segments,
+        } } });
     }
 
     fn addExpr(self: *Cloner, expr: Ast.Expr) Allocator.Error!Ast.ExprId {
@@ -10422,49 +10587,19 @@ const BodyLocalScope = struct {
         }
     }
 
-    fn bindPat(self: *BodyLocalScope, pat_id: Ast.PatId, added: *std.ArrayList(Ast.LocalId)) Allocator.Error!void {
-        switch (self.program.getPat(pat_id).data) {
-            .bind => |local| {
-                try self.bind(local);
-                try added.append(self.allocator, local);
-            },
-            .wildcard,
-            .int_lit,
-            .dec_lit,
-            .frac_f32_lit,
-            .frac_f64_lit,
-            .str_lit,
-            => {},
-            .str_pattern => |str| {
-                const steps = self.program.strPatternStepSpan(str.steps);
-                for (0..steps.len) |index| {
-                    if (GuardedList.at(steps, index).capture) |capture| try self.bindPat(capture, added);
-                }
-            },
-            .as => |as| {
-                try self.bindPat(as.pattern, added);
-                try self.bind(as.local);
-                try added.append(self.allocator, as.local);
-            },
-            .record => |fields| {
-                const destructs = self.program.recordDestructSpan(fields);
-                for (0..destructs.len) |index| try self.bindPat(GuardedList.at(destructs, index).pattern, added);
-            },
-            .tuple => |items| {
-                const children = self.program.patSpan(items);
-                for (0..children.len) |index| try self.bindPat(GuardedList.at(children, index), added);
-            },
-            .list => |list| {
-                const children = self.program.patSpan(list.patterns);
-                for (0..children.len) |index| try self.bindPat(GuardedList.at(children, index), added);
-                if (list.rest) |rest| if (rest.pattern) |rest_pattern| try self.bindPat(rest_pattern, added);
-            },
-            .tag => |tag| {
-                const payloads = self.program.patSpan(tag.payloads);
-                for (0..payloads.len) |index| try self.bindPat(GuardedList.at(payloads, index), added);
-            },
-            .nominal => |backing| try self.bindPat(backing, added),
+    /// Records each bound local into the body-local scope's bound counts.
+    const ScopeBinder = struct {
+        scope: *BodyLocalScope,
+        added: *std.ArrayList(Ast.LocalId),
+
+        pub fn bindLocal(self: ScopeBinder, local: Ast.LocalId) Allocator.Error!void {
+            try self.scope.bind(local);
+            try self.added.append(self.scope.allocator, local);
         }
+    };
+
+    fn bindPat(self: *BodyLocalScope, pat_id: Ast.PatId, added: *std.ArrayList(Ast.LocalId)) Allocator.Error!void {
+        try Ast.forEachBoundLocal(self.program, pat_id, ScopeBinder{ .scope = self, .added = added });
     }
 
     fn walkExprSpan(self: *BodyLocalScope, span: Ast.Span(Ast.ExprId)) Allocator.Error!void {
@@ -10835,29 +10970,19 @@ const BodySizeCounter = struct {
     }
 };
 
-const FnUseSummary = struct {
-    external_calls: usize = 0,
-    external_call_expr: ?Ast.ExprId = null,
-    value_refs: usize = 0,
-};
-
 /// Program-wide procedure-use snapshot shared by SpecConstr graph rewrites.
 /// A transformation that changes edges requires a fresh snapshot; consumers
 /// never combine usage counts from different program generations.
 const ProgramProcedureUsage = struct {
-    contains_return: []bool,
     tail_self_calls: []TailSelfCallSummary,
-    fn_uses: []FnUseSummary,
+    fn_uses: []ProcedureUse,
 
     fn collect(allocator: Allocator, program: *const Ast.Program) Allocator.Error!ProgramProcedureUsage {
         const fn_count = program.fnCount();
-        const contains_return = try allocator.alloc(bool, fn_count);
-        errdefer allocator.free(contains_return);
-        @memset(contains_return, false);
         const tail_self_calls = try allocator.alloc(TailSelfCallSummary, fn_count);
         errdefer allocator.free(tail_self_calls);
         @memset(tail_self_calls, .{});
-        const fn_uses = try allocator.alloc(FnUseSummary, fn_count);
+        const fn_uses = try allocator.alloc(ProcedureUse, fn_count);
         errdefer allocator.free(fn_uses);
         @memset(fn_uses, .{});
 
@@ -10867,7 +10992,7 @@ const ProgramProcedureUsage = struct {
                 .roc => |body| body,
                 .hosted => continue,
             };
-            contains_return[owner_index] = exprContainsReturn(program, body);
+            fn_uses[owner_index].contains_return = exprContainsReturn(program, body);
             tail_self_calls[owner_index] = tailSelfCallSummary(program, body, owner);
             collectAllFnUsesInExpr(program, body, owner, fn_uses);
         }
@@ -10875,16 +11000,20 @@ const ProgramProcedureUsage = struct {
             fn_uses[@intFromEnum(root.fn_id)].value_refs += 1;
         }
         return .{
-            .contains_return = contains_return,
             .tail_self_calls = tail_self_calls,
             .fn_uses = fn_uses,
         };
     }
 
+    fn takeFnUses(self: *ProgramProcedureUsage) []ProcedureUse {
+        const fn_uses = self.fn_uses;
+        self.fn_uses = &.{};
+        return fn_uses;
+    }
+
     fn deinit(self: *ProgramProcedureUsage, allocator: Allocator) void {
-        allocator.free(self.fn_uses);
-        allocator.free(self.tail_self_calls);
-        allocator.free(self.contains_return);
+        if (self.fn_uses.len != 0) allocator.free(self.fn_uses);
+        if (self.tail_self_calls.len != 0) allocator.free(self.tail_self_calls);
         self.* = undefined;
     }
 };
@@ -10893,7 +11022,7 @@ fn collectAllFnUsesInExpr(
     program: *const Ast.Program,
     expr_id: Ast.ExprId,
     owner: Ast.FnId,
-    uses: []FnUseSummary,
+    uses: []ProcedureUse,
 ) void {
     switch (program.getExpr(expr_id).data) {
         .local,
@@ -10957,6 +11086,7 @@ fn collectAllFnUsesInExpr(
                     const summary = &uses[@intFromEnum(callee)];
                     summary.external_calls += 1;
                     summary.external_call_expr = expr_id;
+                    summary.external_call_owner = owner;
                 }
             }
             collectAllFnUsesInExprSpan(program, call.args, owner, uses);
@@ -11029,17 +11159,17 @@ fn collectAllFnUsesInExpr(
     }
 }
 
-fn collectAllFnUsesInExprSpan(program: *const Ast.Program, span: Ast.Span(Ast.ExprId), owner: Ast.FnId, uses: []FnUseSummary) void {
+fn collectAllFnUsesInExprSpan(program: *const Ast.Program, span: Ast.Span(Ast.ExprId), owner: Ast.FnId, uses: []ProcedureUse) void {
     const exprs = program.exprSpan(span);
     for (0..exprs.len) |index| collectAllFnUsesInExpr(program, GuardedList.at(exprs, index), owner, uses);
 }
 
-fn collectAllFnUsesInCaptureOperands(program: *const Ast.Program, span: Ast.Span(Ast.CaptureOperand), owner: Ast.FnId, uses: []FnUseSummary) void {
+fn collectAllFnUsesInCaptureOperands(program: *const Ast.Program, span: Ast.Span(Ast.CaptureOperand), owner: Ast.FnId, uses: []ProcedureUse) void {
     const operands = program.captureOperandSpan(span);
     for (0..operands.len) |index| collectAllFnUsesInExpr(program, GuardedList.at(operands, index).value, owner, uses);
 }
 
-fn collectAllFnUsesInStmt(program: *const Ast.Program, stmt_id: Ast.StmtId, owner: Ast.FnId, uses: []FnUseSummary) void {
+fn collectAllFnUsesInStmt(program: *const Ast.Program, stmt_id: Ast.StmtId, owner: Ast.FnId, uses: []ProcedureUse) void {
     switch (program.getStmt(stmt_id)) {
         .let_ => |let_| collectAllFnUsesInExpr(program, let_.value, owner, uses),
         .expr, .expect, .dbg => |expr| collectAllFnUsesInExpr(program, expr, owner, uses),
@@ -12129,11 +12259,17 @@ fn valueType(program: *const Ast.Program, value: Value) Type.TypeId {
 /// Whether two Monotype ids denote the same type. The type store is not
 /// interned: each specialization materializes its own ids, so structurally
 /// identical types reached from different specializations (a call site and
-/// the callee's own body) carry different ids and compare by digest.
-fn sameType(program: *const Ast.Program, lhs: Type.TypeId, rhs: Type.TypeId) bool {
+/// the callee's own body) carry different ids and compare by digest. Both
+/// sides digest through the store's memoized construction, which is why this
+/// probe (and everything that reaches it) takes the program mutable.
+///
+/// The full digest treats aliases as opaque, so this deliberately answers
+/// false for an alias-wrapped type against its backing: that can miss an
+/// optimization but can never merge two representations invalidly.
+fn sameType(program: *Ast.Program, lhs: Type.TypeId, rhs: Type.TypeId) bool {
     if (lhs == rhs) return true;
-    const lhs_digest = program.types.typeDigest(&program.names, lhs);
-    const rhs_digest = program.types.typeDigest(&program.names, rhs);
+    const lhs_digest = program.types.typeDigestCached(&program.names, lhs, null);
+    const rhs_digest = program.types.typeDigestCached(&program.names, rhs, null);
     return std.mem.eql(u8, &lhs_digest.bytes, &rhs_digest.bytes);
 }
 
@@ -12160,7 +12296,7 @@ fn typeTagByName(
     return null;
 }
 
-fn patternEql(program: *const Ast.Program, lhs: CallPattern, rhs: CallPattern) bool {
+fn patternEql(program: *Ast.Program, lhs: CallPattern, rhs: CallPattern) bool {
     if (lhs.args.len != rhs.args.len) return false;
     for (lhs.args, rhs.args) |lhs_arg, rhs_arg| {
         if (!shapeEql(program, lhs_arg, rhs_arg)) return false;
@@ -12168,7 +12304,7 @@ fn patternEql(program: *const Ast.Program, lhs: CallPattern, rhs: CallPattern) b
     return true;
 }
 
-fn shapeEql(program: *const Ast.Program, lhs: Shape, rhs: Shape) bool {
+fn shapeEql(program: *Ast.Program, lhs: Shape, rhs: Shape) bool {
     if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
     return switch (lhs) {
         .any => |lhs_ty| sameType(program, lhs_ty, rhs.any),
@@ -12229,7 +12365,7 @@ fn shapeEql(program: *const Ast.Program, lhs: Shape, rhs: Shape) bool {
 /// This reads the values the caller already cloned and takes no `Cloner`, so
 /// deciding a specialization cannot clone a source argument a second time and a
 /// rejected specialization costs nothing and leaves nothing behind.
-fn callPatternMatchesValues(program: *const Ast.Program, pattern: CallPattern, values: []const Value) bool {
+fn callPatternMatchesValues(program: *Ast.Program, pattern: CallPattern, values: []const Value) bool {
     if (pattern.args.len != values.len) Common.invariant("call-pattern arity differed from direct call arity");
     for (pattern.args, values) |shape, value| {
         if (!shapeMatchesValue(program, shape, value)) return false;
@@ -12237,7 +12373,7 @@ fn callPatternMatchesValues(program: *const Ast.Program, pattern: CallPattern, v
     return true;
 }
 
-fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bool {
+fn shapeMatchesValue(program: *Ast.Program, shape: Shape, value: Value) bool {
     const structural_value = if (value == .static_data_candidate) value.static_data_candidate.runtime.* else value;
     return switch (shape) {
         .any => true,
@@ -12350,6 +12486,16 @@ fn fieldFromValueStripping(program: *const Ast.Program, value: Value, name: name
     };
 }
 
+fn fieldPathFromValue(program: *const Ast.Program, receiver: Value, segments: anytype) ?Value {
+    if (segments.len == 0) Common.invariant("field access path had no segments");
+    var value = receiver;
+    for (0..segments.len) |index| {
+        const segment = GuardedList.at(segments, index);
+        value = fieldFromValue(program, value, segment.field) orelse return null;
+    }
+    return value;
+}
+
 fn fieldFromRecord(program: *const Ast.Program, record: RecordValue, name: names.RecordFieldNameId) ?Value {
     for (record.fields) |field| {
         if (program.names.recordFieldLabelTextEql(field.name, name)) return field.value;
@@ -12438,6 +12584,7 @@ fn emptyLiftedProgramForTest(allocator: Allocator) Ast.Program {
         .empty, // typed_locals
         .empty, // stmt_ids
         .empty, // field_exprs
+        .empty, // field_access_segments
         .empty, // fn_def_captures
         .empty, // capture_operands
         .empty, // record_destructs
@@ -12461,6 +12608,29 @@ fn emptyLiftedProgramForTest(allocator: Allocator) Ast.Program {
     );
 }
 
+test "loop exit selection clone is isolated from ordinary rewrites" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+
+    var rewrite = Cloner.initForRewrite(&pass);
+    defer rewrite.deinit();
+    try std.testing.expectEqual(ClonePurpose.rewrite, rewrite.purpose);
+    try std.testing.expectEqual(InlineCallMode.all, rewrite.inline_calls);
+    try std.testing.expect(rewrite.rewrite_call_patterns);
+    try std.testing.expect(rewrite.emit_callable_workers);
+
+    var exit_selection = Cloner.initForLoopExitSelection(&pass);
+    defer exit_selection.deinit();
+    try std.testing.expectEqual(ClonePurpose.loop_exit_selection, exit_selection.purpose);
+    try std.testing.expectEqual(InlineCallMode.none, exit_selection.inline_calls);
+    try std.testing.expect(!exit_selection.rewrite_call_patterns);
+    try std.testing.expect(!exit_selection.emit_callable_workers);
+}
+
 test "SpecConstr preserves record update ordering while exposing its final shape" {
     const allocator = std.testing.allocator;
     var program = emptyLiftedProgramForTest(allocator);
@@ -12470,8 +12640,8 @@ test "SpecConstr preserves record update ordering while exposing its final shape
     const a = try program.names.internRecordFieldLabel("a");
     const b = try program.names.internRecordFieldLabel("b");
     const record_ty = try program.types.add(.{ .record = try program.types.addRecordFields(&program.names, &.{
-        .{ .name = a, .ty = u8_ty },
-        .{ .name = b, .ty = u8_ty },
+        .{ .name = a, .ty = u8_ty, .default = null },
+        .{ .name = b, .ty = u8_ty, .default = null },
     }) });
     const base_local = try program.addLocal(@enumFromInt(1), record_ty);
     const update_local = try program.addLocal(@enumFromInt(2), u8_ty);
@@ -12498,16 +12668,57 @@ test "SpecConstr preserves record update ordering while exposing its final shape
     const base_binding = cloned.bindings.first orelse return error.TestUnexpectedResult;
     const read_binding = base_binding.next orelse return error.TestUnexpectedResult;
     try std.testing.expect(read_binding.next == null);
-    const read_data = program.getExpr(read_binding.binding.value).data;
-    if (read_data != .field_access) return error.TestUnexpectedResult;
-    const read = read_data.field_access;
-    try std.testing.expectEqual(a, read.field);
+    const read = blk_read: {
+        const scrutinee = program.getExpr(read_binding.binding.value).data;
+        if (scrutinee != .field_access) return error.TestUnexpectedResult;
+        break :blk_read scrutinee.field_access;
+    };
+    const read_segments = program.fieldAccessSegmentSpan(read.segments);
+    try std.testing.expectEqual(@as(usize, 1), GuardedList.borrowLen(read_segments));
+    try std.testing.expectEqual(a, GuardedList.at(read_segments, 0).field);
     try std.testing.expectEqual(base_binding.binding.local, program.getExpr(read.receiver).data.local);
 
     try std.testing.expectEqual(a, record.fields[0].name);
     try std.testing.expectEqual(read_binding.binding.local, program.getExpr(record.fields[0].value.expr).data.local);
     try std.testing.expectEqual(b, record.fields[1].name);
     try std.testing.expectEqual(update_local, program.getExpr(record.fields[1].value.expr).data.local);
+}
+
+test "SpecConstr accepts a transparent alias record update base" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const u8_ty = try program.types.add(.{ .primitive = .u8 });
+    const field = try program.names.internRecordFieldLabel("field");
+    const record_ty = try program.types.add(.{ .record = try program.types.addRecordFields(&program.names, &.{
+        .{ .name = field, .ty = u8_ty, .default = null },
+    }) });
+    const module_identity = try program.names.internModuleIdentity(&([_]u8{0xAB} ** 32));
+    const type_name = try program.names.internTypeName("RecordAlias");
+    const alias_ty = try program.types.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = @enumFromInt(1) },
+        .def = .{ .module = module_identity, .type_name = type_name },
+        .kind = .alias,
+        .args = Type.Span.empty(),
+        .backing = .{ .ty = record_ty, .use = .inspectable },
+    } });
+    const base_local = try program.addLocal(@enumFromInt(1), record_ty);
+    const update_local = try program.addLocal(@enumFromInt(2), u8_ty);
+    const base = try program.addExpr(.{ .ty = record_ty, .data = .{ .local = base_local } });
+    const update_value = try program.addExpr(.{ .ty = u8_ty, .data = .{ .local = update_local } });
+    const update = try program.addExpr(.{ .ty = alias_ty, .data = .{ .record_update = .{
+        .base = base,
+        .fields = try program.addFieldExprSpan(&.{.{ .name = field, .value = update_value }}),
+    } } });
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+    const cloned = try cloner.cloneExprValue(update);
+    try std.testing.expect(cloned.value == .record);
+    try std.testing.expectEqual(record_ty, cloned.value.record.ty);
 }
 
 test "call-pattern scans direct call and function reference capture operands" {
@@ -12651,7 +12862,8 @@ test "SpecConstr admission uses body size and worker count before cloning" {
     }
     try std.testing.expectEqual(SpecAdmission.denied_spec_count, pass.newSpecAdmission(0));
     try std.testing.expectEqual(SpecAdmission.denied_body_size, pass.newSpecAdmission(1));
-    try std.testing.expectEqual(SpecAdmission.denied_body_size, pass.inlineBodyAdmission(@enumFromInt(1), large_body));
+    const large_inline_source = pass.inlineSourceBody(@enumFromInt(1)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!large_inline_source.size.admits());
 
     const fn_ty = try program.types.add(.{ .func = .{
         .args = Type.Span.empty(),
@@ -12678,7 +12890,7 @@ test "SpecConstr admission uses body size and worker count before cloning" {
         .body = .{ .roc = unit_expr },
         .ret = large_fn.ret,
     });
-    pass.refreshPreCloneBodySize(1);
+    pass.refreshPreCloneSource(1);
     try std.testing.expectEqual(SpecAdmission.admitted, pass.newSpecAdmission(1));
 }
 
@@ -12751,6 +12963,108 @@ test "SpecConstr bounds cumulative inlining across small acyclic wrappers" {
     }
     try std.testing.expect(retained_call);
     try std.testing.expect(growth < Cloner.inline_body_work_budget * 2);
+}
+
+test "issue 10760 SpecConstr bounds cloning of rewritten inline bodies" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const unit_ty = try program.types.add(.zst);
+    const pair_ty = try program.types.add(.{ .tuple = try program.types.addSpan(&.{ unit_ty, unit_ty }) });
+    const unit_expr = try program.addExpr(.{ .ty = unit_ty, .data = .unit });
+    const pair_expr = try program.addExpr(.{
+        .ty = pair_ty,
+        .data = .{ .tuple = try program.addExprSpan(&.{ unit_expr, unit_expr }) },
+    });
+
+    const leaf_arg = try program.addLocal(@enumFromInt(1), pair_ty);
+    var result_ty = unit_ty;
+    var callee = try program.addFn(.{
+        .symbol = @enumFromInt(2),
+        .args = try program.addTypedLocalSpan(&.{.{ .local = leaf_arg, .ty = pair_ty }}),
+        .captures = Ast.Span(Ast.TypedLocal).empty(),
+        .body = .{ .roc = unit_expr },
+        .ret = unit_ty,
+    });
+    // Each source wrapper is tiny. Before source and output bodies were kept
+    // separate, rewriting in source order replaced both calls with the already
+    // rewritten output of the preceding wrapper. Re-cloning the final output
+    // while charging the final wrapper's original body size is the
+    // non-converging path from issue 10760.
+    for (0..9) |depth| {
+        const first = try program.addExpr(.{ .ty = result_ty, .data = .{ .call_proc = .{
+            .callee = .{ .lifted = callee },
+            .args = try program.addExprSpan(&.{pair_expr}),
+            .captures = Ast.Span(Ast.CaptureOperand).empty(),
+        } } });
+        const second = try program.addExpr(.{ .ty = result_ty, .data = .{ .call_proc = .{
+            .callee = .{ .lifted = callee },
+            .args = try program.addExprSpan(&.{pair_expr}),
+            .captures = Ast.Span(Ast.CaptureOperand).empty(),
+        } } });
+        const wrapper_ty = try program.types.add(.{ .tuple = try program.types.addSpan(&.{ result_ty, result_ty }) });
+        const body = try program.addExpr(.{
+            .ty = wrapper_ty,
+            .data = .{ .tuple = try program.addExprSpan(&.{ first, second }) },
+        });
+        const arg = try program.addLocal(
+            @enumFromInt(@as(u32, @intCast(depth + 3))),
+            pair_ty,
+        );
+        callee = try program.addFn(.{
+            .symbol = @enumFromInt(@as(u32, @intCast(depth + 12))),
+            .args = try program.addTypedLocalSpan(&.{.{ .local = arg, .ty = pair_ty }}),
+            .captures = Ast.Span(Ast.TypedLocal).empty(),
+            .body = .{ .roc = body },
+            .ret = wrapper_ty,
+        });
+        result_ty = wrapper_ty;
+    }
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+
+    for (0..pass.plans.len) |index| {
+        try pass.cloneFnBodyInPlace(@enumFromInt(@as(u32, @intCast(index))));
+    }
+
+    const rewritten_body = switch (program.getFn(callee).body) {
+        .roc => |body| body,
+        .hosted => return error.TestUnexpectedResult,
+    };
+    const inline_source = pass.inlineSourceBody(callee) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(inline_source.expr != rewritten_body);
+    const source_work = inline_source.size.exactValue() orelse return error.TestUnexpectedResult;
+    const rewritten_work = switch (exprBodySizeWithin(&program, rewritten_body, Cloner.inline_body_work_budget)) {
+        .exact => |size| size,
+        .over_limit => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(rewritten_work > source_work);
+
+    const root_call = try program.addExpr(.{ .ty = result_ty, .data = .{ .call_proc = .{
+        .callee = .{ .lifted = callee },
+        .args = try program.addExprSpan(&.{pair_expr}),
+        .captures = Ast.Span(Ast.CaptureOperand).empty(),
+    } } });
+    const root_source_size = switch (exprBodySizeWithin(&program, root_call, spec_constr_body_expr_threshold)) {
+        .exact => |size| size,
+        .over_limit => return error.TestUnexpectedResult,
+    };
+
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+    cloner.inline_direct_requires_known_arg = true;
+    const before_exprs = program.exprCount();
+    const before_work = cloner.inline_body_growth.remaining;
+    _ = try cloner.cloneExpr(root_call);
+    const growth = program.exprCount() - before_exprs;
+    const charged_work = before_work - cloner.inline_body_growth.remaining;
+
+    // An admitted inline must charge enough source-body work to bound what it
+    // emits. Declining the inline may emit only the original residual call.
+    const growth_limit = charged_work + root_source_size;
+    try std.testing.expectEqual(growth_limit, @max(growth_limit, growth));
 }
 
 test "value-aware call-pattern collection keeps generic producer calls opaque" {
@@ -12970,6 +13284,100 @@ test "issue 10168 SpecConstr clones every capture when nested cloning grows the 
     try std.testing.expectEqual(@as(usize, 2), callable.captures.len);
     try std.testing.expectEqual(first_id, callable.captures[0].id);
     try std.testing.expectEqual(second_id, callable.captures[1].id);
+}
+
+test "field access folding preserves shared residual suffix spans" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const outer_name = try program.names.internRecordFieldLabel("outer");
+    const middle_name = try program.names.internRecordFieldLabel("middle");
+    const leaf_name = try program.names.internRecordFieldLabel("leaf");
+
+    const leaf_ty = try program.types.add(.{ .primitive = .u8 });
+    const inner_ty = try program.types.add(.{ .record = try program.types.addFields(&.{
+        .{ .name = leaf_name, .ty = leaf_ty, .default = null },
+    }) });
+    const middle_ty = try program.types.add(.{ .record = try program.types.addFields(&.{
+        .{ .name = middle_name, .ty = inner_ty, .default = null },
+    }) });
+    const outer_ty = try program.types.add(.{ .record = try program.types.addFields(&.{
+        .{ .name = outer_name, .ty = middle_ty, .default = null },
+    }) });
+
+    const leaf_local = try program.addLocal(@enumFromInt(1), leaf_ty);
+    const leaf_expr = try program.addExpr(.{ .ty = leaf_ty, .data = .{ .local = leaf_local } });
+    const inner_expr = try program.addExpr(.{ .ty = inner_ty, .data = .{
+        .record = try program.addFieldExprSpan(&.{.{ .name = leaf_name, .value = leaf_expr }}),
+    } });
+    const middle_expr = try program.addExpr(.{ .ty = middle_ty, .data = .{
+        .record = try program.addFieldExprSpan(&.{.{ .name = middle_name, .value = inner_expr }}),
+    } });
+    const full_receiver = try program.addExpr(.{ .ty = outer_ty, .data = .{
+        .record = try program.addFieldExprSpan(&.{.{ .name = outer_name, .value = middle_expr }}),
+    } });
+    const full_segments = try program.addFieldAccessSegmentSpan(&.{
+        .{ .field = outer_name },
+        .{ .field = middle_name },
+        .{ .field = leaf_name },
+    });
+    const full_access = try program.addExpr(.{ .ty = leaf_ty, .data = .{ .field_access = .{
+        .receiver = full_receiver,
+        .segments = full_segments,
+    } } });
+
+    const unknown_middle_local = try program.addLocal(@enumFromInt(2), middle_ty);
+    const unknown_middle_expr = try program.addExpr(.{ .ty = middle_ty, .data = .{ .local = unknown_middle_local } });
+    const observable_unknown_middle = try program.addExpr(.{ .ty = middle_ty, .data = .{ .dbg = unknown_middle_expr } });
+    const partial_receiver = try program.addExpr(.{ .ty = outer_ty, .data = .{
+        .record = try program.addFieldExprSpan(&.{.{ .name = outer_name, .value = observable_unknown_middle }}),
+    } });
+    const partial_access = try program.addExpr(.{ .ty = leaf_ty, .data = .{ .field_access = .{
+        .receiver = partial_receiver,
+        .segments = full_segments,
+    } } });
+
+    const original_segment_count = program.field_access_segments.len();
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+
+    const full_expr_start = program.exprCount();
+    const folded_leaf = try cloner.cloneExpr(full_access);
+    try std.testing.expectEqual(full_expr_start + 1, program.exprCount());
+    try std.testing.expectEqual(leaf_local, program.getExpr(folded_leaf).data.local);
+    try std.testing.expectEqual(original_segment_count, program.field_access_segments.len());
+
+    const partial_expr_start = program.exprCount();
+    const residual_expr = try cloner.cloneExpr(partial_access);
+    const residual = blk_residual: {
+        const scrutinee = program.getExpr(residual_expr).data;
+        if (scrutinee != .field_access) return error.TestUnexpectedResult;
+        break :blk_residual scrutinee.field_access;
+    };
+    const residual_receiver_child = blk_residual_receiver_child: {
+        const scrutinee = program.getExpr(residual.receiver).data;
+        if (scrutinee != .dbg) return error.TestUnexpectedResult;
+        break :blk_residual_receiver_child scrutinee.dbg;
+    };
+    try std.testing.expectEqual(unknown_middle_local, program.getExpr(residual_receiver_child).data.local);
+    try std.testing.expectEqual(full_segments.start + 1, residual.segments.start);
+    try std.testing.expectEqual(full_segments.len - 1, residual.segments.len);
+    try std.testing.expectEqual(middle_name, program.fieldAccessSegmentAt(residual.segments, 0).field);
+    try std.testing.expectEqual(leaf_name, program.fieldAccessSegmentAt(residual.segments, 1).field);
+    try std.testing.expectEqual(original_segment_count, program.field_access_segments.len());
+
+    var dbg_count: usize = 0;
+    var field_access_count: usize = 0;
+    for (partial_expr_start..program.exprCount()) |raw_expr| {
+        const counted_expr = program.getExpr(@enumFromInt(@as(u32, @intCast(raw_expr)))).data;
+        if (counted_expr == .dbg) dbg_count += 1;
+        if (counted_expr == .field_access) field_access_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), dbg_count);
+    try std.testing.expectEqual(@as(usize, 1), field_access_count);
 }
 
 test "expression traversal visits both operands of structural_hash" {
@@ -13240,13 +13648,49 @@ test "whole-body normalization resolves binder-equivalent argument locals" {
 
     var pass = try Pass.init(allocator, &program);
     defer pass.deinit();
-    try pass.cloneFnBodyInPlace(fn_id, equivalent_ref);
+    try pass.cloneFnBodyInPlace(fn_id);
 
     const cloned_body = switch (program.getFn(fn_id).body) {
         .roc => |body| body,
         .hosted => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(argument, program.getExpr(cloned_body).data.local);
+}
+
+test "substitution resolves equivalent named types with distinct checked provenance" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const module_identity = try program.names.internModuleIdentity(&([_]u8{0xAB} ** 32));
+    const type_name = try program.names.internTypeName("Nominal");
+    const def: Type.TypeDef = .{ .module = module_identity, .type_name = type_name };
+    const first_ty = try program.types.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = @enumFromInt(1) },
+        .def = def,
+        .kind = .nominal,
+        .args = Type.Span.empty(),
+    } });
+    const second_ty = try program.types.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = @enumFromInt(2) },
+        .def = def,
+        .kind = .nominal,
+        .args = Type.Span.empty(),
+    } });
+    const binder: check.CheckedModule.PatternBinderId = @enumFromInt(1);
+    const first = try program.addLocalWithBinder(@enumFromInt(1), first_ty, binder);
+    const second = try program.addLocalWithBinder(@enumFromInt(2), second_ty, binder);
+    const replacement = try program.addLocal(@enumFromInt(3), first_ty);
+    const replacement_expr = try program.addExpr(.{ .ty = first_ty, .data = .{ .local = replacement } });
+    const second_expr = try program.addExpr(.{ .ty = second_ty, .data = .{ .local = second } });
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+    try cloner.subst.put(&program, first, .{ .expr = replacement_expr });
+    const cloned = try cloner.cloneExpr(second_expr);
+    try std.testing.expectEqual(replacement, program.getExpr(cloned).data.local);
 }
 
 test "known match fold aborts on undecidable branches and trips the invariant when every branch is excluded" {
@@ -13314,6 +13758,34 @@ test "known match fold aborts on undecidable branches and trips the invariant wh
             (std.posix.W.IFEXITED(raw_status) and std.posix.W.EXITSTATUS(raw_status) != 0);
         try std.testing.expect(failed);
     }
+}
+
+test "known match fold preserves absurd elimination of a structural product" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    const empty_union_ty = try program.types.add(.{ .tag_union = Type.Span.empty() });
+    const field_name = try program.names.internRecordFieldLabel("impossible");
+    const record_ty = try program.types.add(.{ .record = try program.types.addRecordFields(&program.names, &.{
+        .{ .name = field_name, .ty = empty_union_ty, .default = null },
+    }) });
+    const impossible_local = try program.addLocal(@enumFromInt(1), empty_union_ty);
+    const impossible_expr = try program.addExpr(.{ .ty = empty_union_ty, .data = .{ .local = impossible_local } });
+    const record_value = Value{ .record = .{
+        .ty = record_ty,
+        .fields = &.{.{ .name = field_name, .value = .{ .expr = impossible_expr } }},
+    } };
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+    var bindings: BindingChain = .{};
+    try std.testing.expectEqual(
+        @as(?Value, null),
+        try cloner.simplifyKnownMatchValue(record_value, Ast.Span(Ast.Branch).empty(), &bindings),
+    );
 }
 
 test "call-pattern specialization declarations are referenced" {

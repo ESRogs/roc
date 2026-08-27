@@ -286,9 +286,10 @@ fn finalize(
         defer batch_root_ids.deinit(allocator);
 
         for (requests, 0..) |request, request_index| {
+            const root_id = state.rootIdForRequestIndex(request_index);
             if (!state.dependenciesComplete(request)) {
                 if (batch_requests.items.len == 0) {
-                    finalizationInvariant("compile-time root request order referenced an unfinished dependency");
+                    finalizationInvariant("compile-time root request order placed a root before its field defaults or another dependency");
                 }
                 _ = try lowerEvalAndFinishRoots(
                     allocator,
@@ -310,7 +311,7 @@ fn finalize(
                 }
             }
             try batch_requests.append(allocator, request);
-            try batch_root_ids.append(allocator, state.rootIdForRequestIndex(request_index));
+            try batch_root_ids.append(allocator, root_id);
         }
 
         if (batch_requests.items.len != 0) {
@@ -355,6 +356,15 @@ const RootCompletionState = struct {
     visited_templates: []u32,
     visit: u32,
     current_root_id: ?checked.ComptimeRootId = null,
+    /// Requested `field_default` roots not yet finished. Derived parsers
+    /// restore archived default constants from within OTHER roots' lowering
+    ///—which happens before those roots' own evaluation—so every
+    /// non-default root carries an implicit dependency edge on ALL field
+    /// defaults (design.md "Defaulted Fields"). The checked-artifact request
+    /// scheduler records those edges explicitly; this counter validates the
+    /// durable order and makes the defaults evaluate as their own leading
+    /// batch.
+    pending_field_defaults: usize,
 
     fn init(
         allocator: Allocator,
@@ -384,6 +394,13 @@ const RootCompletionState = struct {
         errdefer allocator.free(visited_templates);
         @memset(visited_templates, 0);
 
+        var pending_field_defaults: usize = 0;
+        for (module.compile_time_roots.roots, 0..) |root, i| {
+            if (root.kind == .field_default and requested_roots[i]) {
+                pending_field_defaults += 1;
+            }
+        }
+
         return .{
             .allocator = allocator,
             .module = module,
@@ -392,6 +409,7 @@ const RootCompletionState = struct {
             .request_root_ids = request_root_ids,
             .visited_templates = visited_templates,
             .visit = 0,
+            .pending_field_defaults = pending_field_defaults,
         };
     }
 
@@ -409,7 +427,13 @@ const RootCompletionState = struct {
     }
 
     fn markDone(self: *RootCompletionState, root_id: checked.ComptimeRootId) void {
-        self.statuses[@intFromEnum(root_id)] = .done;
+        const raw = @intFromEnum(root_id);
+        if (self.statuses[raw] != .done and
+            self.module.compile_time_roots.roots[raw].kind == .field_default)
+        {
+            self.pending_field_defaults -= 1;
+        }
+        self.statuses[raw] = .done;
     }
 
     fn rootIdForRequestIndex(self: *const RootCompletionState, request_index: usize) checked.ComptimeRootId {
@@ -423,9 +447,18 @@ const RootCompletionState = struct {
         self: *RootCompletionState,
         request: checked.RootRequest,
     ) bool {
+        const request_root_id = compileTimeRootForRequest(self.module, request);
+        // Every non-default root depends on ALL field defaults (see
+        // `pending_field_defaults`).
+        if (self.pending_field_defaults != 0 and
+            self.module.compile_time_roots.roots[@intFromEnum(request_root_id)].kind != .field_default)
+        {
+            return false;
+        }
+
         const saved_current_root_id = self.current_root_id;
         defer self.current_root_id = saved_current_root_id;
-        self.current_root_id = compileTimeRootForRequest(self.module, request);
+        self.current_root_id = request_root_id;
 
         self.visit +%= 1;
         if (self.visit == 0) {
@@ -504,8 +537,16 @@ const RootCompletionState = struct {
         self: *RootCompletionState,
         const_use: checked.ConstUseTemplate,
     ) bool {
+        // A declaration with no implementation evaluates nothing, so it
+        // publishes no compile-time root and there is nothing to wait on.
+        if (self.constUseIsUnimplemented(const_use.const_ref)) return true;
         const root_id = self.rootForConstRef(const_use.const_ref) orelse return true;
         return self.rootDependencyComplete(root_id);
+    }
+
+    fn constUseIsUnimplemented(self: *RootCompletionState, const_ref: checked.ConstRef) bool {
+        if (!artifactMatches(const_ref.artifact, self.module.key)) return false;
+        return self.module.const_templates.get(const_ref).state == .unimplemented;
     }
 
     fn rootDependencyComplete(
@@ -643,7 +684,7 @@ fn lowerEvalAndFinishRoots(
         );
     }
 
-    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+    var lowered = try lowerFinalizationModulesToLir(
         allocator,
         .{
             .root = checked.loweringViewWithRelations(module, relation_modules),
@@ -806,7 +847,10 @@ fn lowerEvalAndFinishRoots(
                     error.ExpectErr => unreachable,
                 };
                 defer interpreter.dropValue(eval_result.value, root.ret_layout);
-                break :blk try writer.storeRoot(root, eval_result.value);
+                break :blk if (compile_time_root.kind == .hoisted_validation)
+                    .discarded
+                else
+                    try writer.storeRoot(root, eval_result.value);
             }
 
             const eval_result = try evalCompileTimeRoot(allocator, &interpreter, problem_store, module, compile_time_root, &lowered.lir_result, root.proc, root.ret_layout);
@@ -814,7 +858,10 @@ fn lowerEvalAndFinishRoots(
             switch (eval_result) {
                 .value => |value| {
                     defer interpreter.dropValue(value.value, root.ret_layout);
-                    break :blk try writer.storeRoot(root, value.value);
+                    break :blk if (compile_time_root.kind == .hoisted_validation)
+                        .discarded
+                    else
+                        try writer.storeRoot(root, value.value);
                 },
                 .failed => |failed_payload| break :blk failed_payload,
             }
@@ -828,20 +875,19 @@ fn lowerEvalAndFinishRoots(
             interpreter.getExpectFailures(),
         )) had_problem = true;
 
-        switch (compile_time_root.kind) {
-            .numeral_conversion, .quote_conversion => {
-                payload = try finishLiteralConversionRoot(allocator, module, problem_store, compile_time_root, payload);
-            },
-            .constant, .hoisted_constant, .callable_binding, .expect => {},
+        if (compile_time_root.literalConversionKind() != null) {
+            payload = try finishLiteralConversionRoot(allocator, module, problem_store, compile_time_root, payload);
         }
 
         module.compile_time_roots.fillPayload(root_id, payload);
         const stored_root_type = switch (compile_time_root.kind) {
             .constant, .hoisted_constant => try writer.storeRootType(root),
+            .hoisted_validation,
             .callable_binding,
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .field_default,
             => null,
         };
         finishConstRoot(module, compile_time_root, payload, stored_root_type);
@@ -1139,7 +1185,7 @@ fn lowerDevEvalAndFinishRoots(
     coverage: *ComptimeCoverage,
     options: Options,
 ) FinalizeError!bool {
-    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+    var lowered = try lowerFinalizationModulesToLir(
         allocator,
         .{
             .root = checked.loweringViewWithRelations(module, relation_modules),
@@ -1438,7 +1484,10 @@ fn lowerDevEvalAndFinishRoots(
                 job.host.failed_region,
                 &had_problem,
             ),
-            .success => try writer.storeRoot(job.root, .{ .ptr = job.ret_buf.ptr }),
+            .success => if (job.compile_time_root.kind == .hoisted_validation)
+                .discarded
+            else
+                try writer.storeRoot(job.root, .{ .ptr = job.ret_buf.ptr }),
         };
 
         try recordComptimeSiteHits(problem_store, coverage, module, job.compile_time_root, &lowered.lir_result, job.host.comptime_branch_hits.items, job.root.proc);
@@ -1447,22 +1496,21 @@ fn lowerDevEvalAndFinishRoots(
             had_problem = true;
         }
 
-        switch (job.compile_time_root.kind) {
-            .numeral_conversion, .quote_conversion => {
-                const conversion = try finishLiteralConversionRootDetailed(allocator, module, problem_store, job.compile_time_root, payload);
-                payload = conversion.payload;
-                if (conversion.had_problem) had_problem = true;
-            },
-            .constant, .hoisted_constant, .callable_binding, .expect => {},
+        if (job.compile_time_root.literalConversionKind() != null) {
+            const conversion = try finishLiteralConversionRootDetailed(allocator, module, problem_store, job.compile_time_root, payload);
+            payload = conversion.payload;
+            if (conversion.had_problem) had_problem = true;
         }
 
         module.compile_time_roots.fillPayload(job.root_id, payload);
         const stored_root_type = switch (job.compile_time_root.kind) {
             .constant, .hoisted_constant => try writer.storeRootType(job.root),
+            .hoisted_validation,
             .callable_binding,
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .field_default,
             => null,
         };
         finishConstRoot(module, job.compile_time_root, payload, stored_root_type);
@@ -1704,7 +1752,7 @@ fn finishLiteralConversionRootDetailed(
 ) FinalizeError!LiteralConversionFinish {
     const try_node = switch (payload) {
         .const_node => |node| node,
-        .pending, .fn_value, .expect => finalizationInvariant("numeral conversion root did not store a constant"),
+        .pending, .fn_value, .discarded, .expect => finalizationInvariant("numeral conversion root did not store a constant"),
     };
     switch (module.const_store.get(try_node)) {
         // The from_numeral implementation itself crashed; that crash was
@@ -1753,20 +1801,15 @@ fn finishLiteralConversionRootDetailed(
     if (problem_store) |store| {
         const message_idx = try store.putExtraString(message);
         const region = module.checked_bodies.expr(root.expr).source_region;
-        switch (root.kind) {
-            .numeral_conversion => _ = try store.appendProblem(allocator, .{ .comptime_invalid_numeral = .{
+        switch (root.literalConversionKind() orelse finalizationInvariant("non literal-conversion root reported a conversion problem")) {
+            .numeral => _ = try store.appendProblem(allocator, .{ .comptime_invalid_numeral = .{
                 .message = message_idx,
                 .region = region,
             } }),
-            .quote_conversion => _ = try store.appendProblem(allocator, .{ .comptime_invalid_quote = .{
+            .quote => _ = try store.appendProblem(allocator, .{ .comptime_invalid_quote = .{
                 .message = message_idx,
                 .region = region,
             } }),
-            .constant,
-            .hoisted_constant,
-            .callable_binding,
-            .expect,
-            => finalizationInvariant("non literal-conversion root reported a conversion problem"),
         }
         return .{
             .payload = .{ .const_node = try appendCrashConst(module, message) },
@@ -1903,8 +1946,11 @@ fn reportsUnusedBranches(kind: checked.CompileTimeRootKind) bool {
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .field_default,
         => true,
-        .hoisted_constant => false,
+        .hoisted_constant,
+        .hoisted_validation,
+        => false,
     };
 }
 
@@ -2039,11 +2085,13 @@ fn failedRootPayload(
 ) Allocator.Error!checked.CompileTimeRootPayload {
     return switch (root.kind) {
         .expect => .expect,
+        .hoisted_validation => .discarded,
         .constant,
         .hoisted_constant,
         .callable_binding,
         .numeral_conversion,
         .quote_conversion,
+        .field_default,
         => .{ .const_node = try appendCrashConst(module, message) },
     };
 }
@@ -2101,23 +2149,31 @@ fn compileTimeRootForRequest(
     module: *const checked.CheckedModuleArtifact,
     request: checked.RootRequest,
 ) checked.ComptimeRootId {
-    for (module.compile_time_roots.roots) |root| {
-        const kind_matches = switch (request.kind) {
-            .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .numeral_conversion or root.kind == .quote_conversion,
-            .compile_time_callable => root.kind == .callable_binding,
-            .runtime_entrypoint,
-            .provided_export,
-            .platform_required_binding,
-            .hosted_export,
-            .test_expect,
-            .repl_expr,
-            .dev_expr,
-            => finalizationInvariant("non compile-time request reached compile-time root lookup"),
-        };
-        if (kind_matches and rootSourceEql(root.source, request.source)) return root.id;
+    const root_id = request.compile_time_root orelse {
+        finalizationInvariant("compile-time request had no exact checked root identity");
+    };
+    const raw = @intFromEnum(root_id);
+    if (raw >= module.compile_time_roots.roots.len) {
+        finalizationInvariant("compile-time request root identity was outside the checked root table");
+    }
+    const root = module.compile_time_roots.roots[raw];
+    const kind_matches = switch (request.kind) {
+        .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .hoisted_validation or root.kind == .numeral_conversion or root.kind == .quote_conversion or root.kind == .field_default,
+        .compile_time_callable => root.kind == .callable_binding,
+        .runtime_entrypoint,
+        .provided_export,
+        .platform_required_binding,
+        .hosted_export,
+        .test_expect,
+        .repl_expr,
+        .dev_expr,
+        => finalizationInvariant("non compile-time request reached compile-time root lookup"),
+    };
+    if (root.id != root_id or !kind_matches or !rootSourceEql(root.source, request.source)) {
+        finalizationInvariant("compile-time request identity did not match its checked root");
     }
 
-    finalizationInvariant("compile-time root request did not match a checked root");
+    return root_id;
 }
 
 fn finishConstRoot(
@@ -2131,13 +2187,17 @@ fn finishConstRoot(
         .const_node => |id| id,
         .pending,
         .fn_value,
+        .discarded,
         .expect,
         => finalizationInvariant("constant root finalized with non-constant payload"),
     };
     const const_ref = switch (root.kind) {
         .constant => blk: {
-            const pattern = root.pattern orelse finalizationInvariant("constant root had no checked pattern");
-            const top_level = module.top_level_values.lookupByPattern(pattern) orelse
+            const def_idx = switch (root.source) {
+                .def => |def| def,
+                .expr, .statement, .required_binding, .hoisted => finalizationInvariant("constant root source was not a top-level definition"),
+            };
+            const top_level = module.top_level_values.lookupByDef(def_idx) orelse
                 finalizationInvariant("constant root had no top-level value");
             break :blk switch (top_level.value) {
                 .const_ref => |ref| ref,
@@ -2149,10 +2209,12 @@ fn finishConstRoot(
                 finalizationInvariant("hoisted constant root had no hoisted const entry");
             break :blk hoisted.const_ref;
         },
+        .hoisted_validation,
         .callable_binding,
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .field_default,
         => unreachable,
     };
     const stored = checked.StoredConstTemplate{
@@ -2178,6 +2240,26 @@ fn rootSourceEql(a: checked.RootSource, b: checked.RootSource) bool {
 
 fn artifactMatches(a: anytype, b: checked.CheckedModuleArtifactKey) bool {
     return std.meta.eql(a.bytes, b.bytes);
+}
+
+/// Lower a module that is still being checked.
+///
+/// `lowerCheckedModulesToLir` binds hosted declarations against a platform
+/// header's hosted section only once the module holding that section finished
+/// checking, so the unbound-declaration rejection cannot reach compile-time
+/// finalization.
+fn lowerFinalizationModulesToLir(
+    allocator: Allocator,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
+    roots: lir.CheckedPipeline.RootRequestSet,
+    target: lir.CheckedPipeline.TargetConfig,
+) Allocator.Error!lir.CheckedPipeline.LoweredProgram {
+    return lir.CheckedPipeline.lowerCheckedModulesToLir(allocator, modules, roots, target) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.HostedFunctionNotBound => finalizationInvariant(
+            "compile-time finalization lowering rejected a hosted declaration the platform header did not bind",
+        ),
+    };
 }
 
 fn finalizationInvariant(comptime message: []const u8) noreturn {

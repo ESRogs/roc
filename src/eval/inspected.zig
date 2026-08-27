@@ -41,7 +41,7 @@ const LirImage = lir.LirImage;
 const GuardedList = lir.LirStore.GuardedList;
 
 /// Failures while compiling or executing an inspected root.
-pub const Error = Allocator.Error || std.Thread.SpawnError || std.DynLib.Error || std.Io.File.OpenError || std.Io.File.Reader.Error || std.Io.File.Writer.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || std.Io.Writer.Error || check.CheckedArtifact.CompileTimeFinalizer.Error || error{
+pub const Error = Allocator.Error || lir.CheckedPipeline.LowerResourceError || std.Thread.SpawnError || std.DynLib.Error || std.Io.File.OpenError || std.Io.File.Reader.Error || std.Io.File.Writer.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || std.Io.Writer.Error || check.CheckedArtifact.CompileTimeFinalizer.Error || error{
     InvalidUtf8,
     LlvmBackendUnavailable,
     DevBackendUnavailable,
@@ -582,6 +582,14 @@ pub const CompiledTargetProgram = struct {
     }
 };
 
+/// The result of preparing one explicit evaluation root. A rejected program
+/// retains the exact checked resources that produced its diagnostics so an
+/// interactive caller can render them without checking the source again.
+pub const CompileTargetOutcome = union(enum) {
+    compiled: CompiledTargetProgram,
+    diagnostics: ParsedResources,
+};
+
 /// Type alias for CompiledProgram used for inspect-wrapped expressions.
 pub const CompiledInspectedExpr = CompiledProgram;
 
@@ -903,6 +911,40 @@ pub fn compileProgramForTargetWithBuiltinAndContext(
     roc_ctx: ?CoreCtx,
     specialization_strategy: base.SpecializationStrategy,
 ) Error!CompiledTargetProgram {
+    const outcome = try compileProgramForTargetWithBuiltinAndContextReporting(
+        allocator,
+        io,
+        source_kind,
+        source,
+        imports,
+        target_usize,
+        pre_published_builtin,
+        roc_ctx,
+        specialization_strategy,
+    );
+    return switch (outcome) {
+        .compiled => |compiled| compiled,
+        .diagnostics => |resources_value| {
+            var resources = resources_value;
+            resources.deinit(allocator);
+            return error.TypeCheckError;
+        },
+    };
+}
+
+/// Compile one explicit evaluation root, preserving checked resources when
+/// the root has diagnostics so the caller can render those exact problems.
+pub fn compileProgramForTargetWithBuiltinAndContextReporting(
+    allocator: Allocator,
+    io: std.Io,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    target_usize: base.target.TargetUsize,
+    pre_published_builtin: PrePublishedBuiltin,
+    roc_ctx: ?CoreCtx,
+    specialization_strategy: base.SpecializationStrategy,
+) Error!CompileTargetOutcome {
     var resources = try parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
@@ -915,6 +957,14 @@ pub fn compileProgramForTargetWithBuiltinAndContext(
     );
     errdefer cleanupParseAndCanonical(allocator, resources);
 
+    // This API compiles one explicit evaluation root. If checking rejected
+    // that root, publication intentionally leaves it out of the runtime root
+    // table; diagnose the checked program before post-check lowering rather
+    // than invoking a pipeline that requires at least one explicit root.
+    if (try parsedResourcesHaveErrorDiagnostics(allocator, &resources)) {
+        return .{ .diagnostics = resources };
+    }
+
     const lowered = try lowerParsedProgramToLirWithOptions(allocator, io, &resources, target_usize, .{
         .specialization_strategy = specialization_strategy,
     });
@@ -923,10 +973,10 @@ pub fn compileProgramForTargetWithBuiltinAndContext(
         owned.deinit(allocator);
     }
 
-    return .{
+    return .{ .compiled = .{
         .resources = resources,
         .lowered = lowered,
-    };
+    } };
 }
 
 /// Compile a program with inspect wrapping so the main proc returns a Str.
@@ -1128,8 +1178,8 @@ pub fn compileInspectedExpr(allocator: Allocator, io: std.Io, source: []const u8
 /// capturing the Debug verifier's materialized Lambda Mono program in
 /// `materialized_out`. Compiles with the specialization cache disabled (so
 /// every function body materializes locally rather than loading as an
-/// imported shard) and the in-place List.map path off (so the materialized
-/// tree stays on the copy path a tree evaluator executes).
+/// imported shard) and the in-place list-transform paths off (so the
+/// materialized tree stays on the copy paths a tree evaluator executes).
 pub fn compileInspectedProgramWithLambdaMono(
     allocator: Allocator,
     io: std.Io,
@@ -1478,6 +1528,20 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
         .published_roots_only => {},
     }
 
+    const selected_hoisted_roots = main_checked.checker.selectedHoistedRoots();
+    var top_level_hoisted_roots = std.ArrayList(check.HoistRoots.SelectedHoistedRoot).empty;
+    defer top_level_hoisted_roots.deinit(allocator);
+    const hoisted_roots = switch (root_mode) {
+        .eval_root => roots: {
+            for (selected_hoisted_roots) |root| {
+                if (main_checked.checker.selectedHoistedRootIsTopLevel(root)) {
+                    try top_level_hoisted_roots.append(allocator, root);
+                }
+            }
+            break :roots top_level_hoisted_roots.items;
+        },
+        .published_roots_only => selected_hoisted_roots,
+    };
     var checked_artifact = try check.CheckedArtifact.publishFromTypedModule(
         allocator,
         &typed_cir_modules,
@@ -1487,6 +1551,7 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
             .imports = publish_imports,
             .available_artifacts = available_artifacts,
             .explicit_roots = explicit_roots,
+            .hoisted_roots = hoisted_roots,
             .compile_time_finalizer = CompileTimeFinalization.finalizer(),
             .problem_store = switch (problem_reporting) {
                 .ignore_comptime_problems => null,
@@ -1591,7 +1656,6 @@ pub fn parseCheckModule(
             .builtin_indices = builtin_indices,
         },
         .imported_modules = if (available_imports.len == 0) null else &imported_modules,
-        .explicit_root_names = explicit_root_names,
     });
     errdefer czer.deinit();
 
@@ -1681,9 +1745,9 @@ const LowerToLirOptions = struct {
     tag_reachability: bool = false,
     prove_ranges: bool = false,
     /// Match optimized builds so every backend exercises the in-place
-    /// List.map path; the copy path is still covered by shared-list,
-    /// slice, and layout-mismatch cases. The Lambda Mono differential
-    /// harness disables this so its tree stays on the copy path.
+    /// List.map and List.update paths; the copy paths are still covered by
+    /// shared-list, slice, and layout-mismatch cases. The Lambda Mono
+    /// differential harness disables this so its tree stays on the copy path.
     list_in_place_map: bool = true,
     /// Specialization cache control; the differential harness disables the
     /// cache so every function body materializes locally.
@@ -2028,7 +2092,7 @@ fn moduleDiagnosticsHaveErrors(
         var report = try module_env.diagnosticToReport(diagnostic, allocator, "repl");
         defer report.deinit();
         switch (report.severity) {
-            .info, .warning => {},
+            .warning => {},
             .runtime_error, .fatal => return true,
         }
     }
@@ -2049,7 +2113,7 @@ fn moduleDiagnosticsHaveErrors(
         var report = try report_builder.build(problem);
         defer report.deinit();
         switch (report.severity) {
-            .info, .warning => {},
+            .warning => {},
             .runtime_error, .fatal => return true,
         }
     }

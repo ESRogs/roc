@@ -48,6 +48,11 @@ pub const io_spec_tests = [_]TestSpec{
         .description = "Basic effectful functions: Stdout.line!, Stderr.line!",
     },
     .{
+        .roc_file = "test/fx/phantom_capability_parameter.roc",
+        .io_spec = "1>41",
+        .description = "Repro for issue 10770: a nominal's phantom parameter survives a call boundary",
+    },
+    .{
         .roc_file = "test/fx/subdir/app.roc",
         .io_spec = "1>Hello from stdout!|1>Line 1 to stdout|2>Line 2 to stderr|1>Line 3 to stdout|2>Error from stderr!",
         .description = "Relative paths starting with ..",
@@ -118,7 +123,32 @@ pub const io_spec_tests = [_]TestSpec{
     .{
         .roc_file = "test/fx/runtime_dec_to_int_wrap_widths.roc",
         .io_spec = "0<3|1>widths: 3 3 3 3 3 3 3 3 3 3|1>trunc: 3 -3 -3|1>wide: 11553255926290448384 30000000000000000000 0",
-        .description = "Every runtime Dec-to-integer width recovers the whole part, truncates toward zero, and wraps past the destination range",
+        .description = "Every runtime Dec-to-integer width recovers the whole part and truncates toward zero; all but I128 wrap past the destination range",
+    },
+    .{
+        .roc_file = "test/fx/runtime_conversion_exact_widths.roc",
+        .io_spec = "0<3|1>int: 3 3|1>frac: 3 3.0|1>signed: -3",
+        .description = "Conversions defined for every source value agree across backends",
+    },
+    .{
+        .roc_file = "test/fx/runtime_conversion_wrap_widths.roc",
+        .io_spec = "0<3|1>small: 3 3|1>negative: 65533|1>big: 44 44",
+        .description = "Wrapping conversions sign-extend a negative source and reduce modulo the destination range",
+    },
+    .{
+        .roc_file = "test/fx/runtime_conversion_try_widths.roc",
+        .io_spec = "0<3|1>fits: 3 3|1>past i8: out of range 150|1>past u8: out of range|1>from f64: 4 out of range",
+        .description = "Fallible conversions return an error when the value does not fit the destination",
+    },
+    .{
+        .roc_file = "test/fx/runtime_conversion_trunc_widths.roc",
+        .io_spec = "0<3|1>toward zero: 3 -3|1>narrow: 3 3",
+        .description = "Float-to-integer conversions discard the fractional part toward zero",
+    },
+    .{
+        .roc_file = "test/fx/runtime_conversion_to_str_widths.roc",
+        .io_spec = "0<3|1>unsigned: 3 3 3 3 3|1>signed: -3 -3 -3 -3 -3|1>frac: 3 3 3.0",
+        .description = "Every number type renders as text the same way on every backend",
     },
     .{
         .roc_file = "test/fx/runtime_i128_div_rem_mod.roc",
@@ -258,6 +288,11 @@ pub const io_spec_tests = [_]TestSpec{
         .roc_file = "test/fx/inspect_record_test.roc",
         .io_spec = "1>{ count: 42.0, name: \"test\" }",
         .description = "Record inspection",
+    },
+    .{
+        .roc_file = "test/fx/inspect_dict_set.roc",
+        .io_spec = "1>Set.from_list([1, 2, 3])|1>Dict.from_list([(\"a\", 3), (\"b\", 2)])|1>Set.from_list([])|1>Dict.from_list([])|1>{ labels: Set.from_list([\"red\", \"blue\"]), scores: Dict.from_list([(\"alice\", 10), (\"bob\", 20)]) }",
+        .description = "Dict and Set inspection uses from_list syntax for direct, empty, polymorphic, and nested values",
     },
     .{
         .roc_file = "test/fx/inspect_field_only_repro.roc",
@@ -418,7 +453,7 @@ pub const io_spec_tests = [_]TestSpec{
     .{
         .roc_file = "test/fx/dbg_corrupts_recursive_tag_union.roc",
         .io_spec = "1>Child is Text: hello",
-        .expected_build_stderr_contains = &.{"`DBG` IN OPTIMIZED BUILD"},
+        .expected_build_stderr_contains = &.{"`dbg` in optimized build"},
         .description = "Regression test: dbg on recursive tag union preserves variant discriminant (issue #8804)",
     },
     .{
@@ -623,6 +658,11 @@ pub const io_spec_tests = [_]TestSpec{
         .roc_file = "test/fx/leak_list_str_drop_nested.roc",
         .io_spec = "0<xy|1>drop done",
         .description = "Leak coverage for dropped heap List(Str) and List(List(Str)) (roc_builtins_list_decref_str / _flat_list callback paths)",
+    },
+    .{
+        .roc_file = "test/fx/hosted_list_str_ownership.roc",
+        .io_spec = "0<abcdefgh|1>hosted bytes: 120 local bytes: 120",
+        .description = "Regression test for #10774: a hosted function owns a List(Str) argument whose elements the caller still holds, so the caller's retain must cover the element strings the host's release drops",
     },
 };
 

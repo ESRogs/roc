@@ -137,23 +137,7 @@ pub const IteratorRepresentation = enum(u8) {
 };
 
 /// Producer or adapter that minted a stored iterator representation.
-pub const IteratorKind = enum(u8) {
-    none,
-    custom,
-    list,
-    str,
-    single,
-    range_exclusive,
-    range_inclusive,
-    map,
-    keep_if,
-    drop_if,
-    take_first,
-    drop_first,
-    concat,
-    append,
-    forced_dynamic,
-};
+pub const IteratorKind = static_dispatch.IteratorKind;
 
 /// How much of a stored named type's backing type later stages may inspect.
 pub const TypeBackingUse = enum {
@@ -181,10 +165,21 @@ pub const TypeNamedKind = enum {
     alias,
 };
 
+/// `??` default identity carried on stored record type evidence, mirroring
+/// Monotype `Type.FieldDefault`: rows disagreeing about defaults are
+/// distinct monotypes, so restored evidence must reproduce the default to
+/// reproduce the type.
+pub const TypeFieldDefault = struct {
+    module: names.ModuleIdentityId,
+    expr_node: u32,
+};
+
 /// Record field entry for stored monomorphic type evidence.
 pub const TypeField = struct {
     name: names.RecordFieldNameId,
     ty: ConstTypeId,
+    value_ty: ?ConstTypeId = null,
+    default: ?TypeFieldDefault,
 };
 
 /// Tag-union variant entry for stored monomorphic type evidence.
@@ -248,6 +243,9 @@ pub const ConstFnNestedEvidence = union(enum(u8)) {
 /// Exact checked callable relation attached to a stored target edge.
 pub const ConstFnCallableInstantiation = struct {
     view: names.CheckedModuleDigest,
+    /// Stable checked identity of `callable_ty`. The raw checked id remains
+    /// replay payload and may differ between equivalent fresh instantiations.
+    callable_key: names.CanonicalTypeKey,
     callable_ty: checked_ids.CheckedTypeId,
 };
 
@@ -258,6 +256,8 @@ pub const ConstFnEvidence = union(enum(u8)) {
     target: struct {
         view: names.CheckedModuleDigest,
         method: static_dispatch.MethodTarget,
+        /// Stable checked identity of `method.callable_ty`.
+        method_callable_key: names.CanonicalTypeKey,
         instantiation: ?ConstFnCallableInstantiation,
         nested: ConstFnNestedEvidence,
     },
@@ -418,7 +418,7 @@ pub const ConstTypeStore = struct {
     field_pool: std.ArrayList(TypeField),
     /// Flat pool of tag-union variants.
     tag_pool: std.ArrayList(TypeTag),
-    /// Flat pool of nominal declared field order entries.
+    /// Flat pool of nominal declared field entries.
     declared_field_pool: std.ArrayList(TypeDeclaredField),
     /// True for a store reconstructed from a serialized buffer.
     serialized: bool = false,
@@ -555,6 +555,11 @@ pub const ConstTypeStore = struct {
                     cloned_fields[i] = .{
                         .name = try translateRecordFieldName(name_translation, field.name),
                         .ty = try self.cloneTypeFromInner(source, name_translation, field.ty, map),
+                        .value_ty = if (field.value_ty) |value_ty|
+                            try self.cloneTypeFromInner(source, name_translation, value_ty, map)
+                        else
+                            null,
+                        .default = try translateFieldDefault(name_translation, field.default),
                     };
                 }
                 break :blk ConstType{ .record = try self.appendFieldSpan(cloned_fields) };
@@ -619,6 +624,15 @@ pub const ConstTypeStore = struct {
     fn translateTagName(name_translation: ?NameTranslation, id: names.TagNameId) Allocator.Error!names.TagNameId {
         const translation = name_translation orelse return id;
         return translation.target.internTagLabel(translation.source.tagLabelText(id));
+    }
+
+    fn translateFieldDefault(name_translation: ?NameTranslation, default: ?TypeFieldDefault) Allocator.Error!?TypeFieldDefault {
+        const field_default = default orelse return null;
+        const translation = name_translation orelse return field_default;
+        return .{
+            .module = try translation.target.internModuleIdentity(translation.source.moduleIdentityBytes(field_default.module)),
+            .expr_node = field_default.expr_node,
+        };
     }
 
     fn translateTypeDef(name_translation: ?NameTranslation, def: TypeDef) Allocator.Error!TypeDef {
@@ -859,6 +873,7 @@ pub const ConstStore = struct {
         const evidence = [_]ConstFnEvidence{.{ .target = .{
             .view = .{},
             .method = undefined,
+            .method_callable_key = .{},
             .instantiation = null,
             .nested = .from_callable,
         } }};
@@ -1182,6 +1197,10 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
     target_view.bytes[0] = 0xA1;
     var instantiation_view: names.CheckedModuleDigest = .{};
     instantiation_view.bytes[0] = 0xB2;
+    var method_callable_key: names.CanonicalTypeKey = .{};
+    method_callable_key.bytes[0] = 0xC3;
+    var instantiation_callable_key: names.CanonicalTypeKey = .{};
+    instantiation_callable_key.bytes[0] = 0xD4;
     const evidence = [_]ConstFnEvidence{
         .{ .target = .{
             .view = target_view,
@@ -1195,7 +1214,12 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
                 } },
                 .callable_ty = @enumFromInt(6),
             },
-            .instantiation = .{ .view = instantiation_view, .callable_ty = @enumFromInt(7) },
+            .method_callable_key = method_callable_key,
+            .instantiation = .{
+                .view = instantiation_view,
+                .callable_key = instantiation_callable_key,
+                .callable_ty = @enumFromInt(7),
+            },
             .nested = .{ .resolved = .{ .count = 1, .subtree_len = 1 } },
         } },
         .{ .structural = .equality },
@@ -1263,8 +1287,10 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
     try std.testing.expectEqual(@as(u32, 5), @intFromEnum(loaded_target.method.def_idx));
     try std.testing.expectEqual(evidence[0].target.method.kind, loaded_target.method.kind);
     try std.testing.expectEqual(@as(checked_ids.CheckedTypeId, @enumFromInt(6)), loaded_target.method.callable_ty);
+    try std.testing.expectEqual(method_callable_key, loaded_target.method_callable_key);
     const loaded_instantiation = loaded_target.instantiation.?;
     try std.testing.expectEqualSlices(u8, &instantiation_view.bytes, &loaded_instantiation.view.bytes);
+    try std.testing.expectEqual(instantiation_callable_key, loaded_instantiation.callable_key);
     try std.testing.expectEqual(@as(checked_ids.CheckedTypeId, @enumFromInt(7)), loaded_instantiation.callable_ty);
     const loaded_nested = loaded_target.nested.resolved;
     try std.testing.expectEqual(@as(u32, 1), loaded_nested.count);

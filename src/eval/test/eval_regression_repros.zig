@@ -5,6 +5,40 @@ const TestCase = @import("parallel_runner.zig").TestCase;
 /// Eval regression cases.
 pub const tests = [_]TestCase{
     .{
+        // One statement consuming the same list in two argument positions.
+        // Both consumes happen whenever the statement runs, so the value has
+        // two live references and the write must not land in place: doing so
+        // would rewrite the buffer being read from. No execution path has to
+        // be explored to know that, which is what makes this shape a hole for
+        // a uniqueness check that only reasons about paths between statements.
+        .name = "list concatenated with itself keeps both copies intact",
+        .source_kind = .module,
+        .source =
+        \\main : List(U64)
+        \\main = {
+        \\    xs = [1, 2, 3]
+        \\    List.concat(xs, xs)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "[1, 2, 3, 1, 2, 3]" },
+    },
+    .{
+        // The same shape with room to grow. Spare capacity is what makes an
+        // in-place concat physically possible, so a wrong uniqueness verdict
+        // corrupts the result here rather than being hidden by a reallocation.
+        .name = "list with spare capacity concatenated with itself keeps both copies intact",
+        .source_kind = .module,
+        .source =
+        \\main : List(U64)
+        \\main = {
+        \\    xs = List.with_capacity(16)
+        \\    ys = xs.append(1).append(2).append(3)
+        \\    List.concat(ys, ys)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "[1, 2, 3, 1, 2, 3]" },
+    },
+    .{
         .name = "regression: Dict uses a custom nominal key hash method",
         .source_kind = .module,
         .source =
@@ -869,5 +903,21 @@ pub const tests = [_]TestCase{
         \\main = to_instruction(Str.to_utf8("UUC"))
         ,
         .expected = .{ .inspect_str = "Ok(3)" },
+    },
+    .{
+        // A local function returning a two-member lambda set is instantiated at
+        // its uses, so its declaration owns an evidence scope that carries the
+        // members' dispatch requirements. Checking records that instantiation
+        // whatever rank the definition's pattern var settles at.
+        .name = "regression: local function returning a two-member lambda set dispatches both members",
+        .source =
+        \\{
+        \\    pick = |flag| if flag { |x| x + 1.I64 } else { |x| x * 2.I64 }
+        \\    f = pick(True)
+        \\    g = pick(False)
+        \\    (f(10.I64), g(10.I64))
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(11, 20)" },
     },
 };

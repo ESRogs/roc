@@ -2,9 +2,9 @@
 //! bodies.
 //!
 //! For each corpus program, the harness compiles once (Debug pipeline,
-//! specialization cache disabled, in-place List.map off) while capturing the
-//! Debug verifier's materialized Lambda Mono program, then executes the
-//! program twice:
+//! specialization cache disabled, in-place list transforms off) while
+//! capturing the Debug verifier's materialized Lambda Mono program. It then
+//! executes the program twice:
 //!
 //!   - the LIR interpreter runs the direct lowering's LIR output;
 //!   - a tree-walking evaluator (`postcheck.LambdaMono.Eval`) runs the
@@ -69,6 +69,7 @@ fn classifyTestHelperError(err: helpers.TestHelperError) TestHelperErrorKind {
         error.InvalidUtf8,
         error.FileNotFound,
         error.AccessDenied,
+        error.HostedFunctionNotBound,
         error.NotDir,
         error.SymLinkLoop,
         error.InputOutput,

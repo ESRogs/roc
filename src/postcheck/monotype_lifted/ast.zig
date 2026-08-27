@@ -56,6 +56,8 @@ pub const ComptimeSite = Mono.ComptimeSite;
 pub const FieldExpr = Mono.FieldExpr;
 /// Record update expression.
 pub const RecordUpdate = Mono.RecordUpdate;
+/// One source-ordered segment in a flattened record-field access path.
+pub const FieldAccessSegment = Mono.FieldAccessSegment;
 /// Keyed pre-lift function capture operand.
 pub const FnDefCapture = Mono.FnDefCapture;
 /// Keyed lifted capture operand (CaptureId + supplying expression).
@@ -183,6 +185,7 @@ pub const ProgramView = struct {
     typed_locals: []const TypedLocal,
     stmt_ids: []const StmtId,
     field_exprs: []const FieldExpr,
+    field_access_segments: []const FieldAccessSegment,
     fn_def_captures: []const FnDefCapture,
     capture_operands: []const CaptureOperand,
     record_destructs: []const RecordDestruct,
@@ -275,6 +278,15 @@ pub const ProgramView = struct {
 
     pub fn fieldExprSpan(self: ProgramView, span_: Span(FieldExpr)) []const FieldExpr {
         return self.field_exprs[span_.start..][0..span_.len];
+    }
+
+    pub fn fieldAccessSegmentSpan(self: ProgramView, span_: Span(FieldAccessSegment)) []const FieldAccessSegment {
+        return self.field_access_segments[span_.start..][0..span_.len];
+    }
+
+    pub fn fieldAccessSegmentAt(self: ProgramView, span_: Span(FieldAccessSegment), index: usize) FieldAccessSegment {
+        if (index >= span_.len) Common.invariant("field access segment index was outside span");
+        return self.field_access_segments[span_.start + index];
     }
 
     pub fn recordDestructSpan(self: ProgramView, span_: Span(RecordDestruct)) []const RecordDestruct {
@@ -422,6 +434,7 @@ pub const Program = struct {
     typed_locals: ProgramList(TypedLocal, "typed_locals"),
     stmt_ids: ProgramList(StmtId, "stmt_ids"),
     field_exprs: ProgramList(FieldExpr, "field_exprs"),
+    field_access_segments: ProgramList(FieldAccessSegment, "field_access_segments"),
     fn_def_captures: ProgramList(FnDefCapture, "fn_def_captures"),
     /// Backing pool for `Span(CaptureOperand)` capture operand spans on lifted
     /// `fn_ref`/`call_proc` nodes.
@@ -514,6 +527,7 @@ pub const Program = struct {
         typed_locals: std.ArrayList(TypedLocal),
         stmt_ids: std.ArrayList(StmtId),
         field_exprs: std.ArrayList(FieldExpr),
+        field_access_segments: std.ArrayList(FieldAccessSegment),
         fn_def_captures: std.ArrayList(FnDefCapture),
         capture_operands: std.ArrayList(CaptureOperand),
         record_destructs: std.ArrayList(RecordDestruct),
@@ -554,6 +568,7 @@ pub const Program = struct {
             .typed_locals = ProgramList(TypedLocal, "typed_locals").fromArrayList(typed_locals),
             .stmt_ids = ProgramList(StmtId, "stmt_ids").fromArrayList(stmt_ids),
             .field_exprs = ProgramList(FieldExpr, "field_exprs").fromArrayList(field_exprs),
+            .field_access_segments = ProgramList(FieldAccessSegment, "field_access_segments").fromArrayList(field_access_segments),
             .fn_def_captures = ProgramList(FnDefCapture, "fn_def_captures").fromArrayList(fn_def_captures),
             .capture_operands = ProgramList(CaptureOperand, "capture_operands").fromArrayList(capture_operands),
             .record_destructs = ProgramList(RecordDestruct, "record_destructs").fromArrayList(record_destructs),
@@ -616,6 +631,7 @@ pub const Program = struct {
         self.record_destructs.deinit(self.allocator);
         self.fn_def_captures.deinit(self.allocator);
         self.capture_operands.deinit(self.allocator);
+        self.field_access_segments.deinit(self.allocator);
         self.field_exprs.deinit(self.allocator);
         self.stmt_ids.deinit(self.allocator);
         self.typed_locals.deinit(self.allocator);
@@ -651,6 +667,7 @@ pub const Program = struct {
             .typed_locals = self.typed_locals.unsafeRawItemsForView(),
             .stmt_ids = self.stmt_ids.unsafeRawItemsForView(),
             .field_exprs = self.field_exprs.unsafeRawItemsForView(),
+            .field_access_segments = self.field_access_segments.unsafeRawItemsForView(),
             .fn_def_captures = self.fn_def_captures.unsafeRawItemsForView(),
             .capture_operands = self.capture_operands.unsafeRawItemsForView(),
             .record_destructs = self.record_destructs.unsafeRawItemsForView(),
@@ -1091,45 +1108,35 @@ pub const Program = struct {
     }
 
     pub fn addTypedLocalSpan(self: *Program, values: []const TypedLocal) std.mem.Allocator.Error!Span(TypedLocal) {
-        const start: u32 = @intCast(self.typed_locals.len());
-        try self.typed_locals.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(TypedLocal, &self.typed_locals, self.allocator, values);
     }
 
     pub fn addExprSpan(self: *Program, ids: []const ExprId) std.mem.Allocator.Error!Span(ExprId) {
-        const start: u32 = @intCast(self.expr_ids.len());
-        try self.expr_ids.appendSlice(self.allocator, ids);
-        return .{ .start = start, .len = @intCast(ids.len) };
+        return try Common.appendSpan(ExprId, &self.expr_ids, self.allocator, ids);
     }
 
     pub fn addPatSpan(self: *Program, ids: []const PatId) std.mem.Allocator.Error!Span(PatId) {
-        const start: u32 = @intCast(self.pat_ids.len());
-        try self.pat_ids.appendSlice(self.allocator, ids);
-        return .{ .start = start, .len = @intCast(ids.len) };
+        return try Common.appendSpan(PatId, &self.pat_ids, self.allocator, ids);
     }
 
     pub fn addStmtSpan(self: *Program, ids: []const StmtId) std.mem.Allocator.Error!Span(StmtId) {
-        const start: u32 = @intCast(self.stmt_ids.len());
-        try self.stmt_ids.appendSlice(self.allocator, ids);
-        return .{ .start = start, .len = @intCast(ids.len) };
+        return try Common.appendSpan(StmtId, &self.stmt_ids, self.allocator, ids);
     }
 
     pub fn addFieldExprSpan(self: *Program, values: []const FieldExpr) std.mem.Allocator.Error!Span(FieldExpr) {
-        const start: u32 = @intCast(self.field_exprs.len());
-        try self.field_exprs.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(FieldExpr, &self.field_exprs, self.allocator, values);
+    }
+
+    pub fn addFieldAccessSegmentSpan(self: *Program, values: []const FieldAccessSegment) std.mem.Allocator.Error!Span(FieldAccessSegment) {
+        return try Common.appendNonemptySpan(FieldAccessSegment, &self.field_access_segments, self.allocator, values, "field access segment span must be nonempty");
     }
 
     pub fn addFnDefCaptureSpan(self: *Program, values: []const FnDefCapture) std.mem.Allocator.Error!Span(FnDefCapture) {
-        const start: u32 = @intCast(self.fn_def_captures.len());
-        try self.fn_def_captures.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(FnDefCapture, &self.fn_def_captures, self.allocator, values);
     }
 
     pub fn addCaptureOperandSpan(self: *Program, values: []const CaptureOperand) std.mem.Allocator.Error!Span(CaptureOperand) {
-        const start: u32 = @intCast(self.capture_operands.len());
-        try self.capture_operands.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(CaptureOperand, &self.capture_operands, self.allocator, values);
     }
 
     /// Read one operand by value from a stable span identity. Unlike
@@ -1146,21 +1153,15 @@ pub const Program = struct {
     }
 
     pub fn addRecordDestructSpan(self: *Program, values: []const RecordDestruct) std.mem.Allocator.Error!Span(RecordDestruct) {
-        const start: u32 = @intCast(self.record_destructs.len());
-        try self.record_destructs.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(RecordDestruct, &self.record_destructs, self.allocator, values);
     }
 
     pub fn addStrPatternStepSpan(self: *Program, values: []const Mono.StrPatternStep) std.mem.Allocator.Error!Span(Mono.StrPatternStep) {
-        const start: u32 = @intCast(self.str_pattern_steps.len());
-        try self.str_pattern_steps.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(Mono.StrPatternStep, &self.str_pattern_steps, self.allocator, values);
     }
 
     pub fn addBranchSpan(self: *Program, values: []const Branch) std.mem.Allocator.Error!Span(Branch) {
-        const start: u32 = @intCast(self.branches.len());
-        try self.branches.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(Branch, &self.branches, self.allocator, values);
     }
 
     /// Read one branch by value from a stable span identity. Unlike
@@ -1172,9 +1173,7 @@ pub const Program = struct {
     }
 
     pub fn addIfBranchSpan(self: *Program, values: []const IfBranch) std.mem.Allocator.Error!Span(IfBranch) {
-        const start: u32 = @intCast(self.if_branches.len());
-        try self.if_branches.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
+        return try Common.appendSpan(IfBranch, &self.if_branches, self.allocator, values);
     }
 
     pub fn exprSpan(self: *const Program, span_: Span(ExprId)) ProgramSpanBorrow(ExprId, "expr_ids") {
@@ -1210,6 +1209,15 @@ pub const Program = struct {
 
     pub fn fieldExprSpan(self: *const Program, span_: Span(FieldExpr)) ProgramSpanBorrow(FieldExpr, "field_exprs") {
         return self.field_exprs.borrowSpan(span_.start, span_.len);
+    }
+
+    pub fn fieldAccessSegmentSpan(self: *const Program, span_: Span(FieldAccessSegment)) ProgramSpanBorrow(FieldAccessSegment, "field_access_segments") {
+        return self.field_access_segments.borrowSpan(span_.start, span_.len);
+    }
+
+    pub fn fieldAccessSegmentAt(self: *const Program, span_: Span(FieldAccessSegment), index: usize) FieldAccessSegment {
+        if (index >= span_.len) Common.invariant("field access segment index was outside span");
+        return self.field_access_segments.get(span_.start + index);
     }
 
     pub fn fnDefCaptureSpan(self: *const Program, span_: Span(FnDefCapture)) ProgramSpanBorrow(FnDefCapture, "fn_def_captures") {
@@ -1330,6 +1338,68 @@ pub const Program = struct {
         return self.stmts.unsafeRawItemsForView()[@intFromEnum(id)];
     }
 };
+
+/// Visit every local a pattern binds, innermost first, in binding order.
+///
+/// Three consumers need this walk—the lift pass's bound-set scan, its capture
+/// graph builder, and SpecConstr's body-local scope—and they differ only in
+/// what they do at a binding site, never in which pattern positions bind. The
+/// walk lives here so a new `PatData` variant is one edit, and so the three
+/// cannot come to disagree about, say, whether a list rest pattern binds.
+///
+/// `binder` is any value exposing `bindLocal(LocalId) !void`.
+pub fn forEachBoundLocal(program: *const Program, pat_id: PatId, binder: anytype) std.mem.Allocator.Error!void {
+    switch (program.getPat(pat_id).data) {
+        .bind => |local| try binder.bindLocal(local),
+        .wildcard,
+        .int_lit,
+        .dec_lit,
+        .frac_f32_lit,
+        .frac_f64_lit,
+        .str_lit,
+        => {},
+        .str_pattern => |str| {
+            const steps = program.strPatternStepSpan(str.steps);
+            for (0..steps.len) |index| {
+                if (GuardedList.at(steps, index).capture) |capture| {
+                    try forEachBoundLocal(program, capture, binder);
+                }
+            }
+        },
+        .as => |as| {
+            try forEachBoundLocal(program, as.pattern, binder);
+            try binder.bindLocal(as.local);
+        },
+        .record => |fields| {
+            const destructs = program.recordDestructSpan(fields);
+            for (0..destructs.len) |index| {
+                try forEachBoundLocal(program, GuardedList.at(destructs, index).pattern, binder);
+            }
+        },
+        .tuple => |items| {
+            const children = program.patSpan(items);
+            for (0..children.len) |index| {
+                try forEachBoundLocal(program, GuardedList.at(children, index), binder);
+            }
+        },
+        .list => |list| {
+            const children = program.patSpan(list.patterns);
+            for (0..children.len) |index| {
+                try forEachBoundLocal(program, GuardedList.at(children, index), binder);
+            }
+            if (list.rest) |rest| if (rest.pattern) |rest_pattern| {
+                try forEachBoundLocal(program, rest_pattern, binder);
+            };
+        },
+        .tag => |tag| {
+            const payloads = program.patSpan(tag.payloads);
+            for (0..payloads.len) |index| {
+                try forEachBoundLocal(program, GuardedList.at(payloads, index), binder);
+            }
+        },
+        .nominal => |backing| try forEachBoundLocal(program, backing, binder),
+    }
+}
 
 test "monotype lifted declarations are referenced" {
     std.testing.refAllDecls(@This());

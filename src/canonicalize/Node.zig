@@ -69,6 +69,7 @@ pub const Tag = enum {
     record_field,
     record_destruct,
     expr_field_access,
+    field_access_segment,
     expr_method_call,
     expr_dispatch_call,
     expr_interpolation,
@@ -140,6 +141,7 @@ pub const Tag = enum {
     ty_tuple,
     ty_record,
     ty_record_field,
+    ty_record_field_defaulted,
     ty_fn,
     ty_parens,
     ty_lookup_external,
@@ -210,6 +212,7 @@ pub const Tag = enum {
     diag_erroneous_value_expr,
     diag_qualified_ident_does_not_exist,
     diag_invalid_top_level_statement,
+    diag_invalid_associated_statement,
     diag_expr_not_canonicalized,
     diag_invalid_string_interpolation,
     diag_unreachable_string_pattern_capture,
@@ -226,6 +229,8 @@ pub const Tag = enum {
     diag_where_alias_constraint_not_on_receiver,
     diag_open_ext_not_allowed_in_type_decl,
     diag_unnamed_field_not_allowed_in_structural_record,
+    diag_optional_field_cannot_have_default,
+    diag_record_default_not_literal,
     diag_type_module_missing_matching_type,
     diag_type_module_has_alias_not_nominal,
     diag_default_app_missing_main,
@@ -257,6 +262,7 @@ pub const Tag = enum {
     diag_type_from_missing_module,
     diag_module_not_imported,
     diag_nested_type_not_found,
+    diag_internal_builtin_type,
     diag_nested_value_not_found,
     diag_record_builder_map2_not_found,
     diag_too_many_exports,
@@ -284,6 +290,7 @@ pub const Tag = enum {
     diag_mutually_recursive_type_aliases,
     diag_deprecated_number_suffix,
     diag_range_op_chained,
+    diag_unnamed_field_cannot_have_default,
 };
 
 /// Typed payload union for accessing node data in a type-safe manner.
@@ -343,6 +350,7 @@ pub const Payload = extern union {
     expr_num_from_numeral: ExprNumFromNumeral,
     expr_string: ExprString,
     expr_field_access: ExprFieldAccess,
+    field_access_segment: FieldAccessSegment,
     expr_method_call: ExprMethodCall,
     expr_dispatch_call: ExprDispatchCall,
     expr_interpolation: ExprInterpolation,
@@ -418,12 +426,14 @@ pub const Payload = extern union {
     diag_single_value: DiagSingleValue,
     diag_two_idents: DiagTwoIdents,
     diag_three_idents: DiagThreeIdents,
+    diag_internal_builtin_type: DiagInternalBuiltinType,
     diag_ident_with_region: DiagIdentWithRegion,
     diag_two_idents_extra: DiagTwoIdentsExtra,
     diag_single_ident_extra: DiagSingleIdentExtra,
     diag_two_enums: DiagTwoEnums,
     type_header: TypeHeader,
     ty_record_field: TyRecordField,
+    ty_record_field_defaulted: TyRecordFieldDefaulted,
     exposed_item: ExposedItem,
     if_branch: IfBranch,
     type_var_slot: TypeVarSlot,
@@ -704,8 +714,14 @@ pub const Payload = extern union {
 
     pub const ExprFieldAccess = extern struct {
         receiver: u32,
-        field_name: u32,
-        field_name_region_span2_idx: u32,
+        segments_start: u32,
+        segments_len: u32,
+    };
+
+    pub const FieldAccessSegment = extern struct {
+        name: u32,
+        mode: u8,
+        _padding: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
     };
 
     pub const ExprMethodCall = extern struct {
@@ -1102,19 +1118,39 @@ pub const Payload = extern union {
     pub const Annotation = extern struct {
         anno: u32,
         /// Index into span2_data: (where_start, where_len); meaningful only when
-        /// `has_where`.
+        /// `flags.has_where`.
         where_span2_idx: u32,
-        /// Whether the annotation has a `where` clause.
-        has_where: bool,
-        /// Whether the annotation mentions any type variable—a fresh
-        /// `.rigid_var` or a `.rigid_var_lookup` reference to an enclosing one.
-        mentions_type_var: bool,
-        /// Whether the annotation *introduces* a type variable (`.rigid_var`), as
-        /// opposed to only referencing one from an enclosing scope.
-        introduces_type_var: bool,
-        /// Whether the annotation (its type tree or any where-clause method
-        /// signature) contains an `_` inference hole.
-        contains_underscore: bool,
+        /// Index into span2_data: (name_offset, name_byte_len) locating the
+        /// annotated name token in source; meaningful only when
+        /// `flags.has_name_region`.
+        name_region_span2_idx: u32,
+        /// The annotation's boolean properties.
+        flags: Flags,
+
+        /// The annotation's boolean properties, packed into one byte.
+        ///
+        /// A fifth standalone `bool` would grow this payload past the 16-byte
+        /// budget the `Payload` union enforces, so the flags share a backing
+        /// integer instead of each taking their own byte.
+        pub const Flags = packed struct(u8) {
+            /// Whether the annotation has a `where` clause.
+            has_where: bool = false,
+            /// Whether the annotation mentions any type variable—a fresh
+            /// `.rigid_var` or a `.rigid_var_lookup` reference to an enclosing one.
+            mentions_type_var: bool = false,
+            /// Whether the annotation *introduces* a type variable (`.rigid_var`), as
+            /// opposed to only referencing one from an enclosing scope.
+            introduces_type_var: bool = false,
+            /// Whether the annotation (its type tree or any where-clause method
+            /// signature) contains an `_` inference hole.
+            contains_underscore: bool = false,
+            /// Whether `name_region_span2_idx` locates a real name token. False
+            /// for annotations the compiler synthesizes, which have no name in
+            /// source.
+            has_name_region: bool = false,
+            /// Unused bits, kept zero so the byte compares equal across builds.
+            unused: u3 = 0,
+        };
     };
 
     // === Diagnostic payload structs ===
@@ -1153,6 +1189,13 @@ pub const Payload = extern union {
         ident1: u32, // @bitCast(Ident.Idx)
         ident2: u32, // @bitCast(Ident.Idx)
         ident3: u32, // @bitCast(Ident.Idx)
+    };
+
+    /// Internal builtin type diagnostic with its exact codec family.
+    pub const DiagInternalBuiltinType = extern struct {
+        parent_name: u32, // @bitCast(Ident.Idx)
+        nested_name: u32, // @bitCast(Ident.Idx)
+        kind: u32, // @intFromEnum(Diagnostic.InternalBuiltinTypeKind)
     };
 
     /// Diagnostics with an identifier and inline region offsets.
@@ -1196,8 +1239,18 @@ pub const Payload = extern union {
     pub const TyRecordField = extern struct {
         name: u32,
         ty: u32,
+        is_optional: bool = false,
         is_unnamed: bool = false,
-        _padding: [3]u8 = .{ 0, 0, 0 },
+        _padding: [2]u8 = .{ 0, 0 },
+    };
+
+    /// A DEFAULTED record-annotation field (`a : U8 ?? 10`): never optional,
+    /// never unnamed (both rejected at canonicalization), so the third word
+    /// carries the canonicalized default expression instead of flags.
+    pub const TyRecordFieldDefaulted = extern struct {
+        name: u32,
+        ty: u32,
+        default_value: u32,
     };
 
     pub const ExposedItem = extern struct {
@@ -1220,9 +1273,14 @@ pub const Payload = extern union {
     // Compile-time size verification
     comptime {
         std.debug.assert(@sizeOf(Payload) == 16);
-        // anno + where_span2_idx (2 x u32) + 4 bool flags. The four bools fill
-        // the trailing 4 bytes exactly (no padding); assert the size so a stray
-        // field can't silently grow it.
-        std.debug.assert(@sizeOf(Annotation) == 12);
+        // Access mode occupies padding that was already present on the segment
+        // payload; flattened field-access paths must not increase the per-node
+        // footprint.
+        std.debug.assert(@sizeOf(FieldAccessSegment) == 12);
+        // anno + where_span2_idx + name_region_span2_idx (3 x u32) + a packed
+        // flags byte, rounded up to the struct's 4-byte alignment. That fills
+        // the Payload union exactly; assert the size so a stray field can't
+        // silently grow it past the union budget.
+        std.debug.assert(@sizeOf(Annotation) == 16);
     }
 };

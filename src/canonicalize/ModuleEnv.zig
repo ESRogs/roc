@@ -113,8 +113,8 @@ pub const CommonIdents = extern struct {
     is_gt: Ident.Idx,
     is_gte: Ident.Idx,
     is_eq: Ident.Idx,
-    range_exclusive: Ident.Idx,
-    range_inclusive: Ident.Idx,
+    range_exclusive_to: Ident.Idx,
+    range_inclusive_to: Ident.Idx,
     to_hash: Ident.Idx,
     parser_for: Ident.Idx,
     encoder_for: Ident.Idx,
@@ -152,6 +152,7 @@ pub const CommonIdents = extern struct {
 
     // Fully-qualified type identifiers for type checking and layout generation
     builtin_iter: Ident.Idx,
+    builtin_range: Ident.Idx,
     builtin_try: Ident.Idx,
     builtin_numeral: Ident.Idx,
     builtin_str: Ident.Idx,
@@ -226,6 +227,12 @@ pub const CommonIdents = extern struct {
     question_err: Ident.Idx,
     // Synthetic identifier for .. implicit rigids in open tag unions or records
     open_ext: Ident.Idx,
+    // Synthetic identifier naming the rigid presence variable minted when
+    // checking a definition's body against its own `?:` optional-field signature.
+    optional_presence: Ident.Idx,
+    // Error tag produced by optional field access (`r.?x`) when the field is
+    // absent: the Err side of `Try(field_type, [MissingField])`.
+    missing_field: Ident.Idx,
 
     /// Insert all well-known identifiers into a CommonEnv.
     /// Use this when creating a fresh ModuleEnv from scratch.
@@ -246,8 +253,8 @@ pub const CommonIdents = extern struct {
             .is_gt = try common.insertIdent(gpa, Ident.for_text("is_gt")),
             .is_gte = try common.insertIdent(gpa, Ident.for_text("is_gte")),
             .is_eq = try common.insertIdent(gpa, Ident.for_text("is_eq")),
-            .range_exclusive = try common.insertIdent(gpa, Ident.for_text("range_exclusive")),
-            .range_inclusive = try common.insertIdent(gpa, Ident.for_text("range_inclusive")),
+            .range_exclusive_to = try common.insertIdent(gpa, Ident.for_text("range_exclusive_to")),
+            .range_inclusive_to = try common.insertIdent(gpa, Ident.for_text("range_inclusive_to")),
             .to_hash = try common.insertIdent(gpa, Ident.for_text("to_hash")),
             .parser_for = try common.insertIdent(gpa, Ident.for_text("parser_for")),
             .encoder_for = try common.insertIdent(gpa, Ident.for_text("encoder_for")),
@@ -280,6 +287,7 @@ pub const CommonIdents = extern struct {
             .f64 = try common.insertIdent(gpa, Ident.for_text("F64")),
             .dec = try common.insertIdent(gpa, Ident.for_text("Dec")),
             .builtin_iter = try common.insertIdent(gpa, Ident.for_text("Builtin.Iter")),
+            .builtin_range = try common.insertIdent(gpa, Ident.for_text("Builtin.Num.Range")),
             .builtin_try = try common.insertIdent(gpa, Ident.for_text("Builtin.Try")),
             .builtin_numeral = try common.insertIdent(gpa, Ident.for_text("Builtin.Num.Numeral")),
             .builtin_str = try common.insertIdent(gpa, Ident.for_text("Builtin.Str")),
@@ -352,6 +360,10 @@ pub const CommonIdents = extern struct {
             .question_err = try common.insertIdent(gpa, Ident.for_text("#err")),
             // Synthetic identifier for .. implicit rigids in open tag unions or records
             .open_ext = try common.insertIdent(gpa, Ident.for_text("#others")),
+            // Synthetic identifier naming rigid presence vars for `?:` fields
+            .optional_presence = try common.insertIdent(gpa, Ident.for_text("#optional")),
+            // Error tag for optional field access on an absent field
+            .missing_field = try common.insertIdent(gpa, Ident.for_text("MissingField")),
         };
     }
 
@@ -375,8 +387,8 @@ pub const CommonIdents = extern struct {
             .is_gt = common.findIdent("is_gt") orelse unreachable,
             .is_gte = common.findIdent("is_gte") orelse unreachable,
             .is_eq = common.findIdent("is_eq") orelse unreachable,
-            .range_exclusive = common.findIdent("range_exclusive") orelse unreachable,
-            .range_inclusive = common.findIdent("range_inclusive") orelse unreachable,
+            .range_exclusive_to = common.findIdent("range_exclusive_to") orelse unreachable,
+            .range_inclusive_to = common.findIdent("range_inclusive_to") orelse unreachable,
             .to_hash = common.findIdent("to_hash") orelse unreachable,
             .parser_for = common.findIdent("parser_for") orelse unreachable,
             .encoder_for = common.findIdent("encoder_for") orelse unreachable,
@@ -409,6 +421,7 @@ pub const CommonIdents = extern struct {
             .f64 = common.findIdent("F64") orelse unreachable,
             .dec = common.findIdent("Dec") orelse unreachable,
             .builtin_iter = common.findIdent("Builtin.Iter") orelse unreachable,
+            .builtin_range = common.findIdent("Builtin.Num.Range") orelse unreachable,
             .builtin_try = common.findIdent("Builtin.Try") orelse unreachable,
             .builtin_numeral = common.findIdent("Builtin.Num.Numeral") orelse unreachable,
             .builtin_str = common.findIdent("Builtin.Str") orelse unreachable,
@@ -481,6 +494,10 @@ pub const CommonIdents = extern struct {
             .question_err = common.findIdent("#err") orelse unreachable,
             // Synthetic identifier for .. implicit rigids in open tag unions or records
             .open_ext = common.findIdent("#others") orelse unreachable,
+            // Synthetic identifier naming rigid presence vars for `?:` fields
+            .optional_presence = common.findIdent("#optional") orelse unreachable,
+            // Error tag for optional field access on an absent field
+            .missing_field = common.findIdent("MissingField") orelse unreachable,
         };
     }
 };
@@ -573,6 +590,10 @@ pub const MethodBinding = extern struct {
 /// associated methods to be published through the module exposure table.
 pub const MethodDefs = SortedArrayBuilder(MethodKey, MethodBinding);
 
+/// Construction-time position shared by the parallel method identity and
+/// definition tables.
+pub const MethodTableIndex = enum(u32) { _ };
+
 /// A definition whose implementation was authored by the compiler as one
 /// exact low-level operation. Canonicalization publishes this alongside CIR so
 /// every later stage can consume the producer-owned runtime identity without
@@ -603,6 +624,8 @@ pub const ForLoopDispatchPlan = extern struct {
     node_idx: u32,
     pattern_idx: u32,
     iterable_idx: u32,
+    iterator_var: u32,
+    step_var: u32,
     iter_fn_var: u32,
     next_fn_var: u32,
     step_topology: IteratorStepTopology,
@@ -800,6 +823,32 @@ pub const NumericSuffixTarget = extern struct {
     }
 };
 
+/// Checker-produced construction evidence for one field omitted by a record
+/// literal through defaulted-field width absorption. The field's default is
+/// construction-site data; it must survive even when later value unification
+/// normalizes the shared runtime row to `required`.
+pub const RecordOmittedDefault = extern struct {
+    expr: CIR.Expr.Idx,
+    field_name: Ident.Idx,
+    origin_module: base.ModuleIdentity.Idx,
+    default_expr_node: u32,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
+/// A source node whose checked value is a rank-1 polymorphic type scheme.
+///
+/// Generalization records this explicitly because a partially generalized
+/// scheme can have a monomorphic structural root with quantified descendants.
+/// Consumers must therefore not infer scheme-ness from the root variable's
+/// rank. The table is kept sorted by `node_idx` for allocation-free imported
+/// lookup.
+pub const BindingScheme = extern struct {
+    node_idx: u32,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
 gpa: std.mem.Allocator,
 
 common: CommonEnv,
@@ -817,6 +866,14 @@ all_defs: CIR.Def.Span,
 /// Module-global value definitions: top-level values, associated items, and
 /// compiler-created hosted globals. Local block definitions are not included.
 global_value_defs: CIR.Def.Span,
+/// Exact module-global value definitions selected by canonicalization's
+/// source-name collision policy. Contains one definition per source-visible
+/// name plus every definition whose pattern has no single source name.
+top_level_value_defs: CIR.Def.Span,
+/// Module-global definitions that introduce checked value bindings. Concrete
+/// shadowed definitions retain their exact identities; annotation-only
+/// declarations superseded by an implementation are excluded.
+value_binding_defs: CIR.Def.Span,
 /// Exact definitions rewritten from annotation-only declarations to hosted lambdas.
 hosted_defs: CIR.Def.Span,
 /// All the top-level statements in the module (populated by canonicalization)
@@ -882,8 +939,10 @@ store: NodeStore,
 evaluation_order: ?*DependencyGraph.EvaluationOrder,
 
 /// Exact strict-demand edges between top-level definitions. Canonicalization
-/// produces this data and serialization preserves it for checked-artifact
-/// publication; unlike `evaluation_order`, it is not a transient traversal aid.
+/// produces the initial relation and checking replaces it after resolving
+/// literal dispatch; serialization preserves the finalized relation for
+/// checked-artifact publication. Unlike `evaluation_order`, it is not a
+/// transient traversal aid.
 top_level_demand_dependencies: DependencyGraph.Dependency.SafeList,
 top_level_demand_dependencies_ready: bool,
 
@@ -924,6 +983,9 @@ numeric_suffix_targets: NumericSuffixTarget.SafeList,
 scheme_uses: SchemeUseRecord.SafeList,
 /// Flat pool of (scheme var → fresh var) pairs backing `scheme_uses`.
 scheme_use_pairs: SchemeUsePair.SafeList,
+/// Exact source bindings that checking generalized into rank-1 type schemes.
+/// Sorted by source node for allocation-free cross-module lookup.
+binding_schemes: BindingScheme.SafeList,
 /// Generated codec derivations validated by checking and consumed by checked
 /// artifact publication.
 generated_codec_derivations: GeneratedCodecDerivation.SafeList,
@@ -932,6 +994,8 @@ generated_codec_calls: GeneratedCodecCall.SafeList,
 /// Static-dispatch obligations explicitly rejected by checking. Publication
 /// consumes these records instead of inferring rejection from erroneous types.
 rejected_static_dispatches: RejectedStaticDispatch.SafeList,
+/// Exact default identities selected at record-literal omission sites.
+record_omitted_defaults: RecordOmittedDefault.SafeList,
 
 /// A type alias mapping from a for-clause: [Model : model]
 /// Maps an alias name (Model) to a rigid variable name (model)
@@ -1022,10 +1086,19 @@ pub const FileDependencyState = enum(u8) {
 pub const FileDependency = extern struct {
     relative_path: StringLiteral.Idx,
     state: FileDependencyState,
-    _padding: [3]u8,
+    _padding: [3]u8 = .{ 0, 0, 0 },
     content_hash: [32]u8,
+    start_offset: u32,
+    end_offset: u32,
 
     pub const SafeList = collections.SafeList(@This());
+
+    pub fn region(self: @This()) Region {
+        return .{
+            .start = .{ .offset = self.start_offset },
+            .end = .{ .offset = self.end_offset },
+        };
+    }
 };
 
 /// Relocate all pointers in the ModuleEnv by the given offset.
@@ -1050,7 +1123,9 @@ pub fn relocate(self: *Self, offset: isize) void {
     self.method_defs.relocate(offset);
     self.provided_low_level_defs.relocate(offset);
     self.for_loop_dispatch_plans.relocate(offset);
+    self.binding_schemes.relocate(offset);
     self.rejected_static_dispatches.relocate(offset);
+    self.record_omitted_defaults.relocate(offset);
 
     // Relocate the module_name pointer if it's not empty
     if (self.module_name.len > 0) {
@@ -1066,6 +1141,8 @@ pub fn initCIRFields(self: *Self, module_name: []const u8) Allocator.Error!void 
     self.module_role = .user;
     self.all_defs = .{ .span = .{ .start = 0, .len = 0 } };
     self.global_value_defs = .{ .span = .{ .start = 0, .len = 0 } };
+    self.top_level_value_defs = .{ .span = .{ .start = 0, .len = 0 } };
+    self.value_binding_defs = .{ .span = .{ .start = 0, .len = 0 } };
     self.hosted_defs = .{ .span = .{ .start = 0, .len = 0 } };
     self.all_statements = .{ .span = .{ .start = 0, .len = 0 } };
     self.type_decls = .{ .span = .{ .start = 0, .len = 0 } };
@@ -1109,6 +1186,8 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .module_role = .user,
         .all_defs = .{ .span = .{ .start = 0, .len = 0 } },
         .global_value_defs = .{ .span = .{ .start = 0, .len = 0 } },
+        .top_level_value_defs = .{ .span = .{ .start = 0, .len = 0 } },
+        .value_binding_defs = .{ .span = .{ .start = 0, .len = 0 } },
         .hosted_defs = .{ .span = .{ .start = 0, .len = 0 } },
         .all_statements = .{ .span = .{ .start = 0, .len = 0 } },
         .type_decls = .{ .span = .{ .start = 0, .len = 0 } },
@@ -1145,9 +1224,11 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .numeric_suffix_targets = try NumericSuffixTarget.SafeList.initCapacity(gpa, 8),
         .scheme_uses = try SchemeUseRecord.SafeList.initCapacity(gpa, 8),
         .scheme_use_pairs = try SchemeUsePair.SafeList.initCapacity(gpa, 8),
+        .binding_schemes = try BindingScheme.SafeList.initCapacity(gpa, 8),
         .generated_codec_derivations = try GeneratedCodecDerivation.SafeList.initCapacity(gpa, 4),
         .generated_codec_calls = try GeneratedCodecCall.SafeList.initCapacity(gpa, 16),
         .rejected_static_dispatches = try RejectedStaticDispatch.SafeList.initCapacity(gpa, 4),
+        .record_omitted_defaults = try RecordOmittedDefault.SafeList.initCapacity(gpa, 4),
     };
 }
 
@@ -1174,9 +1255,11 @@ pub fn deinit(self: *Self) void {
     self.numeric_suffix_targets.deinit(self.gpa);
     self.scheme_uses.deinit(self.gpa);
     self.scheme_use_pairs.deinit(self.gpa);
+    self.binding_schemes.deinit(self.gpa);
     self.generated_codec_derivations.deinit(self.gpa);
     self.generated_codec_calls.deinit(self.gpa);
     self.rejected_static_dispatches.deinit(self.gpa);
+    self.record_omitted_defaults.deinit(self.gpa);
     self.top_level_demand_dependencies.deinit(self.gpa);
     // diagnostics are stored in the NodeStore, no need to free separately
     self.store.deinit();
@@ -1218,18 +1301,18 @@ pub fn providedLowLevelForDef(self: *const Self, def_idx: CIR.Def.Idx) ?base.Low
     return null;
 }
 
-/// Return the exact strict-demand relation produced by canonicalization.
+/// Return the current producer-authored exact strict-demand relation.
 pub fn topLevelDemandDependencies(self: *const Self) []const DependencyGraph.Dependency {
     std.debug.assert(self.top_level_demand_dependencies_ready);
     return self.top_level_demand_dependencies.items.items;
 }
 
-/// Whether canonicalization has produced the exact strict-demand relation.
+/// Whether a compiler stage has produced the exact strict-demand relation.
 pub fn topLevelDemandDependenciesReady(self: *const Self) bool {
     return self.top_level_demand_dependencies_ready;
 }
 
-/// Whether one exact strict-demand edge was produced by canonicalization.
+/// Whether the current exact strict-demand relation contains one edge.
 pub fn hasTopLevelDemandDependency(
     self: *const Self,
     dependent: CIR.Def.Idx,
@@ -1275,9 +1358,11 @@ pub fn deinitCachedModule(self: *Self) void {
     self.numeric_suffix_targets.deinit(self.gpa);
     self.scheme_uses.deinit(self.gpa);
     self.scheme_use_pairs.deinit(self.gpa);
+    self.binding_schemes.deinit(self.gpa);
     self.generated_codec_derivations.deinit(self.gpa);
     self.generated_codec_calls.deinit(self.gpa);
     self.rejected_static_dispatches.deinit(self.gpa);
+    self.record_omitted_defaults.deinit(self.gpa);
 
     // If enableRuntimeInserts was called on the interner, it allocated new memory
     // that needs to be freed. The interner.deinit checks supports_inserts internally
@@ -1291,13 +1376,15 @@ pub fn deinitCachedModule(self: *Self) void {
 }
 
 /// Record a relative file dependency before its final read state is known.
-pub fn recordFileDependency(self: *Self, relative_path: []const u8) Allocator.Error!FileDependency.SafeList.Idx {
+pub fn recordFileDependency(self: *Self, relative_path: []const u8, start_offset: u32, end_offset: u32) Allocator.Error!FileDependency.SafeList.Idx {
     const path_idx = try self.insertString(relative_path);
     return try self.file_dependencies.append(self.gpa, .{
         .relative_path = path_idx,
         .state = .pending,
         ._padding = .{ 0, 0, 0 },
         .content_hash = [_]u8{0} ** 32,
+        .start_offset = start_offset,
+        .end_offset = end_offset,
     });
 }
 
@@ -1734,7 +1821,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             const owned_ident = try report.addOwnedString(ident_name);
             try report.headline.addReflowingText("Variable ");
             try report.headline.addUnqualifiedSymbol(owned_ident);
-            try report.headline.addReflowingText(" is defined here and then never used.");
+            try report.headline.addReflowingText(" is defined here and then never used:");
 
             try report.document.addReflowingText("If you don't need this variable, prefix it with an underscore like ");
             const ident_with_underscore = try std.fmt.allocPrint(allocator, "_{s}", .{owned_ident});
@@ -1832,9 +1919,6 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.headline.addInlineCode(owned_type_name);
             try report.headline.addReflowingText(" is being redeclared.");
 
-            // Show where the redeclaration is
-            try report.document.addReflowingText("The redeclaration is here:");
-            try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 redeclared_region_info,
@@ -1847,7 +1931,9 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addReflowingText("But ");
             try report.document.addType(owned_type_name);
-            try report.document.addReflowingText(" was already declared here:");
+            try report.document.addReflowingText(" was already declared in ");
+            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.document.addReflowingText(":");
             try report.document.addLineBreak();
             try report.document.addSourceRegion(
                 original_region_info,
@@ -1870,8 +1956,6 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.headline.addInlineCode(owned_type_name);
             try report.headline.addReflowingText(" is being redeclared.");
 
-            try report.document.addReflowingText("The redeclaration is here:");
-            try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 redeclared_region_info,
@@ -1884,7 +1968,9 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addReflowingText("But ");
             try report.document.addType(owned_type_name);
-            try report.document.addReflowingText(" was already declared here:");
+            try report.document.addReflowingText(" was already declared in ");
+            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.document.addReflowingText(":");
             try report.document.addLineBreak();
             try report.document.addSourceRegion(
                 original_region_info,
@@ -1907,8 +1993,6 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.headline.addInlineCode(owned_type_name);
             try report.headline.addReflowingText(" is being redeclared.");
 
-            try report.document.addReflowingText("The redeclaration is here:");
-            try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 redeclared_region_info,
@@ -1921,7 +2005,9 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addReflowingText("But ");
             try report.document.addType(owned_type_name);
-            try report.document.addReflowingText(" was already declared here:");
+            try report.document.addReflowingText(" was already declared in ");
+            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.document.addReflowingText(":");
             try report.document.addLineBreak();
             try report.document.addSourceRegion(
                 original_region_info,
@@ -1943,6 +2029,29 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.headline.addInlineCode(owned_stmt);
             try report.headline.addReflowingText(" is not allowed at the top level.");
             try report.document.addReflowingText("Only definitions, type annotations, and imports are allowed at the top level.");
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+            const owned_filename = try report.addOwnedString(filename);
+            try report.document.addSourceRegion(
+                region_info,
+                .error_highlight,
+                owned_filename,
+                self.getSourceAll(),
+                self.getLineStartsAll(),
+            );
+
+            break :blk report;
+        },
+        .invalid_associated_statement => |data| blk: {
+            const stmt_name = self.getString(data.stmt);
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Invalid Statement", "", .runtime_error);
+            const owned_stmt = try report.addOwnedString(stmt_name);
+            try report.headline.addReflowingText("The statement ");
+            try report.headline.addInlineCode(owned_stmt);
+            try report.headline.addReflowingText(" is not allowed in an associated block.");
+            try report.document.addReflowingText("Only associated values, type declarations, and type annotations are allowed in an associated block.");
             try report.document.addLineBreak();
             try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
@@ -2039,9 +2148,6 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.headline.addRecordField(owned_field_name);
             try report.headline.addReflowingText(" appears more than once in this record.");
 
-            // Show where the duplicate field is
-            try report.document.addReflowingText("This field is duplicated here:");
-            try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 duplicate_region_info,
@@ -2054,7 +2160,9 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addReflowingText("The field ");
             try report.document.addRecordField(owned_field_name);
-            try report.document.addReflowingText(" was first defined here:");
+            try report.document.addReflowingText(" was first defined in ");
+            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.document.addReflowingText(":");
             try report.document.addLineBreak();
             try report.document.addSourceRegion(
                 original_region_info,
@@ -2262,9 +2370,9 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             const owned_ident = try report.addOwnedString(ident_name);
             try report.headline.addReflowingText("The name ");
             try report.headline.addUnqualifiedSymbol(owned_ident);
-            try report.headline.addReflowingText(" is being redeclared here.");
+            try report.headline.addReflowingText(" is being redeclared here:");
 
-            // The main box shows the new declaration; point below it at the original.
+            // The primary region shows the new declaration; point below it at the original.
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 new_region_info,
@@ -2277,7 +2385,9 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addReflowingText("In this scope, ");
             try report.document.addUnqualifiedSymbol(owned_ident);
-            try report.document.addReflowingText(" was already defined here:");
+            try report.document.addReflowingText(" was already defined in ");
+            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.document.addReflowingText(":");
             try report.document.addLineBreak();
             try report.document.addSourceRegion(
                 original_region_info,
@@ -2678,6 +2788,39 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
 
             break :blk report;
         },
+        .internal_builtin_type => |data| blk: {
+            const region_info = self.calcRegionInfo(data.region);
+
+            const parent_bytes = self.getIdent(data.parent_name);
+            const nested_bytes = self.getIdent(data.nested_name);
+
+            var report = try Report.init(allocator, "Internal Builtin Type", "", .runtime_error);
+            const parent_name = try report.addOwnedString(parent_bytes);
+            const nested_name = try report.addOwnedString(nested_bytes);
+
+            try report.headline.addInlineCode(nested_name);
+            try report.headline.addReflowingText(" is internal to ");
+            try report.headline.addInlineCode(parent_name);
+            try report.headline.addReflowingText(", so it can't be named here.");
+
+            const owned_filename = try report.addOwnedString(filename);
+            try report.document.addSourceRegion(
+                region_info,
+                .error_highlight,
+                owned_filename,
+                self.getSourceAll(),
+                self.getLineStartsAll(),
+            );
+
+            try report.document.addReflowingText("It describes how a builtin format tracks its own state while encoding or parsing, which is why it has no spelling in Roc code. To require that a type can be encoded or parsed, name the constraint instead, as in ");
+            try report.document.addInlineCode(switch (data.kind) {
+                .json => "where [a.Json.Encodable([])]",
+                .http_header => "where [a.Encoding.HttpHeader.Parseable([])]",
+            });
+            try report.document.addReflowingText(".");
+
+            break :blk report;
+        },
         .nested_value_not_found => |data| blk: {
             const region_info = self.calcRegionInfo(data.region);
 
@@ -2762,8 +2905,6 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.headline.addInlineCode(owned_count);
             try report.headline.addReflowingText(" values, which exceeds the compiler limit.");
 
-            try report.document.addReflowingText("The export list starts here:");
-            try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 region_info,
@@ -2783,8 +2924,6 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.headline.addInlineCode("where");
             try report.headline.addReflowingText(" clause inside a type declaration.");
 
-            try report.document.addReflowingText("You're attempting do this here:");
-            try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 region_info,
@@ -2793,6 +2932,11 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
                 self.getSourceAll(),
                 self.getLineStartsAll(),
             );
+            try report.document.addLineBreak();
+            try report.document.addAnnotated("Hint:", .emphasized);
+            try report.document.addReflowingText(" ");
+            try report.document.addInlineCode("where");
+            try report.document.addReflowingText(" clauses can only go on function type annotations.");
 
             break :blk report;
         },
@@ -2840,6 +2984,80 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText(" You need a named variable, like ");
             try report.document.addInlineCode("..others");
             try report.document.addReflowingText(", to use this here.");
+
+            break :blk report;
+        },
+        .record_default_not_literal => |data| blk: {
+            const field_name = self.getIdent(data.field_name);
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Default Value Must Be A Literal", "", .runtime_error);
+            const owned_field_name = try report.addOwnedString(field_name);
+            try report.headline.addReflowingText("The default value for the ");
+            try report.headline.addRecordField(owned_field_name);
+            try report.headline.addReflowingText(" field is not a literal.");
+
+            const owned_filename = try report.addOwnedString(filename);
+            try report.document.addSourceRegion(
+                region_info,
+                .error_highlight,
+                owned_filename,
+                self.getSourceAll(),
+                self.getLineStartsAll(),
+            );
+
+            try report.document.addLineBreak();
+            try report.document.addReflowingText("A field default (");
+            try report.document.addInlineCode("??");
+            try report.document.addReflowingText(") is materialized by the compiler at every construction site that omits the field, so it must be a literal: a number, an interpolation-free string, a tag, or a list, record, or tuple built only from literals. Anything that refers to another value could form an evaluation cycle the compiler will not chase.");
+
+            break :blk report;
+        },
+        .optional_field_cannot_have_default => |data| blk: {
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Optional Field Cannot Have A Default", "", .runtime_error);
+            try report.headline.addReflowingText("A field cannot be both optional (");
+            try report.headline.addInlineCode("?:");
+            try report.headline.addReflowingText(") and defaulted (");
+            try report.headline.addInlineCode("??");
+            try report.headline.addReflowingText("): a default fills the field whenever construction omits it, so the field can never be missing. Use ");
+            try report.headline.addInlineCode(":");
+            try report.headline.addReflowingText(" with ");
+            try report.headline.addInlineCode("??");
+            try report.headline.addReflowingText(" instead.");
+
+            const owned_filename = try report.addOwnedString(filename);
+            try report.document.addSourceRegion(
+                region_info,
+                .error_highlight,
+                owned_filename,
+                self.getSourceAll(),
+                self.getLineStartsAll(),
+            );
+
+            break :blk report;
+        },
+        .unnamed_field_cannot_have_default => |data| blk: {
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Unnamed Field Cannot Have A Default", "", .runtime_error);
+            try report.headline.addReflowingText("Unnamed fields (");
+            try report.headline.addInlineCode("_");
+            try report.headline.addReflowingText(" or ");
+            try report.headline.addInlineCode("_name");
+            try report.headline.addReflowingText(") reserve padding in a nominal record layout, so they cannot have a ");
+            try report.headline.addInlineCode("??");
+            try report.headline.addReflowingText(" default. Remove the default, or give the field a regular name if it should be filled when omitted.");
+
+            const owned_filename = try report.addOwnedString(filename);
+            try report.document.addSourceRegion(
+                region_info,
+                .error_highlight,
+                owned_filename,
+                self.getSourceAll(),
+                self.getLineStartsAll(),
+            );
 
             break :blk report;
         },
@@ -3377,8 +3595,6 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addLineBreak();
 
-            try report.document.addReflowingText("This type is declared here:");
-            try report.document.addLineBreak();
             const owned_filename = try report.addOwnedString(filename);
             try report.document.addSourceRegion(
                 region_info,
@@ -3391,7 +3607,9 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addReflowingText("And it references ");
             try report.document.addType(owned_other_name);
-            try report.document.addReflowingText(" declared here:");
+            try report.document.addReflowingText(" declared in ");
+            try report.document.addSourceLocation(other_region_info, owned_filename);
+            try report.document.addReflowingText(":");
             try report.document.addLineBreak();
             try report.document.addSourceRegion(
                 other_region_info,
@@ -3531,6 +3749,8 @@ pub const Serialized = extern struct {
     module_role: ModuleRole,
     all_defs: CIR.Def.Span,
     global_value_defs: CIR.Def.Span,
+    top_level_value_defs: CIR.Def.Span,
+    value_binding_defs: CIR.Def.Span,
     hosted_defs: CIR.Def.Span,
     all_statements: CIR.Statement.Span,
     type_decls: CIR.Statement.Span,
@@ -3570,9 +3790,11 @@ pub const Serialized = extern struct {
     numeric_suffix_targets: NumericSuffixTarget.SafeList.Serialized,
     scheme_uses: SchemeUseRecord.SafeList.Serialized,
     scheme_use_pairs: SchemeUsePair.SafeList.Serialized,
+    binding_schemes: BindingScheme.SafeList.Serialized,
     generated_codec_derivations: GeneratedCodecDerivation.SafeList.Serialized,
     generated_codec_calls: GeneratedCodecCall.SafeList.Serialized,
     rejected_static_dispatches: RejectedStaticDispatch.SafeList.Serialized,
+    record_omitted_defaults: RecordOmittedDefault.SafeList.Serialized,
     // Reserved space (was is_lambda_lifted and is_defunctionalized, now unused)
     _reserved_flags: [2]u8 = .{ 0, 0 },
     _padding: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
@@ -3621,6 +3843,8 @@ pub const Serialized = extern struct {
         self.module_role = env.module_role;
         self.all_defs = env.all_defs;
         self.global_value_defs = env.global_value_defs;
+        self.top_level_value_defs = env.top_level_value_defs;
+        self.value_binding_defs = env.value_binding_defs;
         self.hosted_defs = env.hosted_defs;
         self.all_statements = env.all_statements;
         self.type_decls = env.type_decls;
@@ -3681,9 +3905,11 @@ pub const Serialized = extern struct {
         try self.numeric_suffix_targets.serialize(&env.numeric_suffix_targets, allocator, writer);
         try self.scheme_uses.serialize(&env.scheme_uses, allocator, writer);
         try self.scheme_use_pairs.serialize(&env.scheme_use_pairs, allocator, writer);
+        try self.binding_schemes.serialize(&env.binding_schemes, allocator, writer);
         try self.generated_codec_derivations.serialize(&env.generated_codec_derivations, allocator, writer);
         try self.generated_codec_calls.serialize(&env.generated_codec_calls, allocator, writer);
         try self.rejected_static_dispatches.serialize(&env.rejected_static_dispatches, allocator, writer);
+        try self.record_omitted_defaults.serialize(&env.record_omitted_defaults, allocator, writer);
 
         self._reserved_flags = .{ 0, 0 };
     }
@@ -3711,6 +3937,8 @@ pub const Serialized = extern struct {
             .module_role = self.module_role,
             .all_defs = self.all_defs,
             .global_value_defs = self.global_value_defs,
+            .top_level_value_defs = self.top_level_value_defs,
+            .value_binding_defs = self.value_binding_defs,
             .hosted_defs = self.hosted_defs,
             .all_statements = self.all_statements,
             .type_decls = self.type_decls,
@@ -3747,9 +3975,11 @@ pub const Serialized = extern struct {
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
             .scheme_uses = self.scheme_uses.deserializeInto(base_addr),
             .scheme_use_pairs = self.scheme_use_pairs.deserializeInto(base_addr),
+            .binding_schemes = self.binding_schemes.deserializeInto(base_addr),
             .generated_codec_derivations = self.generated_codec_derivations.deserializeInto(base_addr),
             .generated_codec_calls = self.generated_codec_calls.deserializeInto(base_addr),
             .rejected_static_dispatches = self.rejected_static_dispatches.deserializeInto(base_addr),
+            .record_omitted_defaults = self.record_omitted_defaults.deserializeInto(base_addr),
         };
 
         return env;
@@ -3777,6 +4007,8 @@ pub const Serialized = extern struct {
             .module_role = self.module_role,
             .all_defs = self.all_defs,
             .global_value_defs = self.global_value_defs,
+            .top_level_value_defs = self.top_level_value_defs,
+            .value_binding_defs = self.value_binding_defs,
             .hosted_defs = self.hosted_defs,
             .all_statements = self.all_statements,
             .type_decls = self.type_decls,
@@ -3813,9 +4045,11 @@ pub const Serialized = extern struct {
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
             .scheme_uses = self.scheme_uses.deserializeInto(base_addr),
             .scheme_use_pairs = self.scheme_use_pairs.deserializeInto(base_addr),
+            .binding_schemes = self.binding_schemes.deserializeInto(base_addr),
             .generated_codec_derivations = self.generated_codec_derivations.deserializeInto(base_addr),
             .generated_codec_calls = self.generated_codec_calls.deserializeInto(base_addr),
             .rejected_static_dispatches = self.rejected_static_dispatches.deserializeInto(base_addr),
+            .record_omitted_defaults = self.record_omitted_defaults.deserializeInto(base_addr),
         };
     }
 
@@ -3843,6 +4077,8 @@ pub const Serialized = extern struct {
             .module_role = self.module_role,
             .all_defs = self.all_defs,
             .global_value_defs = self.global_value_defs,
+            .top_level_value_defs = self.top_level_value_defs,
+            .value_binding_defs = self.value_binding_defs,
             .hosted_defs = self.hosted_defs,
             .all_statements = self.all_statements,
             .type_decls = self.type_decls,
@@ -3881,9 +4117,11 @@ pub const Serialized = extern struct {
             .numeric_suffix_targets = try self.numeric_suffix_targets.deserializeWithCopy(base_addr, gpa),
             .scheme_uses = try self.scheme_uses.deserializeWithCopy(base_addr, gpa),
             .scheme_use_pairs = try self.scheme_use_pairs.deserializeWithCopy(base_addr, gpa),
+            .binding_schemes = try self.binding_schemes.deserializeWithCopy(base_addr, gpa),
             .generated_codec_derivations = try self.generated_codec_derivations.deserializeWithCopy(base_addr, gpa),
             .generated_codec_calls = try self.generated_codec_calls.deserializeWithCopy(base_addr, gpa),
             .rejected_static_dispatches = try self.rejected_static_dispatches.deserializeWithCopy(base_addr, gpa),
+            .record_omitted_defaults = try self.record_omitted_defaults.deserializeWithCopy(base_addr, gpa),
         };
 
         return env;
@@ -3906,6 +4144,8 @@ pub fn recordForLoopDispatchPlan(
     node_idx: Node.Idx,
     pattern_idx: Node.Idx,
     iterable_idx: Node.Idx,
+    iterator_var: TypeVar,
+    step_var: TypeVar,
     iter_fn_var: TypeVar,
     next_fn_var: TypeVar,
     step_topology: IteratorStepTopology,
@@ -3919,6 +4159,8 @@ pub fn recordForLoopDispatchPlan(
             .node_idx = raw_node,
             .pattern_idx = raw_pattern,
             .iterable_idx = raw_iterable,
+            .iterator_var = @intFromEnum(iterator_var),
+            .step_var = @intFromEnum(step_var),
             .iter_fn_var = @intFromEnum(iter_fn_var),
             .next_fn_var = @intFromEnum(next_fn_var),
             .step_topology = step_topology,
@@ -3929,6 +4171,8 @@ pub fn recordForLoopDispatchPlan(
         .node_idx = raw_node,
         .pattern_idx = raw_pattern,
         .iterable_idx = raw_iterable,
+        .iterator_var = @intFromEnum(iterator_var),
+        .step_var = @intFromEnum(step_var),
         .iter_fn_var = @intFromEnum(iter_fn_var),
         .next_fn_var = @intFromEnum(next_fn_var),
         .step_topology = step_topology,
@@ -4025,6 +4269,29 @@ fn findSortedByNode(comptime T: type, entries: []const T, raw_node: u32) ?T {
     const slot = sortedNodeSlot(T, entries, raw_node);
     if (slot < entries.len and entries[slot].node_idx == raw_node) return entries[slot];
     return null;
+}
+
+/// Record that `node_idx` names a rank-1 polymorphic value scheme. This is
+/// checker-produced binding metadata, not a property reconstructed from the
+/// solved type graph.
+pub fn recordBindingScheme(self: *Self, node_idx: Node.Idx) std.mem.Allocator.Error!void {
+    try upsertSortedByNode(
+        BindingScheme,
+        &self.binding_schemes,
+        self.gpa,
+        .{ .node_idx = @intFromEnum(node_idx) },
+    );
+}
+
+/// Whether checking classified `node_idx` as a rank-1 polymorphic value
+/// scheme. Imported value resolution uses this exact producer-authored bit to
+/// preserve the classification on its local type-graph copy.
+pub fn nodeIsBindingScheme(self: *const Self, node_idx: Node.Idx) bool {
+    return findSortedByNode(
+        BindingScheme,
+        self.binding_schemes.items.items,
+        @intFromEnum(node_idx),
+    ) != null;
 }
 
 /// Return the digits before the decimal point for a recorded numeral.
@@ -4340,6 +4607,36 @@ pub fn addExpr(self: *Self, expr: CIR.Expr, region: Region) std.mem.Allocator.Er
     const expr_idx = try self.store.addExpr(expr, region);
     self.debugAssertArraysInSync();
     return expr_idx;
+}
+
+/// Reserve one contiguous field-access path plus its enclosing expression.
+pub fn startFieldAccessPath(self: *Self, segment_count: u32) std.mem.Allocator.Error!NodeStore.FieldAccessPathBuilder {
+    return self.store.startFieldAccessPath(segment_count);
+}
+
+/// Append one source-ordered field-access segment to a reserved path.
+pub fn appendFieldAccessPathSegmentAssumeCapacity(
+    self: *Self,
+    builder: NodeStore.FieldAccessPathBuilder,
+    segment: CIR.Expr.FieldAccessSegment,
+    region: Region,
+) CIR.Expr.FieldAccessSegment.Idx {
+    const segment_idx = self.store.appendFieldAccessPathSegmentAssumeCapacity(builder, segment, region);
+    self.debugAssertArraysInSync();
+    return segment_idx;
+}
+
+/// Finish a fully populated field-access path.
+pub fn finishFieldAccessPath(self: *Self, builder: NodeStore.FieldAccessPathBuilder) CIR.Expr.FieldAccessSegment.Span {
+    const span = self.store.finishFieldAccessPath(builder);
+    self.debugAssertArraysInSync();
+    return span;
+}
+
+/// Roll back a field-access path whose construction did not finish.
+pub fn rollbackFieldAccessPath(self: *Self, builder: NodeStore.FieldAccessPathBuilder) void {
+    self.store.rollbackFieldAccessPath(builder);
+    self.debugAssertArraysInSync();
 }
 
 /// Add a new capture to the node store.
@@ -4850,7 +5147,26 @@ pub fn getLineStartsAll(self: *const Self) []const u32 {
 }
 
 pub fn initTypeWriter(self: *Self) std.mem.Allocator.Error!TypeWriter {
-    return TypeWriter.initFromParts(self.gpa, &self.types, self.getIdentStore(), null);
+    var type_writer = try TypeWriter.initFromParts(self.gpa, &self.types, self.getIdentStore(), null);
+    type_writer.setDefaultSourceResolver(self, typeWriterDefaultSource);
+    return type_writer;
+}
+
+/// Resolve a defaulted field's identity to its default's source snippet for
+/// type rendering (design.md "Defaulted Fields"): renderable exactly when
+/// the default was declared in THIS module and its source text is a short
+/// single line; a foreign or unwieldy default renders as `?? …`.
+pub fn typeWriterDefaultSource(ctx: *const anyopaque, id: types_mod.DefaultId) ?[]const u8 {
+    const env: *const Self = @ptrCast(@alignCast(ctx));
+    if (id.origin_module != env.selfModuleIdentity()) return null;
+    const region = env.store.getExprRegion(@as(CIR.Expr.Idx, @enumFromInt(id.expr_node)));
+    const source = env.getSourceAll();
+    if (region.start.offset > region.end.offset or region.end.offset > source.len) return null;
+    const snippet = source[region.start.offset..region.end.offset];
+    // Keep type strings readable: long or multi-line defaults render `…`.
+    if (snippet.len == 0 or snippet.len > 40) return null;
+    if (std.mem.findScalar(u8, snippet, '\n') != null) return null;
+    return snippet;
 }
 
 /// Inserts an identifier into the common environment and returns its index.
@@ -5021,6 +5337,42 @@ pub fn registerMethodDefForOwner(self: *Self, owner: CIR.Statement.Idx, method_i
 pub fn registerMethodDefForMethodOwner(self: *Self, owner: MethodOwner, method_ident: Ident.Idx, binding: MethodBinding) Allocator.Error!void {
     const key = MethodKey.init(owner, method_ident);
     try self.method_defs.put(self.gpa, key, binding);
+}
+
+/// Appends one complete method entry to the parallel construction tables.
+pub fn appendMethodForMethodOwner(
+    self: *Self,
+    owner: MethodOwner,
+    method_ident: Ident.Idx,
+    qualified_ident: Ident.Idx,
+    binding: MethodBinding,
+) Allocator.Error!MethodTableIndex {
+    std.debug.assert(self.method_idents.entries.items.len == self.method_defs.entries.items.len);
+    const index: MethodTableIndex = @enumFromInt(self.method_idents.entries.items.len);
+
+    try self.method_idents.entries.ensureUnusedCapacity(self.gpa, 1);
+    try self.method_defs.entries.ensureUnusedCapacity(self.gpa, 1);
+    try self.registerMethodIdentForMethodOwner(owner, method_ident, qualified_ident);
+    try self.registerMethodDefForMethodOwner(owner, method_ident, binding);
+    return index;
+}
+
+/// Replaces the values at one construction-time method table position while
+/// preserving its explicit owner-and-name key.
+pub fn replaceMethodAt(
+    self: *Self,
+    index: MethodTableIndex,
+    owner: MethodOwner,
+    method_ident: Ident.Idx,
+    qualified_ident: Ident.Idx,
+    binding: MethodBinding,
+) void {
+    const table_index: usize = @intFromEnum(index);
+    const key = MethodKey.init(owner, method_ident);
+    std.debug.assert(MethodKey.order(self.method_idents.entries.items[table_index].key, key) == .eq);
+    std.debug.assert(MethodKey.order(self.method_defs.entries.items[table_index].key, key) == .eq);
+    self.method_idents.entries.items[table_index].value = qualified_ident;
+    self.method_defs.entries.items[table_index].value = binding;
 }
 
 /// Looks up a qualified method ident for an explicit owner declaration.

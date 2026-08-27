@@ -32,6 +32,7 @@ fn sharedBuiltinModules() eval.BuiltinModules.InitError!*eval.BuiltinModules {
 
 /// Error set shared by LIR-lowering harness helpers and focused inspectors.
 pub const LowerToLirHarnessError = std.mem.Allocator.Error ||
+    lir.CheckedPipeline.LowerResourceError ||
     std.Io.Dir.CreateDirPathError ||
     std.Io.Dir.RealPathFileAllocError ||
     std.Io.Dir.WriteFileError ||
@@ -79,8 +80,10 @@ pub const LirInspectFn = *const fn (
 
 /// Options controlling how the harness lowers an app to LIR.
 pub const LirLoweringOptions = struct {
+    specialization_strategy: base.SpecializationStrategy = .lss,
     target_usize: base.target.TargetUsize = base.target.TargetUsize.native,
     inline_mode: lir.CheckedPipeline.InlineMode = .none,
+    consume_dead_boxes: bool = false,
     list_in_place_map: bool = false,
     proc_debug_names: bool = false,
     prove_ranges: bool = false,
@@ -289,8 +292,10 @@ fn lowerAppPathToLir(
         },
         .{ .requests = lir_roots },
         .{
+            .specialization_strategy = opts.specialization_strategy,
             .target_usize = opts.target_usize,
             .inline_mode = opts.inline_mode,
+            .consume_dead_boxes = opts.consume_dead_boxes,
             .list_in_place_map = opts.list_in_place_map,
             .proc_debug_names = opts.proc_debug_names,
             .prove_ranges = opts.prove_ranges,

@@ -379,14 +379,17 @@ test "Monotype generated-private selection cannot become ordinary or reopen fini
     try expectContains(selection, "containsFinishedMono(public_node)");
     try expectContains(selection, "containsFinishedMono(private_node)");
     try expectContains(selection, "finished Monotype reached generated-private representation selection");
-    try expectContains(selection, "unifyRootsTransitively(public_node, private_node, true)");
+    try expectContains(selection, "selectGeneratedPrivateRepresentationAtWidth(public_node, private_node, .exact)");
+    try expectContains(selection, "selectGeneratedPrivateRepresentationAtWidth(public_node, private_node, .construction)");
+    try expectContains(selection, "unifyRootsTransitively(public_node, private_node, true, row_width)");
 
     const ordinary_unify = sourceSliceBetween(
         solve_source,
         "pub fn unify(self: *InstGraph",
         "fn relationStamp(",
     );
-    try expectContains(ordinary_unify, "unifyRootsTransitively(a, b, false)");
+    try expectContains(ordinary_unify, "unifyRootsTransitively(a, b, false, .exact)");
+    try expectContains(ordinary_unify, "unifyRootsTransitively(a, b, false, .construction)");
     try expectContains(ordinary_unify, "generated-private representation reached ordinary public/private graph unification");
 
     const lower_source = @embedFile("monotype/lower.zig");
@@ -445,6 +448,33 @@ test "Monotype draft local identity stays graph-native" {
     try expectContains(identity, "rhs_data.ty.toGraphNode(self.graph)");
     try expectContains(identity, "self.graph.sameClass(lhs_node, rhs_node)");
     try expectNotContains(identity, "activeTypeFromCell");
+}
+
+test "Monotype iterator result completion stays out of relation replay and retains public request lookups" {
+    const lower_source = @embedFile("monotype/lower.zig");
+    const dispatch_result = sourceSliceBetween(
+        lower_source,
+        "fn callableDispatchResultTypeNodeInPhase(",
+        "fn materializeEvidence(",
+    );
+    try expectContains(dispatch_result, "if (phase == .expression_lowering)");
+    try expectContains(dispatch_result, "lowerAndCompleteIteratorMethodResultAtNode(");
+
+    const completion = sourceSliceBetween(
+        lower_source,
+        "fn completeDeferredIteratorResult(",
+        "fn constUseMonoType(",
+    );
+    try expectContains(completion, "try updateTemplateSpecInterfaceLookups(");
+    try expectContains(completion, "completed_source.evidence_digest.bytes");
+    try expectNotContains(completion, "unregisterTemplateSpec");
+
+    const template_spec = sourceSliceBetween(
+        lower_source,
+        "const DraftTemplateSpec = struct",
+        "const DraftConstUseProvenance",
+    );
+    try expectContains(template_spec, "lookup_request_fn_node: ?NodeId");
 }
 
 test "Monotype direct uninhabited calls lower argument through graph cell" {
@@ -548,6 +578,28 @@ test "Monotype gates divergent relations and crash dispatches before type instan
     );
     try expectContains(relation_gate, "if (self.checkedExprDivergesInLoweredRuntime(checked_expr)) return;");
     try expectNotContains(relation_gate, "checkedTypeContainsError");
+}
+
+test "Monotype dispatch result modes retain graph-backed result types" {
+    const lower_source = @embedFile("monotype/lower.zig");
+    const parametric_low_level = sourceSliceBetween(
+        lower_source,
+        "if (direct_parametric_low_level) |op| {",
+        "const call_data = if (direct_graph_call)",
+    );
+    try expectContains(parametric_low_level, "applyDispatchResultMode(plan.result_mode, call_expr)");
+    try expectNotContains(parametric_low_level, "activeTypeFromNode(plan_ret_node)");
+
+    const result_mode = sourceSliceBetween(
+        lower_source,
+        "fn applyDispatchResultMode(",
+        "fn typeCellHasBuiltinOwner(",
+    );
+    try expectContains(result_mode, "self.exprTypeCell(expr)");
+    try expectContains(result_mode, "self.addExprWithTypeCell(result_cell");
+    try expectNotContains(result_mode, "Type.TypeId");
+    try expectNotContains(result_mode, "activeTypeFrom");
+    try expectNotContains(result_mode, "primitiveType(.bool)");
 }
 
 test "Monotype const type lookup remains graph-native" {
@@ -691,7 +743,6 @@ test "Monotype open specialization lookup covers the complete function interface
         try expectContains(lookup_source, "functionInterfaceIterator(request_fn_node)");
         try expectContains(lookup_source, "classMemberIterator(interface_node)");
         try expectContains(lookup_source, "seen_specs.getOrPut(raw_spec)");
-        try expectContains(lookup_source, "sameFunctionInterface(spec.request_fn_node, request_fn_node)");
         try expectContains(lookup_source, "draftOpenCandidateQualifies(");
         try expectContains(lookup_source, "spec.runtime_demand_guard_frames");
         try expectContains(lookup_source, "source_ctx.runtimeDemandGuardFrameAddresses()");
@@ -699,10 +750,17 @@ test "Monotype open specialization lookup covers the complete function interface
         try expectContains(lookup_source, "if (selection.selected()) |raw_spec|");
         try expectContains(lookup_source, "try source_ctx.graph.unifyRecursiveFunctionInterface(");
         try expectContains(lookup_source, "spec.initial_request_arg_classes");
-        try expectContains(lookup_source, "indexed_nodes.getOrPut(interface_node)");
-        try expectContains(lookup_source, "draftOpenRequestKey(interface_node)");
         try expectNotContains(lookup_source, "functionInterfaceAnchor");
     }
+    try expectContains(template_source, "draftTemplateSpecLookupRequestNode(spec)");
+    try expectContains(nested_source, "sameFunctionInterface(spec.request_fn_node, request_fn_node)");
+    const interface_registration = sourceSliceBetween(
+        lower_source,
+        "fn updateTemplateSpecInterfaceLookups(",
+        "fn draftNestedSpecRequestNode(",
+    );
+    try expectContains(interface_registration, "indexed_nodes.getOrPut(interface_node)");
+    try expectContains(interface_registration, "draftOpenRequestKey(interface_node)");
     try expectContains(nested_source, "std.meta.eql(spec.lexical_owner, source_ctx.draft.current_owner)");
 }
 
@@ -1033,7 +1091,7 @@ test "Monotype inspect-only unresolved values defer until final graph sealing" {
         "fn inspectCall(self: *BodyContext",
         "fn inspectDefForType(self: *BodyContext",
     );
-    try expectContains(inspect_call, ".sealed = try self.builder.closedFunctionType(&.{value_ty}, str_ty)");
+    try expectContains(inspect_call, ".sealed = try self.functionType(&.{value_ty}, str_ty)");
     try expectNotContains(inspect_call, "oneArgFnTypeCell");
     const to_inspect = sourceSliceBetween(
         lower_source,
@@ -1148,11 +1206,12 @@ test "Monotype recursive materialization predicate stays paired with graph shell
         "fn patternNeedsExplicitBinding(",
         "const CheckedPatternRefutabilityAdapter",
     );
-    try expectContains(predicate, ".as => |as| self.patternNeedsExplicitBinding(as.pattern)");
+    try expectContains(predicate, ".as => |as| try self.patternNeedsExplicitBinding(as.pattern)");
     try expectContains(predicate, ".applied_tag => |tag|");
-    try expectContains(predicate, ".nominal => |nominal| self.patternNeedsExplicitBinding(nominal.backing_pattern)");
+    try expectContains(predicate, ".nominal => |nominal| try self.patternNeedsExplicitBinding(nominal.backing_pattern)");
     try expectContains(predicate, ".tuple => |items|");
     try expectContains(predicate, "patternRequiresOwnMaterialization");
+    try expectContains(predicate, "recordDestructsHaveOptionalField");
 
     const prepass = sourceSliceBetween(
         lower_source,
@@ -1256,7 +1315,7 @@ test "Monotype encoding intrinsics consume producer-owned identity and result to
         "fn lowerCallsiteIntrinsicArgAtType(",
     );
     try expectContains(intrinsic_call, "intrinsic.requestResultSource()");
-    try expectContains(intrinsic_call, "checkedMonoRequestNode(self.graph, callable.ret, callable.args[index])");
+    try expectContains(intrinsic_call, "checkedMonoRequestNode(self.graph, callable.ret, callable.args[index], .exact)");
     try expectContains(intrinsic_call, "self.currentPhaseTypeForNode(callable.ret)");
     try expectNotContains(intrinsic_call, "generatedFieldNamesBackingValueFieldNames");
 
@@ -1288,7 +1347,7 @@ test "Monotype generated-private call requests retain separate request nodes" {
     const full_request = sourceSliceBetween(
         lower_source,
         "fn instantiateTargetCallNodeFromMonoArgs",
-        "fn callArgumentEvidenceNode",
+        "fn exprCallResultEvidenceNode",
     );
     const iterator = sourceSliceBetween(
         lower_source,
@@ -1390,7 +1449,236 @@ test "direct LIR verification consumes producer-owned specialization identities"
     try expectContains(direct_lower, "different types for an exact function specialization");
 }
 
+fn countDefinitions(source: []const u8, decl: []const u8) usize {
+    var count: usize = 0;
+    var rest = source;
+    while (std.mem.find(u8, rest, decl)) |index| {
+        count += 1;
+        rest = rest[index + decl.len ..];
+    }
+    return count;
+}
+
+test "each primitive mapping has exactly one definition" {
+    // `MonoType.Primitive` is an alias of `checked.CheckedPrimitive`
+    // (monotype/type.zig), so nothing in the type system stops a consumer from
+    // writing a second switch over the same 24 members. These tables are the
+    // single source of truth; a copy would let two lowering paths decide a
+    // layout, hasher op, or inspect op differently for the same primitive.
+    const sources = [_][]const u8{
+        @embedFile("common.zig"),
+        @embedFile("monotype/type.zig"),
+        @embedFile("monotype/lower.zig"),
+        @embedFile("solved_lir_lower.zig"),
+        @embedFile("boxy/lower.zig"),
+        @embedFile("boxy/plan.zig"),
+        @embedFile("boxy/layouts.zig"),
+    };
+    const single_definition = [_][]const u8{
+        "fn primitiveLayout(",
+        "fn primitiveInspectLowLevelOp(",
+        "fn hasherWriteOp(",
+    };
+    for (single_definition) |decl| {
+        var total: usize = 0;
+        for (sources) |source| total += countDefinitions(source, decl);
+        try std.testing.expectEqual(@as(usize, 1), total);
+    }
+    try expectContains(@embedFile("common.zig"), "pub fn primitiveLayout(");
+    try expectContains(@embedFile("common.zig"), "pub fn primitiveInspectLowLevelOp(");
+    try expectContains(@embedFile("common.zig"), "pub fn hasherWriteOp(");
+
+    // The primitive-to-owner table lives beside `CheckedPrimitive` itself, so
+    // post-check holds no definition of it at all and consumes the checked one.
+    for (sources) |source| {
+        try expectNotContains(source, "fn builtinOwnerForPrimitive(");
+        try expectNotContains(source, "fn builtinOwnerFromPrimitive(");
+    }
+    const owner_fn = @typeInfo(@TypeOf(check.CheckedModule.builtinOwnerForPrimitive)).@"fn";
+    try std.testing.expect(owner_fn.params.len == 1);
+    try std.testing.expect(owner_fn.params[0].type.? == check.CheckedModule.CheckedPrimitive);
+    try std.testing.expect(owner_fn.return_type.? == check.StaticDispatchRegistry.BuiltinOwner);
+}
+
+test "boxy representation queries have one definition on the plan" {
+    // Boxy planning decides an unwrap, a descriptor argument, or a dictionary
+    // argument by asking these; Boxy lowering emits that decision by asking the
+    // same ones. A second copy lets the two disagree about the program they are
+    // both describing, which is how the planner's
+    // `repSubtreeHasDescriptorInOtherChildren` carve-out came to be absent from
+    // both lowering copies. Every consumer goes through `Plan.RepQuery` /
+    // `Plan.NamedRepQuery`; none re-derives.
+    const consumers = [_][]const u8{
+        @embedFile("boxy/lower.zig"),
+        @embedFile("boxy/layouts.zig"),
+    };
+    const shared = [_][]const u8{
+        "repSubtreeHasDescriptor",
+        "repSubtreeHasDescriptorInner",
+        "repSubtreeHasDescriptorInOtherChildren",
+        "repSubtreeHasDictionary",
+        "repSubtreeHasDictionaryInner",
+        "repSubtreeHasDictionaryInOtherChildren",
+        "repSubtreeContainsRep",
+        "repSubtreeContainsRepInner",
+        "structuralWrapperBackingRep",
+        "descriptorArgumentIdentityRep",
+        "dictionaryArgumentIdentityRep",
+        "workerChildCanMatchUnwrappedCallRep",
+        "workerChildCanMatchUnwrappedCallRepForDictionaries",
+        "functionChildren",
+        "functionIdentityRep",
+        "requiredSingleChild",
+        "sameChildRoleKind",
+        "childRolesMatch",
+        "findMatchingChildByRole",
+        "findMatchingChildBySourceType",
+        "findMatchingDictionaryChildBySourceType",
+        "findMatchingTagPayloadInRep",
+        "findMatchingTagPayloadInRowExtension",
+        "findMatchingTagPayloadInRowExtensionInner",
+        "recordFieldNameMatches",
+        "tagLabelNameMatches",
+    };
+    const plan_source = @embedFile("boxy/plan.zig");
+    inline for (shared) |name| {
+        const decl = "fn " ++ name ++ "(";
+        for (consumers) |source| {
+            try std.testing.expectEqual(@as(usize, 0), countDefinitions(source, decl));
+        }
+        try std.testing.expectEqual(@as(usize, 1), countDefinitions(plan_source, decl));
+    }
+
+    // The exact-role and same-kind role comparisons are different predicates
+    // and must not collapse into each other: `sameChildRoleKind` answers false
+    // for every role carrying a payload.
+    try expectContains(plan_source, "pub fn sameChildRoleKind(");
+    try expectNotContains(plan_source, "fn sameChildRole(");
+}
+
+test "boxy stage tests share one set of checked-type fixtures" {
+    const sources = [_][]const u8{
+        @embedFile("boxy/lower.zig"),
+        @embedFile("boxy/plan.zig"),
+        @embedFile("boxy/layouts.zig"),
+    };
+    for (sources) |source| {
+        try expectNotContains(source, "fn builtinNominal(");
+        try expectNotContains(source, "fn fixtureTableIndex(");
+    }
+    try expectContains(@embedFile("boxy/test_fixtures.zig"), "pub fn builtinNominal(");
+    try expectContains(@embedFile("boxy/test_fixtures.zig"), "pub fn tableIndex(");
+}
+
+test "one pattern walk collects bound locals" {
+    // The lift pass's bound-set scan, its capture graph builder, and
+    // SpecConstr's body-local scope all walk a pattern for the locals it binds.
+    // They differ only in what they do at a binding site, never in which
+    // positions bind, so the walk lives once on the lifted AST. Three copies
+    // could come to disagree about a position (whether a list rest pattern
+    // binds, say) and only one of them would be right.
+    const consumers = [_][]const u8{
+        @embedFile("monotype_lifted/lift.zig"),
+        @embedFile("monotype_lifted/spec_constr.zig"),
+    };
+    for (consumers) |source| {
+        try expectNotContains(source, "fn forEachBoundLocal(");
+        // Each consumer keeps only a thin `bindPat` that names its binder.
+        try expectContains(source, "forEachBoundLocal(");
+    }
+    try expectContains(@embedFile("monotype_lifted/ast.zig"), "pub fn forEachBoundLocal(");
+}
+
+test "the match compiler's stated consumers are its actual consumers" {
+    // `match_tree.zig` and `mod.zig` both claimed this compiler was "shared by
+    // both LIR lowerers". It is not: `.boxy` folds match branches into a
+    // sequential chain of its own. A doc comment asserting a sharing invariant
+    // that does not hold is worse than none, because the next reader budgets
+    // for one match semantics and there are two. This pins the claim to the
+    // imports, so whichever way the gap closes, the comment has to move with it.
+    const boxy_uses_it = std.mem.find(u8, @embedFile("boxy/lower.zig"), "match_tree") != null;
+    const header = @embedFile("match_tree.zig");
+    const mod_source = @embedFile("mod.zig");
+    if (boxy_uses_it) {
+        try expectNotContains(header, "does not consume this yet");
+        try expectNotContains(mod_source, "does not use it yet");
+    } else {
+        try expectContains(header, "does not consume this yet");
+        try expectContains(mod_source, "does not use it yet");
+        try expectContains(@embedFile("solved_lir_lower.zig"), "match_tree.Compiler(");
+    }
+}
+
+test "post-check IR stores append spans through one implementation" {
+    // All three post-check IRs address their flat side tables the same way, and
+    // the append that produces a span was written out once per table per store
+    // (33 copies of the same three lines). It lives in `Common` now, so a change
+    // to how spans are allocated cannot land on one table and miss the rest.
+    const stores = [_][]const u8{
+        @embedFile("monotype/ast.zig"),
+        @embedFile("monotype_lifted/ast.zig"),
+        @embedFile("lambda_mono/ast.zig"),
+    };
+    for (stores) |source| {
+        // The hand-written form these replaced. Its absence is the invariant.
+        try expectNotContains(source, "const start: u32 = @intCast(self.expr_ids.len());");
+        try expectContains(source, "Common.appendSpan(");
+    }
+    try expectContains(@embedFile("common.zig"), "pub fn appendSpan(");
+    try expectContains(@embedFile("common.zig"), "pub fn appendNonemptySpan(");
+}
+
+test "const restoration has one implementation per shape" {
+    // `Builder` and `BodyContext` emit into different stores and different
+    // expression-data types, but which const shape maps to which expression
+    // form, and the length invariants relating a stored aggregate to its
+    // checked type, are one set of rules. Two copies could come to disagree
+    // about, say, whether a stored record's length is checked against the
+    // checked type at all.
+    const source = @embedFile("monotype/lower.zig");
+    const shapes = [_][]const u8{
+        "constRestoreData",
+        "constRestoreListData",
+        "constRestoreList",
+        "constRestoreTuple",
+        "constRestoreRecord",
+        "constRestoreTagPayloads",
+    };
+    inline for (shapes) |name| {
+        try std.testing.expectEqual(@as(usize, 1), countDefinitions(source, "fn " ++ name ++ "("));
+    }
+    // The scope-local copies these replaced must not come back.
+    try expectNotContains(source, "    fn restoreConstData(");
+    try expectNotContains(source, "    fn restoreConstRecord(");
+    try expectNotContains(source, "    fn restoreConstTuple(");
+    try expectNotContains(source, "    fn restoreConstTagPayloads(");
+}
+
 test "post-check invariant helper is failure-only" {
     const fn_info = @typeInfo(@TypeOf(Common.invariant)).@"fn";
     try std.testing.expect(fn_info.return_type.? == noreturn);
+}
+
+test "hoist-preserving iterator producers are reachable through their method names" {
+    // The checker pre-filters hoist classification on
+    // `hoist_preserving_method_names` before resolving a receiver, so every
+    // producer that answers "preserves hoistable source input" must be
+    // reachable through one of those names; one that is not would silently
+    // stop having its receiver hoisted. This lives here because the type
+    // checker's own sources may not compare strings.
+    const registry = check.StaticDispatchRegistry;
+    for (registry.iterator_procedure_names) |entry| {
+        if (!entry[1].preservesHoistableSourceInput()) continue;
+        const qualified_name = entry[0];
+        const start = if (std.mem.findScalarLast(u8, qualified_name, '.')) |dot| dot + 1 else 0;
+        const method = qualified_name[start..];
+        var reachable = false;
+        for (registry.hoist_preserving_method_names) |candidate| {
+            if (std.mem.eql(u8, method, candidate)) reachable = true;
+        }
+        if (!reachable) {
+            std.debug.print("unreachable hoist-preserving producer: {s}\n", .{qualified_name});
+        }
+        try std.testing.expect(reachable);
+    }
 }

@@ -63,10 +63,9 @@ pub fn run(store: *LirStore, layouts: *layout_mod.Store) ResourceError!void {
 }
 
 fn transformProc(store: *LirStore, layouts: *layout_mod.Store, proc_id: LIR.LirProcSpecId) ResourceError!void {
-    const proc = store.getProcSpec(proc_id);
-    if (proc.body == null or proc.hosted != null or proc.abi != .roc) return;
+    const body = body_clone.rewritableProcBody(store, proc_id) orelse return;
 
-    var reads = try body_clone.countReachableReads(store, proc.body.?);
+    var reads = try body_clone.countReachableReads(store, body);
     defer reads.deinit();
 
     var transform = Transform{
@@ -78,7 +77,7 @@ fn transformProc(store: *LirStore, layouts: *layout_mod.Store, proc_id: LIR.LirP
     };
     defer transform.new_locals.deinit(store.allocator);
 
-    var current = proc.body.?;
+    var current = body;
     while (true) {
         _ = try transform.rewriteAt(current);
         const next = transform.nextOf(current) orelse break;
@@ -111,6 +110,10 @@ const Transform = struct {
         const unbox_args = self.store.getLocalSpan(unbox_stmt.args);
         if (unbox_args.len != 1) return false;
         const boxed = GuardedList.at(unbox_args, 0);
+        const boxed_layout = self.layouts.getLayout(self.store.getLocal(boxed).layout_idx);
+        if (boxed_layout.tag == .box and payloadNeedsOwnedUnbox(self.layouts, boxed_layout.getIdx())) {
+            return false;
+        }
 
         if (try self.rewriteDirectBoxAt(unbox_stmt_id, unbox_stmt, boxed)) return true;
         return try self.rewriteJoinedBoxAt(unbox_stmt_id, unbox_stmt, boxed);
@@ -164,6 +167,7 @@ const Transform = struct {
         const box_layout_value = self.layouts.getLayout(box_layout);
         if (box_layout_value.tag != .box) return false;
         const payload_layout = box_layout_value.getIdx();
+        if (payloadNeedsOwnedUnbox(self.layouts, payload_layout)) return false;
         if (self.store.getLocal(unbox_stmt.target).layout_idx != payload_layout) return false;
         if (self.store.getLocal(payload_value).layout_idx != payload_layout) return false;
 
@@ -270,6 +274,7 @@ const Transform = struct {
         const box_layout_value = self.layouts.getLayout(box_layout);
         if (box_layout_value.tag != .box) return false;
         const payload_layout = box_layout_value.getIdx();
+        if (payloadNeedsOwnedUnbox(self.layouts, payload_layout)) return false;
         if (self.store.getLocal(unbox_stmt.target).layout_idx != payload_layout) return false;
         if (self.store.getLocal(prelude.value).layout_idx != payload_layout) return false;
         if (self.store.getLocal(call_prelude.value).layout_idx != payload_layout) return false;
@@ -376,6 +381,7 @@ const Transform = struct {
         const box_layout_value = self.layouts.getLayout(box_layout);
         if (box_layout_value.tag != .box) return false;
         const payload_layout = box_layout_value.getIdx();
+        if (payloadNeedsOwnedUnbox(self.layouts, payload_layout)) return false;
         if (self.store.getLocal(unbox_stmt.target).layout_idx != payload_layout) return false;
         if (self.store.getLocal(call_prelude.value).layout_idx != payload_layout) return false;
         if (self.store.getLocal(join_payload).layout_idx != payload_layout) return false;
@@ -641,6 +647,15 @@ const Transform = struct {
     }
 };
 
+fn payloadNeedsOwnedUnbox(layouts: *const layout_mod.Store, payload_layout: layout_mod.Idx) bool {
+    const payload = layouts.getLayout(payload_layout);
+    if (!layouts.layoutContainsRefcounted(payload)) return false;
+    return switch (payload.tag) {
+        .list, .struct_, .tag_union, .closure, .erased_callable => true,
+        .scalar, .list_of_zst, .box, .box_of_zst, .erased_box, .zst, .ptr => false,
+    };
+}
+
 fn spanHasLocal(locals: anytype, needle: LocalId) bool {
     for (0..locals.len) |index| {
         if (GuardedList.at(locals, index) == needle) return true;
@@ -787,7 +802,7 @@ test "box reuse rewrites an inlined straight-line payload producer" {
 
     const ret = try store.addCFStmt(.{ .ret = .{ .value = result_box } });
     const rebox = try testLowLevel(&store, result_box, .box_box, &.{new_payload}, ret);
-    const add = try testLowLevel(&store, new_payload, .num_plus, &.{ old_payload, one }, rebox);
+    const add = try testLowLevel(&store, new_payload, .num_int_add_wrap, &.{ old_payload, one }, rebox);
     const literal = try store.addCFStmt(.{ .assign_literal = .{
         .target = one,
         .value = .{ .i64_literal = .{ .value = 1, .layout_idx = .u64 } },

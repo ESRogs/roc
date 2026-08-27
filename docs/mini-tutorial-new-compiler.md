@@ -307,8 +307,6 @@ We mentioned `expect` earlier - if you put these at the top level of your file, 
 You can also put them in blocks, in which case they will work essentially like a `crash` when you're doing `roc test` or
 a debug build of `roc`, but when you do `roc --opt=speed`, they will be skipped.
 
-> Note: `--opt=speed` does not discard `expect`s yet but it could be implemented at any moment.
-
 ```ruby
 digits_to_num = |digits| {
     if digits.is_empty() {
@@ -709,7 +707,7 @@ Let's break the header down:
 
 ### Platforms
 
-Roc has a first-class concept of _platforms_ and _applications_. You can [read about the design philosophy](https://www.roc-lang.org/platforms), but for our purposes what matters is:
+Roc has a first-class concept of _platforms_ and _applications_. You can [read about the design philosophy](https://www.roc-lang.org/docs/main/langref/platforms/), but for our purposes what matters is:
 
 - Every Roc application specifies [exactly one platform](https://www.roc-lang.org/faq#multiple-platforms) that it will be built on
 - The platform provides all the I/O primitives (such as `Stdout` and `Stdin` - they are imported as `pf.Stdout` and `pf.Stdin`)

@@ -32,8 +32,69 @@ const glibc_cross_targets = [_]CrossTarget{
 /// Windows cross-compile targets
 const windows_cross_targets = [_]CrossTarget{
     .{ .name = "x64win", .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .msvc } },
+    .{ .name = "x64mingw", .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu } },
     .{ .name = "arm64win", .query = .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .msvc } },
+    .{ .name = "arm64mingw", .query = .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .gnu } },
 };
+
+/// MinGW C runtime files that a `*mingw` target must find next to `host.lib`.
+///
+/// A MinGW link passes `-lldmingw /nodefaultlib` and then only the inputs the
+/// platform declares (see `src/cli/linker.zig`), so the startup object, the
+/// compiled runtime archives, and the UCRT/Win32 import libraries all have to
+/// live in the platform's `targets/<target>/` directory. `test/fx` holds the
+/// checked-in copy (regenerate with `ci/vendor_mingw_runtime.py`) and the build
+/// copies it into the other test platforms rather than committing duplicates.
+const mingw_runtime_files = [_][]const u8{
+    "crt2.obj",
+    "dllcrt2.obj",
+    "libmingw32.lib",
+    "zigc.lib",
+    "compiler_rt.lib",
+    "api-ms-win-crt-conio-l1-1-0.lib",
+    "api-ms-win-crt-convert-l1-1-0.lib",
+    "api-ms-win-crt-environment-l1-1-0.lib",
+    "api-ms-win-crt-filesystem-l1-1-0.lib",
+    "api-ms-win-crt-heap-l1-1-0.lib",
+    "api-ms-win-crt-locale-l1-1-0.lib",
+    "api-ms-win-crt-math-l1-1-0.lib",
+    "api-ms-win-crt-multibyte-l1-1-0.lib",
+    "api-ms-win-crt-private-l1-1-0.lib",
+    "api-ms-win-crt-process-l1-1-0.lib",
+    "api-ms-win-crt-runtime-l1-1-0.lib",
+    "api-ms-win-crt-stdio-l1-1-0.lib",
+    "api-ms-win-crt-string-l1-1-0.lib",
+    "api-ms-win-crt-time-l1-1-0.lib",
+    "api-ms-win-crt-utility-l1-1-0.lib",
+    "advapi32.lib",
+    "kernel32.lib",
+    "ntdll.lib",
+    "shell32.lib",
+    "user32.lib",
+    // The http-headers host calls into Winsock; `/nodefaultlib` drops the
+    // `.drectve /defaultlib:ws2_32` its object carries, so platforms that need
+    // sockets list this explicitly.
+    "ws2_32.lib",
+};
+
+/// Copies fx's checked-in MinGW C runtime into another test platform's
+/// `platform/targets/<target_name>/` directory, so a `*mingw` link finds every
+/// input the platform declares without committing more copies of the same
+/// binaries. Returns the step so callers can order it after the host build.
+fn copyMingwRuntimeToTestPlatform(
+    b: *std.Build,
+    platform_dir: []const u8,
+    target_name: []const u8,
+) *Step {
+    const copy = b.addUpdateSourceFiles();
+    for (mingw_runtime_files) |runtime_filename| {
+        copy.addCopyFileToSource(
+            b.path(b.pathJoin(&.{ "test/fx/platform/targets", target_name, runtime_filename })),
+            b.pathJoin(&.{ "test", platform_dir, "platform/targets", target_name, runtime_filename }),
+        );
+    }
+    return &copy.step;
+}
 
 /// BSD cross-compile targets
 const bsd_cross_targets = [_]CrossTarget{
@@ -66,7 +127,7 @@ comptime {
 }
 
 /// Test platform directories that need host libraries built
-const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive", "alloc-count" };
+const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive", "alloc-count", "box-model-uniqueness" };
 const glibc_test_platform_dirs = [_][]const u8{ "str", "int", "dylib", "archive" };
 
 fn mustUseLlvm(target: ResolvedTarget) bool {
@@ -88,6 +149,17 @@ fn testHostNeedsCompilerRt(target: ResolvedTarget) bool {
     return target.result.os.tag == .linux or
         mustUseLlvm(target) or
         (target.result.os.tag == .windows and target.result.cpu.arch == .aarch64);
+}
+
+/// Every executable that links the whole compiler emits more `.text` than an
+/// ARM32 branch can reach. LLD places range-extension thunks *between* input
+/// sections, so a monolithic `.text` leaves it nowhere to put one and the link
+/// fails with "InputSection too large for range extension thunk". Splitting per
+/// function and per datum gives LLD those insertion points, and lets the final
+/// link discard unused compiler code on every target.
+fn splitCompilerSections(step: *Step.Compile) void {
+    step.link_function_sections = true;
+    step.link_data_sections = true;
 }
 
 fn configureBackend(step: *Step.Compile, target: ResolvedTarget) void {
@@ -114,10 +186,21 @@ fn linkWatchPlatformLibs(step: *Step.Compile, target: ResolvedTarget) void {
 
 const TestHostOptions = struct {
     uses_stack_handler: bool = false,
+    /// Extra source files compiled as their own objects and added to the host
+    /// archive as separate members, for platforms that test multi-member hosts.
+    extra_sources: []const []const u8 = &.{},
 };
 
+/// The dylib host keeps its hosted functions in a second archive member that
+/// only the app references, so `run-test-dylib` fails if a link ever stops
+/// rooting the hosted symbols it uses (see test/dylib/platform/host_hosted.zig).
+fn testPlatformExtraHostSources(platform_dir: []const u8) []const []const u8 {
+    if (std.mem.eql(u8, platform_dir, "dylib")) return &.{"test/dylib/platform/host_hosted.zig"};
+    return &.{};
+}
+
 fn testPlatformUsesStackHandler(platform_dir: []const u8) bool {
-    return std.mem.eql(u8, platform_dir, "fx");
+    return std.mem.eql(u8, platform_dir, "fx") or std.mem.eql(u8, platform_dir, "fx-open");
 }
 
 fn testPlatformRequiresSectionDceHost(platform_dir: []const u8) bool {
@@ -662,10 +745,10 @@ const CheckTypeCheckerPatternsStep = struct {
         .{ .file = "inspected.zig", .start = 226, .end = 232 },
         // inspected.zig trims the trailing newline off a rendered report. This is
         // presentation text on its way out, not a type-checker comparison.
-        .{ .file = "inspected.zig", .start = 2147, .end = 2147 },
+        .{ .file = "inspected.zig", .start = 2211, .end = 2211 },
         // inspected.zig converts a NUL-terminated dylib path from the linker into a
         // slice. Path bytes, not identifiers.
-        .{ .file = "inspected.zig", .start = 2936, .end = 2940 },
+        .{ .file = "inspected.zig", .start = 3000, .end = 3004 },
         // inspected_run.zig dispatches on a hosted function's ABI symbol, which is
         // matched by name at the host boundary and has no Ident.Idx.
         .{ .file = "inspected_run.zig", .start = 107, .end = 107 },
@@ -1849,8 +1932,9 @@ const TestAssetCoverageDir = struct {
     spec_files: []const []const u8,
 };
 
-// Every top-level app .roc file in these directories must be named by at least
-// one of its spec sources; otherwise it is dead test data no runner executes.
+// Every app .roc file in these directories (including nested subdirectories) must
+// be named by at least one of its spec sources; otherwise it is dead test data no
+// runner executes.
 // Module and platform .roc files are dependencies of apps, so only files whose
 // first non-comment line is an `app` header are required to be covered.
 const test_asset_coverage_dirs = [_]TestAssetCoverageDir{
@@ -1866,6 +1950,9 @@ const test_asset_coverage_dirs = [_]TestAssetCoverageDir{
     .{ .dir = "test/cli", .spec_files = &.{
         "src/cli/test/parallel_cli_runner.zig",
         "src/compile/test/embedding_smoke.zig",
+    } },
+    .{ .dir = "test/package-effect-boundary", .spec_files = &.{
+        "src/cli/test/parallel_cli_runner.zig",
     } },
     .{ .dir = "test/str", .spec_files = &.{
         "src/cli/test/platform_config.zig",
@@ -1911,13 +1998,20 @@ fn checkTestAssetCoverage(step: *Step) !void {
             app_files.deinit(allocator);
         }
 
-        var dir_iter = asset_dir.iterate();
-        while (try dir_iter.next(io)) |entry| {
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".roc")) continue;
-            const contents = try asset_dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
+        // Fixtures group each case in its own subdirectory, so walk the whole
+        // tree instead of only the top level. Paths stay relative to cfg.dir and
+        // are always '/'-separated so they compare directly against the paths
+        // written in the spec sources.
+        var walker = try asset_dir.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".roc")) continue;
+            const contents = try entry.dir.readFileAlloc(io, entry.basename, allocator, .limited(1024 * 1024));
             defer allocator.free(contents);
             if (!isRocAppFile(contents)) continue;
-            try app_files.append(allocator, try allocator.dupe(u8, entry.name));
+            const rel_path = try allocator.dupe(u8, entry.path);
+            std.mem.replaceScalar(u8, rel_path, std.fs.path.sep, '/');
+            try app_files.append(allocator, rel_path);
         }
 
         std.mem.sort([]const u8, app_files.items, {}, struct {
@@ -1957,15 +2051,13 @@ fn checkTestAssetCoverage(step: *Step) !void {
                     const rest_of_line = line[idx..];
                     if (std.mem.find(u8, rest_of_line, ".roc")) |roc_pos| {
                         const full_path = rest_of_line[0 .. roc_pos + 4];
+                        // Path relative to cfg.dir; may name a file in a subdirectory.
                         const filename = full_path[dir_prefix.len..];
-                        // Only count top-level files, not subdirectory paths.
-                        if (std.mem.find(u8, filename, "/") == null) {
-                            const duped_filename = try allocator.dupe(u8, filename);
-                            if (tested_files.contains(duped_filename)) {
-                                allocator.free(duped_filename);
-                            } else {
-                                try tested_files.put(duped_filename, {});
-                            }
+                        const duped_filename = try allocator.dupe(u8, filename);
+                        if (tested_files.contains(duped_filename)) {
+                            allocator.free(duped_filename);
+                        } else {
+                            try tested_files.put(duped_filename, {});
                         }
                     }
                     search_start = idx + 1;
@@ -2159,8 +2251,34 @@ fn createTestPlatformHostLib(
         // link inputs. Zig's LLVM backend emits that ELF visibility metadata.
         lib.use_llvm = true;
     }
+    for (options.extra_sources) |source| {
+        const obj = b.addObject(.{
+            .name = b.fmt("{s}_{s}", .{ name, std.fs.path.stem(source) }),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(source),
+                .target = host_target,
+                .optimize = optimize,
+                .strip = strip,
+                .omit_frame_pointer = omit_frame_pointer,
+                .stack_check = if (isGlibcTestHost(host_target)) false else null,
+                .pic = true,
+            }),
+        });
+        configureBackend(obj, host_target);
+        if (testHostNeedsLlvm(host_target)) obj.use_llvm = true;
+        obj.link_function_sections = true;
+        obj.link_data_sections = true;
+        lib.root_module.addObject(obj);
+    }
     if (options.uses_stack_handler) {
         lib.root_module.addImport("base", roc_modules.base);
+        const crash_handlers = b.createModule(.{
+            .root_source_file = b.path("test/host_crash_handlers.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        });
+        crash_handlers.addImport("base", roc_modules.base);
+        lib.root_module.addImport("host_crash_handlers", crash_handlers);
     }
     lib.root_module.addImport("builtins", roc_modules.builtins);
     lib.root_module.addImport("build_options", roc_modules.build_options);
@@ -2196,6 +2314,7 @@ fn buildAndCopyTestPlatformHostLib(
 ) *Step {
     const options = TestHostOptions{
         .uses_stack_handler = testPlatformUsesStackHandler(platform_dir),
+        .extra_sources = testPlatformExtraHostSources(platform_dir),
     };
     // The dylib/archive tests assert that unused hosted symbols and their
     // canary data are removed by the final link. Zig Debug emits host objects
@@ -2334,11 +2453,48 @@ fn buildAndCopyWasmHostObject(
     // Per-function/data sections so wasm final-link DCE can strip unused host code.
     obj.link_function_sections = true;
     obj.link_data_sections = true;
+    // Match production Rust hosts, which contribute weak compiler-rt symbols.
+    // Wasm LLD must resolve these against Roc's strong builtins definitions.
+    obj.bundle_compiler_rt = true;
 
     const dest_path = "test/wasm/platform/targets/wasm32/host.wasm";
     const copy_step = b.addUpdateSourceFiles();
     copy_step.addCopyFileToSource(obj.getEmittedBin(), dest_path);
 
+    return &copy_step.step;
+}
+
+/// Build a wasm host which owns a compiler-rt-spelled symbol with strong
+/// binding, as stable Rust hosts must when they implement an intrinsic by
+/// hand. Roc's sealed object must not expose or resolve against this symbol.
+fn buildAndCopyStrongIntrinsicWasmHostObject(
+    b: *std.Build,
+    target: ResolvedTarget,
+    optimize: OptimizeMode,
+    strip: bool,
+    omit_frame_pointer: ?bool,
+) *Step {
+    const obj = b.addObject(.{
+        .name = "strong_intrinsic_host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/wasm/issue_10827_strong_intrinsic_host/platform/wasm_host.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
+            .pic = true,
+        }),
+    });
+    configureBackend(obj, target);
+    obj.link_function_sections = true;
+    obj.link_data_sections = true;
+    obj.bundle_compiler_rt = false;
+
+    const copy_step = b.addUpdateSourceFiles();
+    copy_step.addCopyFileToSource(
+        obj.getEmittedBin(),
+        "test/wasm/issue_10827_strong_intrinsic_host/platform/targets/wasm32/host.wasm",
+    );
     return &copy_step.step;
 }
 
@@ -2589,18 +2745,18 @@ fn setupTestPlatforms(
             );
             clear_cache_step.dependOn(copy_step);
 
-            // test/alloc-count declares fx's musl runtime objects (crt1.o,
-            // libc.a) as link inputs; copy them alongside its host library
+            // Allocation-sensitive test platforms declare fx's musl runtime
+            // objects as link inputs; copy them alongside their host library
             // rather than committing more copies of the same binaries.
-            if (std.mem.eql(u8, platform_dir, "alloc-count") and std.mem.endsWith(u8, cross_target.name, "musl")) {
+            if ((std.mem.eql(u8, platform_dir, "alloc-count") or std.mem.eql(u8, platform_dir, "box-model-uniqueness")) and std.mem.endsWith(u8, cross_target.name, "musl")) {
                 const copy_musl_runtime = b.addUpdateSourceFiles();
                 copy_musl_runtime.addCopyFileToSource(
                     b.path(b.pathJoin(&.{ "test/fx/platform/targets", cross_target.name, "crt1.o" })),
-                    b.pathJoin(&.{ "test/alloc-count/platform/targets", cross_target.name, "crt1.o" }),
+                    b.pathJoin(&.{ "test", platform_dir, "platform/targets", cross_target.name, "crt1.o" }),
                 );
                 copy_musl_runtime.addCopyFileToSource(
                     b.path(b.pathJoin(&.{ "test/fx/platform/targets", cross_target.name, "libc.a" })),
-                    b.pathJoin(&.{ "test/alloc-count/platform/targets", cross_target.name, "libc.a" }),
+                    b.pathJoin(&.{ "test", platform_dir, "platform/targets", cross_target.name, "libc.a" }),
                 );
                 clear_cache_step.dependOn(&copy_musl_runtime.step);
             }
@@ -2648,6 +2804,13 @@ fn setupTestPlatforms(
                 omit_frame_pointer,
             );
             clear_cache_step.dependOn(copy_step);
+
+            // MinGW targets link only what the platform declares, so each one
+            // needs fx's checked-in C runtime alongside its host library.
+            // test/fx is the source of those files, so it needs no copy.
+            if (std.mem.endsWith(u8, cross_target.name, "mingw") and !std.mem.eql(u8, platform_dir, "fx")) {
+                clear_cache_step.dependOn(copyMingwRuntimeToTestPlatform(b, platform_dir, cross_target.name));
+            }
         }
     }
 
@@ -2662,6 +2825,13 @@ fn setupTestPlatforms(
         omit_frame_pointer,
     );
     clear_cache_step.dependOn(wasm_host_step);
+    clear_cache_step.dependOn(buildAndCopyStrongIntrinsicWasmHostObject(
+        b,
+        wasm_target,
+        optimize,
+        strip,
+        omit_frame_pointer,
+    ));
 
     b.getInstallStep().dependOn(clear_cache_step);
     build_test_hosts_step.dependOn(clear_cache_step);
@@ -2732,6 +2902,7 @@ pub fn build(b: *std.Build) void {
     const run_check_simd_codegen_step = b.step("run-check-simd-codegen", "Check that optimized x86-64 integer SIMD kernels select native instructions");
     const run_check_match_extension_codegen_step = b.step("run-check-match-extension-codegen", "Check the pinned instruction counts for the match-extension loop");
     const run_check_baseline_codegen_step = b.step("run-check-baseline-codegen", "Check that v1 targets emit no instruction above the architecture baseline");
+    const run_check_str_eq_same_allocation_step = b.step("run-check-str-eq-same-allocation", "Check that comparing a string against itself does not read its bytes");
     const build_snapshot_tool_step = b.step("build-snapshot-tool", "Build the snapshot tool");
     const run_check_snapshots_step = b.step("run-check-snapshots", "Regenerate snapshots and fail if tracked snapshots changed");
     const build_test_zig_step = b.step("build-test-zig", "Build Zig unit-test binaries");
@@ -2980,11 +3151,18 @@ pub fn build(b: *std.Build) void {
     // Don't omit frame pointer when tracy callstack is enabled (needed for callstack capture)
     const omit_frame_pointer: ?bool = if (flag_tracy_callstack) false else null;
 
+    // Whether the host can execute binaries built for the configured target.
+    // The ABI is deliberately not part of this: Linux builds default to
+    // `.musl` (statically linked) while the build runner itself is gnu, and
+    // such a binary runs fine on a glibc host.
+    const host_can_run_target =
+        target.result.os.tag == builtin.target.os.tag and
+        target.result.cpu.arch == builtin.target.cpu.arch;
+
     const target_is_native =
         // `query.isNative()` becomes false as soon as users override CPU features (e.g. -Dcpu=x86_64_v3),
         // but we still want to treat those builds as native so macOS can link against real FSEvents.
-        target.result.os.tag == builtin.target.os.tag and
-        target.result.cpu.arch == builtin.target.cpu.arch and
+        host_can_run_target and
         target.result.abi == builtin.target.abi;
     build_options.addOption(bool, "target_is_native", target_is_native);
 
@@ -3147,7 +3325,7 @@ pub fn build(b: *std.Build) void {
     // b.addTest site below. They are only passed when the host can execute
     // the configured target and no --test-filter trimmed the test set;
     // otherwise the checker falls back to its import-level check alone.
-    const enumerate_tests_for_wiring_check = target_is_native and test_filters.len == 0;
+    const enumerate_tests_for_wiring_check = host_can_run_target and test_filters.len == 0;
 
     const run_minici = b.addRunArtifact(minici_exe);
     run_minici.addArg(b.graph.zig_exe);
@@ -3322,6 +3500,11 @@ pub fn build(b: *std.Build) void {
     run_match_extension_codegen_check.addArtifactArg(roc_exe);
     run_match_extension_codegen_check.step.dependOn(build_test_hosts_step);
     run_check_match_extension_codegen_step.dependOn(&run_match_extension_codegen_check.step);
+
+    const run_str_eq_same_allocation_check = b.addSystemCommand(&.{ "bash", "ci/check_str_eq_same_allocation.sh" });
+    run_str_eq_same_allocation_check.addArtifactArg(roc_exe);
+    run_str_eq_same_allocation_check.step.dependOn(build_test_hosts_step);
+    run_check_str_eq_same_allocation_step.dependOn(&run_str_eq_same_allocation_check.step);
 
     // Glue ABI locks compile the generated bindings themselves. Zig is checked
     // for every native architecture/OS plus wasm, C is checked against the
@@ -3870,6 +4053,7 @@ pub fn build(b: *std.Build) void {
             .valgrind = valgrind_support,
         }),
     });
+    splitCompilerSections(snapshot_exe);
     configureBackend(snapshot_exe, target);
     roc_modules.addAll(snapshot_exe);
     snapshot_exe.root_module.addImport("compiled_builtins", compiled_builtins_module);
@@ -4150,6 +4334,28 @@ pub fn build(b: *std.Build) void {
     wasm_archive_exe.root_module.addImport("build_options", roc_modules.build_options);
     wasm_archive_exe.root_module.linkLibrary(host_zstd.artifact("zstd"));
 
+    // The playground Wasm module compiles the whole compiler for wasm32, which
+    // makes it the most expensive job in `build-ci`. Measured peak linker RSS
+    // for the same sources: Debug 11.8 GiB (85 MB of output), ReleaseSafe
+    // 9.6 GiB, ReleaseSmall 4.0 GiB. The default build does not need a Debug
+    // Wasm module -- the playground is driven over a Wasm protocol rather than
+    // a debugger, and the compiler code it contains is safety-checked by the
+    // native Debug tests -- so an unrequested Debug default becomes
+    // ReleaseSmall. That also makes the default build agree with CI, which runs
+    // `run-test-playground -Doptimize=ReleaseSmall`, and with `repl_wasm` and
+    // `echo`, which are pinned to ReleaseSmall for the same reason.
+    //
+    // Every explicitly requested mode is honored, including `-Doptimize=Debug`:
+    // an omitted `-Doptimize` also resolves to `.Debug`, so the two are only
+    // distinguishable through `user_input_options` (as with `target` and `cpu`
+    // above). Asking for a Debug playground has to keep working -- it is just
+    // not what an unqualified `zig build` should spend 12 GiB on.
+    const playground_wasm_optimize: std.builtin.OptimizeMode =
+        if (optimize == .Debug and !b.user_input_options.contains("optimize"))
+            .ReleaseSmall
+        else
+            optimize;
+
     const playground_exe = b.addExecutable(.{
         .name = "playground",
         .root_module = b.createModule(.{
@@ -4158,7 +4364,7 @@ pub fn build(b: *std.Build) void {
                 .cpu_arch = .wasm32,
                 .os_tag = .freestanding,
             }),
-            .optimize = optimize,
+            .optimize = playground_wasm_optimize,
         }),
     });
     configureBackend(playground_exe, b.resolveTargetQuery(.{
@@ -4399,36 +4605,20 @@ pub fn build(b: *std.Build) void {
     }
 
     // Build playground integration tests - now enabled for all optimization modes.
+    // These drive `playground_exe` itself rather than a private copy of the same
+    // root source: a second full compiler-for-wasm32 build would be duplicated
+    // work, and testing the module `build-web` actually ships is the point.
     const playground_test_install = blk: {
-        const playground_test_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseSafe else optimize;
-        const playground_wasm_target = b.resolveTargetQuery(.{
-            .cpu_arch = .wasm32,
-            .os_tag = .freestanding,
-        });
-        const playground_test_wasm = b.addExecutable(.{
-            .name = "playground-test",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/playground_wasm/main.zig"),
-                .target = playground_wasm_target,
-                .optimize = playground_test_optimize,
-            }),
-        });
-        configureBackend(playground_test_wasm, playground_wasm_target);
-        playground_test_wasm.entry = .disabled;
-        playground_test_wasm.rdynamic = true;
-        playground_test_wasm.link_function_sections = true;
-        playground_test_wasm.import_memory = false;
-        roc_modules.addAll(playground_test_wasm);
-        playground_test_wasm.root_module.addImport("compiled_builtins", compiled_builtins_module);
-        playground_test_wasm.step.dependOn(&write_compiled_builtins.step);
-        add_tracy(b, roc_modules.build_options, playground_test_wasm, playground_wasm_target, false, null);
-
+        // The native runner follows `optimize` like every other test runner.
+        // It used to share the Wasm copy's optimize mode so that the two agreed
+        // on `compiler_version`; that expectation is now passed in explicitly
+        // below, so the runner is free to keep Debug's safety checks.
         const playground_integration_test_exe = b.addExecutable(.{
             .name = "playground_integration_test",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("test/playground-integration/main.zig"),
                 .target = target,
-                .optimize = playground_test_optimize,
+                .optimize = optimize,
             }),
         });
         configureBackend(playground_integration_test_exe, target);
@@ -4438,12 +4628,18 @@ pub fn build(b: *std.Build) void {
         roc_modules.addAll(playground_integration_test_exe);
 
         const install = b.addInstallArtifact(playground_integration_test_exe, .{});
-        install.step.dependOn(&playground_test_wasm.step);
+        install.step.dependOn(&playground_exe.step);
         build_test_playground_runner_step.dependOn(&install.step);
 
         const run_playground_test = b.addRunArtifact(playground_integration_test_exe);
         run_playground_test.addArg("--wasm-path");
-        run_playground_test.addFileArg(playground_test_wasm.getEmittedBin());
+        run_playground_test.addFileArg(playground_exe.getEmittedBin());
+        // The runner cannot read the playground's version off its own
+        // build_options: that prefix comes from the runner's own build mode, and
+        // the two binaries are built at different optimize levels.
+        run_playground_test.addArg("--playground-version");
+        run_playground_test.addArg(compiler_version_override orelse
+            compilerVersionForMode(b, playground_wasm_optimize, compiler_version_git));
         for (test_filters) |f| {
             run_playground_test.addArg("--filter");
             run_playground_test.addArg(f);
@@ -4606,6 +4802,39 @@ pub fn build(b: *std.Build) void {
         build_wasm_str_concat_join_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_str_concat_join_app.step);
 
+        const build_wasm_issue_10957_app = b.addRunArtifact(roc_exe);
+        build_wasm_issue_10957_app.addArgs(&.{
+            "build",
+            "test/wasm/issue_10957_json_camel_long_field_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/issue_10957_json_camel_long_field_static_lib_app.wasm",
+        });
+        build_wasm_issue_10957_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_issue_10957_app.step);
+
+        const build_wasm_str_interp_leading_literal_app = b.addRunArtifact(roc_exe);
+        build_wasm_str_interp_leading_literal_app.addArgs(&.{
+            "build",
+            "test/wasm/str_interp_leading_literal_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/str_interp_leading_literal_static_lib_app.wasm",
+        });
+        build_wasm_str_interp_leading_literal_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_str_interp_leading_literal_app.step);
+
+        const build_wasm_str_concat_unique_reuse_app = b.addRunArtifact(roc_exe);
+        build_wasm_str_concat_unique_reuse_app.addArgs(&.{
+            "build",
+            "test/wasm/str_concat_unique_reuse_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/str_concat_unique_reuse_static_lib_app.wasm",
+        });
+        build_wasm_str_concat_unique_reuse_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_str_concat_unique_reuse_app.step);
+
         // End-to-end cart gate for the minted-iterator `for`-loop drive. The
         // size build covers the LLVM cart path, and the dev build covers wasm
         // composite loop-state rebinding for recursive generated iterators.
@@ -4705,6 +4934,17 @@ pub fn build(b: *std.Build) void {
         build_wasm_boxed_model_update_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_boxed_model_update_app.step);
 
+        const build_wasm_issue_10836_app = b.addRunArtifact(roc_exe);
+        build_wasm_issue_10836_app.addArgs(&.{
+            "build",
+            "test/wasm/issue_10836_boxed_low_alignment_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/issue_10836_boxed_low_alignment_static_lib_app.wasm",
+        });
+        build_wasm_issue_10836_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_issue_10836_app.step);
+
         const wasm_test_exe = b.addExecutable(.{
             .name = "wasm_static_lib_test",
             .root_module = b.createModule(.{
@@ -4803,6 +5043,46 @@ pub fn build(b: *std.Build) void {
             });
             run_wasm_str_concat_join_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_str_concat_join_test.step);
+
+            const run_wasm_issue_10957_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_issue_10957_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/issue_10957_json_camel_long_field_static_lib_app.wasm",
+                "--expected",
+                "14",
+            });
+            run_wasm_issue_10957_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_issue_10957_test.step);
+
+            const run_wasm_str_interp_leading_literal_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_str_interp_leading_literal_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/str_interp_leading_literal_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+                "--min-allocs",
+                "1",
+                "--max-allocs",
+                "2",
+            });
+            run_wasm_str_interp_leading_literal_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_str_interp_leading_literal_test.step);
+
+            const run_wasm_str_concat_unique_reuse_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_str_concat_unique_reuse_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/str_concat_unique_reuse_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+                "--min-allocs",
+                "1",
+                "--max-allocs",
+                "1",
+            });
+            run_wasm_str_concat_unique_reuse_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_str_concat_unique_reuse_test.step);
 
             // Boot-and-play the minted-iterator `for`-loop cart; "ok" means every
             // inlined `for` over append/map/concat/chained minted chains ran to
@@ -4914,6 +5194,16 @@ pub fn build(b: *std.Build) void {
             });
             run_wasm_boxed_model_update_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_boxed_model_update_test.step);
+
+            const run_wasm_issue_10836_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_issue_10836_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/issue_10836_boxed_low_alignment_static_lib_app.wasm",
+                "--expected",
+                "7,9;11,13;Inc(42)",
+            });
+            run_wasm_issue_10836_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_issue_10836_test.step);
         }
         run_wasm_test.step.dependOn(build_test_wasm_static_lib_runner_step);
         run_test_wasm_static_lib_step.dependOn(&run_wasm_test.step);
@@ -6075,12 +6365,10 @@ pub fn build(b: *std.Build) void {
                 .{ b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }), "arm64musl" }
             else
                 .{ target, native_fx_target_dir },
-            .windows => if (fx_arch == .x86_64)
-                .{ target, "x64win" }
-            else if (fx_arch == .aarch64)
-                .{ target, "arm64win" }
-            else
-                .{ target, native_fx_target_dir },
+            // Windows: build for the native ABI. A gnu-ABI `zig build` lands in
+            // x64mingw/arm64mingw and an MSVC one in x64win/arm64win, matching
+            // what `roc build` picks as its default target.
+            .windows => .{ target, native_fx_target_dir },
             .macos, .freebsd, .openbsd, .netbsd, .other => .{ target, native_fx_target_dir },
         };
 
@@ -6158,6 +6446,10 @@ pub fn build(b: *std.Build) void {
             );
             copy_musl_runtime.step.dependOn(final_static_data_host_step);
             break :blk &copy_musl_runtime.step;
+        } else if (std.mem.endsWith(u8, static_data_host_target_dir, "mingw")) blk: {
+            const copy_mingw_runtime = copyMingwRuntimeToTestPlatform(b, "static-data-host", static_data_host_target_dir);
+            copy_mingw_runtime.dependOn(final_static_data_host_step);
+            break :blk copy_mingw_runtime;
         } else final_static_data_host_step;
         b.getInstallStep().dependOn(final_static_data_platform_step);
 
@@ -6185,6 +6477,10 @@ pub fn build(b: *std.Build) void {
             );
             copy_musl_runtime.step.dependOn(final_provided_callable_host_step);
             break :blk &copy_musl_runtime.step;
+        } else if (std.mem.endsWith(u8, static_data_host_target_dir, "mingw")) blk: {
+            const copy_mingw_runtime = copyMingwRuntimeToTestPlatform(b, "provided-callable-host", static_data_host_target_dir);
+            copy_mingw_runtime.dependOn(final_provided_callable_host_step);
+            break :blk copy_mingw_runtime;
         } else final_provided_callable_host_step;
         b.getInstallStep().dependOn(final_provided_callable_platform_step);
 
@@ -6223,7 +6519,9 @@ pub fn build(b: *std.Build) void {
                 .{ b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }), "arm64musl" }
             else
                 .{ target, null },
-            .windows => if (http_arch == .x86_64) .{ target, "x64win" } else if (http_arch == .aarch64) .{ target, "arm64win" } else .{ target, null },
+            // Windows: build for the native ABI so a gnu-ABI `zig build` lands
+            // in x64mingw/arm64mingw, matching `roc build`'s default target.
+            .windows => .{ target, roc_target.RocTarget.fromStdTarget(target.result).toName() },
             .macos => if (http_arch == .x86_64) .{ target, "x64mac" } else if (http_arch == .aarch64) .{ target, "arm64mac" } else .{ target, null },
             .freebsd, .openbsd, .netbsd, .other => .{ target, null },
         };
@@ -6240,6 +6538,12 @@ pub fn build(b: *std.Build) void {
                 omit_frame_pointer,
             );
             b.getInstallStep().dependOn(final_http_host_step);
+
+            // A MinGW link uses only what the platform declares, so the C
+            // runtime has to sit next to the host library.
+            if (std.mem.endsWith(u8, target_dir, "mingw")) {
+                final_http_host_step.dependOn(copyMingwRuntimeToTestPlatform(b, "http-headers", target_dir));
+            }
 
             const http_app_exe_name = if (http_host_target.result.os.tag == .windows)
                 "http_header_decoder_server_prebuilt.exe"
@@ -6300,6 +6604,12 @@ pub fn build(b: *std.Build) void {
                 omit_frame_pointer,
             );
             b.getInstallStep().dependOn(final_json_host_step);
+
+            // A MinGW link uses only what the platform declares, so the C
+            // runtime has to sit next to the host library.
+            if (std.mem.endsWith(u8, target_dir, "mingw")) {
+                final_json_host_step.dependOn(copyMingwRuntimeToTestPlatform(b, "json-decoder", target_dir));
+            }
 
             const json_exe_ext = if (http_host_target.result.os.tag == .windows) ".exe" else "";
             const json_app_exe_name = b.fmt("json_decoder_prebuilt{s}", .{json_exe_ext});
@@ -6746,7 +7056,10 @@ fn buildBoxyRuntimeObject(
             .optimize = optimize,
             .strip = strip,
             .omit_frame_pointer = omit_frame_pointer,
-            .pic = true,
+            // Native runtime objects can participate in shared-library links.
+            // Wasm uses direct data-symbol relocations so compiler-only
+            // relocatable composition can bind its app-specific Boxy sidecar.
+            .pic = target.result.cpu.arch != .wasm32,
         }),
     });
     const boxy_eval_module = b.createModule(.{
@@ -6825,12 +7138,7 @@ fn addMainExe(
     // SetUnhandledExceptionFilter stack-overflow handler before the interpreter
     // can catch the overflow itself. Reserve 64 MiB to match eval-test-runner.
     exe.stack_size = 64 * 1024 * 1024;
-    // Keep functions and data in independent sections. Besides allowing the
-    // final linker to discard unused compiler code, this is required on ARM32:
-    // LLD cannot place range-extension thunks inside the monolithic .text
-    // section Zig otherwise emits for Roc's large debug executable.
-    exe.link_function_sections = true;
-    exe.link_data_sections = true;
+    splitCompilerSections(exe);
     configureBackend(exe, target);
     exe.root_module.addImport("llvm_codegen", llvm_codegen_module);
     linkWatchPlatformLibs(exe, target);
@@ -7024,7 +7332,14 @@ fn addMainExe(
     machine_code_shim_lib.root_module.addImport("compiled_builtins", compiled_builtins_module);
     machine_code_shim_lib.step.dependOn(&write_compiled_builtins.step);
     machine_code_shim_lib.root_module.addObjectFile(builtins_obj.getEmittedBin());
-    machine_code_shim_lib.bundle_compiler_rt = true;
+    // The shim is linked alongside a platform host that is its own compiler-rt
+    // carrier, and COFF rejects the resulting duplicate definitions of `memcpy`
+    // and the integer/float libcalls outright (the same hazard noted on the
+    // boxy object above). The shim does not need a copy of its own: its objects
+    // reference only memcpy, memmove and memset, which the rest of the link
+    // already provides -- both for a platform host and for the freestanding
+    // default platform.
+    machine_code_shim_lib.bundle_compiler_rt = false;
     // On Linux the shim reaches the kernel directly, so the executables it is
     // linked into need no libc. Declaring that here makes the Zig compiler
     // enforce it: any new libc dependency in the shim's module graph becomes a
@@ -7103,8 +7418,10 @@ fn addMainExe(
         .{ .name = "x64glibc", .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu } },
         .{ .name = "arm64glibc", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu } },
         .{ .name = "wasm32", .query = .{ .cpu_arch = .wasm32, .os_tag = .freestanding, .abi = .none } },
-        .{ .name = "x64win", .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu } },
-        .{ .name = "arm64win", .query = .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .gnu } },
+        .{ .name = "x64win", .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .msvc } },
+        .{ .name = "x64mingw", .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu } },
+        .{ .name = "arm64win", .query = .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .msvc } },
+        .{ .name = "arm64mingw", .query = .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .gnu } },
         .{ .name = "x64freebsd", .query = .{ .cpu_arch = .x86_64, .os_tag = .freebsd, .abi = .none } },
         .{ .name = "x64openbsd", .query = .{ .cpu_arch = .x86_64, .os_tag = .openbsd, .abi = .none } },
         .{ .name = "x64netbsd", .query = .{ .cpu_arch = .x86_64, .os_tag = .netbsd, .abi = .none } },
@@ -7156,9 +7473,9 @@ fn addMainExe(
         cross_builtins_obj.bundle_compiler_rt = false;
         configureBackend(cross_builtins_obj, cross_resolved_target);
 
-        const cross_builtins_bin = if (cross_is_wasm) blk: {
+        const cross_wasm32_compiler_rt_obj: ?*Step.Compile = if (cross_is_wasm) blk: {
             const zig_lib_path = b.fmt("{f}", .{b.graph.zig_lib_directory});
-            const cross_wasm32_compiler_rt_obj = b.addObject(.{
+            const compiler_rt_obj = b.addObject(.{
                 .name = "compiler_rt_wasm32",
                 .root_module = b.createModule(.{
                     .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ zig_lib_path, "compiler_rt.zig" }) },
@@ -7169,14 +7486,17 @@ fn addMainExe(
                     .pic = true,
                 }),
             });
-            cross_wasm32_compiler_rt_obj.bundle_compiler_rt = false;
-            configureBackend(cross_wasm32_compiler_rt_obj, cross_resolved_target);
+            compiler_rt_obj.bundle_compiler_rt = false;
+            configureBackend(compiler_rt_obj, cross_resolved_target);
+            break :blk compiler_rt_obj;
+        } else null;
 
+        const cross_builtins_bin = if (cross_wasm32_compiler_rt_obj) |compiler_rt_obj| blk: {
             const link_cross_wasm32_builtins = b.addSystemCommand(&.{ b.graph.zig_exe, "wasm-ld", "-r" });
             link_cross_wasm32_builtins.addArg("-o");
             const merged_cross_wasm32_builtins = link_cross_wasm32_builtins.addOutputFileArg("roc_builtins.o");
             link_cross_wasm32_builtins.addFileArg(cross_builtins_obj.getEmittedBin());
-            link_cross_wasm32_builtins.addFileArg(cross_wasm32_compiler_rt_obj.getEmittedBin());
+            link_cross_wasm32_builtins.addFileArg(compiler_rt_obj.getEmittedBin());
             break :blk merged_cross_wasm32_builtins;
         } else cross_builtins_obj.getEmittedBin();
 
@@ -7189,6 +7509,19 @@ fn addMainExe(
             b.pathJoin(&.{ "src/cli/targets", cross_target.name, builtins_ext }),
         );
         exe.step.dependOn(&copy_cross_builtins.step);
+
+        // Standalone wasm builds compose compiler-rt into the Roc-owned object
+        // and localize it before the platform link. Keep it separate from the
+        // extern builtins object so compiler support is never a public archive
+        // member or a platform-resolvable global.
+        if (cross_wasm32_compiler_rt_obj) |compiler_rt_obj| {
+            const copy_cross_compiler_rt = b.addUpdateSourceFiles();
+            copy_cross_compiler_rt.addCopyFileToSource(
+                compiler_rt_obj.getEmittedBin(),
+                b.pathJoin(&.{ "src/cli/targets", cross_target.name, "roc_compiler_rt.o" }),
+            );
+            exe.step.dependOn(&copy_cross_compiler_rt.step);
+        }
 
         // Extern-symbol-mode builtins object for this target (the symbol ABI).
         const cross_builtins_extern_obj = b.addObject(.{
@@ -7235,7 +7568,6 @@ fn addMainExe(
                 b.fmt("roc_boxy_runtime_{s}", .{cross_target.name}),
                 b.path("src/boxy_runtime/main.zig"),
             );
-            add_tracy(b, roc_modules.build_options, cross_boxy_runtime_obj, b.graph.host, false, flag_enable_tracy);
             const boxy_runtime_artifact = if (cross_is_wasm)
                 wasmObjectArtifact(b, cross_boxy_runtime_obj)
             else
@@ -7289,6 +7621,34 @@ fn addMainExe(
                 b.pathJoin(&.{ "src/cli/targets", cross_target.name, default_runtime_ext }),
             );
             exe.step.dependOn(&copy_default_platform_runtime.step);
+
+            // A shared-memory run of the synthetic Linux default platform has
+            // no external platform host to provide compiler-rt. Keep that
+            // carrier explicit and default-platform-owned instead of hiding it
+            // in the machine-code shim, which is also linked with user hosts.
+            if (default_platform_os == .linux) {
+                const zig_lib_path = b.fmt("{f}", .{b.graph.zig_lib_directory});
+                const default_platform_compiler_rt_obj = b.addObject(.{
+                    .name = b.fmt("roc_default_compiler_rt_{s}", .{cross_target.name}),
+                    .root_module = b.createModule(.{
+                        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ zig_lib_path, "compiler_rt.zig" }) },
+                        .target = cross_resolved_target,
+                        .optimize = .ReleaseFast,
+                        .strip = false,
+                        .omit_frame_pointer = false,
+                        .pic = true,
+                    }),
+                });
+                default_platform_compiler_rt_obj.bundle_compiler_rt = false;
+                configureBackend(default_platform_compiler_rt_obj, cross_resolved_target);
+
+                const copy_default_platform_compiler_rt = b.addUpdateSourceFiles();
+                copy_default_platform_compiler_rt.addCopyFileToSource(
+                    default_platform_compiler_rt_obj.getEmittedBin(),
+                    b.pathJoin(&.{ "src/cli/targets", cross_target.name, "roc_default_compiler_rt.o" }),
+                );
+                exe.step.dependOn(&copy_default_platform_compiler_rt.step);
+            }
 
             const default_platform_executable_obj = b.addObject(.{
                 .name = b.fmt("roc_default_platform_{s}", .{cross_target.name}),
@@ -7922,6 +8282,24 @@ fn getCompilerVersionGit(b: *std.Build) []const u8 {
 
     // Git not available or failed, use fallback
     return "no-git";
+}
+
+/// The `compiler_version` string a binary built at `mode` reports at runtime.
+///
+/// Mirrors the `@import("builtin").mode` switch in the generated build_options
+/// module (see where `compiler_version` is assembled in build()). Needed when
+/// one binary has to predict another's version, because the build-mode prefix
+/// is resolved at each binary's own compile time rather than here.
+fn compilerVersionForMode(b: *std.Build, mode: std.builtin.OptimizeMode, compiler_version_git: []const u8) []const u8 {
+    return b.fmt("{s}-{s}", .{
+        switch (mode) {
+            .Debug => "debug",
+            .ReleaseSafe => "release-safe",
+            .ReleaseFast => "release-fast",
+            .ReleaseSmall => "release-small",
+        },
+        compiler_version_git,
+    });
 }
 
 /// Return the semantic checked-artifact compiler hash.

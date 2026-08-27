@@ -141,6 +141,59 @@ pub fn isIteratorOwner(owner: BuiltinOwner) bool {
     return owner == .iter or owner == .stream;
 }
 
+/// Producer-owned identity of an internal iterator representation. This is
+/// shared by Monotype and ConstStore so crossing that boundary never depends
+/// on the ordinal layout of two separately maintained enums.
+pub const IteratorKind = enum(u8) {
+    none,
+    custom,
+    list,
+    list_rev,
+    str,
+    single,
+    range,
+    numeric_until,
+    numeric_to,
+    map,
+    keep_if,
+    drop_if,
+    take_first,
+    drop_first,
+    concat,
+    append,
+    forced_dynamic,
+
+    /// See `IteratorComponentTopology`. Null for `none` (no minted kind) and
+    /// `forced_dynamic` (no static topology).
+    pub fn componentTopology(self: IteratorKind) ?IteratorComponentTopology {
+        return switch (self) {
+            .none, .forced_dynamic => null,
+            .range, .numeric_until, .numeric_to => .source_without_components,
+            .custom, .list, .list_rev, .str, .single => .source_with_components,
+            .map, .keep_if, .drop_if, .take_first, .drop_first, .concat, .append => .adapter,
+        };
+    }
+};
+
+/// Structural role of a minted iterator kind's nominal component arguments.
+/// This is the one partition consumed by Monotype's mint-depth assignment,
+/// graph depth finalization, and expected-producer request shaping; consumers
+/// must never re-derive it independently, since a kind classified as source
+/// in one consumer and adapter in another compiles clean and mints the wrong
+/// representation far from the edit.
+pub const IteratorComponentTopology = enum {
+    /// A source whose construction inputs initialize generated step state
+    /// without being stored as nominal component arguments (ranges). Its
+    /// representation depth is exactly one.
+    source_without_components,
+    /// A source that stores its construction inputs as nominal components.
+    /// Its representation depth is exactly one.
+    source_with_components,
+    /// An adapter over iterator components; its representation depth derives
+    /// from those components.
+    adapter,
+};
+
 /// Semantic identity assigned to compiler-owned iterator procedures while
 /// checking still has the defining builtin declaration in hand.
 pub const IteratorProcedureId = enum(u8) {
@@ -149,6 +202,7 @@ pub const IteratorProcedureId = enum(u8) {
     iter_custom,
     iter_single,
     list_iter,
+    list_iter_rev,
     str_iter_utf8,
     iter_map,
     iter_keep_if,
@@ -157,10 +211,10 @@ pub const IteratorProcedureId = enum(u8) {
     iter_drop_first,
     iter_concat,
     iter_append,
-    iter_exclusive_range,
-    iter_inclusive_range,
-    numeric_range_exclusive,
-    numeric_range_inclusive,
+    range_iter,
+    numeric_range_delegate,
+    numeric_to,
+    numeric_until,
     iter_from_step,
     range_done,
 
@@ -176,6 +230,7 @@ pub const IteratorProcedureId = enum(u8) {
             .iter_custom,
             .iter_single,
             .list_iter,
+            .list_iter_rev,
             .str_iter_utf8,
             .iter_map,
             .iter_keep_if,
@@ -184,62 +239,201 @@ pub const IteratorProcedureId = enum(u8) {
             .iter_drop_first,
             .iter_concat,
             .iter_append,
-            .iter_exclusive_range,
-            .iter_inclusive_range,
-            .numeric_range_exclusive,
-            .numeric_range_inclusive,
+            .range_iter,
+            .numeric_range_delegate,
+            .numeric_to,
+            .numeric_until,
             .iter_from_step,
             => true,
         };
     }
+
+    /// The minted iterator kind this procedure constructs, or null for
+    /// procedures that pass through or consume an existing iterator
+    /// (`Iter.iter`, `Iter.next`) and the internal step constructors. This is
+    /// the one producer-to-kind mapping; Monotype's per-procedure request
+    /// construction reads it instead of restating kinds beside each arm.
+    pub fn iteratorKind(self: IteratorProcedureId) ?IteratorKind {
+        return switch (self) {
+            .iter_iter, .iter_next, .numeric_range_delegate, .iter_from_step, .range_done => null,
+            .iter_custom => .custom,
+            .iter_single => .single,
+            .list_iter => .list,
+            .list_iter_rev => .list_rev,
+            .str_iter_utf8 => .str,
+            .iter_map => .map,
+            .iter_keep_if => .keep_if,
+            .iter_drop_if => .drop_if,
+            .iter_take_first => .take_first,
+            .iter_drop_first => .drop_first,
+            .iter_concat => .concat,
+            .iter_append => .append,
+            .range_iter => .range,
+            .numeric_to => .numeric_to,
+            .numeric_until => .numeric_until,
+        };
+    }
+
+    /// Whether the checker must keep a call to this producer out of hoist
+    /// root/cover position so its closed source expression stays available as
+    /// a separate hoist root.
+    ///
+    /// List-backed conversions need this so an inline collection remains
+    /// available for static-data hoisting, and the `Iter.iter` identity needs
+    /// it so its step-closure-bearing result is never selected as a
+    /// static-data root itself. Adapter inputs are already iterator
+    /// expressions, while ranges and custom iterators have no eager source
+    /// expression to preserve.
+    pub fn preservesHoistableSourceInput(self: IteratorProcedureId) bool {
+        return switch (self) {
+            .list_iter, .list_iter_rev, .iter_iter => true,
+            .iter_next,
+            .iter_custom,
+            .iter_single,
+            .str_iter_utf8,
+            .iter_map,
+            .iter_keep_if,
+            .iter_drop_if,
+            .iter_take_first,
+            .iter_drop_first,
+            .iter_concat,
+            .iter_append,
+            .range_iter,
+            .numeric_range_delegate,
+            .numeric_to,
+            .numeric_until,
+            .iter_from_step,
+            .range_done,
+            => false,
+        };
+    }
 };
+
+const IteratorProcedureNameEntry = struct { []const u8, IteratorProcedureId };
+
+const iterator_procedure_base_names = [_]IteratorProcedureNameEntry{
+    .{ "Builtin.Iter.iter", .iter_iter },
+    .{ "Builtin.Iter.next", .iter_next },
+    .{ "Builtin.Iter.custom", .iter_custom },
+    .{ "Builtin.Iter.single", .iter_single },
+    .{ "Builtin.List.iter", .list_iter },
+    .{ "Builtin.List.iter_rev", .list_iter_rev },
+    .{ "Builtin.Str.iter_utf8", .str_iter_utf8 },
+    .{ "Builtin.Iter.map", .iter_map },
+    .{ "Builtin.Iter.keep_if", .iter_keep_if },
+    .{ "Builtin.Iter.drop_if", .iter_drop_if },
+    .{ "Builtin.Iter.take_first", .iter_take_first },
+    .{ "Builtin.Iter.drop_first", .iter_drop_first },
+    .{ "Builtin.Iter.concat", .iter_concat },
+    .{ "Builtin.Iter.append", .iter_append },
+    .{ "Builtin.Num.Range.iter", .range_iter },
+    .{ "iter_from_step", .iter_from_step },
+    .{ "Builtin.iter_from_step", .iter_from_step },
+    .{ "range_done", .range_done },
+    .{ "Builtin.range_done", .range_done },
+};
+
+// Single-sourced from BuiltinLowLevel so the numeric rosters cannot drift from
+// the low-level registration tables. Range iteration covers every numeric
+// type, while `to`/`until` need `minus_try` and therefore exclude IEEE floats.
+const iterator_range_numeric_type_names = can.BuiltinLowLevel.numeric_type_names;
+
+const iterator_to_until_numeric_type_names = can.BuiltinLowLevel.non_float_numeric_type_names;
+
+const iterator_procedure_name_entries = blk: {
+    var entries: [
+        iterator_procedure_base_names.len +
+            iterator_range_numeric_type_names.len +
+            iterator_to_until_numeric_type_names.len * 2
+    ]IteratorProcedureNameEntry = undefined;
+    for (iterator_procedure_base_names, 0..) |entry, index| entries[index] = entry;
+    var index = iterator_procedure_base_names.len;
+    for (iterator_range_numeric_type_names) |numeric| {
+        entries[index] = .{ "Builtin.Num." ++ numeric ++ ".range_iter", .numeric_range_delegate };
+        index += 1;
+    }
+    for (iterator_to_until_numeric_type_names) |numeric| {
+        entries[index] = .{ "Builtin.Num." ++ numeric ++ ".to", .numeric_to };
+        index += 1;
+        entries[index] = .{ "Builtin.Num." ++ numeric ++ ".until", .numeric_until };
+        index += 1;
+    }
+    break :blk entries;
+};
+
+const iterator_procedure_by_name = std.StaticStringMap(IteratorProcedureId).initComptime(&iterator_procedure_name_entries);
+
+/// Return the compiler-owned iterator role assigned to a Builtin definition.
+pub fn iteratorProcedureForEnvDef(env: *const ModuleEnv, def_idx: CIR.Def.Idx) ?IteratorProcedureId {
+    if (env.module_role != .builtin) return null;
+    const def = env.store.getDef(def_idx);
+    const pattern = env.store.getPattern(def.pattern);
+    if (pattern != .assign) return null;
+    return iterator_procedure_by_name.get(env.getIdent(pattern.assign.ident));
+}
+
+/// Every method name a hoist-preserving iterator conversion can be reached
+/// through. The checker uses this as a cheap pre-filter before resolving a
+/// receiver and looking up its binding, and answers from a user-defined
+/// method's result type under these same names, so a producer reachable
+/// through any other name would silently lose its receiver's hoistability.
+/// The comptime block below keeps this in step with the two tables that
+/// decide the answer.
+pub const hoist_preserving_method_names = [_][]const u8{ "iter", "iter_rev" };
+
+/// Builtin nominals whose iterator conversions delegate to a registered
+/// producer (`Dict.iter` calls `List.iter` on its backing entries, and so on).
+/// They carry no `IteratorProcedureId` of their own—their iterator
+/// representation arrives through procedure-return propagation—but their
+/// closed receiver must stay hoistable exactly like the producer they
+/// delegate to.
+const hoist_preserving_delegating_owners = [_][]const u8{ "Builtin.Dict", "Builtin.Set", "Builtin.Num.Range" };
+
+/// Built from the two rosters above rather than listed separately, so the
+/// delegating names cannot drift from the method names the checker
+/// pre-filters on.
+const hoist_preserving_delegating_producer_names = blk: {
+    var entries: [hoist_preserving_delegating_owners.len * hoist_preserving_method_names.len]struct {
+        []const u8,
+    } = undefined;
+    var index: usize = 0;
+    for (hoist_preserving_delegating_owners) |owner| {
+        for (hoist_preserving_method_names) |method| {
+            entries[index] = .{owner ++ "." ++ method};
+            index += 1;
+        }
+    }
+    break :blk std.StaticStringMap(void).initComptime(&entries);
+};
+
+/// Producer definition names, exposed so the naming invariant that ties them
+/// to `hoist_preserving_method_names` can be asserted outside this file (the
+/// type checker's own sources may not compare strings).
+pub const iterator_procedure_names = iterator_procedure_base_names;
+
+/// Whether this exact Builtin procedure needs its eager receiver preserved as
+/// a separate hoist root. Iterator identity covers public producers, the
+/// delegating Dict/Set conversions preserve their receiver the same way, and
+/// the generated FieldNames iterator is an intrinsic with the same
+/// source-lifetime requirement.
+pub fn procedurePreservesHoistableSourceInputForEnvDef(env: *const ModuleEnv, def_idx: CIR.Def.Idx) bool {
+    if (env.module_role != .builtin) return false;
+    if (iteratorProcedureForEnvDef(env, def_idx)) |producer| {
+        return producer.preservesHoistableSourceInput();
+    }
+    const def = env.store.getDef(def_idx);
+    const pattern = env.store.getPattern(def.pattern);
+    if (pattern == .assign and hoist_preserving_delegating_producer_names.has(env.getIdent(pattern.assign.ident))) {
+        return true;
+    }
+    const expr = env.store.getExpr(def.expr);
+    if (expr != .e_anno_only) return false;
+    return can.BuiltinLowLevel.intrinsicAnnotation(env, expr.e_anno_only.ident) == .field_names_iter;
+}
 
 /// Return the compiler-owned iterator role assigned to a Builtin definition.
 pub fn iteratorProcedureForDef(module: TypedCIR.Module, def_idx: CIR.Def.Idx) ?IteratorProcedureId {
-    const env = module.moduleEnvConst();
-    if (env.module_role != .builtin) return null;
-    const def = module.def(def_idx);
-    if (std.meta.activeTag(def.pattern.data) != .assign) return null;
-    const ident = def.pattern.data.assign.ident;
-    const text = module.getIdent(ident);
-
-    const exact = [_]struct { []const u8, IteratorProcedureId }{
-        .{ "Builtin.Iter.iter", .iter_iter },
-        .{ "Builtin.Iter.next", .iter_next },
-        .{ "Builtin.Iter.custom", .iter_custom },
-        .{ "Builtin.Iter.single", .iter_single },
-        .{ "Builtin.List.iter", .list_iter },
-        .{ "Builtin.Str.iter_utf8", .str_iter_utf8 },
-        .{ "Builtin.Iter.map", .iter_map },
-        .{ "Builtin.Iter.keep_if", .iter_keep_if },
-        .{ "Builtin.Iter.drop_if", .iter_drop_if },
-        .{ "Builtin.Iter.take_first", .iter_take_first },
-        .{ "Builtin.Iter.drop_first", .iter_drop_first },
-        .{ "Builtin.Iter.concat", .iter_concat },
-        .{ "Builtin.Iter.append", .iter_append },
-        .{ "Builtin.Iter.exclusive_range", .iter_exclusive_range },
-        .{ "Builtin.Iter.inclusive_range", .iter_inclusive_range },
-        .{ "iter_from_step", .iter_from_step },
-        .{ "Builtin.iter_from_step", .iter_from_step },
-        .{ "range_done", .range_done },
-        .{ "Builtin.range_done", .range_done },
-    };
-    for (exact) |entry| {
-        if (Ident.textEql(text, entry[0])) return entry[1];
-    }
-
-    const numeric_types = [_][]const u8{
-        "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128", "Dec",
-    };
-    inline for (numeric_types) |numeric| {
-        if (Ident.textEql(text, "Builtin.Num." ++ numeric ++ ".range_exclusive")) {
-            return .numeric_range_exclusive;
-        }
-        if (Ident.textEql(text, "Builtin.Num." ++ numeric ++ ".range_inclusive")) {
-            return .numeric_range_inclusive;
-        }
-    }
-    return null;
+    return iteratorProcedureForEnvDef(module.moduleEnvConst(), def_idx);
 }
 
 /// Public `MethodKey` declaration.
@@ -340,10 +534,36 @@ pub const MethodTarget = struct {
     callable_ty: CheckedTypeId,
 };
 
+/// What resolving an (owner, method) pair against the checked method
+/// registries found. Distinct from "no view declares this method": a
+/// declaration the earlier stages rejected is still declared, but it has no
+/// runtime target, so every dispatch that lands on it is a `checked_error`.
+pub const CheckedMethodLookup = union(enum) {
+    target: MethodTarget,
+    rejected,
+
+    /// The lowerable target. Post-check stages run only on programs with no
+    /// diagnostics, so a rejected declaration reaching one is a compiler bug,
+    /// not a shape to route around.
+    pub fn requireTarget(self: CheckedMethodLookup, comptime context: []const u8) MethodTarget {
+        return switch (self) {
+            .target => |target| target,
+            .rejected => std.debug.panic(
+                "checked method lookup invariant violated: rejected declaration reached " ++ context,
+                .{},
+            ),
+        };
+    }
+};
+
 /// Public `MethodRegistryEntry` declaration.
 pub const MethodRegistryEntry = struct {
     key: MethodKey,
-    target: MethodTarget,
+    /// `null` when canonicalization or checking rejected this method's
+    /// declaration (`methodBindingIsRejectedDeclaration`). Storing the key with
+    /// no target is what keeps a rejected method distinguishable from a method
+    /// no view declares at all.
+    target: ?MethodTarget,
 };
 
 /// Public `MethodRegistry` declaration.
@@ -360,7 +580,7 @@ pub const MethodRegistry = struct {
         }
     };
 
-    pub fn lookup(self: *const MethodRegistry, key: MethodKey) ?MethodTarget {
+    pub fn lookup(self: *const MethodRegistry, key: MethodKey) ?CheckedMethodLookup {
         // Stack-built keys carry undefined bytes in the owner union's padding
         // and inactive-variant region; ReleaseFast fuses the comparator's
         // field reads into wide loads that touch them. Zero those bytes so
@@ -368,7 +588,8 @@ pub const MethodRegistry = struct {
         var normalized = key;
         collections.CompactWriter.zeroValuePadding(MethodKey, @ptrCast(&normalized));
         const found = artifact_serialize.binarySearchByKey(MethodRegistryEntry, MethodKey, self.entries, normalized, methodEntryOrder) orelse return null;
-        return found.target;
+        const target = found.target orelse return .rejected;
+        return .{ .target = target };
     }
 
     /// Build-time-only teardown (see `StaticDispatchPlanTable.deinit`): a frozen
@@ -424,6 +645,18 @@ pub const MethodRegistry = struct {
                 available_artifacts,
                 entry.key.ownerIdent(),
             );
+            const method_key: MethodKey = .{
+                .owner = method_owner,
+                .method = try names.internMethodIdent(idents, entry.key.methodIdent()),
+            };
+            // A rejected declaration is still declared. Record the key with no
+            // target so dispatch resolution can tell it apart from a method no
+            // view declares, and resolve it to a checked error instead of
+            // hunting for a runtime target that cannot exist.
+            if (methodBindingIsRejectedDeclaration(module, entry.value)) {
+                try entries.append(allocator, .{ .key = method_key, .target = null });
+                continue;
+            }
             var referenced_callable_var: ?Var = null;
             const target_kind: MethodTargetKind = if (generatedStructuralTargetForMethodBinding(module, entry.value)) |generated|
                 .{ .structural = generated }
@@ -466,10 +699,7 @@ pub const MethodRegistry = struct {
             const callable_var = referenced_callable_var orelse methodTargetCallableVar(module, def_idx, entry.value, target_kind);
 
             try entries.append(allocator, .{
-                .key = .{
-                    .owner = method_owner,
-                    .method = try names.internMethodIdent(idents, entry.key.methodIdent()),
-                },
+                .key = method_key,
                 .target = .{
                     .module_idx = module_idx,
                     .def_idx = def_idx,
@@ -484,6 +714,20 @@ pub const MethodRegistry = struct {
         return .{ .entries = try entries.toOwnedSlice(allocator) };
     }
 };
+
+/// Whether this method binding's declaration was rejected before publication.
+///
+/// Canonicalization emits `e_runtime_error` for a body it could not
+/// canonicalize, and checking rewrites a poisoned body to the same node, so
+/// this is the single explicit marker for "this declaration has no runtime
+/// target, and its diagnostic is already reported".
+fn methodBindingIsRejectedDeclaration(
+    module: TypedCIR.Module,
+    binding: ModuleEnv.MethodBinding,
+) bool {
+    const expr_idx = methodBindingExpr(module, binding) orelse return false;
+    return std.meta.activeTag(module.expr(expr_idx).data) == .e_runtime_error;
+}
 
 fn methodTargetCallableVar(
     module: TypedCIR.Module,
@@ -1802,8 +2046,8 @@ pub const StaticDispatchPlanTable = struct {
             const item_ty = try checkedTypeIdForVar(allocator, module, checked_types, module.patternType(pattern_idx));
             const iter_callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, @enumFromInt(for_plan.iter_fn_var));
             const next_callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, @enumFromInt(for_plan.next_fn_var));
-            const iterator_ty = checkedFunctionReturnTypeId(checked_types, iter_callable_ty);
-            const step_ty = checkedFunctionReturnTypeId(checked_types, next_callable_ty);
+            const iterator_ty = try checkedTypeIdForVar(allocator, module, checked_types, @enumFromInt(for_plan.iterator_var));
+            const step_ty = try checkedTypeIdForVar(allocator, module, checked_types, @enumFromInt(for_plan.step_var));
             const step_topology = IteratorStepTopology{
                 .done_tag = try names.internTagIdent(module.identStoreConst(), @bitCast(for_plan.step_topology.done_tag_ident)),
                 .one_tag = try names.internTagIdent(module.identStoreConst(), @bitCast(for_plan.step_topology.one_tag_ident)),
@@ -1848,6 +2092,7 @@ pub const StaticDispatchPlanTable = struct {
                 });
                 try iterator_plan_sources.append(allocator, .{
                     .iter_dispatcher_var = module.exprType(iterable_idx),
+                    .next_dispatcher_var = @enumFromInt(for_plan.iterator_var),
                     .iter_fn_var = @enumFromInt(for_plan.iter_fn_var),
                     .next_fn_var = @enumFromInt(for_plan.next_fn_var),
                 });
@@ -1990,6 +2235,7 @@ pub const PlanSource = struct {
 /// `iterator_for_plans`.
 pub const IteratorPlanSource = struct {
     iter_dispatcher_var: Var,
+    next_dispatcher_var: Var,
     iter_fn_var: Var,
     next_fn_var: Var,
 };
@@ -2292,17 +2538,20 @@ pub fn lookupCheckedMethodTarget(
     imported_views: anytype,
     owner: MethodOwner,
     method: canonical.MethodNameId,
-) ?MethodTarget {
-    if (local_method_registry.lookup(.{ .owner = owner, .method = method })) |target| return target;
+) ?CheckedMethodLookup {
+    if (local_method_registry.lookup(.{ .owner = owner, .method = method })) |found| return found;
 
     const method_name = names.methodNameText(method);
     for (imported_views) |imported| {
         const imported_owner = methodOwnerInImportedStore(names, imported.canonical_names, owner) orelse continue;
         const imported_method = imported.canonical_names.lookupMethodName(method_name) orelse continue;
-        if (imported.method_registry.lookup(.{ .owner = imported_owner, .method = imported_method })) |target| {
-            switch (target.kind) {
-                .procedure, .structural => return target,
-                .local_proc => continue,
+        if (imported.method_registry.lookup(.{ .owner = imported_owner, .method = imported_method })) |found| {
+            switch (found) {
+                .rejected => return found,
+                .target => |target| switch (target.kind) {
+                    .procedure, .structural => return found,
+                    .local_proc => continue,
+                },
             }
         }
     }
@@ -2340,27 +2589,6 @@ fn checkedTypeIdForVar(
         }
         unreachable;
     };
-}
-
-fn checkedFunctionReturnTypeId(
-    checked_types: anytype,
-    callable_ty: CheckedTypeId,
-) CheckedTypeId {
-    const raw = @intFromEnum(callable_ty);
-    if (raw >= checked_types.store.payloadCount()) {
-        if (@import("builtin").mode == .Debug) {
-            std.debug.panic("checked static dispatch invariant violated: callable type root was outside the checked type store", .{});
-        }
-        unreachable;
-    }
-    const payload = checked_types.store.payload(callable_ty);
-    if (std.meta.activeTag(payload) != .function) {
-        if (@import("builtin").mode == .Debug) {
-            std.debug.panic("checked static dispatch invariant violated: for-loop dispatch constraint was not a function", .{});
-        }
-        unreachable;
-    }
-    return payload.function.ret;
 }
 
 fn staticDispatchOperandsForSlice(
@@ -2404,7 +2632,7 @@ test "method registry finalization sorts entries for binary lookup" {
         .key = .{ .owner = .{ .builtin = .box }, .method = @enumFromInt(2) },
         .target = testMethodTarget(@enumFromInt(20)),
     };
-    entries[0].target.kind = .{ .structural = .equality };
+    entries[0].target.?.kind = .{ .structural = .equality };
     entries[1] = .{
         .key = .{ .owner = .{ .builtin = .list }, .method = @enumFromInt(1) },
         .target = testMethodTarget(@enumFromInt(10)),
@@ -2418,10 +2646,39 @@ test "method registry finalization sorts entries for binary lookup" {
 
     var registry = MethodRegistry{ .entries = entries };
     const found = registry.lookup(.{ .owner = .{ .builtin = .box }, .method = @enumFromInt(1) }) orelse return error.MissingSortedMethodTarget;
-    try std.testing.expectEqual(@as(CIR.Def.Idx, @enumFromInt(15)), found.def_idx);
+    try std.testing.expectEqual(@as(CIR.Def.Idx, @enumFromInt(15)), found.target.def_idx);
     const structural = registry.lookup(.{ .owner = .{ .builtin = .box }, .method = @enumFromInt(2) }) orelse return error.MissingStructuralMethodTarget;
-    try std.testing.expectEqual(StructuralKind.equality, structural.kind.structural);
+    try std.testing.expectEqual(StructuralKind.equality, structural.target.kind.structural);
     try std.testing.expect(registry.lookup(.{ .owner = .{ .builtin = .list }, .method = @enumFromInt(2) }) == null);
+}
+
+test "method registry distinguishes a rejected declaration from an undeclared method" {
+    const allocator = std.testing.allocator;
+
+    const entries = try allocator.alloc(MethodRegistryEntry, 2);
+    defer allocator.free(entries);
+
+    entries[0] = .{
+        .key = .{ .owner = .{ .builtin = .box }, .method = @enumFromInt(1) },
+        .target = testMethodTarget(@enumFromInt(10)),
+    };
+    entries[1] = .{
+        .key = .{ .owner = .{ .builtin = .box }, .method = @enumFromInt(2) },
+        .target = null,
+    };
+
+    finalizeMethodRegistryEntries(entries);
+
+    var registry = MethodRegistry{ .entries = entries };
+    const declared = registry.lookup(.{ .owner = .{ .builtin = .box }, .method = @enumFromInt(1) }) orelse
+        return error.MissingDeclaredMethodTarget;
+    try std.testing.expectEqual(@as(CIR.Def.Idx, @enumFromInt(10)), declared.target.def_idx);
+
+    const rejected = registry.lookup(.{ .owner = .{ .builtin = .box }, .method = @enumFromInt(2) }) orelse
+        return error.MissingRejectedMethodEntry;
+    try std.testing.expect(rejected == .rejected);
+
+    try std.testing.expect(registry.lookup(.{ .owner = .{ .builtin = .box }, .method = @enumFromInt(3) }) == null);
 }
 
 /// Convert an intentional fixture-table position while preserving enum inference.
